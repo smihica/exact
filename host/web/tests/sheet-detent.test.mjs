@@ -175,6 +175,107 @@ check('the bottom safe area is added below every detent, a content-high one incl
   expect(await open(evaluate, 'fit-content')).toEqual([844 - content - 34, content + 34]);
 }), 60000);
 
+// The sheet's content as an app writes a scrolled sheet: a header, then a scroller filling the rest whose column is at
+// least its height, `rows` px of rows in it and the scroller's own bottom padding `pad` or class. What the scroller
+// shows at its end: the sheet's frame, the last row's distance from the window's foot, the scroller's bottom padding
+// and border, and whether it scrolls.
+const scrolled = (evaluate, rows, pad = '', className = '') => evaluate(`{
+  const sheet = document.getElementById('sheet');
+  sheet.innerHTML = '<header><h2>Sheet</h2></header><div id="scroller" class="${className}" style="flex:1;min-height:0;overflow:auto;${pad && `padding-bottom:${pad}`}"><div style="min-height:100%;display:flex;flex-direction:column"><div style="height:${rows}px;flex-shrink:0"></div><div id="last" style="height:20px;flex-shrink:0"></div></div></div>';
+  select('1'); select('2');
+  const frame = box('sheet');
+  [frame, ...end()];
+}`);
+const end = (evaluate) => evaluate(`end()`);
+const endScript = `window.end = () => {
+  const scroller = document.getElementById('scroller'), s = getComputedStyle(scroller);
+  scroller.scrollTop = scroller.scrollHeight;
+  return [Math.round(innerHeight - document.getElementById('last').getBoundingClientRect().bottom), s.paddingBottom, s.borderBottomWidth, scroller.scrollHeight > scroller.clientHeight];
+}`;
+const headerHeight = (evaluate) => evaluate(`document.querySelector('#sheet > header').getBoundingClientRect().height`);
+
+check("a narrow sheet's bottom-edge scroller keeps its content above the bottom safe area once, short or tall, at any detent", () => inChrome(async (evaluate, size, call) => {
+  await call('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 34 } });
+  await size(390, 844);
+  await evaluate(`${endScript}; detents('sheet', 'fit-content')`);
+  // Short: the sheet is its content and the inset once, which the scroller's border holds; nothing scrolls.
+  const short = await scrolled(evaluate, 200), header = await headerHeight(evaluate);
+  expect(short).toEqual([[844 - header - 220 - 34, header + 220 + 34], 34, '0px', '34px', false]);
+  // Tall: the tallest sheet, its last row ending above the inset.
+  expect(await scrolled(evaluate, 2000)).toEqual([[12, 832], 34, '0px', '34px', true]);
+  // An author's bottom padding, inline or from a class rule, is left alone and adds to the inset.
+  expect(await scrolled(evaluate, 200, '10px')).toEqual([[844 - header - 220 - 44, header + 220 + 44], 44, '10px', '34px', false]);
+  expect(await scrolled(evaluate, 2000, '10px')).toEqual([[12, 832], 44, '10px', '34px', true]);
+  await evaluate(`document.head.insertAdjacentHTML('beforeend', '<style>.padded { padding-bottom: 10px } .more { padding-bottom: 30px } .tall { padding-bottom: 2vh }</style>')`);
+  expect(await scrolled(evaluate, 200, '', 'padded')).toEqual([[844 - header - 220 - 44, header + 220 + 44], 44, '10px', '34px', false]);
+  // A class switched with no projection, as the JS target writes an enumerated binding, and a length relative to the
+  // window after a resize, still count.
+  expect(await scrolled(evaluate, 2000, '', 'padded')).toEqual([[12, 832], 44, '10px', '34px', true]);
+  await evaluate(`document.getElementById('scroller').className = 'more'`);
+  expect(await end(evaluate)).toEqual([64, '30px', '34px', true]);
+  await evaluate(`document.getElementById('scroller').className = 'tall'`);
+  await size(390, 744);
+  expect(await end(evaluate)).toEqual([49, '14.88px', '34px', true]);
+  await size(390, 844);
+  // A detent and the tallest sheet keep their heights, their scroller ending above the inset.
+  await evaluate(`detents('sheet', 'medium large')`);
+  expect(await scrolled(evaluate, 2000)).toEqual([[411, 433], 34, '0px', '34px', true]);
+  await evaluate(`detents('sheet', null)`);
+  expect(await scrolled(evaluate, 2000)).toEqual([[12, 832], 34, '0px', '34px', true]);
+  // A wide window's card is clear of the window's edge.
+  await size(1280, 900);
+  expect(await scrolled(evaluate, 2000)).toEqual([[90, 720], 90, '0px', '0px', true]);
+  // With no inset, nothing is added.
+  await call('Emulation.setSafeAreaInsetsOverride', { insets: { top: 0, bottom: 0, left: 0, right: 0 } });
+  await size(390, 844);
+  await evaluate(`detents('sheet', 'fit-content')`);
+  expect(await scrolled(evaluate, 200)).toEqual([[844 - header - 220, header + 220], 0, '0px', '0px', false]);
+}), 60000);
+
+check("an author's bottom border on a sheet's bottom-edge scroller replaces the inset", () => inChrome(async (evaluate, size, call) => {
+  await call('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 34 } });
+  await size(390, 844);
+  await evaluate(`${endScript}; document.head.insertAdjacentHTML('beforeend', '<style>.lined { border-bottom: 1px solid black }</style>'); detents('sheet', 'fit-content')`);
+  expect((await scrolled(evaluate, 2000, '', 'lined')).slice(2)).toEqual(['0px', '1px', true]);
+}), 60000);
+
+check('without calc-size() a content-high sheet whose scroller takes the inset adds no band of its own', () => inChrome(async (evaluate, size, call) => {
+  await call('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 34 } });
+  await size(390, 844);
+  // The `@supports not (calc-size)` rules laid over the page, as a browser without calc-size() reads them.
+  await evaluate(`{
+    ${endScript};
+    const rules = [], walk = list => { for (const r of list) r instanceof CSSSupportsRule && r.conditionText.includes('calc-size') ? rules.push(...[...r.cssRules].map(c => c.cssText)) : r.cssRules && walk(r.cssRules); };
+    for (const s of document.styleSheets) walk(s.cssRules);
+    const style = document.createElement('style');
+    style.textContent = rules.join('\\n');
+    document.head.append(style);
+    detents('sheet', 'fit-content');
+  }`);
+  const short = await scrolled(evaluate, 200), header = await headerHeight(evaluate);
+  expect(short).toEqual([[844 - header - 220 - 34, header + 220 + 34], 34, '0px', '34px', false]);
+  expect(await evaluate(`getComputedStyle(document.getElementById('sheet')).borderBottomWidth`)).toBe('0px');
+  expect(await scrolled(evaluate, 2000)).toEqual([[12, 832], 34, '0px', '34px', true]);
+}), 60000);
+
+check('a sheet whose last child in flow is not a scroller keeps the band below its content', () => inChrome(async (evaluate, size, call) => {
+  await call('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 34 } });
+  await size(390, 844);
+  const [, banded] = await open(evaluate, 'fit-content');
+  await evaluate(`{
+    const scroller = document.createElement('div');
+    scroller.id = 'scroller';
+    scroller.style.cssText = 'height:40px;flex-shrink:0;overflow:auto';
+    document.getElementById('sheet').prepend(scroller);
+  }`);
+  expect(await open(evaluate, 'fit-content')).toEqual([844 - banded - 40, banded + 40]);
+  expect(await evaluate(`[getComputedStyle(document.getElementById('scroller')).borderBottomWidth, document.getElementById('sheet').hasAttribute('data-exact-bottom-scroller')]`)).toEqual(['0px', false]);
+  // A text area last is a field, not the sheet's content scroller.
+  await evaluate(`document.getElementById('sheet').append(Object.assign(document.createElement('textarea'), { id: 'notes' }))`);
+  await open(evaluate, 'fit-content');
+  expect(await evaluate(`[document.getElementById('notes').hasAttribute('data-exact-bottom-inset'), document.getElementById('sheet').hasAttribute('data-exact-bottom-scroller')]`)).toEqual([false, false]);
+}), 60000);
+
 check('each presented route is drawn above every route beneath it, sheet or full screen', () => inChrome(async (evaluate, size) => {
   // The route painted at a point, with every slide ended: hit testing skips an inert route, so the covered ones are
   // made hittable for the read.

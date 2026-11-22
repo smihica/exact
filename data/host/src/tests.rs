@@ -1127,9 +1127,30 @@ fn document_work_stays_on_the_selected_directory_during_path_swaps() {
 /// with the web's refusal word for word, which the module can handle — where
 /// an unconfigured host refuses the answer itself.
 #[test]
-fn an_agent_drive_without_a_store_answers_with_the_webs_refusal() {
+fn a_live_drive_without_a_store_answers_with_the_webs_refusal() {
+    const CHILD: &str = "EXACT_TEST_STORAGE_REFUSAL";
+    if std::env::var_os(CHILD).is_none() {
+        for mode in ["1", "live"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::a_live_drive_without_a_store_answers_with_the_webs_refusal",
+                ])
+                .env(CHILD, "1")
+                .env("EXACT_AGENT", mode)
+                .env_remove("EXACT_AGENT_STORAGE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
     let mut host = Storage::new(Fixture::new());
-    host.agent = true;
     host.activate().unwrap();
     let refused = run(
         &mut host,

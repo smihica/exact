@@ -46,6 +46,18 @@ impl Default for Glyphs {
 }
 
 impl Glyphs {
+    /// Whether Swash supplies the glyph placements for this frame.
+    pub fn swash_placements(&self) -> bool {
+        #[cfg(windows)]
+        {
+            !directwrite_enabled()
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
     pub fn pin(&mut self, texture: crate::instance::TextureId) {
         self.alpha.pin(texture);
         self.color.pin(texture);

@@ -400,11 +400,14 @@ pub(crate) fn pointer(
 ) -> Option<Pointer> {
     let holder = monitors.get(on)?;
     let placed = layout(monitors);
-    // `ScreenToDIPPoint`: from the holder's physical origin to its laid-out one.
+    // `ScreenToDIPPoint`: from the holder's physical origin to its laid-out one,
+    // divided once, so a point beside the origin is as near as `at / scale`
+    // (-3 px at 125 % is -2.4, not -2048 + 2045.6).
     let scale = f64::from(holder.scale);
     let origin = placed[on].0;
-    let from =
-        |axis: usize| f64::from(origin[axis]) + f64::from(at[axis] - holder.rect[axis]) / scale;
+    let from = |axis: usize| {
+        (f64::from(origin[axis]) * scale + f64::from(at[axis] - holder.rect[axis])) / scale
+    };
     let picks = [current_of(monitors, current), on];
     let (screens, [current, on]) = arrange(monitors, &placed, client, picks);
     Some(Pointer {

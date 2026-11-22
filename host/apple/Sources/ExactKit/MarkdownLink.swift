@@ -38,6 +38,12 @@ package protocol MarkdownCapability: AnyObject {
     func restyle(_ node: NodeView)
     /// The `formatElement` command (LLP 1045 D6).
     func formatElement(_ presenter: Presenter, _ args: [Any])
+    /// `runs` with each atom's icon split out as its own run, inside the
+    /// atom's direction isolate (LLP 1045.000 D4); a picture still loading
+    /// tells `node` when it arrives.
+    func atomIcons(_ engine: TextEngine, _ runs: [Run], node: NodeView?) -> [Run]
+    /// The paint record of a run's atom icon.
+    func atomIcon(_ icon: AtomIconRun) -> any TextAtomIconPainting
     #if os(iOS) || os(tvOS)
     /// The edit menu's Markdown items for `textView`.
     func menu(_ node: NodeView, _ textView: UITextView, range: NSRange, suggested: [UIMenuElement]) -> UIMenu?
@@ -238,7 +244,7 @@ extension NodeView {
     }
     func editMarkupLink() { MarkdownLink.installed?.editLink(self) }
     func publishMarkupSelection(force: Bool = false) { MarkdownLink.installed?.publishSelection(self, force: force) }
-    func restyleMarkup() {
+    package func restyleMarkup() {
         MarkdownLink.installed?.restyle(self)
         restyleDecorations()
     }

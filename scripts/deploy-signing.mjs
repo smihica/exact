@@ -42,7 +42,7 @@ export function canonicalJson(value, dropSignature = false) {
 /** Refuse a numeric token whose spelling Rust's canonical parser cannot
  * admit. `JSON.parse` alone loses this evidence by normalizing `7.0`, `7e0`,
  * and `-0` to the number 7 or 0 before the signature check sees it. */
-export function validateRawIntegers(text) {
+export function validateRawIntegers(text, label = 'the envelope') {
   for (let i = 0; i < text.length;) {
     if (text[i] === '"') {
       i++;
@@ -52,11 +52,11 @@ export function validateRawIntegers(text) {
         const first = Number.parseInt(text.slice(i + 2, i + 6), 16);
         if (first >= 0xd800 && first <= 0xdbff) {
           const second = text.slice(i + 6, i + 8) === '\\u' ? Number.parseInt(text.slice(i + 8, i + 12), 16) : NaN;
-          if (!(second >= 0xdc00 && second <= 0xdfff)) throw new Error('the envelope carries an escaped lone surrogate, not a Unicode scalar value');
+          if (!(second >= 0xdc00 && second <= 0xdfff)) throw new Error(`${label} carries an escaped lone surrogate, not a Unicode scalar value`);
           i += 12;
           continue;
         }
-        if (first >= 0xdc00 && first <= 0xdfff) throw new Error('the envelope carries an escaped lone surrogate, not a Unicode scalar value');
+        if (first >= 0xdc00 && first <= 0xdfff) throw new Error(`${label} carries an escaped lone surrogate, not a Unicode scalar value`);
         i += 6;
       }
       if (text[i] === '"') i++;
@@ -66,7 +66,7 @@ export function validateRawIntegers(text) {
     const token = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/.exec(text.slice(i))?.[0];
     if (!token) { i++; continue; } // JSON.parse below reports malformed JSON.
     if (!/^(?:0|-[1-9][0-9]*|[1-9][0-9]*)$/.test(token) || !Number.isSafeInteger(Number(token))) {
-      throw new Error(`the envelope carries the non-canonical integer ${token}; canonical bytes require shortest exact integers`);
+      throw new Error(`${label} carries the non-canonical integer ${token}; canonical bytes require shortest exact integers`);
     }
     i += token.length;
   }
@@ -110,10 +110,17 @@ export function assetIndex(cards, url) {
   return { bytes, card: { url: typeof url === 'function' ? url(sha256) : url, sha256, bytes: bytes.length, count: cards.length } };
 }
 
-/** An envelope's bytes as served, refused over its bound with what it holds. */
+/** An envelope's bytes as served, refused over its bound with its largest inline part. */
 export function envelopeBytes(envelope) {
   const bytes = Buffer.from(JSON.stringify(envelope) + '\n', 'utf8');
-  if (bytes.length > ENVELOPE_BYTES) refuse(`the envelope is ${kib(bytes.length)}; the most is ${kib(ENVELOPE_BYTES)} (its asset index names ${envelope.assets?.count ?? 0} assets)`);
+  if (bytes.length > ENVELOPE_BYTES) {
+    const size = value => Buffer.byteLength(JSON.stringify(value) ?? '');
+    const parts = Object.entries(envelope).map(([name, value]) => ({ name, value, bytes: size(value) }));
+    const { name, value, bytes: largest } = parts.reduce((a, b) => a.bytes >= b.bytes ? a : b);
+    let detail = `${name} is ${kib(largest)}`;
+    if (name === 'cohort' && value?.sources) detail += `; the cohort's sources are ${kib(size(value.sources))}`;
+    refuse(`the envelope is ${kib(bytes.length)}; the most is ${kib(ENVELOPE_BYTES)} (largest part: ${detail})`);
+  }
   return bytes;
 }
 

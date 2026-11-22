@@ -491,6 +491,7 @@ fn validate(schema: &Schema) {
                             | "list<number>"
                             | "option<string>"
                             | "option<number>"
+                            | "option<ScrollMetrics>"
                     ),
                 "format: stdlib `{}` type `{t}`",
                 f.name
@@ -527,7 +528,9 @@ fn main() {
     println!("cargo:rerun-if-changed={SCHEMA_PATH}");
     println!("cargo:rerun-if-changed=build.rs");
     let text = std::fs::read_to_string(SCHEMA_PATH).expect("read tables/format.json");
-    let value: serde_json::Value = serde_json::from_str(&text).expect("format.json parses");
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("format.json parses");
+    // A host can enable serde_json's preserve_order feature through another build dependency.
+    value.sort_all_objects();
     let schema: Schema = serde_json::from_value(value.clone()).expect("format.json shape");
     validate(&schema);
     let canonical = serde_json::to_string(&value).unwrap();
@@ -983,10 +986,7 @@ fn main() {
             );
         }
     }
-    let _ = writeln!(
-        w,
-        "        w.u32(self.strings.len() as u32); for s in &self.strings {{ w.string(s); }}"
-    );
+    let _ = writeln!(w, "        self.strings.encode(&mut w);");
     let _ = writeln!(
         w,
         "        w.u32(self.code.len() as u32); w.bytes(&self.code);"
@@ -1238,7 +1238,7 @@ fn main() {
     }
     let _ = writeln!(w, "        if snapshot_entry != snapshot.unwrap_or(\"\") {{ return Err(PlanError::WrongEntry); }}");
     let _ = writeln!(w, "        if (surface == \"terminal\") != terminal {{ return Err(PlanError::WrongSurface {{ plan: if surface.is_empty() {{ \"gui\".into() }} else {{ surface }}, host: if terminal {{ \"terminal\" }} else {{ \"gui\" }} }}); }}");
-    // A string is its 4-byte length and its bytes.
+    // The string pool owns the literal and qualified records.
     let _ = writeln!(
         w,
         "        let strings = crate::pool::Strings::decode(&mut r, bytes, lent)?;"

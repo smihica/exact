@@ -143,6 +143,20 @@ final class InlineFocusMacTests: XCTestCase {
         var focused: [UInt32] = [], blurred: [UInt32] = [], pressed: [UInt32] = [], menus: [UInt32] = []
         p.onFocus = { focused.append($0) }; p.onBlur = { blurred.append($0) }
         p.onPress = { pressed.append($0) }; p.onClipboard = { id, kind, _ in if kind == 10 { menus.append(id) } }
+        let rect = try XCTUnwrap(paragraph.inlineRects(try XCTUnwrap(p.inlineText(7))).first)
+        let down = paragraph.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+        func mouse(_ type: NSEvent.EventType, dx: CGFloat) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: NSPoint(x: down.x + dx, y: down.y),
+                               modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+                               context: nil, eventNumber: 1, clickCount: 1, pressure: 0)!
+        }
+        for dx: CGFloat in [1, 4, 10] {
+            paragraph.mouseDown(with: mouse(.leftMouseDown, dx: 0))
+            paragraph.mouseDragged(with: mouse(.leftMouseDragged, dx: dx))
+            paragraph.mouseUp(with: mouse(.leftMouseUp, dx: dx))
+            XCTAssertEqual(pressed, dx <= 4 ? [7] : [])
+            pressed.removeAll()
+        }
         _ = Agent(session: session).type(["id": 5, "key": "Enter"])
         XCTAssertEqual(pressed, [5], "the driver can address a run before the first Tab")
         pressed.removeAll(); focused.removeAll(); blurred.removeAll()

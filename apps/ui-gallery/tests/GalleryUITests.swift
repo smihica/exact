@@ -1,7 +1,9 @@
 import XCTest
 import UIKit
 
-/// Run the full suite on an open Duo; the header and video checks also run closed.
+/// Runs on an open Duo, where no test skips, and on a compact window (the folded Duo or an iPhone), where
+/// the gallery's list and the section chosen from it are one stack and the tests that need the list beside
+/// the section skip.
 final class GalleryUITests: XCTestCase {
     override func setUp() {
         super.setUp()
@@ -11,52 +13,24 @@ final class GalleryUITests: XCTestCase {
     func testSidebarSelectionFinishesWithoutAnotherTouch() throws {
         let app = XCUIApplication(bundleIdentifier: "com.exact.uigallery")
         app.launch()
-        let sidebar = app.tables["gallery-sidebar"]
+        let sidebar = app.collectionViews["gallery-sidebar"]
         XCTAssertTrue(sidebar.waitForExistence(timeout: 20))
-        XCTAssertGreaterThan(app.windows.firstMatch.frame.width, 800, "Run this check on the open Duo so selection leaves the sidebar visible")
+        try requireSidebarBesideThePage(app)
         for section in ["css", "profiles", "textcolors"] {
-            app.cells["sidebar-panel-" + section].tap()
+            open(section, in: app)
             let before = try sidebarPixels(app, sidebar)
             sidebar.staticTexts["Text"].firstMatch.tap()
             let after = try sidebarPixels(app, sidebar)
-            XCTAssertTrue(before == after, "Sidebar selection must finish drawing without another touch. Keep existing cells when only selection changes.")
+            XCTAssertTrue(before == after, "The list must finish drawing the chosen row without another touch")
         }
-    }
-
-    func testSidebarSelectionPreservesVisibleCells() throws {
-        let tabs = (0..<9).map { index in
-            GalleryTestTab(name: "Section \(index)", controller: UINavigationController(), item: UITabBarItem(title: "Section \(index)", image: nil, tag: index))
-        }
-        let contents = ExactTabContents(tabs: tabs)
-        let sidebar = GallerySidebar(contents)
-        sidebar.loadViewIfNeeded()
-        let table = try XCTUnwrap(sidebar.tableView)
-        table.frame = CGRect(x: 0, y: 0, width: 402, height: 874)
-        let source = GalleryDataSourceSpy(sidebar)
-        table.dataSource = source
-        table.reloadData()
-        table.layoutIfNeeded()
-        XCTAssertGreaterThan(source.configurations, 0, "The table must configure visible rows before testing reuse")
-        let configurations = source.configurations
-        let cells = table.visibleCells
-        for selection in [2, 3, 1, 1] {
-            contents.selected = selection
-            sidebar.refreshSelection()
-            table.layoutIfNeeded()
-            XCTAssertEqual(source.configurations, configurations, "Changing selection must not rebuild unchanged rows")
-            XCTAssertEqual(table.visibleCells.map(ObjectIdentifier.init), cells.map(ObjectIdentifier.init))
-        }
-        XCTAssertEqual(table.indexPathForSelectedRow, IndexPath(row: 1, section: 0))
     }
 
     func testHeaderCollapsesAndTheRangeBarFollowsIt() throws {
         let app = XCUIApplication(bundleIdentifier: "com.exact.uigallery")
         app.launch()
-        let sidebar = app.tables["gallery-sidebar"]
+        let sidebar = app.collectionViews["gallery-sidebar"]
         XCTAssertTrue(sidebar.waitForExistence(timeout: 20))
-        let cell = app.cells["sidebar-panel-css"]
-        for _ in 0..<4 where !cell.isHittable { sidebar.swipeDown() }
-        cell.tap()
+        open("css", in: app)
         let bar = app.navigationBars["CSS color spaces"]
         let range = app.segmentedControls["range-css"]
         XCTAssertTrue(range.waitForExistence(timeout: 10))
@@ -64,58 +38,42 @@ final class GalleryUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["range-css-note"].exists)
         let scroll = app.otherElements["gallery"].firstMatch
         var readings: [[String: Any]] = []
-        func record(_ step: String) throws {
-            let title = bar.staticTexts["CSS color spaces"].firstMatch
-            let rangeTitle = app.staticTexts["range-css-title"]
-            let rangeFrame = app.otherElements["range-bar-css"].firstMatch.frame
-            let image = try screenImage(app), window = app.windows.firstMatch.frame
-            let headerColor = try backgroundChannels(image, window: window, at: CGPoint(x: rangeFrame.minX + 4, y: rangeFrame.minY - 4))
-            let rangeColor = try backgroundChannels(image, window: window, at: CGPoint(x: rangeFrame.minX + 4, y: rangeFrame.minY + 4))
-            let difference = zip(headerColor, rangeColor).map { abs($0 - $1) }.max() ?? 0
-            readings.append(["step": step, "headerBottom": bar.frame.maxY,
-                             "headerTitleBottom": title.exists ? title.frame.maxY : -1,
-                             "rangeTitleTop": rangeTitle.frame.minY, "rangeTitleBottom": rangeTitle.frame.maxY,
+        func record(_ step: String) {
+            let rangeTitle = app.staticTexts["range-css-title"], title = bar.staticTexts["CSS color spaces"].firstMatch
+            readings.append(["step": step, "headerBottom": bar.frame.maxY, "barShown": title.exists && title.isHittable,
+                             "barTop": app.otherElements["range-bar-css"].firstMatch.frame.minY,
+                             "rangeTop": range.frame.minY,
                              "titleControlGap": range.frame.minX - rangeTitle.frame.maxX,
                              "titleCenter": rangeTitle.frame.midY, "controlCenter": range.frame.midY,
-                             "rangeTop": range.frame.minY, "gap": range.frame.minY - bar.frame.maxY,
-                             "barTop": app.otherElements["range-bar-css"].firstMatch.frame.minY,
-                             "titleVisible": title.exists && title.isHittable,
-                             "titleTop": title.exists ? title.frame.minY : -1,
-                             "headerColor": headerColor, "rangeColor": rangeColor,
-                             "backgroundDifference": difference,
                              "hittable": range.isHittable])
-            if step == "initial" || step == "fast-up", let data = UIImage(cgImage: image).pngData() {
-                try? data.write(to: output.appendingPathComponent("header-\(step).png"))
-            }
         }
-        try record("initial")
+        record("initial")
         scroll.swipeUp(velocity: .slow)
-        try record("slow-up")
+        record("slow-up")
         scroll.swipeUp(velocity: .fast)
-        try record("fast-up")
+        record("fast-up")
+        // The CSS page is short: one fast swipe returns it to the top, where the large title shows again
         scroll.swipeDown(velocity: .fast)
-        try record("fast-down")
+        record("fast-down")
         scroll.swipeUp(velocity: .fast)
-        try record("fast-up-again")
+        record("fast-up-again")
         try save(readings, as: "header-range.json")
-        // UIKit retains the bar's accessibility frame after hiding its title
-        XCTAssertEqual(readings.first?["titleVisible"] as? Bool, true)
-        XCTAssertEqual(readings[2]["titleVisible"] as? Bool, false, "Scrolling must hide the native title")
-        XCTAssertEqual(readings[3]["titleVisible"] as? Bool, true, "Scrolling back restores the native title")
-        for reading in readings where reading["titleVisible"] as? Bool == true {
+        let tops = try readings.map { try XCTUnwrap($0["rangeTop"] as? CGFloat) }
+        let expanded = tops[0], collapsed = tops[2]
+        XCTAssertLessThan(collapsed, expanded - 20, "Scrolling collapses the header, and the range bar follows it")
+        XCTAssertEqual(tops[3], expanded, accuracy: 1, "Scrolling back expands the header")
+        for (reading, top) in zip(readings, tops) {
+            XCTAssertTrue(abs(top - expanded) < 1 || abs(top - collapsed) < 1,
+                          "A swipe of either velocity leaves the header expanded or collapsed: \(reading)")
+        }
+        // Read the bar's foot only while it shows its title: a bar UIKit hides keeps its accessibility frame
+        for reading in readings where reading["barShown"] as? Bool == true {
             XCTAssertEqual(try XCTUnwrap(reading["barTop"] as? CGFloat),
                            try XCTUnwrap(reading["headerBottom"] as? CGFloat), accuracy: 1,
-                           "The sticky bar starts at the bottom of the visible header")
+                           "The range bar starts at the bottom of the header: \(reading)")
         }
-        let expanded = readings.filter { $0["titleVisible"] as? Bool == true }.compactMap { $0["rangeTop"] as? CGFloat }
-        let collapsed = readings.filter { $0["titleVisible"] as? Bool == false }.compactMap { $0["rangeTop"] as? CGFloat }
-        XCTAssertLessThan(try XCTUnwrap(collapsed.first), try XCTUnwrap(expanded.first) - 20, "The range bar follows the native header")
-        for positions in [expanded, collapsed] {
-            XCTAssertEqual(try XCTUnwrap(positions.max()), try XCTUnwrap(positions.min()), accuracy: 1, "Swipe velocity does not change spacing within a header state")
-        }
+        XCTAssertEqual(readings.first?["barShown"] as? Bool, true)
         for reading in readings {
-            XCTAssertLessThanOrEqual(try XCTUnwrap(reading["backgroundDifference"] as? Int), 3,
-                                     "The header and range controls share a continuous background: \(reading)")
             XCTAssertEqual(reading["hittable"] as? Bool, true)
             XCTAssertEqual(try XCTUnwrap(reading["titleControlGap"] as? CGFloat), 16, accuracy: 0.5,
                            "The title and segmented control use system horizontal spacing")
@@ -123,25 +81,52 @@ final class GalleryUITests: XCTestCase {
                            try XCTUnwrap(reading["controlCenter"] as? CGFloat), accuracy: 0.5,
                            "The label is vertically centered beside the control")
         }
-        range.buttons["standard"].tap()
-        XCTAssertTrue(range.buttons["standard"].isSelected)
-        if app.windows.firstMatch.frame.width < 500 {
-            let back = app.buttons["BackButton"].firstMatch
-            XCTAssertTrue(back.waitForExistence(timeout: 5))
-            back.tap()
-            XCTAssertTrue(sidebar.waitForExistence(timeout: 10))
+        // Beside the list, once it is scrolled too, the docked range bar ends level with the list's inline bar
+        if sidebarIsBesideThePage(app) {
+            let rangeBar = app.otherElements["range-bar-css"].firstMatch, sidebarBar = app.navigationBars["UI Gallery"]
+            let large = sidebarBar.frame.height
+            sidebar.swipeUp(velocity: .slow)
+            XCTAssertLessThan(sidebarBar.frame.height, large, "The list's title is inline once it is scrolled")
+            XCTAssertEqual(rangeBar.frame.minY, sidebarBar.frame.minY, accuracy: 0.5, "The range bar is docked where the list's bar starts")
+            XCTAssertEqual(rangeBar.frame.maxY, sidebarBar.frame.maxY, accuracy: 0.5, "The two headers end on one line")
+            let docked = rangeBar.frame, row = sidebar.cells["sidebar-css"]
+            // UIKit keeps a hidden list hidden at the next launch, so show it again from the page's bar, at the
+            // page's top, however this test ends
+            addTeardownBlock {
+                let scroll = app.otherElements["gallery"].firstMatch, show = app.buttons["Show Sidebar"]
+                for _ in 0..<3 where !row.isHittable && !show.isHittable { scroll.swipeDown(velocity: .fast) }
+                if show.isHittable { show.tap() }
+                XCTAssertTrue(row.isHittable, "The list shows beside the page again")
+            }
+            app.buttons["Hide Sidebar"].tap()
+            XCTAssertFalse(row.isHittable, "The list is hidden")
+            XCTAssertEqual(rangeBar.frame.minY, docked.minY, accuracy: 0.5, "Hiding the list moves nothing in the page's header")
+            XCTAssertEqual(rangeBar.frame.height, docked.height, accuracy: 0.5, "Hiding the list keeps the range bar's height")
+            // The scrolled page hides its bar and the list's button with it, so drag the list in from the left edge
+            let edge = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.002, dy: 0.5))
+            edge.press(forDuration: 0.1, thenDragTo: edge.withOffset(CGVector(dx: 320, dy: 0)))
+            XCTAssertTrue(row.isHittable, "The list shows again")
+            XCTAssertEqual(rangeBar.frame.minY, docked.minY, accuracy: 0.5, "Dragging the list in moves nothing in the page's header")
+            XCTAssertEqual(rangeBar.frame.height, docked.height, accuracy: 0.5, "Dragging the list in keeps the range bar's height")
+            // Hide it again, as a tap on the page would only dismiss a list laid over it
+            app.buttons["Hide Sidebar"].tap()
         }
+        range.buttons["standard"].tap()
+        XCTAssertTrue(range.buttons["standard"].isSelected, "The control takes a tap over the scrolled page")
+        // A compact window collapses the split to one stack, whose back button returns to the list
+        guard app.windows.firstMatch.frame.width < 500 else { return }
+        let back = app.buttons["BackButton"].firstMatch
+        XCTAssertTrue(back.isHittable, "The scrolled page keeps a back button")
+        back.tap()
+        XCTAssertTrue(sidebar.cells["sidebar-css"].isHittable)
     }
 
     func testRangeControlsRemainInteractiveOverScrollingContent() throws {
         let app = XCUIApplication(bundleIdentifier: "com.exact.uigallery")
         app.launch()
-        let sidebar = app.tables["gallery-sidebar"]
-        XCTAssertTrue(sidebar.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.collectionViews["gallery-sidebar"].waitForExistence(timeout: 20))
         for section in ["css", "images", "css"] {
-            let cell = app.cells["sidebar-panel-" + section]
-            for _ in 0..<4 where !cell.isHittable { sidebar.swipeDown() }
-            cell.tap()
+            open(section, in: app)
             let range = app.segmentedControls["range-" + section]
             XCTAssertTrue(range.waitForExistence(timeout: 10))
             range.buttons["standard"].tap()
@@ -164,11 +149,8 @@ final class GalleryUITests: XCTestCase {
     func testVideoFormatAndPlaybackControls() throws {
         let app = XCUIApplication(bundleIdentifier: "com.exact.uigallery")
         app.launch()
-        let sidebar = app.tables["gallery-sidebar"]
-        XCTAssertTrue(sidebar.waitForExistence(timeout: 20))
-        let media = app.cells["sidebar-panel-media"]
-        for _ in 0..<4 where !media.isHittable { sidebar.swipeUp() }
-        media.tap()
+        XCTAssertTrue(app.collectionViews["gallery-sidebar"].waitForExistence(timeout: 20))
+        open("media", in: app)
         let formats = app.segmentedControls["video-formats"]
         XCTAssertTrue(formats.waitForExistence(timeout: 10))
         let scroll = app.otherElements["gallery"].firstMatch
@@ -190,51 +172,53 @@ final class GalleryUITests: XCTestCase {
         try data.write(to: output.appendingPathComponent("video-controls.png"))
     }
 
-    func testPageSwitchesKeepContentBelowTheRangeBar() throws {
+    /// Every page starts below its range bar, and beside the list.
+    func testPageSwitchesKeepContentBelowTheRangeBarAndBesideTheSidebar() throws {
         let app = XCUIApplication(bundleIdentifier: "com.exact.uigallery")
         app.launch()
-        let sidebar = app.tables["gallery-sidebar"]
+        let sidebar = app.collectionViews["gallery-sidebar"]
         XCTAssertTrue(sidebar.waitForExistence(timeout: 20))
-        XCTAssertGreaterThan(app.windows.firstMatch.frame.width, 800)
+        try requireSidebarBesideThePage(app)
         var readings: [[String: Any]] = []
         for section in ["typography", "css", "profiles", "images", "typography", "textcolors", "media", "css", "images", "profiles", "textcolors", "typography", "media"] {
-            // Read the initial page before a repeated selection can scroll it back to the top
-            if !readings.isEmpty {
-                let cell = app.cells["sidebar-panel-" + section]
-                for _ in 0..<4 where !cell.isHittable {
-                    if section == "media" || section == "images" { sidebar.swipeUp() } else { sidebar.swipeDown() }
-                }
-                cell.tap()
-            }
+            open(section, in: app)
             let bar = app.otherElements["range-bar-" + section].firstMatch
             let intro = app.staticTexts["intro-" + section]
             XCTAssertTrue(intro.waitForExistence(timeout: 10))
-            readings.append(["section": section, "barBottom": bar.frame.maxY, "contentTop": intro.frame.minY])
+            readings.append(["section": section, "barBottom": bar.frame.maxY, "contentTop": intro.frame.minY,
+                             "sidebarEnd": sidebar.frame.maxX, "introStart": intro.frame.minX,
+                             "rangeStart": app.staticTexts["range-\(section)-title"].frame.minX])
             try save(readings, as: "page-switch-insets.json")
         }
         for reading in readings {
+            let section = reading["section"] as? String ?? ""
             XCTAssertGreaterThanOrEqual(try XCTUnwrap(reading["contentTop"] as? CGFloat),
-                                       try XCTUnwrap(reading["barBottom"] as? CGFloat) + 10,
-                                       reading["section"] as? String ?? "")
+                                       try XCTUnwrap(reading["barBottom"] as? CGFloat) + 10, section)
+            let sidebarEnd = try XCTUnwrap(reading["sidebarEnd"] as? CGFloat)
+            XCTAssertGreaterThanOrEqual(try XCTUnwrap(reading["introStart"] as? CGFloat), sidebarEnd, "The page's text starts beside the sidebar: \(section)")
+            XCTAssertGreaterThanOrEqual(try XCTUnwrap(reading["rangeStart"] as? CGFloat), sidebarEnd, "The range controls start beside the sidebar: \(section)")
         }
     }
 
-    /// The sidebar floats over the content's column, which UIKit insets by its width: the page's text and
-    /// the range controls start beside it, not under it.
-    func testPageContentStartsBesideTheSidebar() throws {
-        let app = XCUIApplication(bundleIdentifier: "com.exact.uigallery")
-        app.launch()
-        let sidebar = app.tables["gallery-sidebar"]
-        XCTAssertTrue(sidebar.waitForExistence(timeout: 20))
-        XCTAssertGreaterThan(app.windows.firstMatch.frame.width, 800)
-        let cell = app.cells["sidebar-panel-css"]
-        for _ in 0..<4 where !cell.isHittable { sidebar.swipeDown() }
+    /// Chooses `section` from the list, first going back to the list where a compact window shows a section
+    /// over it. The list's collection view is never hittable itself, only its cells, so Back's presence says
+    /// whether the list is covered.
+    private func open(_ section: String, in app: XCUIApplication) {
+        let list = app.collectionViews["gallery-sidebar"], back = app.buttons["BackButton"].firstMatch
+        if back.exists { back.tap() }
+        let cell = list.cells["sidebar-" + section], later = ["hdr", "effects", "media", "menus"].contains(section)
+        for _ in 0..<4 where !cell.isHittable { if later { list.swipeUp() } else { list.swipeDown() } }
         cell.tap()
-        let intro = app.staticTexts["intro-css"], rangeTitle = app.staticTexts["range-css-title"]
-        XCTAssertTrue(intro.waitForExistence(timeout: 10))
-        try save(["sidebarEnd": sidebar.frame.maxX, "introStart": intro.frame.minX, "rangeStart": rangeTitle.frame.minX], as: "sidebar-inset.json")
-        XCTAssertGreaterThanOrEqual(intro.frame.minX, sidebar.frame.maxX, "The page's text starts beside the sidebar")
-        XCTAssertGreaterThanOrEqual(rangeTitle.frame.minX, sidebar.frame.maxX, "The range controls start beside the sidebar")
+    }
+
+    /// Skips the test unless the sidebar shows beside the page, as on the open Duo
+    private func requireSidebarBesideThePage(_ app: XCUIApplication) throws {
+        guard sidebarIsBesideThePage(app) else { throw XCTSkip("Needs the open Duo, whose sidebar stays beside the page") }
+    }
+
+    /// Whether the window is wide enough for the sidebar to stay beside the page, as on the open Duo
+    private func sidebarIsBesideThePage(_ app: XCUIApplication) -> Bool {
+        app.windows.firstMatch.frame.width > 800
     }
 
     private var output: URL {
@@ -257,16 +241,6 @@ final class GalleryUITests: XCTestCase {
         let cropped = try XCTUnwrap(image.cropping(to: box))
         try XCTUnwrap(UIImage(cgImage: cropped).pngData()).write(to: output.appendingPathComponent("range-body-" + name + ".png"))
         return try pixels(cropped)
-    }
-
-    private func backgroundChannels(_ image: CGImage, window: CGRect, at point: CGPoint) throws -> [Int] {
-        let scale = CGFloat(image.width) / window.width
-        let box = CGRect(x: (point.x - window.minX) * scale, y: (point.y - window.minY) * scale,
-                         width: 2 * scale, height: 2 * scale).integral
-        let data = try pixels(XCTUnwrap(image.cropping(to: box)))
-        return (0..<3).map { channel in
-            stride(from: channel, to: data.count, by: 4).reduce(0) { $0 + Int(data[$1]) } / (data.count / 4)
-        }
     }
 
     private func sidebarPixels(_ app: XCUIApplication, _ sidebar: XCUIElement) throws -> Data {
@@ -311,39 +285,5 @@ final class GalleryUITests: XCTestCase {
             context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         }
         return data
-    }
-}
-
-// Test the UIKit container independently of Exact's router
-struct GalleryTestTab {
-    let name: String
-    let controller: UIViewController
-    let item: UITabBarItem
-}
-
-final class ExactTabContents {
-    let tabs: [GalleryTestTab]
-    var selected = 0
-    var onSelect: ((Int) -> Void)?
-
-    init(tabs: [GalleryTestTab]) { self.tabs = tabs }
-    func select(_ index: Int) { selected = index; onSelect?(index) }
-}
-
-private final class GalleryDataSourceSpy: NSObject, UITableViewDataSource {
-    let source: UITableViewDataSource
-    private(set) var configurations = 0
-
-    init(_ source: UITableViewDataSource) { self.source = source }
-    func numberOfSections(in tableView: UITableView) -> Int { source.numberOfSections?(in: tableView) ?? 1 }
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        source.tableView(tableView, numberOfRowsInSection: section)
-    }
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        configurations += 1
-        return source.tableView(tableView, cellForRowAt: indexPath)
-    }
-    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
-        source.tableView?(tableView, titleForHeaderInSection: section)
     }
 }

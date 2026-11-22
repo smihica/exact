@@ -98,7 +98,7 @@ class SharedElementsTest {
         t.shared.begin(state(listOf(1))); t.define(definition(1, box, 7, 3, crop)); t.shared.finish()
         t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 0.5f))))
         assertTrue(t.shared.holdImage(7))
-        t.define(definition(2, RectF(0f, 0f, 400f, 400f), fit = 2)); t.shared.finish(); t.draw()
+        t.define(definition(2, RectF(0f, 0f, 400f, 400f), fit = 2, crop = RectF(0f, 100f, 400f, 300f))); t.shared.finish(); t.draw()
         val shown = t.shared.shown(2)!!
         assertEquals(7, shown.image)
         assertRect(RectF(-20f, 60f, 280f, 210f), shown.crop)
@@ -108,6 +108,22 @@ class SharedElementsTest {
         t.define(definition(2, RectF(0f, 0f, 400f, 400f), 8, 2, RectF(0f, 100f, 400f, 300f)))
         t.draw(); assertEquals(8, t.shared.shown(2)!!.image)
         t.shared.releaseImages { freed.add(it) }; assertEquals(listOf(7), freed)
+    }
+
+    @Test fun aBorrowedRasterUsesTheHostsPlacedCropUntilDecodingFinishes() {
+        val t = Fixture()
+        t.pictures[7] = Bitmap.createBitmap(400, 200, Bitmap.Config.ARGB_8888)
+        val box = RectF(0f, 0f, 160f, 80f)
+        val crop = RectF(7f, 11f, 407f, 211f)
+        t.shared.begin(state(listOf(1)))
+        t.define(definition(1, box, image = 7, fit = 4)); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 1f))))
+        t.define(definition(2, box, fit = 4, crop = crop)); t.shared.finish(); t.draw()
+        assertEquals(7, t.shared.shown(2)!!.image)
+        assertRect(crop, t.shared.shown(2)!!.crop)
+        t.pictures[8] = t.pictures[7]!!
+        t.define(definition(2, box, image = 8, fit = 4, crop = crop)); t.draw()
+        assertRect(crop, t.shared.shown(2)!!.crop)
     }
 
     @Test fun aDestinationThatLeavesTheLifecycleStopsFlying() {
@@ -137,7 +153,7 @@ class SharedElementsTest {
             t.shared.begin(state(listOf(1)))
             t.define(definition(1, RectF(30f, 60f, 330f, 360f), 7, 3, scale = 3f)); t.shared.finish()
             t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 1f))))
-            t.define(definition(2, RectF(0f, 0f, 900f, 900f), fit = fit, scale = 3f, layers = intArrayOf(3))); t.shared.finish()
+            t.define(definition(2, RectF(0f, 0f, 900f, 900f), fit = fit, crop = crops.first(), scale = 3f, layers = intArrayOf(3))); t.shared.finish()
             for ((layerScale, crop) in listOf(1f, 2f).zip(crops)) {
                 t.layerScale = layerScale; t.draw()
                 assertRect(crop, t.shared.shown(2)!!.crop)
@@ -190,6 +206,26 @@ class SharedElementsTest {
             pixels.eraseColor(Color.TRANSPARENT)
             t.shared.draw(Canvas(pixels))
             assertEquals(alpha, Color.alpha(pixels.getPixel(50, 50)))
+        }
+    }
+
+    @Test fun aRasterFlightClipsToTheInterpolatedContentBox() {
+        val t = Fixture()
+        val box = RectF(0f, 0f, 100f, 100f)
+        val photo = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.RED) }
+        val pixels = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
+        t.pictures[7] = photo
+        t.shared.begin(state(listOf(1)))
+        t.define(definition(1, box, 7, 1, crop = RectF(10f, 0f, 100f, 100f), contentBox = RectF(0f, 0f, 90f, 100f)))
+        t.shared.finish()
+        for ((progress, right) in listOf(0f to 90, 0.5f to 85, 1f to 80)) {
+            t.shared.begin(state(listOf(2), listOf(Triple(1, 2, progress))))
+            t.define(definition(2, box, 7, 1, crop = RectF(10f, 0f, 90f, 100f), contentBox = RectF(0f, 0f, 80f, 100f)))
+            t.shared.finish()
+            pixels.eraseColor(Color.TRANSPARENT)
+            t.shared.draw(Canvas(pixels))
+            assertEquals("inside the clip at progress $progress", Color.RED, pixels.getPixel(right - 1, 50))
+            assertEquals("padding at progress $progress", Color.TRANSPARENT, pixels.getPixel(right, 50))
         }
     }
 

@@ -152,9 +152,7 @@ impl<D: DataSource + Default + 'static> App<D> {
                 Input::Dismissed => p.dismiss_status_menu(now),
             }
         }
-        if p.take_status_exit() {
-            self.exit_by_person(events);
-        }
+        self.tray_exit(events);
     }
 
     pub(super) fn tray_access(
@@ -168,13 +166,7 @@ impl<D: DataSource + Default + 'static> App<D> {
                 flyout.access_action(p, request);
             }
         }
-        if self
-            .presenter
-            .as_mut()
-            .is_some_and(|p| p.take_status_exit())
-        {
-            self.exit_by_person(events);
-        }
+        self.tray_exit(events);
         self.about_to_wait(events);
     }
 
@@ -297,46 +289,39 @@ impl<D: DataSource + Default + 'static> App<D> {
         };
         let Some(menu) = p.status_menu() else {
             flyout.hide();
-            flyout.sync_access(p, f64::from(tray.anchor.1));
             tray.painted = None;
             return;
         };
         if tray.painted == Some((menu.serial, menu.revision)) {
-            flyout.sync_access(p, f64::from(tray.anchor.1));
+            flyout.sync_access(p, &menu, f64::from(tray.anchor.1));
             return;
         }
-        let (at, scale) = tray.anchor;
-        match p.status_menu_pixels(scale) {
+        match p.status_menu_pixels(tray.anchor.1) {
             Some(Ok(pixmap)) => {
-                flyout.show(
-                    menu.serial,
-                    at,
-                    pixmap.data(),
-                    (pixmap.width(), pixmap.height()),
-                );
+                flyout.show(&menu, tray.anchor, &pixmap, p);
                 tray.painted = Some((menu.serial, menu.revision));
             }
             Some(Err(error)) => p.host_mut().log(format!("status menu: {error}")),
             None => {}
         }
-        flyout.sync_access(p, f64::from(scale));
     }
 
     /// The status menu's Exit: `beforeunload` is asked, as for a window's
     /// close, and its question shows in the window; otherwise the app ends.
-    fn exit_by_person(&mut self, events: &ActiveEventLoop) {
-        let stays = self.presenter.as_mut().is_some_and(|p| {
-            p.advance(self.started.elapsed().as_secs_f64() * 1000.);
-            let now = p.host().now();
-            !p.before_unload(now)
-        });
-        if stays {
-            return self.bring_forward();
+    fn tray_exit(&mut self, events: &ActiveEventLoop) {
+        let Some(p) = &mut self.presenter else {
+            return;
+        };
+        let flyout = self.tray.as_mut().and_then(|tray| tray.flyout.as_mut());
+        let now = self.started.elapsed().as_secs_f64() * 1000.;
+        match tray::exit_status_menu(p, now, || {
+            if let Some(flyout) = flyout {
+                flyout.hide();
+            }
+        }) {
+            Some(true) => events.exit(),
+            Some(false) => self.bring_forward(),
+            None => {}
         }
-        if let Some(p) = &mut self.presenter {
-            p.end_hatches();
-            p.end_packages();
-        }
-        events.exit();
     }
 }

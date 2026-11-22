@@ -149,11 +149,17 @@ fn write(
     } else {
         "png"
     };
-    for index in 0..displays.len() {
-        let path = format!("{directory}/screen-{index}.{ext}");
-        if crate::picker::place_from(&path, roots.clone()).is_none() {
-            return Err(("NotAllowedError", "capture path is not writable".into()));
-        }
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(failed)?;
+    let capture = u128::from_le_bytes(random);
+    let paths: Vec<_> = (0..displays.len())
+        .map(|index| format!("{directory}/screen-{capture:032x}-{index}.{ext}"))
+        .collect();
+    if paths
+        .iter()
+        .any(|p| crate::picker::place_from(p, roots.clone()).is_none())
+    {
+        return Err(("NotAllowedError", "capture path is not writable".into()));
     }
     for root in roots {
         std::fs::create_dir_all(root).map_err(failed)?;
@@ -176,12 +182,10 @@ fn write(
     let staged = std::thread::scope(|scope| {
         let jobs: Vec<_> = displays
             .into_iter()
-            .enumerate()
-            .map(|(index, display)| {
+            .zip(paths)
+            .map(|(display, path)| {
                 let (directories, grants) = (&directories, &grants);
-                scope.spawn(move || {
-                    encode_file(directories, grants, directory, index, display, encoding)
-                })
+                scope.spawn(move || encode_file(directories, grants, &path, display, encoding))
             })
             .collect();
         jobs.into_iter()
@@ -207,8 +211,7 @@ fn write(
 fn encode_file(
     directories: &AppDirectories,
     grants: &ibex2::grant::GrantSet,
-    directory: &str,
-    index: usize,
+    path: &str,
     display: Display,
     encoding: &Encoding,
 ) -> Result<(ibex2::stdlib::app_fs::Staged, Json), Failure> {
@@ -218,13 +221,7 @@ fn encode_file(
     let pixels = tiny_skia::Pixmap::from_vec(bytes, size)
         .ok_or_else(|| failed("capture returned the wrong pixel count"))?;
     let (bytes, media_type) = encode(&pixels, encoding)?;
-    let ext = if media_type == "image/jpeg" {
-        "jpg"
-    } else {
-        "png"
-    };
-    let path = format!("{directory}/screen-{index}.{ext}");
-    let mut file = directories.stage(grants, &path).map_err(file_error)?;
+    let mut file = directories.stage(grants, path).map_err(file_error)?;
     file.write_all(&bytes).map_err(file_error)?;
     let answer = json!({
         "path": path, "width": display.width, "height": display.height,
@@ -240,17 +237,9 @@ fn encode(
     if encoding.media_type == "image/jpeg" {
         return crate::canvas2d::capture::encode(pixels, encoding).map_err(failed);
     }
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, pixels.width(), pixels.height());
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
-        let mut writer = encoder.write_header().map_err(failed)?;
-        writer.write_image_data(pixels.data()).map_err(failed)?;
-    }
-    Ok((out, "image/png"))
+    crate::canvas2d::capture::png(pixels.width(), pixels.height(), pixels.data())
+        .map(|out| (out, "image/png"))
+        .map_err(failed)
 }
 
 /// Fixture screens, with no native screen read. A drive can set `screens`

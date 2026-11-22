@@ -355,6 +355,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             XCTAssertTrue(selected.scrollsToTop, "a native write updates scroll-to-top without an authored batch")
             XCTAssertFalse(other.scrollsToTop)
             XCTAssertTrue(route.contentScrollView(for: .top) === selected, "the bar follows the selection at once")
+            XCTAssertTrue(p.routeContentScrollView(of: route) === selected, "the host answers a route hatch with the selection at once")
             route.node.props["navigationScroll"] = named
             pass()
             panesUnderTheBar()
@@ -367,6 +368,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         // nil is UIKit's automatic selection, which Exact makes: the pane `navigationScroll` names
         route.node.props["navigationScroll"] = "pane-second"
         route.setContentScrollView(nil, for: .top)
+        XCTAssertTrue(p.routeContentScrollView(of: route) === secondary, "and with the automatic choice at once after a nil")
         XCTAssertTrue(secondary.scrollsToTop)
         XCTAssertFalse(primary.scrollsToTop)
         route.view.layoutIfNeeded()
@@ -488,29 +490,31 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.arrangements.sync()
         XCTAssertEqual(scrolls[0].contentOffset.y, revealedTop, accuracy: 1, "a finished adoption does not undo an element reveal")
         let savedTop = scrolls[1].contentOffset.y + second.scrollTopInset(scrolls[1])
+        // A pane UIKit hides is laid out 0×0, and its sibling owns both edges alone
+        func hidden() -> Bool {
+            self.window?.layoutIfNeeded()
+            return p.arrangements.hiddenPanes.contains(second.id) && second.bounds.isEmpty
+                && [true, false].allSatisfy { p.arrangements.scrollers(in: route.node, top: $0).map(\.id) == [first.id] }
+        }
         controller.setViewController(nil, for: .secondary)
         controller.view.layoutIfNeeded()
         p.arrangements.sync()
-        until("the native-hidden pane leaves the kernel's bottom-edge chain") {
-            self.window?.layoutIfNeeded()
-            return p.navigationHost.covers[second.id] == .whole && abs(first.bounds.height - route.view.bounds.height) < 1
-        }
+        until("the hidden pane leaves both edges to its sibling") { hidden() }
+        // While its saved position waits, a pane carries no position over it from another scroll view
+        second.retainScrollPosition(from: scrolls[0])
+        XCTAssertNil(second.pendingScrollTop, "a hidden pane carries nothing over the position it saved")
         controller.setViewController(holders[1], for: .secondary)
         controller.view.layoutIfNeeded()
-        // UIKit gives the pane room before Exact tells it its allocation, then the kernel lays it out 0×0 until its covers follow
-        for told in [false, true] {
-            if told { p.arrangements.sync() }
-            XCTAssertTrue(!holders[1].view.bounds.isEmpty && second.bounds.isEmpty, "the shown pane has room and no layout yet")
-            for top in [true, false] {
-                XCTAssertEqual(p.arrangements.scrollers(in: route.node, top: top).map(\.id), [first.id],
-                               "a pane UIKit shows again owns no edge until it is laid out, and its sibling keeps its own")
-            }
-        }
         until("the shown peer restores its inset and position") {
             self.window?.layoutIfNeeded()
-            return p.navigationHost.covers[second.id] != .whole && scrolls[1].contentInsetAdjustmentBehavior == .automatic
+            return !p.arrangements.hiddenPanes.contains(second.id) && scrolls[1].contentInsetAdjustmentBehavior == .automatic
                 && abs(scrolls[1].contentOffset.y + second.scrollTopInset(scrolls[1]) - savedTop) < 1
         }
+        // A shown pane not yet laid out owns no edge, and its sibling keeps its own
+        let shownFrame = second.frame
+        second.frame.size = .zero
+        for top in [true, false] { XCTAssertEqual(p.arrangements.scrollers(in: route.node, top: top).map(\.id), [first.id]) }
+        second.frame = shownFrame
         let rootBox = root.kernelContentBox, rootPadding = root.kernelPadding
         root.applyKernelContentBox(root.bounds.inset(by: UIEdgeInsets(top: 16, left: 0, bottom: 0, right: 0)), padding: [16, nil, nil, nil])
         XCTAssertTrue(p.arrangements.scrollers(in: route.node, top: true).isEmpty)
@@ -551,7 +555,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         controller.setViewController(nil, for: .secondary)
         controller.view.layoutIfNeeded()
         p.arrangements.sync()
-        until("the secondary is hidden before retiring the arrangement") { p.navigationHost.covers[second.id] == .whole }
+        until("the secondary is hidden before retiring the arrangement") { hidden() }
         XCTAssertTrue(p.arrangements.set(root.id, controller: nil))
         until("retired panes return their insets") {
             p.navigationHost.coversChanged()
@@ -609,7 +613,7 @@ final class ContentOwnersIOSTests: XCTestCase {
 
     /// The edge-effect fixture's Panes tab, its two peers arranged side by side beneath the route's bars.
     @available(iOS 27.1, *)
-    private func arrangedPeers(in scene: UIWindowScene) throws -> (ExactSession, NodeView, NodeView, NodeView, RouteController, UIArrangementViewController) {
+    func arrangedPeers(in scene: UIWindowScene) throws -> (ExactSession, NodeView, NodeView, NodeView, RouteController, UIArrangementViewController) {
         let session = try fixture("arranged-edges", scene.coordinateSpace.bounds.size, plan: "EXACT_EDGE_EFFECT_PLAN")
         let p = session.presenter
         let reply = Agent(session: session).tap(["id": Int(try node(session, "tab-panes").id)])
@@ -678,7 +682,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         override func location(in view: UIView?) -> CGPoint { target.convert(point, to: view) }
     }
 
-    private var window: UIWindow?
+    var window: UIWindow?
     private var host: UIViewController?
     private var sessions: [ExactSession] = []
 
@@ -691,7 +695,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         super.tearDown()
     }
 
-    private func until(_ what: @autoclosure () -> String, _ seconds: Double = 5, _ done: () -> Bool) {
+    func until(_ what: @autoclosure () -> String, _ seconds: Double = 5, _ done: () -> Bool) {
         let deadline = Date().addingTimeInterval(seconds)
         while !done(), Date() < deadline { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02)) }
         XCTAssertTrue(done(), what())
@@ -725,7 +729,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         return session
     }
 
-    private func node(_ session: ExactSession, _ testId: String) throws -> NodeView {
+    func node(_ session: ExactSession, _ testId: String) throws -> NodeView {
         try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == testId }, "no \(testId)")
     }
 

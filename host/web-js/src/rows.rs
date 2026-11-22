@@ -62,26 +62,21 @@ impl Em<'_> {
         Ok(())
     }
 
-    /// Whether image `i` needs symbols.js — it draws a symbol, its source is
-    /// bound, or its source is an `app:/` file, which symbols.js resolves
-    /// (`data-app-src`, LLP 1069.002 D7) — and whether its source is bound.
+    /// Whether image `i` needs symbols.js for a symbol, tint, bound source or
+    /// `app:/` file (`data-app-src`, LLP 1069.002 D7), and whether its source is bound.
     pub(super) fn image_piece(&self, i: u32, parts: &Parts) -> Option<bool> {
         let plan = self.plan;
-        let bound = plan
-            .node(NodesId(i))
-            .bindings
-            .iter()
-            .map(|b| plan.binding(b))
-            .any(|b| {
-                b.kind == BindingKind::Prop
-                    && b.id == PropId::ImageSource as u16
-                    && style::literal(plan, plan.code(b.expr)).is_none()
-            });
-        let app = parts
-            .props
-            .get("src")
-            .is_some_and(|s| s.starts_with("app:/"));
-        (bound || app || parts.props.contains_key("data-symbol-path")).then_some(bound)
+        let row = plan.node(NodesId(i));
+        let bound = row.bindings.iter().map(|b| plan.binding(b)).any(|b| {
+            b.kind == BindingKind::Prop
+                && b.id == PropId::ImageSource as u16
+                && style::literal(plan, plan.code(b.expr)).is_none()
+        });
+        let src = parts.props.get("src");
+        let app = src.is_some_and(|s| s.starts_with("app:/"));
+        let symbol = parts.props.contains_key("data-symbol-path");
+        let tint = parts.css.contains("--exact-tint-offset:");
+        (bound || app || symbol || tint).then_some(bound)
     }
 
     /// @ref LLP 1055.002 — a synced animation: the web host's clocks
@@ -121,8 +116,8 @@ impl Em<'_> {
         if !self.paint || kind.is_svg_element() || kind.is_metadata() {
             return;
         }
-        if let Some((name, value)) = crate::paint::binding(self.plan, kind, b, || {
-            self.uses.share('t', crate::paint::transitions())
+        if let Some((name, value)) = crate::paint::binding(self.plan, kind, b, |parser| {
+            parser.emit(self.plan, &mut self.uses)
         }) {
             let f = if b.kind == BindingKind::Style && b.id == StyleId::BackdropFilter as u16 {
                 format!("()=>{}(({f})(),false)", self.uses.rt("backdropValue"))
@@ -492,12 +487,12 @@ impl Em<'_> {
                 }
                 w
             }
-            StyleId::Transition if press || shift => one(
-                "transition",
-                Some(style::composed_transition_map(press, shift)),
-            ),
+            StyleId::Transition => {
+                let entries = self.uses.constant("$transitionEntries", style::transition_entries);
+                one("transition", Some(self.uses.share('m', style::transition_map(&entries, press, shift))))
+            }
             StyleId::LayoutTransition => {
-                let parser = self.uses.share('t', crate::paint::transitions());
+                let parser = crate::paint::Parser::Transition.emit(plan, &mut self.uses);
                 let (say, view) = (self.uses.rt("say"), self.uses.rt("viewId"));
                 one("--exact-layout-transition", Some(crate::presence::layout_transition_map(&parser, &format!("{view}({e})"), &say)))
             }
@@ -694,7 +689,7 @@ impl Em<'_> {
         }
         // Probe the new region value while presence can still measure the old box.
         if id == StyleId::LayoutTransition {
-            let parser = self.uses.share('t', crate::paint::transitions());
+            let parser = crate::paint::Parser::Transition.emit(plan, &mut self.uses);
             let lt = self.uses.rt("lt");
             let _ = write!(self.out, "{lt}({e},{parser},{f});");
         }
@@ -1186,9 +1181,10 @@ mod tests {
         exact_kernel::style::link_all();
         // LLP 1081 D5, as `style`'s map, then `scale` moved to the press's
         // `--exact-scale`.
+        let map = crate::style::transition_map(&crate::style::transition_entries(), true, false);
         assert_eq!(
             crate::style::tests::run(
-                &crate::style::composed_transition_map(true, false),
+                &map,
                 &[
                     "-exact-tint-color 1s",
                     "tint-color 1s, opacity 1s",
@@ -1207,10 +1203,7 @@ mod tests {
                 "none"
             ])
         );
-        crate::style::tests::assert_spring_transitions(
-            &crate::style::composed_transition_map(true, false),
-            true,
-        );
+        crate::style::tests::assert_spring_transitions(&map, true);
     }
 
     use crate::style::{

@@ -34,6 +34,9 @@ extension Agent {
         let area = presenter.navigation.stackSplit.agentCaptureArea
         let size = area.size
         #endif
+        if req["strict"] as? Bool == true, points.contains(where: {
+            $0.x < 0 || $0.y < 0 || $0.x >= size.width || $0.y >= size.height
+        }) { return ["error": "the sample lies outside the viewport"] }
         let (w, h) = (Int(size.width.rounded(.up)), Int(size.height.rounded(.up)))
         guard w > 0, h > 0, let space = CGColorSpace(name: CGColorSpace.extendedLinearSRGB),
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 32, bytesPerRow: w * 16, space: space,

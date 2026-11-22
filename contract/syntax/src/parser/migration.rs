@@ -9,6 +9,7 @@ impl Parser {
             tokens,
             pos: 0,
             names: NameSpans::default(),
+            view_ranges: false,
             depth: 0,
             view_depth: 0,
             last: 0,
@@ -81,6 +82,7 @@ impl Parser {
 pub(crate) fn parsed_with_edits(
     src: &str,
     source_id: u32,
+    view_ranges: bool,
 ) -> (Result<File, Partial>, Vec<crate::migrate::Edit>) {
     let (tokens, lexed) = Lexer::tokenize_recovering(
         src,
@@ -90,6 +92,7 @@ pub(crate) fn parsed_with_edits(
         },
     );
     let mut p = Parser::new(tokens);
+    p.view_ranges = view_ranges;
     let parsed = p.file_all();
     if lexed.is_empty() {
         return (parsed, p.edits);

@@ -163,6 +163,9 @@ pub fn launch(ctx: LaunchContext) {
     });
 }
 
+/// The log name of `Observe.reportFeedback`, which is sent out of the sample too.
+const FEEDBACK: &str = "expo.feedback";
+
 /// Observe's custom-event validation, copied from expo-app-metrics (`LogEvents`).
 mod rules {
     use super::*;
@@ -178,6 +181,46 @@ mod rules {
             return s.into();
         }
         s.chars().take(max - 1).chain(['…']).collect()
+    }
+
+    /// A feedback report that passed the checks: its id, message and rating.
+    pub struct Feedback {
+        pub id: String,
+        pub message: Option<String>,
+        pub rating: Option<(i64, i64, i64)>,
+    }
+
+    /// Observe's feedback checks, from expo-observe's `reportFeedback.ts`: a non-empty id,
+    /// a message or a rating, and a whole-number rating within a scale from 0 to 10.
+    pub fn feedback(e: &Value) -> Option<Feedback> {
+        let id = e["id"].as_str().unwrap_or("").to_string();
+        let message = e["message"]
+            .as_str()
+            .filter(|m| !m.trim().is_empty())
+            .map(str::to_string);
+        let whole = |v: &Value, or: f64| {
+            let f = if v.is_null() { or } else { v.as_f64()? };
+            (f.fract() == 0.0 && f.abs() < 1e15).then_some(f as i64)
+        };
+        let rating = if e["rating"].is_number() {
+            let r = (whole(&e["rating"], 0.0), whole(&e["min"], 0.0), whole(&e["max"], 10.0));
+            match r {
+                (Some(v), Some(min), Some(max)) if 0 <= min && min < max && max <= 10 && (min..=max).contains(&v) => {
+                    Some((v, min, max))
+                }
+                _ => {
+                    eprintln!("observe: dropped feedback with a rating outside its scale");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        if id.trim().is_empty() || (message.is_none() && rating.is_none()) {
+            eprintln!("observe: dropped feedback with no id, or with neither message nor rating");
+            return None;
+        }
+        Some(Feedback { id, message, rating })
     }
 
     fn reserved(k: &str) -> bool {
@@ -560,6 +603,27 @@ impl Service {
                     (attrs, dropped),
                 );
             }
+            "app.feedback" => {
+                let Some(f) = rules::feedback(e) else { return };
+                let (kept, dropped) = rules::attributes(&e["attributes"]);
+                let mut attrs = self.globals.clone();
+                attrs.extend(kept);
+                attrs.insert("expo.feedback.id".into(), f.id.into());
+                if let Some((value, min, max)) = f.rating {
+                    attrs.insert("expo.feedback.rating".into(), value.into());
+                    attrs.insert("expo.feedback.scale.min".into(), min.into());
+                    attrs.insert("expo.feedback.scale.max".into(), max.into());
+                }
+                let body = f.message.map(|m| rules::truncate(&m, 4096));
+                self.log(
+                    self.session.clone(),
+                    wall,
+                    "info",
+                    FEEDBACK,
+                    body,
+                    (attrs, dropped),
+                );
+            }
             "app.error" => {
                 let mut attrs = object(json!({
                     "expo.error.source": e["source"].as_str().unwrap_or("reportedByUser"),
@@ -868,14 +932,19 @@ impl Service {
         json!({ outer: resources })
     }
 
-    /// Observe's gate: dispatching enabled, this install in the sample, and not a development
-    /// build unless `dispatchInDebug`. When it fails, rows are dropped, not kept for later.
-    fn should_dispatch(&self) -> bool {
+    /// Observe's gate: dispatching enabled, and not a development build unless
+    /// `dispatchInDebug`. When it fails, rows are dropped, not kept for later.
+    fn may_dispatch(&self) -> bool {
         let c = &self.config;
-        let rate = c["sampleRate"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0);
         c["dispatchingEnabled"].as_bool().unwrap_or(true)
-            && uniform(&self.client_id) < rate
             && (!self.development || c["dispatchInDebug"] == true)
+    }
+
+    /// Whether this install is in the `sampleRate` sample. Out of it, only feedback is sent,
+    /// as expo-observe sends it (`ObservabilityManager.dispatchUnsentLogs`).
+    fn in_sample(&self) -> bool {
+        let rate = self.config["sampleRate"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0);
+        uniform(&self.client_id) < rate
     }
 
     fn dispatch(&mut self) {
@@ -885,33 +954,47 @@ impl Service {
         }
         let _sending = self.hold("send.lock");
         let project = self.config["projectId"].as_str().map(str::to_string);
-        let Some(project) = project.filter(|_| self.should_dispatch()) else {
+        let Some(project) = project.filter(|_| self.may_dispatch()) else {
             let _queue = self.hold("queue.lock");
             self.reload();
             self.metrics.clear();
             self.logs.clear();
             return self.save();
         };
+        let only = (!self.in_sample()).then_some(FEEDBACK);
+        if only.is_some() {
+            let _queue = self.hold("queue.lock");
+            self.reload();
+            self.metrics.clear();
+            self.logs.retain(|r| r["name"] == FEEDBACK);
+            self.save();
+        }
         let base = self.config["endpoint"]
             .as_str()
             .unwrap_or("https://o.expo.dev")
             .trim_end_matches('/')
             .to_string();
-        if self.send("metrics", &format!("{base}/{project}/v1/metrics")) {
-            self.send("logs", &format!("{base}/{project}/v1/logs"));
+        if self.send("metrics", &format!("{base}/{project}/v1/metrics"), only) {
+            self.send("logs", &format!("{base}/{project}/v1/logs"), only);
         }
     }
 
-    /// Sends one signal's rows chunk by chunk, as expo-observe's `DispatchLoop.swift` does.
+    /// Sends one signal's rows chunk by chunk, as expo-observe's `DispatchLoop.swift` does,
+    /// or with `only`, just the rows of that name; another process may add others meanwhile.
     /// Returns false when it has to back off.
-    fn send(&mut self, signal: &str, url: &str) -> bool {
+    fn send(&mut self, signal: &str, url: &str, only: Option<&str>) -> bool {
         let mut limit = CHUNK;
         loop {
             let rows: Vec<Row> = {
                 let _queue = self.hold("queue.lock");
                 self.reload();
                 let queue = self.queue(signal);
-                queue[..limit.min(queue.len())].to_vec()
+                queue
+                    .iter()
+                    .filter(|r| only.is_none_or(|name| r["name"] == name))
+                    .take(limit)
+                    .cloned()
+                    .collect()
             };
             if rows.is_empty() {
                 return true;

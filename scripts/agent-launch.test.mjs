@@ -2,6 +2,7 @@
 // defaults and overrides are host/web/agent.test.mjs's "launch setup" test.
 import { test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
@@ -9,6 +10,39 @@ import { PINNED_RUST } from './app.mjs';
 import { Cdp, agentPage, chromium, chromiumBuilds, launchFacts, launchEnvironment, parseFlags, launchLog, launchFailure, webPort, pollUntil } from './agent-launch.mjs';
 import { PassThrough } from 'node:stream';
 import { placeReporter } from '../host/web/navigation/environment.js';
+
+for (const unexpected of [false, true]) test(`Windows carrier cleanup kills only its recorded pipe owners (unexpected exit: ${unexpected})`, async () => {
+  const { windowsCarrier } = await import('./agent-android.mjs');
+  const child = new EventEmitter(), killed = [];
+  child.kill = signal => { killed.push([10, signal]); child.emit('exit', null, signal); return true; };
+  windowsCarrier(child, (pid, signal) => killed.push([pid, signal]));
+  child.emit('message', { adbPipe: 11 });
+  child.emit('message', { adbPipe: 12 });
+  child.emit('message', { adbPipe: 12, exited: true });
+  child.emit('message', { reverse: 13 });
+  if (unexpected) child.emit('exit', 1, null); else expect(child.kill('SIGKILL')).toBe(true);
+  expect(killed).toEqual(unexpected ? [[11, 'SIGKILL']] : [[11, 'SIGKILL'], [10, 'SIGKILL']]);
+  // A spawn notification already in flight when the carrier died still owns a pipe.
+  child.emit('message', { adbPipe: 14 });
+  expect(killed.at(-1)).toEqual([14, 'SIGKILL']);
+});
+
+for (const alreadyExited of [false, true]) test(`closing a carrier bounds inherited pipes left open (already exited: ${alreadyExited})`, async () => {
+  const { closeStdio } = await import('./agent-stdio.mjs');
+  const child = new EventEmitter();
+  Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    exitCode: alreadyExited ? 1 : null, signalCode: null });
+  let killed = false, released = false;
+  child.kill = () => { killed = true; child.signalCode = 'SIGKILL'; child.emit('exit', null, 'SIGKILL'); };
+  const closed = once(child, 'close');
+  try {
+    await closeStdio(child, closed, () => { released = true; });
+    expect(killed).toBe(!alreadyExited);
+    expect(released).toBe(true);
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+  } finally { for (const stream of [child.stdin, child.stdout, child.stderr]) stream.destroy(); child.emit('close'); }
+}, 7000);
 
 // Every browser carrier opens the page with the same query (LLP 1146 D4): the drive's auth fixture among it.
 test('a web drive opens its page with the facts, its auth fixture, storage and hatches', () => {

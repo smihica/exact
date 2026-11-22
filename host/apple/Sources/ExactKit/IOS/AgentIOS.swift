@@ -263,7 +263,7 @@ extension Agent {
         // @ref LLP 1038 D11 — last op, never inferred from route props.
         navigation["url"] = session.routerOp?["url"] ?? NSNull()
         // The scene's title as UIKit holds it (LLP 1048.003 D1; the app sets it).
-        let window: [String: Any] = ["title": presenter.session?.view?.window?.windowScene?.title ?? NSNull()]
+        let window: [String: Any] = ["title": presenter.session?.view?.window?.windowScene?.title ?? NSNull(), "split": presenter.navigation.splitObservation]
         // The list pool and the leaves it holds mid-fling (LLP 1068 §6, §5.1).
         var pool = presenter.pool.observation.merging(presenter.leaves?.observation ?? [:]) { a, _ in a }.merging(presenter.flats.observation) { a, _ in a }
         pool["native"] = session.natives.observation
@@ -396,6 +396,9 @@ extension Agent {
         let b = (presenter.inlineFrame(UInt32(id)) ?? box(host, region: local)).offsetBy(dx: shift.x, dy: shift.y)
         var space: [String: Any] = ["viewport": rect(b), "local": ["w": Agent.r2(local.width), "h": Agent.r2(local.height)],
                                     "capture": ["scale": Agent.r2(vp.window?.screen.scale ?? vp.traitCollection.displayScale)]]
+        if let baseline = host.firstPaintedBaseline(presenter.inlineText(UInt32(id))) {
+            space["baseline"] = Agent.r2(box(host, region: CGRect(origin: baseline, size: .zero)).minY + shift.y)
+        }
         if let w = host.window {
             let inWindow = host.convert(local, to: w)
             space["window"] = rect(inWindow)
@@ -711,7 +714,7 @@ extension Agent {
             if event == "dblclick", req["touch"] as? Bool == true, let zoomed = NodeView.zoomDoubleTap(hit, at: p) {
                 return ["tapped": Int(zoomed.id), "dblclick": "touch", "delivery": "recognized", "scrollZoom": Double(zoomed.scroll?.zoomScale ?? 1), "at": at]
             }
-            selection = presenter.agentSelect(hit, at: p, event: event)
+            selection = presenter.textSelection.agentSelect(hit, at: p, event: event)
             #endif
             // Delivered (a handler heard it, or it selected): a long press or a double tap lets a hold where it landed go (HeldState.swift).
             let landed = { MainActor.assumeIsolated { HeldState.input(at: hit) } }
@@ -741,12 +744,12 @@ extension Agent {
         if let scale = req["pinch"] as? Double {
             // UIKit synthesizes no pinch: the recognized scale (LLP 1057.001 §5).
             var next: UIView? = v
-            while let view = next, !((view as? NodeView).map { presenter.transformBindings[$0.id]?.target != nil || $0.extras?.zoom != nil } ?? false) { next = view.superview }
+            while let view = next, !((view as? NodeView).map { presenter.drags.transformClip($0.id) != nil || $0.extras?.zoom != nil } ?? false) { next = view.superview }
             if let port = next as? NodeView, port.extras?.zoom != nil {
                 let focal = (req["at"] as? [Double]).flatMap { $0.count == 2 ? v.convert(CGPoint(x: $0[0], y: $0[1]), to: nil) : nil } ?? p
                 return delivered(port.recognizedZoomPinch(scale, focal: focal).merging(["at": at]) { a, _ in a }, hit)
             }
-            guard let handle = next as? NodeView, let clipID = presenter.transformBindings[handle.id]?.clip, let clip = presenter.views[clipID] else {
+            guard let handle = next as? NodeView, let clipID = presenter.drags.transformClip(handle.id), let clip = presenter.views[clipID] else {
                 return ["error": "no photo binding (transformDragFor) at view \(v.id)"]
             }
             let offset = (req["at"] as? [Double]).map { CGPoint(x: $0[0], y: $0[1]) } ?? CGPoint(x: handle.bounds.midX, y: handle.bounds.midY)
@@ -776,7 +779,7 @@ extension Agent {
         if v.kind == "iframe" { return delivered(session.webviews.tap(v, request: req, at: at), hit) }
         #if os(iOS)
         // A finger on a number input's stepper steps it (LLP 1116.007 D4).
-        if plain, let text = hit as? NodeView, presenter.textSelection.text(for: text)?.selected.length ?? 0 > 0 {
+        if plain, let text = hit as? NodeView, presenter.textSelection.hasSelection(in: text) {
             presenter.textSelection.clear()
             return delivered(["tapped": Int(text.id), "at": at, "selection": "cleared"], hit)
         }
@@ -917,7 +920,9 @@ extension Agent {
            let top = presenter.keyboardGuideTop(in: container), p.y >= container.convert(CGPoint(x: 0, y: top), to: nil).y {
             return "its middle is under the software keyboard; dismiss it or scroll the target above it first (state shows keyboard.top)"
         }
-        if hit === v || hit.isDescendant(of: v) || (hit is NodeView && v.isDescendant(of: hit)) { return nil }
+        // A child lifted over the tab container is still the target's (LLP 1083.000 D4)
+        let inside = sequence(first: hit, next: { self.presenter.layoutParent(of: $0) }).contains { $0 === v }
+        if hit === v || inside || (hit is NodeView && v.isDescendant(of: hit)) { return nil }
         return Agent.covers(hit)
     }
 

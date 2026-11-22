@@ -169,3 +169,50 @@ fn a_tables_rows_are_visited_in_the_order_it_draws_them() {
         pairs(&[("Head", 1), ("Body", 2), ("Foot", 3)])
     );
 }
+
+#[test]
+fn static_list_and_listitem_roles_preserve_names_and_nested_controls() {
+    let source = r#"component Probe
+  action undo
+  view
+    column role="list" aria-label="Changes"
+      row role="listitem" aria-label="Deleted line"
+        text "Old text"
+        button "Undo" press=undo
+      row role="listitem" aria-label="Blank line"
+        text " " aria-hidden=true
+      text "New text" role="listitem" aria-label="Added line"
+"#;
+    let mut p = boot(source, (400., 400.), 0);
+    let told = statement(&mut p);
+    let list = told
+        .nodes
+        .iter()
+        .find(|n| n.role == role::LIST)
+        .expect("static list node");
+    assert_eq!(list.name, "Changes");
+    assert_eq!(list.set, (0, 3), "{:#?}", told.nodes);
+    let items: Vec<_> = told
+        .nodes
+        .iter()
+        .filter(|n| n.role == role::LIST_ITEM)
+        .collect();
+    assert_eq!(
+        items
+            .iter()
+            .map(|n| (n.name.as_str(), n.parent, n.set))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Deleted line", list.id, (1, 3)),
+            ("Blank line", list.id, (2, 3)),
+            ("Added line", list.id, (3, 3)),
+        ]
+    );
+    assert_eq!(items[1].rect[3], 0.);
+    let undo = told
+        .nodes
+        .iter()
+        .find(|n| n.role == role::BUTTON && n.name == "Undo")
+        .expect("nested button");
+    assert_eq!(undo.parent, items[0].id);
+}

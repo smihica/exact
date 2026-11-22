@@ -197,6 +197,10 @@ final class NoNativeModule: NativeModuleHosting {
     #endif
 }
 
+/// The most text a hatch's act may carry, 64 KB (`input`'s text, a tab
+/// container's URL): more is refused at the asking (`refusedOverBound`).
+package let hatchTextBytes = 65536
+
 /// What the core asks of a presenter's element hatches (LLP 1075.003.000).
 package protocol ElementHatching: AnyObject {
     // A batch's moments.
@@ -214,6 +218,7 @@ package protocol ElementHatching: AnyObject {
     // Acts a hatch asks of an element, queued.
     @discardableResult func later(_ id: UInt32, _ name: String, bytes: Int, _ work: @escaping () -> Void) -> Bool
     @discardableResult func later(_ what: String, _ name: String, bytes: Int, _ work: @escaping () -> Void) -> Bool
+    func refusedOverBound(_ what: String, _ name: String, bytes: Int) -> Bool
     var inFlight: Int { get }
     func drain()
     func observation(_ diagnostics: (any HatchDiagnosing)?) -> [String: Any]
@@ -247,6 +252,7 @@ final class NoElementHatches: ElementHatching {
     func releaseConfigurations() {}
     func later(_ id: UInt32, _ name: String, bytes: Int, _ work: @escaping () -> Void) -> Bool { false }
     func later(_ what: String, _ name: String, bytes: Int, _ work: @escaping () -> Void) -> Bool { false }
+    func refusedOverBound(_ what: String, _ name: String, bytes: Int) -> Bool { false }
     var inFlight: Int { 0 }
     func drain() {}
     func observation(_ diagnostics: (any HatchDiagnosing)?) -> [String: Any] { [:] }
@@ -315,6 +321,13 @@ extension Presenter {
     package func listCreating(_ id: UInt32) -> Bool { pool.list(creating: id) != nil }
     /// The node a route hatch names by its route key and id, or nil.
     package func resolveRoute(_ key: String, id: String) -> UInt32? { navigation.resolve(route: key, id: id)?.id }
+    /// A live route controller's content scroll view now (`NavigationHosting.contentScrollView(of:)`), the one a
+    /// status-bar tap scrolls while the route is active; nil for a controller that is not one of this presenter's
+    /// live routes.
+    package func routeContentScrollView(of controller: UIViewController) -> UIScrollView? {
+        guard let route = controller as? any RouteSurface, views[route.node.id] === route.node else { return nil }
+        return navigation.contentScrollView(of: route)
+    }
     package func tabIntent(_ kind: UInt32, _ text: String) -> Bool { navigation.tabIntent(kind, text) }
     package func setNavigationAppDelegate(_ controller: AnyObject, _ delegate: AnyObject?) { navigation.setAppDelegate(controller, delegate) }
     #if os(iOS)

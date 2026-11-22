@@ -64,7 +64,7 @@ pub(crate) struct Kind {
     /// What the report names as unobserved.
     pub unobserved: &'static [&'static str],
     /// The metrics' `coverage`.
-    pub coverage: fn() -> Value,
+    pub coverage: fn(&str) -> Value,
 }
 
 /// A frame whose work finishes when the publication it sent is ingested.
@@ -378,7 +378,7 @@ impl Health {
     }
 
     /// `perf frames health`: since the collector's reset, or since `cursor`.
-    pub fn metrics(&mut self, cursor: Option<&Value>, now: u64) -> Value {
+    pub fn metrics(&mut self, cursor: Option<&Value>, now: u64, live_agent: &str) -> Value {
         self.expire(now);
         let s = self.snapshot();
         let current = [self.bins(0), self.bins(1)];
@@ -463,7 +463,7 @@ impl Health {
                 "quantiles": "half-open bounds; null upper is overflow"},
             "scheduledPeriodNs": s.period_ns.to_string(), "requestedPeriodNs": "0",
             "observationAgeNs": if s.last_arrival_ns == 0 { Value::Null } else { json!(now.saturating_sub(s.last_arrival_ns).to_string()) },
-            "coverage": (self.kind.coverage)(), "droppedReports": self.dropped.to_string(),
+            "coverage": (self.kind.coverage)(live_agent), "droppedReports": self.dropped.to_string(),
             "capture": {"agentLeaseRemainingMs": self.lease_ms(now)},
             "cursor": {"version": 3, "producer": self.handle.to_string(), "generation": s.generation.to_string(),
                 "values": values.iter().map(u64::to_string).collect::<Vec<_>>(),

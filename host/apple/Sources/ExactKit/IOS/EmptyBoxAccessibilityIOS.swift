@@ -37,6 +37,11 @@ extension NodeView {
         }
     }
 
+    /// `views` in UIKit's reading order, as a list of accessibility children
+    /// (a navigation root's mount, and the layer of nodes lifted over its tab
+    /// container).
+    package static func accessibilityOrder(_ views: [UIView]) -> [Any] { ordered(views) }
+
     /// UIKit's order for a container's children, as XCTest's snapshot of
     /// an iOS 27 app read it: by top edge, except that tops less than 8
     /// points apart are one line, read by leading edge (#721). A stable

@@ -56,6 +56,18 @@ impl<D: DataSource> Host<D> {
         self.canvas_owed_onto(batch);
     }
 
+    /// A display frame reached the canvases that asked for one (LLP 1056 D5).
+    pub(crate) fn canvas_frame(&mut self) {
+        self.runner.canvas_frame();
+    }
+
+    /// Onto every batch: whether a canvas wants the next display frame, and
+    /// whether a deferred draw is owed.
+    pub(crate) fn canvas_onto(&self, batch: &mut Batch) {
+        batch.canvas_frames(self.runner.canvas_wants_frame());
+        self.canvas_owed_onto(batch);
+    }
+
     /// Where draws are deferred, whether one is owed now, on every batch:
     /// the presenter takes the last batch's word for it, and a turn that
     /// ran no canvas work (a list's report inside its window, a draw's own

@@ -24,7 +24,7 @@ impl Edit {
 /// Rewrite retired spellings, including press paints moved into an active part.
 /// Other syntax errors refuse the migration without changing the source.
 pub fn migrate(src: &str) -> Result<String, Vec<SyntaxError>> {
-    let (parsed, edits) = crate::parser::parsed_with_edits(src, 0);
+    let (parsed, edits) = crate::parser::parsed_with_edits(src, 0, false);
     if let Err(partial) = parsed {
         let errors: Vec<_> = partial
             .errors

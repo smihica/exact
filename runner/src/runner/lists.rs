@@ -109,6 +109,14 @@ impl<D: DataSource> Lists<D> for LinkedLists {
             .ok()
             .flatten()
     }
+    fn list_sections(
+        &self,
+        tree: &Tree,
+        u: &mut Update<'_>,
+        view: ViewId,
+    ) -> Result<Option<crate::list_api::SectionTable>, crate::instance::InstanceError> {
+        tree.list_sections(u, view)
+    }
     fn list_index(&self, tree: &Tree, view: ViewId, key: &str) -> Option<usize> {
         tree.list_index(view, key)
     }
@@ -211,7 +219,9 @@ impl<D: DataSource> Lists<D> for LinkedLists {
         r.reorder_json_linked()
     }
     fn reconcile_reorder(&self, r: &mut Runner<D>) -> Result<Vec<Op>, RunnerError> {
-        r.reconcile_reorder_linked()
+        let ops = r.reconcile_reorder_linked()?;
+        r.sync_reorder_target();
+        Ok(ops)
     }
     fn reorder_deadline(&self, r: &Runner<D>) -> Option<f64> {
         r.reorder_deadline_linked()

@@ -182,6 +182,14 @@ fn opening(doc: &str, id: u64) -> &str {
 }
 
 #[test]
+fn sf_backed_icons_prerender_with_a_square_natural_box() {
+    for (w, h) in [(799.1, 184.0), (184.0, 799.1)] {
+        let doc = document(&format!("component App\n  view\n    row font-size=20\n      image \"symbol:icon|star|0 0 {w} {h}|M0 0H{w}V{h}H0Z|\"\n"));
+        assert!(doc.contains("width='24' height='24'"), "{doc}");
+    }
+}
+
+#[test]
 fn caltrain_document_is_the_first_batch_as_html() {
     let (host, first) = caltrain();
     let doc = host.document().unwrap().root;

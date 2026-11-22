@@ -243,6 +243,32 @@ final class StagedApplyMacTests: XCTestCase {
         XCTAssertEqual(session.presenter.views[9004]?.props["title"], "later", "and lands after the earlier one's")
     }
 
+    func testTheRevealPublishesTooltipsAndCursorRectsOnlyWhereRequested() throws {
+        let p = Presenter()
+        show(p.viewport)
+        p.apply(wireBatch(tree))
+        var batch = replacement(row: ["title": "Open details", "href": "#details"])
+        batch.ops += wireBatch([
+            paint(9204, ["cursor": "crosshair"]),
+            ["op": "paragraph", "id": 9207, "runs": [
+                ["id": 9901, "parent": 9207, "paint": true, "props": ["text": "Help", "href": "#help"]],
+            ]],
+        ]).ops
+        let plan = try XCTUnwrap(p.stagePlan(batch))
+        while !plan.preparedAll { p.prepare(plan, until: .infinity) }
+        let link = try XCTUnwrap(plan.made[9202])
+        XCTAssertNotNil(link.window)
+        XCTAssertNil(link.toolTip)
+        XCTAssertEqual(plan.tips.map(\.id), [9202])
+        XCTAssertEqual(Set(plan.cursorRects.map(\.id)), [9202, 9204, 9207])
+
+        p.revealing = plan
+        p.apply(plan.reveal())
+        p.revealing = nil
+        XCTAssertEqual(link.toolTip, "Open details")
+        XCTAssertFalse(link.held)
+    }
+
     func testAButtonNamedByItsContentIsNamedAtTheReveal() throws {
         let p = Presenter()
         show(p.viewport)
@@ -255,6 +281,93 @@ final class StagedApplyMacTests: XCTestCase {
         p.apply(plan.reveal())
         p.revealing = nil
         XCTAssertEqual(button.accessibilityLabel(), "row 1")
+    }
+
+    func testAKeyedFormPreparesItsTextAndRevealsItsNativeControlsInOrder() throws {
+        let source = """
+        component App
+          state generation = 0
+          action swap
+            generation = generation + 1
+          view
+            column
+              button "Swap" press=swap testId="swap"
+              for record in [generation] key=record
+                column testId="form"
+                  for i in range(40) key=i
+                    text `${record} before ${i}` testId=`before-${i}`
+                  button `Edit ${record}` testId="edit"
+                  textarea value=`Note ${record}` testId="note"
+                  for i in range(40) key=i
+                    text `${record} after ${i}` testId=`after-${i}`
+        """
+        let session = ExactApp.shared.makeSession(label: "mixed-staged-form")
+        defer { session.destroy() }
+        show(session.presenter.viewport)
+        XCTAssertNil(session.boot(plan: try TableFixture.plan(source), size: CGSize(width: 400, height: 600)).error)
+        func node(_ name: String) throws -> NodeView {
+            try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == name })
+        }
+        let old = try node("form"), oldButton = try node("edit")
+        session.presenter.onPress?(try node("swap").id)
+        let plan = try XCTUnwrap(session.stage, "the text around the controls can be prepared")
+        while !plan.preparedAll { session.presenter.prepare(plan, until: .infinity) }
+        let rows = plan.made.values.filter { $0.props["testId"]?.hasPrefix("before-") == true || $0.props["testId"]?.hasPrefix("after-") == true }
+        XCTAssertEqual(rows.count, 80)
+        XCTAssertTrue(rows.allSatisfy { $0.held && $0.window != nil })
+        XCTAssertTrue(try node("form") === old)
+        XCTAssertTrue(try node("edit") === oldButton)
+
+        session.finishStage()
+        let form = try node("form"), button = try node("edit"), note = try node("note")
+        XCTAssertFalse(form === old)
+        XCTAssertFalse(button === oldButton)
+        let children = form.structuralChildren.compactMap { $0.props["testId"] }
+        XCTAssertEqual(children, (0..<40).map { "before-\($0)" } + ["edit", "note"] + (0..<40).map { "after-\($0)" })
+        XCTAssertTrue(rows.allSatisfy { !$0.held && session.presenter.views[$0.id] === $0 })
+        XCTAssertEqual((session.presenter.controls.controls[button.id] as? NativeButtonMac)?.title, "Edit 1")
+        XCTAssertEqual(note.props["value"], "Note 1")
+    }
+
+    func testAPreparedChildListTakesALiveViewOnlyAtTheReveal() throws {
+        for rows in [4, 40] {
+            let p = Presenter()
+            show(p.viewport)
+            var original = wireBatch(tree)
+            for i in original.ops.indices where original.ops[i].op == .children {
+                if original.ops[i].id == 9001 { original.ops[i].ids.removeAll { $0 == 9004 } }
+                if original.ops[i].id == 9002 { original.ops[i].ids.append(9004) }
+            }
+            p.apply(original)
+            let live = try XCTUnwrap(p.views[9004]), retiring = try XCTUnwrap(p.views[9002])
+            let oldText = try XCTUnwrap(p.views[9003])
+            let native = NSView()
+            oldText.addSubview(native)
+            var batch = replacement(rows: rows)
+            let into = try XCTUnwrap(batch.ops.firstIndex { $0.op == .children && $0.id == 9100 })
+            let from = try XCTUnwrap(batch.ops.firstIndex { $0.op == .children && $0.id == 9001 })
+            batch.ops[into].ids.insert(9004, at: 1)
+            batch.ops[from].ids.removeAll { $0 == 9004 }
+
+            let plan = try XCTUnwrap(p.stagePlan(batch))
+            while !plan.preparedAll { p.prepare(plan, until: .infinity) }
+            let top = try XCTUnwrap(plan.made[9100])
+            XCTAssertTrue(live.superview === retiring.container)
+            XCTAssertEqual(top.structuralChildren.count, rows)
+            p.revealing = plan
+            p.apply(plan.reveal())
+            p.revealing = nil
+            XCTAssertTrue(oldText.superview === retiring.container)
+            XCTAssertTrue(live.superview === top.container)
+            XCTAssertTrue(retiring.held)
+            p.teardown.finish()
+            XCTAssertNil(retiring.superview)
+            XCTAssertNil(oldText.superview)
+            XCTAssertNil(oldText.presenter)
+            XCTAssertTrue(native.superview === oldText)
+            XCTAssertTrue(live.superview === top.container)
+            XCTAssertEqual(top.structuralChildren.map(\.id), batch.ops[into].ids)
+        }
     }
 
     func testAPreparedSubtreeIsRevealedOnThePixelGridAsAPlainApplyDrawsIt() throws {

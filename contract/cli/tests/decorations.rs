@@ -133,6 +133,18 @@ fn a_decoration_takes_only_what_highlight_admits() {
 }
 
 #[test]
+fn a_forma_app_accepts_leading_unicode_space_in_a_decoration_colour() {
+    let dir = Scratch::new(format!("exact-decoration-space-{}", std::process::id()));
+    std::fs::write(dir.join("app.forma"), "forma t\n\ntheme\n  ink = #123456\n").unwrap();
+    std::fs::write(
+        dir.join("app.contract"),
+        "decoration ink color=\"\u{00a0}light-dark(#ff0060, #0060ff)\"\n\ncomponent App\n  view\n    textarea decorations=TextDecorations(value=\"\", spans=[])\n",
+    )
+    .unwrap();
+    contract::compile_path(&dir.join("app.contract")).unwrap();
+}
+
+#[test]
 fn set_range_text_has_no_undo_mode_and_range_geometry_is_action_only() {
     for (tail, count) in [("", 2), (", 0, 1", 4), (", 0, 1, \"preserve\"", 5)] {
         let source = format!("component App\n  action replace\n    setRangeText(\"editor\", \"x\"{tail})\n  view\n    text \"Editor\"\n");

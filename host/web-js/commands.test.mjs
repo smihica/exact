@@ -7,6 +7,7 @@ import { test, expect } from 'bun:test';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 import { builtFile } from './content-names.mjs';
 import { engagement } from '../web/engagement.js';
+import { agentParameters } from '../web/navigation/agent-parameters.js';
 
 test('relaunch reloads the browser document and keeps committed storage', async () => {
   const server = Bun.serve({ port: 0, fetch(request) {
@@ -228,7 +229,7 @@ test.each([false, true])('a saved scheme waits beneath a grid copy pin (wasm: %s
   const client = glueNode(source('./dev.mjs'), n => n.type === 'VariableDeclarator' && n.id.name === 'client' && n.init);
   // The client writes its replacement boundary and the page's engagement tracker into the script (dev.mjs).
   const boundary = glueNode(source('./dev.mjs'), n => n.type === 'FunctionDeclaration' && n.id.name === 'replacementBoundary' && n);
-  const script = new Function('INSPECT_EVENTS', 'replacementBoundary', 'engagement', `return (${client})(0, null)`)([], boundary, engagement)
+  const script = new Function('INSPECT_EVENTS', 'replacementBoundary', 'engagement', 'agentParameters', `return (${client})(0, null)`)([], boundary, engagement, agentParameters)
     .replace(/^<script>|<\/script>$/g, '');
   const pin = glueNode(wasm ? source('../web/dev.js') : script, n => n.type === 'VariableDeclarator' && n.id.name === 'pin' && n.init);
   const server = Bun.serve({ port: 0, fetch(request) {
@@ -256,11 +257,11 @@ test.each([false, true])('a saved scheme waits beneath a grid copy pin (wasm: %s
           root: document.body, AGENT_ADMITTED: true, agentMode: false,
           bootAttempt: 0, incarnation: 0, devAssets: null,
           memory: { buffer: new ArrayBuffer(128) },
-          wasm: { exact_in: () => 0, exact_plan_fonts: () => '[]', exact_boot_plan: () => JSON.stringify({
+          wasm: { exact_in: () => 0, exact_plan_fonts: () => '[]', exact_set_screen_reader: noop, exact_boot_plan: () => JSON.stringify({
             ops: [{ op: 'command', name: 'setScheme', args: [JSON.parse(localStorage.getItem('exact.state.#scheme'))] }],
           }) },
           readOut: value => value, prepareFonts: async () => [], commitFonts: noop,
-          encoder: new TextEncoder(), launchLocation: () => '/', preferences: () => 0, foldBits: () => 0,
+          encoder: new TextEncoder(), launchLocation: () => '/', launchVisits: () => [], preferences: () => 0, foldBits: () => 0, pageFacts: { screenReaderCode: () => 0 },
           navigation: { reset: noop }, arrange: { reset: noop }, motion: { reset: noop },
           collections: { reset: noop }, lists: new Map(), views: new Map(),
           followedScrolls: new Map(), pendingScrolls: new Map(), messageFrames: new Set(), messageViews: new Set(),

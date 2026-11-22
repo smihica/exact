@@ -18,7 +18,6 @@ use crate::arena::NodeArena;
 use crate::generated::{SafeAreaIgnore, SafeAreaIgnoreAlign, StyleProps};
 use crate::id::{IdMap, IdSet};
 use crate::layout::{LayoutMirror, LayoutReceipt};
-use crate::Direction;
 
 /// What a box that ignores takes past the box its parent places, as the
 /// solve last measured it.
@@ -76,7 +75,7 @@ impl Taken {
     /// counts from its extended box.
     pub(crate) fn origin(&self, arena: &NodeArena, slot: u32) -> (f32, f32) {
         let [top, right, _, left] = self.by;
-        match (self.offset, rtl(arena, slot)) {
+        match (self.offset, super::owner::rtl(arena, slot)) {
             (Some(_), _) => (0.0, 0.0),
             (None, false) => (left, top),
             (None, true) => (right, top),
@@ -160,7 +159,7 @@ impl Kernel {
             return Vec::new();
         }
         let arena = &self.arena;
-        let tolerance = arena.observations.tolerance();
+        let tolerance = super::area::tolerance(arena);
         // Two agree where both extend or both move the box, by frames within tolerance
         let near = |a: Option<Taken>, b: Option<Taken>| match (a, b) {
             (Some(a), Some(b)) => {
@@ -246,14 +245,15 @@ impl Kernel {
                 t.whole = [false; 4];
             }
         }
-        self.restyle_taken(&reopened);
+        self.restyle_measured(&reopened);
     }
 
-    /// Lay out and publish again each box that took more or less: an
-    /// extended one's engine style carries it, and publication places a
-    /// moved one.
-    pub(super) fn restyle_taken(&mut self, taking: &[u32]) {
-        if taking.is_empty() {
+    /// Lay out and publish again each box whose engine style carries a
+    /// measurement that moved: what a box that ignores takes, which
+    /// publication places where it moves the box, or what a parent of bars
+    /// observes past which their slots begin (D12).
+    pub(super) fn restyle_measured(&mut self, boxes: &[u32]) {
+        if boxes.is_empty() {
             return;
         }
         if let Some(r) = &mut self.region {
@@ -261,7 +261,7 @@ impl Kernel {
         }
         let mut unmirrored = crate::layout::Unmirrored;
         let layout = self.layout.as_deref_mut().unwrap_or(&mut unmirrored);
-        for &s in taking {
+        for &s in boxes {
             self.arena.layout_dirty.insert(s);
             if let Some(node) = self.arena.taffy(s) {
                 layout.restyle(&self.arena, s, node);
@@ -303,7 +303,7 @@ fn taking(kernel: &Kernel, slot: u32) -> (Option<Taken>, bool) {
     let [x, y, width, height] = stored.map_or([0.0; 4], |t| t.frame());
     let placed = [top - y, right + x + width, bottom + y + height, left - x];
     let margins = (arena.observations.takings.margins.get(&slot)).map_or([0.0; 4], |m| *m);
-    let tolerance = arena.observations.tolerance();
+    let tolerance = super::area::tolerance(arena);
     let at: [f32; 4] = std::array::from_fn(|e| placed[e] - margins[e]);
     let by: [f32; 4] = std::array::from_fn(|e| {
         let [outer, inner] = sides[e];
@@ -472,7 +472,7 @@ pub(crate) fn edges(arena: &NodeArena, slot: u32, region: SafeAreaIgnore) -> [bo
     }
     // Read the direction only for a logical edge
     let logical = has(SafeAreaIgnore::Start) || has(SafeAreaIgnore::End);
-    let (right, left) = match logical && rtl(arena, slot) {
+    let (right, left) = match logical && super::owner::rtl(arena, slot) {
         false => (SafeAreaIgnore::End, SafeAreaIgnore::Start),
         true => (SafeAreaIgnore::Start, SafeAreaIgnore::End),
     };
@@ -495,7 +495,7 @@ pub(crate) fn edges(arena: &NodeArena, slot: u32, region: SafeAreaIgnore) -> [bo
 fn alignment(arena: &NodeArena, slot: u32) -> Option<(f32, f32)> {
     use SafeAreaIgnoreAlign as A;
     let align = arena.style(slot).rare.safe_area_ignore_align;
-    let across = |trailing: bool| match trailing != rtl(arena, slot) {
+    let across = |trailing: bool| match trailing != super::owner::rtl(arena, slot) {
         true => 1.0,
         false => 0.0,
     };
@@ -511,11 +511,6 @@ fn alignment(arena: &NodeArena, slot: u32) -> Option<(f32, f32)> {
         A::BottomLeading => (across(false), 1.0),
         A::BottomTrailing => (across(true), 1.0),
     })
-}
-
-fn rtl(arena: &NodeArena, slot: u32) -> bool {
-    let style = arena.computed_source(slot, crate::StyleId::Direction);
-    style.direction == Direction::Rtl
 }
 
 /// `v`'s bit in the `safe_area_ignore` row: one for each value after

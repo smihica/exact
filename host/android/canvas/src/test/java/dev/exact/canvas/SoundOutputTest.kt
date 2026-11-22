@@ -89,9 +89,14 @@ class SoundOutputTest {
             .filter { it.msg.contains("assets/broken.wav") }
         org.robolectric.shadows.ShadowLog.clear()
         try {
+            assertEquals("closed", output.state().getString("state"))
             output.apply(cues())
             assertEquals("running", state.getString("state"))
             assertEquals("1/2", state.getString("decoded"))
+            val snapshot = output.state()
+            assertEquals("aaudio", snapshot.getString("kind"))
+            assertEquals("running", snapshot.getString("state"))
+            assertEquals(0.01, snapshot.getDouble("outputLatency"), 0.0)
             assertEquals(listOf(0, 1), backend.ops.map { it.getInt("sound") })
             assertEquals(1, failures().size)
             at += 2

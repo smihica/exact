@@ -82,7 +82,7 @@ component Kit
 "#;
 
 /// The kit's hits: `n` of them, 50 ms apart from the source's `at`, each in
-/// group "g"; `99` answers a string, a shape refusal.
+/// group "g"; the source refuses `99`, which refuses the commit.
 struct Kit {
     at: f64,
 }
@@ -112,7 +112,7 @@ impl DataSource for Kit {
         }
         assert_eq!(source, "hits");
         if n == 99.0 {
-            return Ok(Value::str("not a list"));
+            return Err(DataError::BadArguments("99 hits".into()));
         }
         Ok(Value::list(
             (0..n as usize)

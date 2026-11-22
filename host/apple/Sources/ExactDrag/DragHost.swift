@@ -13,6 +13,7 @@ public enum ExactDrag {
 }
 
 final class DragHost: DragCapability {
+    func handles(_ presenter: Presenter) -> DragHandles { DragHandleSet(presenter) }
     #if os(macOS)
     func mouseDrags(_ presenter: Presenter) -> MouseDrags {
         MouseDrags(transform: MouseTransformDrag(presenter), height: MouseHeightDrag(presenter))
@@ -21,7 +22,7 @@ final class DragHost: DragCapability {
     func updateTransformGesture(_ view: NodeView) { view.updateTransformDragGesture() }
     func updateHeightGesture(_ view: NodeView) { view.updateHeightDragGesture() }
     func shouldBegin(_ view: NodeView, _ gesture: UIGestureRecognizer) -> Bool? {
-        view.transformShouldBegin(gesture)
+        view.transformShouldBegin(gesture) ?? view.heightShouldBegin(gesture)
     }
     func recognizedPinch(_ handle: NodeView, scale: Double, focal: CGPoint) -> String? {
         TransformDragHold.recognizedPinch(handle, scale: scale, focal: focal)

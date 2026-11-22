@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import {checkSteadyResidency} from '../../render/tests/residency.mjs';
 import { proof, proofSDK } from '../../proof.mjs';
-import { decodePng } from '../../../scripts/png.mjs';
+import { crop, decodePng } from '../../../scripts/png.mjs';
 import {residencyProbe, checkResidency, checkTextureFamily, bakedTexture} from '../../render/tests/residency.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -25,7 +25,17 @@ export function foxPixels(image, screen, viewport) {
   return {ok:cropPixels>0 && fraction>.001 && nonwhiteFraction>.1 && shades.size>=8, orange,cropPixels,fraction,nonwhiteFraction,shades:shades.size,crop:[x0,y0,x1,y1]};
 }
 
-export function foxScreenshotPixels(image, screen, reply) {
+export function foxScreenshotPixels(image, screen, reply, canvas) {
+  if (reply.captureSpace === 'screen') {
+    if (reply.front !== true || !canvas?.screen || !canvas.viewport) return { ok: false, reason: 'game viewport could not be placed on the display' };
+    const { x, y, w, h } = canvas.screen;
+    const sx = image.width / reply.w, sy = image.height / reply.h;
+    const left = Math.round(x * sx), top = Math.round(y * sy);
+    const right = Math.round((x + w) * sx), bottom = Math.round((y + h) * sy);
+    if (!(left >= 0 && top >= 0 && right > left && bottom > top && right <= image.width && bottom <= image.height))
+      return { ok: false, reason: 'game viewport is outside the display capture' };
+    return foxPixels(crop(image, left, top, right - left, bottom - top), screen, [canvas.viewport.w, canvas.viewport.h]);
+  }
   const scale = reply.scale ?? image.width / reply.w;
   if (!(reply.w > 0 && reply.h > 0 && scale > 0) || Math.abs(image.width - reply.w * scale) > 1 || Math.abs(image.height - reply.h * scale) > 1) return {ok:false, reason:'screenshot dimensions disagree with logical size and scale'};
   return foxPixels(image, screen, [reply.w, reply.h]);
@@ -69,12 +79,13 @@ if (import.meta.main) await proof(import.meta, async ({pin, pinSave, open, check
   if(host !== 'linux') {
     const path = resolve(out,`fox-mid-stride-${host}.png`);
     const screenshot = await s.screenshot(path);
+    const canvas = screenshot.captureSpace === 'screen' ? (await s.layout('world')).node?.space : undefined;
     const image = decodePng(readFileSync(path));
-    const pixels=foxScreenshotPixels(image, layout.entity.screen, screenshot);
+    const pixels=foxScreenshotPixels(image, layout.entity.screen, screenshot, canvas);
     check('Fox screenshot has textured orange fur',pixels.ok,pixels);
     const white={...image,data:new Uint8Array(image.data).fill(255)};
     for(let i=0;i<image.data.length;i+=80) white.data.set(image.data.subarray(i,i+4),i);
-    check('95 percent white screenshot is rejected',!foxScreenshotPixels(white,layout.entity.screen,screenshot).ok);
+    check('95 percent white screenshot is rejected',!foxScreenshotPixels(white,layout.entity.screen,screenshot,canvas).ok);
   }
   await s.world('world').run(1000);
   const at120 = await s.world('world').snapshot();

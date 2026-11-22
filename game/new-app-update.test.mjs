@@ -89,6 +89,37 @@ test('authored crate names win over the package name and an SDK-named directory'
   } finally { rmSync(parent, { recursive: true, force: true }); }
 }, 60_000);
 
+test('update adds Linux and Android hosts for the data sources the app declares', () => {
+  const scratch = mkdtempSync(resolve(tmpdir(), 'exact-update-data-'));
+  try {
+    for (const mixed of [false, true]) {
+      const dir = resolve(scratch, mixed ? 'mixed' : 'rust');
+      createApp(dir, { with: ['android'] });
+      if (!mixed) rmSync(resolve(dir, 'app.ts'));
+      const manifest = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8'));
+      manifest.rust = { data: { crate: 'pins-data', type: 'pins_data::Pins', source: 'pins_data::Pins::new(3)' } };
+      manifest.deploy.store.android = 'A';
+      write(resolve(dir, 'app.json'), JSON.stringify(manifest));
+      write(resolve(dir, 'Cargo.toml'), '[workspace]\nmembers = ["logic"]\nresolver = "2"\n[workspace.package]\nedition = "2021"\nversion = "0.1.0"\nlicense = "MIT"\n');
+      write(resolve(dir, 'logic/Cargo.toml'), packageText('pins-data'));
+      write(resolve(dir, 'logic/lib.rs'), '');
+
+      createApp(dir, { update: true });
+      for (const kind of ['linux', 'android']) {
+        const read = file => readFileSync(resolve(dir, kind, file), 'utf8');
+        const deps = Bun.TOML.parse(read('Cargo.toml'));
+        assert.equal(deps['build-dependencies']['pins-data']?.path, '../logic');
+        const runtime = deps.dependencies ?? deps.target['cfg(target_os = "android")'].dependencies;
+        assert.equal(runtime['pins-data'].path, '../logic');
+        assert.equal('exact-js' in runtime, mixed);
+        assert.equal('exact-painted-update' in runtime, kind === 'android');
+        assert.match(read('build.rs'), /pins_data::Pins::new\(3\)/);
+        assert.match(read('build.rs'), mixed ? /exact_js_bake::build_beside/ : /exact_bake::host::app/);
+      }
+    }
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+}, 60_000);
+
 function declaration(key, form, scope, path) {
   if (form === 'inline') return `${key} = { path = ${JSON.stringify(path)} }\n`;
   if (form === 'workspace') return `${key}.workspace = true\n`;

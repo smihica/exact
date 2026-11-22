@@ -493,28 +493,43 @@ fn clock_data_answers_a_module_that_did_not_load() {
             Err(DataError::UnknownSource(source.into()))
         }
     }
+    struct NeverMade;
+    impl Default for NeverMade {
+        fn default() -> Self {
+            panic!("a rejected module must not construct hatches")
+        }
+    }
+    impl crate::hatches::Hatches for NeverMade {}
     let plan =
         contract::compile("component App\n  view\n    text \"hi\" testId=\"log\" height=20\n")
             .unwrap();
-    let (mut p, _) = Presenter::boot_with(
-        &plan.encode(),
-        Unloadable,
-        (300.0, 300.0),
-        1.0,
-        std::path::PathBuf::new(),
-        PainterChoice::Cpu,
-    )
-    .unwrap();
-    let reply: serde_json::Value =
-        serde_json::from_str(&handle(&mut p, r#"{"op":"clock","data":true}"#)).unwrap();
-    let error = reply["error"].as_str().unwrap_or_default();
-    assert!(
-        error.starts_with("clock data: activate data: Unavailable")
-            && error.contains("Property 'Intl' doesn't exist"),
-        "{reply}"
-    );
-    let logs = handle(&mut p, r#"{"op":"logs"}"#);
-    assert!(logs.contains("Property 'Intl' doesn't exist"), "{logs}");
+    for displayed in [false, true] {
+        let (mut p, _) = Presenter::boot_with(
+            &plan.encode(),
+            Unloadable,
+            (300.0, 300.0),
+            1.0,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        if displayed {
+            p.set_hatches(Some(crate::hatches::install::<NeverMade>(&[])));
+            let frame = p.display_frame().unwrap();
+            assert!(p.display_complete(&frame));
+            assert_eq!(p.data_state(), -1);
+        }
+        let reply: serde_json::Value =
+            serde_json::from_str(&handle(&mut p, r#"{"op":"clock","data":true}"#)).unwrap();
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(
+            error.starts_with("clock data: activate data: Unavailable")
+                && error.contains("Property 'Intl' doesn't exist"),
+            "{reply}"
+        );
+        let logs = handle(&mut p, r#"{"op":"logs"}"#);
+        assert!(logs.contains("Property 'Intl' doesn't exist"), "{logs}");
+    }
 }
 
 /// LLP 1069.007 §5 item 4, with a synthetic capability standing in for

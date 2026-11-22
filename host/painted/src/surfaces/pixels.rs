@@ -4,6 +4,20 @@ use super::*;
 use std::sync::Arc;
 use tiny_skia::{IntSize, Pixmap};
 
+impl<D: DataSource> Presenter<D> {
+    /// Clock stops can refresh painted geometry without drawing a GPU frame.
+    pub(crate) fn defer_gpu_readback<T>(&mut self, seek: impl FnOnce(&mut Self) -> T) -> T {
+        let deferred = std::mem::replace(&mut self.surfaces.defer_readback, true);
+        let result = seek(self);
+        self.surfaces.defer_readback = deferred;
+        // A geometry pass may have cleared the damage. Paint at the landing.
+        if !deferred && self.surfaces.has_rendered_canvas() {
+            self.repaint();
+        }
+        result
+    }
+}
+
 impl Surfaces {
     pub(crate) fn has_rendered_canvas(&self) -> bool {
         self.canvases
@@ -31,6 +45,12 @@ impl Surfaces {
             };
             let (width, height) = (node.frame.width, node.frame.height);
             if width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            if self.defer_readback {
+                if let Some(paint) = previous.remove(&view) {
+                    result.insert(view, paint);
+                }
                 continue;
             }
             let (w, h) = (
@@ -76,6 +96,7 @@ impl Surfaces {
                         view,
                         crate::canvas2d::CanvasPaint {
                             pixels: Arc::new(pixels),
+                            update: None,
                         },
                     );
                 }

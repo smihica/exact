@@ -352,6 +352,10 @@ export function cargoInputPaths(stdout, base) {
   }))].sort();
 }
 
+/** Cargo library filenames use the target name even when the package has another name. */
+export const cargoLibraryTarget = pkg => pkg.targets.find(target =>
+  target.kind.some(kind => ['cdylib', 'staticlib', 'rlib', 'lib'].includes(kind)));
+
 /** Supply Cargo with a content revision for the selected bake, then retain
  * its actual watches after success. File watches still serve direct Cargo. */
 export function cargoBakeInputs(pkg, target, profile, env, app = null) {
@@ -584,26 +588,37 @@ export function fresh(product, dep, also = []) {
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const CONTRACT = resolve(ROOT, 'target/debug', `contract${EXE}`);
 
-const shapeRecords = stdout => stdout.split('\n').flatMap(line => {
-  const text = /^cargo::?metadata=exact-rust-shapes=(.+)$/.exec(line)?.[1];
-  return text ? [JSON.parse(text)] : [];
+const bindingRecords = stdout => stdout.split('\n').flatMap(line => {
+  const match = /^cargo::?metadata=exact-rust-(shapes|modules)=(.+)$/.exec(line);
+  return match ? [{ ...JSON.parse(match[2]), kind: match[1] }] : [];
 });
 
 /** Contract reads are dev-loop inputs, separate from Cargo's generated Rust watch. */
-export function rustShapeInputs(stdout) {
-  return shapeRecords(stdout).flatMap(record => [record.source,
+export function rustBindingInputs(stdout) {
+  return bindingRecords(stdout).flatMap(record => [record.source,
     ...(record.inputs && existsSync(record.inputs) ? JSON.parse(readFileSync(record.inputs, 'utf8')) : [])]);
+}
+
+function writeBindingOutput(path, text) {
+  try {
+    if (readFileSync(path, 'utf8') === text) return;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try { writeFileSync(temp, text, { flag: 'wx' }); renameSync(temp, path); }
+  finally { rmSync(temp, { force: true }); }
 }
 
 /** Refresh a data crate's generated Rust before checking Cargo's inputs.
  * The build script declares this projection in its stdout; unrelated watches
- * still belong to Cargo. Unchanged shapes retain their bytes and mtime. */
-export function refreshRustShapes(output, env = process.env, packages = null) {
+ * still belong to Cargo. Unchanged bindings retain their bytes and mtime. */
+export function refreshRustBindings(output, env = process.env, packages = null) {
   const stdout = readFileSync(output, 'utf8');
-  const records = shapeRecords(stdout);
+  const records = bindingRecords(stdout);
   for (const record of records) {
     if (packages && !packages.has(resolve(record.package))) continue;
-    const path = resolve(output, output.endsWith('stdout') ? '../../out/shapes.rs' : '../out/shapes.rs');
+    const path = resolve(output, output.endsWith('stdout') ? '../../out' : '../out', `${record.kind}.rs`);
     const built = freshCompiler(CONTRACT);
     const run = command => spawnSync(built ? CONTRACT : 'cargo', built ? [command, record.source]
       : ['run', '-q', '-p', 'contract', '--bin', 'contract', '--', command, record.source], {
@@ -617,11 +632,10 @@ export function refreshRustShapes(output, env = process.env, packages = null) {
       if (graph.stdout) {
         const { sources, consulted } = JSON.parse(graph.stdout);
         const paths = [...new Set([record.source, ...sources.map(s => s.path).filter(isAbsolute), ...consulted])].sort();
-        const text = JSON.stringify(paths);
-        if (!existsSync(record.inputs) || readFileSync(record.inputs, 'utf8') !== text) writeFileSync(record.inputs, text);
+        writeBindingOutput(record.inputs, JSON.stringify(paths));
       }
     }
-    const result = run('rust');
+    const result = run(record.kind === 'modules' ? 'module-rust' : 'rust');
     if (result.status !== 0) {
       // A previous configuration can name a removed or invalid entry. A missing
       // watched output makes Cargo run the generator selected by this build;
@@ -629,16 +643,12 @@ export function refreshRustShapes(output, env = process.env, packages = null) {
       rmSync(path, { force: true });
       continue;
     }
-    if (!existsSync(path) || readFileSync(path, 'utf8') !== result.stdout) {
-      const temp = `${path}.${process.pid}.tmp`;
-      try { writeFileSync(temp, result.stdout); renameSync(temp, path); }
-      finally { rmSync(temp, { force: true }); }
-    }
+    writeBindingOutput(path, result.stdout);
   }
 }
 
 /** Refresh only build scripts in this Cargo graph, in both Cargo layouts. */
-export function refreshCargoRustShapes(targetDir, target, profile, packages, env, buildDir = targetDir) {
+export function refreshCargoRustBindings(targetDir, target, profile, packages, env, buildDir = targetDir) {
   const roots = new Set(packages.map(pkg => resolve(dirname(pkg.manifest_path))));
   const names = new Set(packages.map(pkg => pkg.name));
   const directory = profile === 'dev' ? 'debug' : profile;
@@ -652,7 +662,7 @@ export function refreshCargoRustShapes(targetDir, target, profile, packages, env
         : names.has(entry.name.replace(/-[0-9a-f]+$/, '')) ? [path] : [];
       for (const dir of dirs) {
         const output = buildScriptOutput(dir);
-        if (output) refreshRustShapes(output, env, roots);
+        if (output) refreshRustBindings(output, env, roots);
       }
     }
   }

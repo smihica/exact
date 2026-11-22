@@ -288,11 +288,11 @@ mod presenter_tests {
         assert!(p.clock(61_000.0).1.is_none());
         p.poll_update();
         assert_eq!(checks(&log), 2, "the interval");
-        p.page_execution(true, true);
+        p.page_execution(true, true, false);
         assert!(p.clock(200_000.0).1.is_none());
         p.poll_update();
         assert_eq!(checks(&log), 2, "none while hidden");
-        p.page_execution(false, true);
+        p.page_execution(false, true, false);
         assert_eq!(checks(&log), 3, "back in the foreground");
     }
 

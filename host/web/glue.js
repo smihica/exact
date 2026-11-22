@@ -519,7 +519,7 @@ onKeyboard(pageChanged); // LLP 1039 D9: the VirtualKeyboard API moves the keys 
 const symbolStyle = document.createElement("style");
 document.head.append(symbolStyle);
 // @ref LLP 1081 stage 2 — a symbol draws in its `color`: a zero-specificity default, so a native face's or a bar's own ink wins.
-symbolStyle.textContent = "@property --exact-tint{syntax:\"<color>\";inherits:false;initial-value:#000}:where(img[data-symbol-path]){--exact-tint:currentcolor}img[data-symbol-path]{background-color:var(--exact-tint)!important;mask-image:var(--exact-symbol-mask);mask-repeat:no-repeat;mask-position:center;mask-size:var(--exact-symbol-fit,contain);mask-origin:content-box;mask-clip:content-box}";
+symbolStyle.textContent = "@property --exact-tint{syntax:\"<color>\";inherits:false;initial-value:#000}:where(img[data-symbol-path]){--exact-tint:currentcolor}img[data-symbol-path]{background-color:var(--exact-tint)!important;mask-image:var(--exact-symbol-mask);mask-repeat:no-repeat;mask-position:var(--exact-symbol-position,center);mask-size:var(--exact-symbol-fit,contain);mask-origin:content-box;mask-clip:content-box}";
 // An image's `load` and `error` (LLP 1011 §2) as HTML `<img>` fires them, once per source, the error with its message (rt.js `imageEvent`); a symbol fires neither. A tinted raster paints
 // through its CSS mask (element.rs `host_css`), a CORS fetch: from an origin that sends no CORS headers it paints nothing, so a CORS probe of the source decides. An adopted page's image may have settled before this attached.
 export const IMAGE_ERROR = "the image did not load", CORS_ERROR = "a tinted image from another origin needs CORS (Access-Control-Allow-Origin)", imageProbes = new Map();
@@ -621,7 +621,7 @@ export function surfaceGranted(op) {
   const need = `surface.${op.mode === "capture" ? "read" : "write"} ${op.name}`;
   return scoped?.entries.some(([, source]) => source === need) ?? false;
 }
-function fulfill(requestIncarnation, ticket, kind, status, headersText, body, elapsedMs) {
+function fulfill(requestIncarnation, ticket, kind, status, headersText, body, elapsedMs, askedAt = 0, afterMs = 0, timeoutMs = 0) {
   // Boot reuses ticket IDs; an old incarnation's completion must not land.
   if (!host.wasm || requestIncarnation !== host.incarnation) {
     return;
@@ -635,7 +635,7 @@ function fulfill(requestIncarnation, ticket, kind, status, headersText, body, el
   const mem = new Uint8Array(host.memory.buffer, ptr, h.length + body.length);
   mem.set(h);
   mem.set(body, h.length);
-  send(host.wasm.exact_fulfill(ticket, kind, status, h.length, body.length, now()));
+  send(host.wasm.exact_fulfill(ticket, kind, status, h.length, body.length, now(), askedAt, afterMs, timeoutMs));
 }
 export function safelyFulfill(...args) {
   try {
@@ -653,8 +653,10 @@ export const deferFulfill = deferredFulfill(safelyFulfill, inflight);
 // D3), and the GPU module's picture. `tap`, `type`, and `screenshot` are
 // the driver's, over CDP: real input, real pixels.
 export function ask(request) {
-  // entering an unloaded stage traps mid-call; callers load it first (LLP 1047.000 §9)
-  if (!stageLoaded("inspection")) {
+  // Entering an unloaded stage traps mid-call, so a caller loads it first (LLP 1047.000 §9). A picker's hold is the
+  // core's (`exact_runner::agent::answer` takes it before the stage's `handle`), so a press asks for it at once, inside
+  // its activation.
+  if (request.op !== "showPicker" && !stageLoaded("inspection")) {
     throw new Error("inspection is a stage that has not loaded (LLP 1047.000): load it before asking");
   }
   return JSON.parse(readOut(host.wasm.exact_agent(writeIn(JSON.stringify(request)))));

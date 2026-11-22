@@ -4,6 +4,17 @@
 #if os(iOS) || os(tvOS)
 import UIKit
 
+/// How the native navigation container represents this child of its mount.
+package enum NavigationPaintRole {
+    case sibling, besideRoutes, represented
+}
+
+/// A transform handle's contact, which the Drag module keeps: the core asks
+/// only for its pinch, which gesture precedence orders.
+package protocol TransformPinchContact: AnyObject {
+    var pinchRecognizer: UIGestureRecognizer { get }
+}
+
 /// What most nodes never set — gestures and their holds, editors and
 /// embedded platform views, a canvas's overlay, symbols, focus rings, a
 /// scroller's bookkeeping — held apart and made on the first write that is
@@ -86,7 +97,7 @@ final class NodeExtras {
     var nativeActiveRefusals: [String: String] = [:]
     /// The tint its authored `accent-color` gives its subtree (`applyAccentTint`)
     var authoredAccentTint: UIColor?
-    var pressContact: PressContact?
+    package var pressContact: PressContact?
     var inlinePressed: UInt32?
     /// A Markdown link pressed in this text: its target, followed on release over it.
     var linkPressed: String?
@@ -126,7 +137,7 @@ final class NodeExtras {
     var reorderOrigin: CGPoint = .zero
     var transformRecognizer: UIPanGestureRecognizer?
     var transformHold: DragInput?
-    var transformContact: TransformContact?
+    var transformContact: TransformPinchContact?
     var swipeOrigin: Double = 0
     var contextRecognizer: UILongPressGestureRecognizer?
     var doubleRecognizer: UITapGestureRecognizer?
@@ -167,10 +178,10 @@ final class NodeExtras {
     var lastScrollEvent: [Double] = []
     var dispatchingScrollEvent: Bool = false
     var scrollEnd: ScrollEnd?
-    var beforeLayoutScroll: (offset: CGPoint, topInset: CGFloat)?
+    var beforeLayoutScroll: (offset: CGPoint, topInset: CGFloat, leftInset: CGFloat, room: CGFloat)?
     /// Logical coordinates survive hiding and physical backend replacement.
     var hiddenScroll: CGPoint?
-    var followedScroll: (top: CGFloat, end: Bool, start: Bool)?
+    var followedScroll: (top: CGFloat, end: Bool, start: Bool, port: CGFloat)?
     var followsEndAfterInteraction = false
     var followingEndAnimated = false
     /// Until when a `scrollTop` write UIKit animates (`scroll-behavior: smooth`) counts as running: UIKit does not always
@@ -211,14 +222,18 @@ final class NodeExtras {
     var pageBand = UIEdgeInsets.zero
     /// The part of the band its scroll view's `contentInset` holds (LLP 1131 D2).
     package var bandInset = UIEdgeInsets.zero
+    /// How far D13's reach outsets its scroll view past its box on each edge, as the kernel's
+    /// terms give it (LLP 1123 D13); D14's writer holds the insets that go with it.
+    var reach = UIEdgeInsets.zero
+    /// Whether the kernel has given its reach (`setReach`), zero included: until then a grouped list reaches by its own
+    /// rule (`GroupedListView.sideReach`).
+    var reachGiven = false
     /// The bottom inset a keyboard toolbar gives its scroll view (`KeyboardToolbarIOS.swift`).
     var keyboardInset: CGFloat = 0
     /// A control bar over a scroller's content (LLP 1131 D3, D4): the scroller's paint rank, which it is placed
     /// above, and UIKit's edge effect.
     var bandOver: Int64?
-    /// A child beside the routes or below their tab panels: it paints over
-    /// the whole-view native container (`NavigationHost.clearBesideRoutes`).
-    package var clearsNavigation = false
+    var navigationPaint = NavigationPaintRole.sibling
     var edgeInteraction: AnyObject?
     var scrollWritten: String?
     /// A hatched node whose hatch undoes its own additions: its row may be
@@ -236,6 +251,7 @@ final class NodeExtras {
 extension NodeView {
     var authoredContainerType: UIAccessibilityContainerType? {
         if props["accessibilityRole"] == "group" { return .semanticGroup }
+        if props["accessibilityRole"] == "list" { return .list }
         if kind == "native", authoredLabel != nil, presenter?.session?.natives.speaksForItself(self) == true {
             return .semanticGroup
         }
@@ -307,7 +323,7 @@ extension NodeView {
         set { if !newValue.isEmpty || extras != nil { more.nativeActiveRefusals = newValue } }
     }
     var inlinePressed: UInt32? { get { extras?.inlinePressed } set { if newValue != nil || extras != nil { more.inlinePressed = newValue } } }
-    var pressContact: PressContact? { get { extras?.pressContact } set { if newValue != nil || extras != nil { more.pressContact = newValue } } }
+    package var pressContact: PressContact? { get { extras?.pressContact } set { if newValue != nil || extras != nil { more.pressContact = newValue } } }
     var linkPressed: String? { get { extras?.linkPressed } set { if newValue != nil || extras != nil { more.linkPressed = newValue } } }
     var svgPressed: UInt32? { get { extras?.svgPressed } set { if newValue != nil || extras != nil { more.svgPressed = newValue } } }
     package var clipPath: CGPath? { get { extras?.clipPath } set { if newValue != nil || extras != nil { more.clipPath = newValue } } }
@@ -348,7 +364,7 @@ extension NodeView {
     package var reorderOrigin: CGPoint { get { extras?.reorderOrigin ?? .zero } set { if newValue != .zero || extras != nil { more.reorderOrigin = newValue } } }
     package var transformRecognizer: UIPanGestureRecognizer? { get { extras?.transformRecognizer } set { if newValue != nil || extras != nil { more.transformRecognizer = newValue } } }
     package var transformHold: DragInput? { get { extras?.transformHold } set { if newValue != nil || extras != nil { more.transformHold = newValue } } }
-    package var transformContact: TransformContact? { get { extras?.transformContact } set { if newValue != nil || extras != nil { more.transformContact = newValue } } }
+    package var transformContact: TransformPinchContact? { get { extras?.transformContact } set { if newValue != nil || extras != nil { more.transformContact = newValue } } }
     /// A projection's transform over its layout (PresenterIOS), identity for every other node.
     package var contextTransform: CGAffineTransform {
         get { extras?.contextTransform ?? .identity }
@@ -360,7 +376,7 @@ extension NodeView {
     /// While it flies as a shared element (LLP 1013.000 D4): where its image is drawn.
     package var flightLook: FlightLook? { get { extras?.flightLook } set { if newValue != nil || extras != nil { more.flightLook = newValue } } }
     /// LLP 1093 D7: fragments or columns.
-    var columnRecord: ColumnRecord? { get { extras?.columnRecord } set { if newValue != nil || extras != nil { more.columnRecord = newValue } } }
+    package var columnRecord: ColumnRecord? { get { extras?.columnRecord } set { if newValue != nil || extras != nil { more.columnRecord = newValue } } }
     var liveText: String? { get { extras?.liveText } set { if newValue != nil || extras != nil { more.liveText = newValue } } }
     var swipeOrigin: Double { get { extras?.swipeOrigin ?? 0 } set { if newValue != 0 || extras != nil { more.swipeOrigin = newValue } } }
     var contextRecognizer: UILongPressGestureRecognizer? { get { extras?.contextRecognizer } set { if newValue != nil || extras != nil { more.contextRecognizer = newValue } } }
@@ -452,9 +468,9 @@ extension NodeView {
     var lastScrollEvent: [Double] { get { extras?.lastScrollEvent ?? [] } set { if !newValue.isEmpty || extras != nil { more.lastScrollEvent = newValue } } }
     var dispatchingScrollEvent: Bool { get { extras?.dispatchingScrollEvent ?? false } set { if newValue || extras != nil { more.dispatchingScrollEvent = newValue } } }
     var scrollEnd: ScrollEnd? { get { extras?.scrollEnd } set { if newValue != nil || extras != nil { more.scrollEnd = newValue } } }
-    var beforeLayoutScroll: (offset: CGPoint, topInset: CGFloat)? { get { extras?.beforeLayoutScroll } set { if newValue != nil || extras != nil { more.beforeLayoutScroll = newValue } } }
+    var beforeLayoutScroll: (offset: CGPoint, topInset: CGFloat, leftInset: CGFloat, room: CGFloat)? { get { extras?.beforeLayoutScroll } set { if newValue != nil || extras != nil { more.beforeLayoutScroll = newValue } } }
     var hiddenScroll: CGPoint? { get { extras?.hiddenScroll } set { if newValue != nil || extras != nil { more.hiddenScroll = newValue } } }
-    var followedScroll: (top: CGFloat, end: Bool, start: Bool)? { get { extras?.followedScroll } set { if newValue != nil || extras != nil { more.followedScroll = newValue } } }
+    var followedScroll: (top: CGFloat, end: Bool, start: Bool, port: CGFloat)? { get { extras?.followedScroll } set { if newValue != nil || extras != nil { more.followedScroll = newValue } } }
     var followingEndAnimated: Bool { get { extras?.followingEndAnimated ?? false } set { if newValue || extras != nil { more.followingEndAnimated = newValue } } }
     var followsEndAfterInteraction: Bool { get { extras?.followsEndAfterInteraction ?? false } set { if newValue || extras != nil { more.followsEndAfterInteraction = newValue } } }
     /// A smooth `scrollTop` write is running: the app's scroll, which the end-follow leaves alone (LLP 1070.000 §15).
@@ -491,7 +507,7 @@ extension NodeView {
     package var scrollCollapsed: CGFloat { get { extras?.scrollCollapsed ?? 0 } set { if newValue != 0 || extras != nil { more.scrollCollapsed = newValue } } }
     var scrollWritten: String? { get { extras?.scrollWritten } set { if newValue != nil || extras != nil { more.scrollWritten = newValue } } }
     package var hatchReusable: Bool { get { extras?.hatchReusable ?? false } set { if newValue || extras != nil { more.hatchReusable = newValue } } }
-    package var clearsNavigation: Bool { get { extras?.clearsNavigation ?? false } set { if newValue || extras != nil { more.clearsNavigation = newValue } } }
+    package var navigationPaint: NavigationPaintRole { get { extras?.navigationPaint ?? .sibling } set { if newValue != .sibling || extras != nil { more.navigationPaint = newValue } } }
     /// Where CSS's `scrollTop` 0 is in UIKit's offsets: past the scroller's
     /// top inset when UIKit insets it — a collapsing title's bar, or the bar
     /// over a route's bottom-edge scroller (`reachBottom`), which stays
@@ -504,6 +520,43 @@ extension NodeView {
     }
     /// Its page band (`NodeExtras.pageBand`), zero for most.
     package var pageBand: UIEdgeInsets { extras?.pageBand ?? .zero }
+    /// Its reach (`NodeExtras.reach`), zero until activation applies the kernel's.
+    package var reach: UIEdgeInsets { extras?.reach ?? .zero }
+    /// Whether the kernel has given its reach (`NodeExtras.reachGiven`).
+    package var reachGiven: Bool { extras?.reachGiven ?? false }
+    /// How far its scroll view lies past its box on each edge: its page band's top and bottom, or
+    /// its reach, whichever is larger, the page band reaching no side.
+    package var scrollOutset: UIEdgeInsets {
+        let band = pageBand, reach = reach
+        return UIEdgeInsets(top: max(band.top, reach.top), left: reach.left, bottom: max(band.bottom, reach.bottom), right: reach.right)
+    }
+    /// The part of each of `sv`'s insets it draws its content through (LLP 1123 D13, LLP 1130 D3): with reach, the smaller
+    /// of how far it lies past its box (`scrollOutset`) and its inset less native content room (`scrollPortInsets`), never
+    /// below zero; with none, the page band, which counts whole as it lands, while the inset holding it may still lag. A
+    /// windowed list counts it as port and as padding before its first row and after its last, and the rest of the inset
+    /// narrows its port.
+    package func scrollDrawnThrough(_ sv: UIScrollView) -> UIEdgeInsets {
+        guard reach != .zero else { return pageBand }
+        let o = scrollOutset, a = scrollPortInsets(sv)
+        let t = { (o: CGFloat, a: CGFloat) in max(0, min(o, a)) }
+        return UIEdgeInsets(top: t(o.top, a.top), left: t(o.left, a.left), bottom: t(o.bottom, a.bottom), right: t(o.right, a.right))
+    }
+    /// The outset a scroll event counts into CSS's scroll position: all of it but what the scroll view's own layout
+    /// consumes of a side reach (`BandConsumer`), across which its content stays put, as a grouped list's cards do.
+    package var reportedScrollOutset: UIEdgeInsets {
+        var o = scrollOutset
+        guard o.left > 0 || o.right > 0 else { return o }
+        if let consumed = (scrollView as? BandConsumer)?.consumedBand {
+            o.left -= min(o.left, consumed[3])
+            o.right -= min(o.right, consumed[1])
+        }
+        return o
+    }
+    /// Where CSS's `scrollLeft` 0 is in UIKit's offsets: past the scroller's left inset when UIKit
+    /// insets it, or past native content room, as `scrollTopInset` is for `scrollTop`.
+    package func scrollLeftInset(_ sv: UIScrollView) -> CGFloat {
+        sv.contentInsetAdjustmentBehavior != .never ? sv.adjustedContentInset.left : extras?.nativeScrollContentInsets.left ?? 0
+    }
     package var bandInset: UIEdgeInsets { extras?.bandInset ?? .zero }
     var bandOver: Int64? { get { extras?.bandOver } set { if newValue != nil || extras != nil { more.bandOver = newValue } } }
     var edgeInteraction: AnyObject? { get { extras?.edgeInteraction } set { if newValue != nil || extras != nil { more.edgeInteraction = newValue } } }
@@ -523,8 +576,11 @@ extension NodeView {
         return x ? point.x >= box.minX + widths[3] && point.x <= box.maxX - widths[1]
             : point.y >= box.minY + widths[0] && point.y <= box.maxY - widths[2]
     }
-    /// Its scroll view's frame: its bounds, and the band past them.
-    package var scrollFrame: CGRect { bounds.inset(by: UIEdgeInsets(top: -pageBand.top, left: 0, bottom: -pageBand.bottom, right: 0)) }
+    /// Its scroll view's frame: its bounds, and the band or reach past them.
+    package var scrollFrame: CGRect {
+        let o = scrollOutset
+        return bounds.inset(by: UIEdgeInsets(top: -o.top, left: -o.left, bottom: -o.bottom, right: -o.right))
+    }
     /// Native padding and footer space are content, unlike a bar or keyboard.
     package func scrollPortInsets(_ sv: UIScrollView) -> UIEdgeInsets {
         let inset = sv.adjustedContentInset, content = extras?.nativeScrollContentInsets ?? .zero
@@ -547,8 +603,14 @@ extension NodeView {
     /// collection view's does, not by the whole keyboard.
     package func scrollFloor(_ sv: UIScrollView) -> CGFloat {
         let keyboard = extras?.keyboardInset ?? 0
-        guard case .inset(let top, let bottom)? = presenter?.navigation.covers[id] else { return max(0, sv.bounds.height - pageBand.top - pageBand.bottom - keyboard) }
-        return max(0, sv.bounds.height - top - bottom - pageBand.top - pageBand.bottom - keyboard)
+        let o = scrollOutset
+        guard case .inset(let top, let bottom)? = presenter?.navigation.covers[id] else { return max(0, sv.bounds.height - o.top - o.bottom - keyboard) }
+        return max(0, sv.bounds.height - top - bottom - o.top - o.bottom - keyboard)
+    }
+    /// The least content width UIKit takes: the box's width, the scroll view's less its side reach.
+    package func scrollFloorWidth(_ sv: UIScrollView) -> CGFloat {
+        let o = scrollOutset
+        return max(0, sv.bounds.width - o.left - o.right)
     }
 }
 extension UIColor {
@@ -636,4 +698,5 @@ extension NodeView {
         refreshPressOpacity()
     }
 }
+
 #endif

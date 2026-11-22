@@ -59,11 +59,16 @@ impl<D: DataSource> Bridge<D> {
         &mut self,
         read: Option<crate::geometry::InlineFrameFn>,
         range: Option<crate::geometry::RangeFrameFn>,
+        metrics: Option<crate::geometry::ScrollMetricsFn>,
         ctx: *mut std::ffi::c_void,
     ) {
         self.inline_geometry = read.map(|read| {
-            std::rc::Rc::new(crate::geometry::InlineGeometry { read, range, ctx })
-                as std::rc::Rc<dyn exact_runner::geometry::InlineGeometry>
+            std::rc::Rc::new(crate::geometry::InlineGeometry {
+                read,
+                range,
+                metrics,
+                ctx,
+            }) as std::rc::Rc<dyn exact_runner::geometry::InlineGeometry>
         });
         if let Some(host) = self.host.as_mut() {
             host.runner_mut()
@@ -241,8 +246,8 @@ impl<D: DataSource> Bridge<D> {
     pub(super) fn presenter_hooks(&self, host: &mut crate::host::Host<D>, hooks: &super::Hooks) {
         host.runner_mut()
             .set_inline_geometry(self.inline_geometry.clone());
-        if let Some(f) = hooks.canvas_text {
-            host.set_canvas_text(f, hooks.ctx);
+        if let (Some(f), Some(canvas)) = (hooks.canvas_text, host.turn.canvas) {
+            (canvas.text)(host, f, hooks.ctx);
         }
         host.set_canvas_deferred(self.canvas_deferred);
         host.runner_mut().use_native_timers(self.native_timers);
@@ -523,10 +528,10 @@ impl<D: DataSource> Bridge<D> {
     /// Whether the stack whose root route is `view` splits (`exact_stack_split`;
     /// `Runner::stack_split`, LLP 1115.002 D4), as JSON in the output buffer:
     /// `{"list":view|null,"width":number|null,"rows":[[route,row]...],
-    /// "locations":[[route,url]...],"pressWrites":bool|null}`, the list whose
+    /// "locations":[[route,url]...],"current":view|null,"pressWrites":bool|null}`, the list whose
     /// row pushes, the list column's width where `navigationSplit` names one,
     /// each route above the root that is a row's detail with that row, each
-    /// route above the root with its location, and whether the press of
+    /// route above the root with its location, the current row, and whether the press of
     /// `pressed` (a view being pressed, or 0) writes the router; `null` for a
     /// stack that pushes. Not a batch: nothing changes.
     pub fn stack_split(&mut self, view: u32, retained: u32, pressed: u32) -> u32 {
@@ -556,11 +561,12 @@ impl<D: DataSource> Bridge<D> {
                     })
                     .collect();
                 format!(
-                    "{{\"list\":{},\"width\":{},\"rows\":[{}],\"locations\":[{}],\"pressWrites\":{}}}",
+                    "{{\"list\":{},\"width\":{},\"rows\":[{}],\"locations\":[{}],\"current\":{},\"pressWrites\":{}}}",
                     split.list.map_or("null".into(), |v| v.to_string()),
                     split.width.map_or("null".into(), |w| w.to_string()),
                     rows.join(","),
                     locations.join(","),
+                    split.current.map_or("null".into(), |v| v.to_string()),
                     writes.map_or("null".into(), |w| w.to_string())
                 )
             });
@@ -570,7 +576,9 @@ impl<D: DataSource> Bridge<D> {
 
     /// A grouped list's sections and rows (`exact_grouped_list`, LLP 1084
     /// D4), as JSON in the output buffer: `{"style","sections":[{"view",
-    /// "header","footer","headerLook","footerLook","card","spaceAbove","rows":[{"view","custom","symbol",("symbolPath","symbolViewBox": an
+    /// "header",("headerView": a custom header's node, whose views the host carries,
+    /// "headerParts": whether it holds a control or a press, each its own element),
+    /// "footer","headerLook","footerLook","card","spaceAbove","rows":[{"view","custom","symbol",("symbolPath","symbolViewBox": an
     /// svg-only icon's, `icon_path::push_json`),"title",
     /// "secondary","subtitle","accessory","accessoryView","target","pressable","action",
     /// "checked","destructive","disabled","authoredEdge","nextAuthoredTop","titleLook","secondaryLook"}]}],"spaceBelow","animates"}`,
@@ -644,6 +652,12 @@ impl<D: DataSource> Bridge<D> {
                     json.push_str(if i == 0 { "{" } else { ",{" });
                     json.push_str(&format!("\"view\":{},\"header\":", s.view));
                     opt(&s.header, &mut json);
+                    if let Some(view) = s.header_view {
+                        json.push_str(&format!(
+                            ",\"headerView\":{view},\"headerParts\":{}",
+                            s.header_parts
+                        ));
+                    }
                     json.push_str(",\"footer\":");
                     opt(&s.footer, &mut json);
                     look(",\"headerLook\":", &s.header_look, &mut json);

@@ -7,7 +7,7 @@
 // (js/bake/src/resident.rs `ENV`); the web build and the scripts import it from here.
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, normalize, relative, resolve, sep } from 'node:path';
 import { parseEnv } from 'node:util';
 import { dlopen, FFIType } from 'bun:ffi';
 import { createRequire } from 'node:module';
@@ -280,15 +280,17 @@ export const sourceInputChanges = inputs => (inputs?.reads ?? []).filter(entry =
 /** TypeScript's resolver reports successful and failed file probes separately from its loaded source list. */
 export function checkerOutput(stdout) {
   const lines = String(stdout ?? '').split(/\r?\n/);
-  const source = line => /^(?:\/|[A-Za-z]:[\\/]).*\.[cm]?[jt]sx?$/.test(line);
-  const files = lines.filter(source);
-  const resolution = [...new Set(lines.flatMap(line => [...line.matchAll(/(?:File |file |Directory |directory |at )'([^']+)'/g)].map(match => match[1])).filter(path => /^(?:\/|[A-Za-z]:[\\/])/.test(path)))];
+  const source = line => isAbsolute(line) && /\.[cm]?[jt]sx?$/.test(line);
+  // TypeScript spells Windows paths with `/`; the capture uses native paths.
+  const files = lines.filter(source).map(normalize);
+  const probes = lines.flatMap(line => Array.from(line.matchAll(/(?:File |file |Directory |directory |at )'([^']+)'/g), match => match[1]));
+  const resolution = new Set(probes.filter(isAbsolute).map(normalize));
   for (const line of lines) {
     const imported = /Resolving (?:module|type reference directive) '([^']+)'(?: from |, containing file )'([^']+)'/.exec(line);
-    if (imported) resolution.push(...resolutionCandidates(imported[1], imported[2]));
+    if (imported) for (const path of resolutionCandidates(imported[1], normalize(imported[2]))) resolution.add(path);
   }
   const diagnostics = (lines.some(line => /error TS\d+:/.test(line)) ? lines.filter(line => /error TS\d+:|^\s+\S/.test(line)) : lines.filter(line => !source(line))).join('\n');
-  return {files,resolution,diagnostics};
+  return {files,resolution:[...resolution],diagnostics};
 }
 
 /** The app-local code already in a producer's stage. Package code is captured separately by `capturedSources`. */

@@ -265,8 +265,76 @@ impl Recorder {
 }
 
 #[cfg(test)]
+#[path = "bleed_tests.rs"]
+mod bleed_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sticky_heading_keeps_its_section_background_for_the_backdrop() {
+        use crate::presenter::{PainterChoice, Presenter};
+
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(
+                r#"component App
+  view
+    scroll width=200 height=100
+      column
+        box width=200 height=5
+        column width=200 background-color="blue"
+          box position="sticky" top=0 width=200 height=20 backdrop-filter="saturate(0)"
+          box width=200 height=150
+          box width=200 height=25
+"#,
+            ),
+            (),
+            (200., 120.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Canvas,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let ops = FINISHED.with(|f| f.borrow_mut().take()).expect("a frame");
+        let (mut row, mut background, mut backdrop) = (None, None, None);
+        let mut at = 0;
+        while at < ops.len() {
+            match ops[at] {
+                ROW_BEGIN => {
+                    row = Some(ops[at + 1]);
+                    at += 6;
+                    continue;
+                }
+                ROW_END => row = None,
+                RRECT if ops[at + 1] == 0xff0000ff => background = row,
+                BACKDROP => backdrop = row,
+                _ => {}
+            }
+            at = end(&ops, at).expect("a valid stream");
+        }
+        assert!(
+            backdrop.is_some(),
+            "the reader draws the heading's backdrop"
+        );
+        assert_eq!(backdrop, background, "the reader samples only its own row");
+        let section = backdrop.unwrap();
+        for _ in 0..2 {
+            p.repaint();
+            p.frame();
+            let ops = FINISHED.with(|f| f.borrow_mut().take()).expect("a frame");
+            let mut at = 0;
+            let mut drawn = false;
+            while at < ops.len() {
+                assert_ne!(ops[at], ROW_BEGIN, "an unchanged section keeps its row");
+                drawn |= ops[at] == ROW_DRAW && ops[at + 1] == section;
+                at = end(&ops, at).expect("a valid stream");
+            }
+            assert!(drawn, "the reader still draws the section");
+        }
+    }
 
     #[test]
     fn memory_trim_frees_canvas_rows_without_freeing_their_replacements() {
@@ -480,14 +548,226 @@ mod tests {
         }
     }
 
+    fn media_records(ops: &[u32]) -> Vec<(f32, f32, serde_json::Value)> {
+        let mut players = Vec::new();
+        let mut at = 0;
+        while at < ops.len() {
+            if ops[at] == NATIVE && ops[at + 2] == 0 {
+                let len = ops[at + 15] as usize;
+                let bytes: Vec<_> = ops[at + 16..at + 16 + len.div_ceil(4)]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .take(len)
+                    .collect();
+                let props = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+                players.push((
+                    f32::from_bits(ops[at + 5]),
+                    f32::from_bits(ops[at + 6]),
+                    props,
+                ));
+            }
+            at = end(ops, at).expect("valid Canvas stream");
+        }
+        players
+    }
+
     #[test]
-    fn iframe_sandbox_presence_survives_the_canvas_stream() {
+    fn boxless_audio_is_recorded_without_a_box() {
+        use crate::presenter::{PainterChoice, Presenter};
+
+        let source = r#"component App
+  view
+    column width=160 height=160 overflow="hidden"
+      audio "assets/radio.mp3" autoplay=true
+      audio "assets/hidden-controls.mp3" controls=true width=0 height=0 visibility="hidden" paused=false
+      column display="none"
+        column
+          audio "assets/hidden.mp3" controls=true autoplay=true width=60 height=40
+          video "assets/hidden.mp4" width=60 height=40
+      column opacity=0
+        column opacity=0
+          audio "assets/transparent.mp3" autoplay=true
+          video "assets/transparent.mp4" width=60 height=40
+      column rotate="y 30deg" width=60 height=40
+        audio "assets/rotated.mp3" paused=false
+      column rotate="y 30deg" width=60 height=0
+        audio "assets/flat.mp3" paused=false
+      column filter="blur(2px)" width=60 height=40
+        audio "assets/filtered.mp3" paused=false
+      video "assets/visible.mp4" width=60 height=40
+"#;
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(source),
+            (),
+            (200., 200.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Canvas,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let ops = FINISHED.with(|f| f.borrow_mut().take()).unwrap();
+        let players = media_records(&ops);
+        assert_eq!(players.len(), 8, "{players:?}");
+        let player = |src: &str| {
+            players
+                .iter()
+                .find(|(_, _, props)| props["src"] == src)
+                .unwrap_or_else(|| panic!("missing {src}: {players:?}"))
+        };
+        let (w, h, audio) = player("assets/radio.mp3");
+        assert_eq!((*w, *h), (0., 0.));
+        assert_eq!(audio["audio"], true);
+        assert_eq!(audio["controls"], false);
+        assert_eq!(audio["autoplay"], true);
+        let (w, h, hidden_controls) = player("assets/hidden-controls.mp3");
+        assert_eq!((*w, *h), (0., 0.));
+        assert_eq!(hidden_controls["controls"], true);
+        assert_eq!(hidden_controls["paused"], false);
+        let (w, h, hidden) = player("assets/hidden.mp3");
+        assert_eq!((*w, *h), (0., 0.));
+        assert_eq!(hidden["controls"], true);
+        let (w, h, transparent) = player("assets/transparent.mp3");
+        assert_eq!((*w, *h), (0., 0.));
+        assert_eq!(transparent["audio"], true);
+        for src in [
+            "assets/rotated.mp3",
+            "assets/flat.mp3",
+            "assets/filtered.mp3",
+        ] {
+            let (w, h, audio) = player(src);
+            assert_eq!((*w, *h), (0., 0.));
+            assert_eq!(audio["audio"], true);
+            assert_eq!(audio["paused"], false);
+            assert_eq!(audio["session"], transparent["session"]);
+        }
+        let (w, h, video) = player("assets/visible.mp4");
+        assert_eq!((*w, *h), (60., 40.));
+        assert_eq!(video["audio"], false);
+    }
+
+    #[test]
+    fn boxless_audio_plays_from_a_closed_dialog() {
+        use crate::presenter::{PainterChoice, Presenter};
+
+        let source = r#"component App
+  state paused = true
+  action play
+    paused = false
+  view
+    column
+      button "Play" press=play testId="play"
+      dialog id="station"
+        audio "assets/radio.mp3" paused=paused
+        button "Close" commandfor="station" command="close" testId="close"
+"#;
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(source),
+            (),
+            (200., 200.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Canvas,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let id = |p: &Presenter<()>, name| {
+            let kernel = p.host().kernel();
+            kernel
+                .node_by_key(kernel.find_by_test_id(name)[0])
+                .unwrap()
+                .id
+        };
+        let play = id(&p, "play");
+        let close = id(&p, "close");
+        for paused in [true, false] {
+            if !paused {
+                p.tap(play).unwrap();
+            }
+            p.frame();
+            let ops = FINISHED.with(|f| f.borrow_mut().take()).unwrap();
+            let players = media_records(&ops);
+            assert_eq!(players.len(), 1, "{players:?}");
+            let (w, h, audio) = &players[0];
+            assert_eq!((*w, *h), (0., 0.));
+            assert_eq!(audio["src"], "assets/radio.mp3");
+            assert_eq!(audio["paused"], paused);
+            assert!(p.tap(close).is_err(), "the dialog's controls are hidden");
+        }
+    }
+
+    #[test]
+    fn boxless_audio_survives_a_composite_canvas() {
+        use crate::paint::{Painter, Presented, Scene};
+        use crate::presenter::{PainterChoice, Presenter};
+
+        let source = r#"component App
+  view
+    column
+      canvas testId="outer" width=160 height=160
+        canvas testId="inner" width=100 height=100
+          audio "assets/radio.mp3" paused=false
+      canvas testId="empty" width=160 height=0
+        audio "assets/empty.mp3" paused=false
+"#;
+        let (p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(source),
+            (),
+            (200., 200.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let kernel = p.host().kernel();
+        let canvases = ["outer", "inner", "empty"].map(|name| {
+            kernel
+                .node_by_key(kernel.find_by_test_id(name)[0])
+                .unwrap()
+                .id
+        });
+        let mut painter = Painter::new(p.text().clone(), 1., Box::new(Recorder::new()));
+        painter.composites.canvases.extend(canvases);
+        let scene = Scene {
+            kernel,
+            roots: &kernel.roots(),
+            hidden: &|_| false,
+            presented: &|_| Presented::IDENTITY,
+            paths: &|_| None,
+            filters: &|_| None,
+            scroll: &Default::default(),
+            page: (0., 0.),
+            images: &Default::default(),
+            focus: None,
+            selection: None,
+            caret_upstream: false,
+            pointer: None,
+            controls: &Default::default(),
+            chosen: &Default::default(),
+            menu: None,
+        };
+        painter.paint(&scene, (200., 200.)).unwrap();
+        let ops = FINISHED.with(|f| f.borrow_mut().take()).unwrap();
+        let players = media_records(&ops);
+        assert_eq!(players.len(), 2, "{players:?}");
+        for ((w, h, audio), src) in players.iter().zip(["assets/radio.mp3", "assets/empty.mp3"]) {
+            assert_eq!((*w, *h), (0., 0.));
+            assert_eq!(audio["src"], src);
+            assert_eq!(audio["paused"], false);
+            assert_eq!(audio["session"], painter.native_session);
+        }
+    }
+
+    #[test]
+    fn iframe_sandbox_and_allocation_survive_the_canvas_stream() {
         use crate::presenter::{PainterChoice, Presenter};
 
         for sandbox in [None, Some(""), Some("allow-scripts")] {
             let attribute = sandbox.map_or(String::new(), |s| format!(" sandbox=\"{s}\""));
             let source = format!(
-                "component App\n  view\n    iframe src=\"https://example.com/\" width=100 height=100{attribute}\n"
+                "component App\n  view\n    iframe src=\"https://example.com/\" width=100 height=100 testId=\"frame\"{attribute}\n"
             );
             let (mut p, error) = Presenter::boot_with_fixture_fonts(
                 &crate::test_plan(&source),
@@ -518,6 +798,10 @@ mod tests {
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0]["src"], "https://example.com/");
             assert_eq!(frames[0].get("sandbox"), Some(&serde_json::json!(sandbox)));
+            let key = p.host().kernel().find_by_test_id("frame")[0];
+            assert_eq!(frames[0]["slot"], key.index);
+            assert_eq!(frames[0]["generation"], key.generation);
+            assert_eq!(frames[0]["session"], p.brush.native_session);
         }
     }
 

@@ -50,7 +50,7 @@ final class PresentedText: TextPresentation {
     func markdown(_ engine: TextEngine, source: Run, atoms: String, faces: String, rtl: Bool) -> [Run]? {
         MarkdownLink.installed?.expand(source.text, base: source, color: nil, boldText: engine.boldTextSteps(source.family), atoms: MarkdownAtoms(kinds: atoms, faces: faces, rtl: rtl))
     }
-    func resolveRuns(_ engine: TextEngine, runs: [Run]) -> [Run] { engine.atomIcons(runs) }
+    func resolveRuns(_ engine: TextEngine, runs: [Run]) -> [Run] { MarkdownLink.installed?.atomIcons(engine, runs, node: nil) ?? runs }
     func editorMarkdown(_ engine: TextEngine, source: Run, atoms: String, faces: String, rtl: Bool, width: CGFloat?) -> [Run]? {
         MarkdownLink.installed?.editorRuns(source.text, base: source, atoms: MarkdownAtoms(kinds: atoms, faces: faces, rtl: rtl), width: width) { engine.font($0) }
     }
@@ -58,7 +58,7 @@ final class PresentedText: TextPresentation {
         a[.foregroundColor] = r.color.map(TextEngine.color) ?? TextEngine.color(color)
         if r.hidden { a[.exactHidden] = true }
         if !r.opacity.isEmpty { a[.exactOpacity] = r.opacity }
-        if let icon = r.atomIcon { a[.exactAtomIcon] = TextAtomIcon(icon) }
+        if let icon = r.atomIcon { a[.exactAtomIcon] = MarkdownLink.installed?.atomIcon(icon) }
         if r.fixedInk, r.color != nil { a[.exactFixedInk] = true }
         // A centred stroke over the fill: Core Text's negative width,
         // in percent of the run's size (LLP 1077 D7). Each run's own.
@@ -180,7 +180,7 @@ extension TextEngine {
     /// A baseline on the raster's device pixels (`scale`). On macOS, on the
     /// device pixels its line box was rounded to (`Paragraph.lineScale`) as
     /// well: whole points where text is laid out at 1 (LLP 1008 §3).
-    static func paintedBaseline(_ baseline: CGFloat, scale: CGFloat, lineScale: CGFloat = 1) -> CGFloat {
+    package static func paintedBaseline(_ baseline: CGFloat, scale: CGFloat, lineScale: CGFloat = 1) -> CGFloat {
         #if os(iOS) || os(tvOS)
         let scale = max(1, scale)
         #else
@@ -369,7 +369,7 @@ enum TextLinePaint {
         ctx.textPosition = .zero
         if !drawShadowed(line, in: ctx, scale: scale, pass: pass) {
             CTLineDraw(line, ctx)
-            TextAtomIcon.draw(line, in: ctx)
+            TextAtomIcons.draw(line, in: ctx)
         }
         ctx.textMatrix = matrix
         ctx.restoreGState()

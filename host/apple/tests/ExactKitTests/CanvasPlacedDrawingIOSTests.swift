@@ -568,11 +568,11 @@ final class CanvasPlacedDrawingIOSTests: XCTestCase {
         d.host.entries[d.canvas.id]?.through = true
         let child = node(101, d.session.presenter, CGRect(x: 0, y: 0, width: 100, height: 100), in: d.overlay)
         paint(.red, into: child)
-        _ = d.host.tick(now: 0)
-        waitForMainQueue()
-        d.session.frames.run(false)
-        XCTAssertFalse(d.host.wantsFrames)
-        XCTAssertNil(d.session.frames.link)
+        // Core Animation's first display of the child marks the canvas for capture (`repaintThrough`), and that capture
+        // asks for the frame that draws it
+        waitFor("the canvas captures and draws its child, and rests", facts: {
+            "\(d.host.captures) captures, \(d.host.rendered) renders, wants frames \(d.host.wantsFrames), needs capture \(d.canvas.needsCapture), link \(d.session.frames.link != nil)"
+        }) { d.host.captures > 0 && !d.canvas.needsCapture && d.host.rendered > 0 && !d.host.wantsFrames && d.session.frames.link == nil }
         let rendered = d.host.rendered
         capturedChildPixels = []
 

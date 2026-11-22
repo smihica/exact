@@ -3,12 +3,15 @@
 // `.xctestrun` xcodebuild wrote, without the Thread Performance Checker.
 import { spawn, spawnSync } from './toolchain.mjs';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { availableParallelism } from 'node:os';
+import { availableParallelism, homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { appleAssets, appleAssetCatalogInventory, rasterIconAssets, iosAssets, plistFile } from './assets.mjs';
+import { simulators } from './devices.mjs';
 import { encodePng } from '../../scripts/png.mjs';
 
 const read = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, ...opts });
+/** The device set xcodebuild makes the simulator clones for parallel test runners in. */
+const TESTING_DEVICES = resolve(homedir(), 'Library/Developer/XCTestDevices');
 
 /** Rebuild fixture plans with `env.EXACT_CONTRACT`; write their paths to `<prefix>_<KEY>_PLAN`.
  * Plans embed the current schema digest. App entries need the test app's `appId` to boot. */
@@ -38,6 +41,7 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
 
   contract([resolve(root, 'host/apple/tests/fixtures/fragment.contract'), '-o', env[`${prefix}_FRAGMENT_PLAN`] = resolve(dir, 'fragment.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/table-access.contract'), '-o', env[`${prefix}_TABLE_ACCESS_PLAN`] = resolve(dir, 'table-access.plan')]);
+  contract([resolve(root, 'scripts/fixtures/prose-list.contract'), '-o', env[`${prefix}_PROSE_LIST_PLAN`] = resolve(dir, 'prose-list.plan')]);
   if (prefix === 'TEST_RUNNER_EXACT') {
     // LaunchColorIOSTests reads the build's XML and compiled catalogue as an app bundle.
     const fixtures = env[`${prefix}_LAUNCH_COLOR_FIXTURES`] = resolve(dir, 'launch-colors');
@@ -45,6 +49,7 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
       ['white', { background_color: '#ffffff' }],
       ['opaque', { background_color: '#abc', color_scheme_dark: { background_color: '#123456' } }],
       ['translucent', { background_color: '#abc', color_scheme_dark: { background_color: '#12345680' } }],
+      ['p3', { color_scheme_light: { background_color: 'color(display-p3 1 0 0)' }, color_scheme_dark: { background_color: 'color(display-p3 0.1 0.2 0.3 / 0.5)' } }],
     ]) {
       const bundle = resolve(fixtures, `${name}.bundle`);
       mkdirSync(bundle, { recursive: true });
@@ -56,6 +61,10 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   contract([resolve(root, 'host/apple/tests/fixtures/overflowing-tabs.contract'), '-o', env[`${prefix}_OVERFLOWING_TABS_PLAN`] = resolve(dir, 'overflowing-tabs.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/shop-scroll.contract'), '-o', env[`${prefix}_SHOP_SCROLL_PLAN`] = resolve(dir, 'shop-scroll.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/quiet-scroll.contract'), '-o', env[`${prefix}_QUIET_SCROLL_PLAN`] = resolve(dir, 'quiet-scroll.plan')]);
+  const filteredFeed = resolve(dir, 'filtered-feed.contract');
+  writeFileSync(filteredFeed, readFileSync(resolve(root, 'host/apple/tests/fixtures/quiet-scroll.contract'), 'utf8')
+    .replace('for n in items ', 'for n in items.filter(n => n % 2 != 0) '));
+  contract([filteredFeed, '-o', env[`${prefix}_FILTERED_FEED_PLAN`] = resolve(dir, 'filtered-feed.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/quiet-edge.contract'), '-o', env[`${prefix}_QUIET_EDGE_PLAN`] = resolve(dir, 'quiet-edge.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/scroll-facts.contract'), '-o', env[`${prefix}_SCROLL_FACTS_PLAN`] = resolve(dir, 'scroll-facts.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/scroll-snap.contract'), '-o', env[`${prefix}_SCROLL_SNAP_PLAN`] = resolve(dir, 'scroll-snap.plan')]);
@@ -70,7 +79,8 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   contract([resolve(root, 'host/apple/tests/fixtures/range-adjust.contract'), '-o', env[`${prefix}_RANGE_ADJUST_PLAN`] = resolve(dir, 'range-adjust.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/replacement-hold.contract'), '-o', env[`${prefix}_REPLACEMENT_HOLD_PLAN`] = resolve(dir, 'replacement-hold.plan')]);
   const replaced = resolve(dir, 'replacement-hold-after.contract');
-  writeFileSync(replaced, readFileSync(resolve(root, 'host/apple/tests/fixtures/replacement-hold.contract'), 'utf8').replace('"before"', '"after"'));
+  writeFileSync(replaced, readFileSync(resolve(root, 'host/apple/tests/fixtures/replacement-hold.contract'), 'utf8')
+    .replace('"before"', '"after"').replace('      DraftNote()', '      OtherNote()\n      DraftNote()'));
   contract([replaced, '-o', env[`${prefix}_REPLACEMENT_HOLD_AFTER_PLAN`] = resolve(dir, 'replacement-hold-after.plan')]);
   // A test that writes its own manifest names the app the tests link (`SheetFixture`'s `data`).
   env[`${prefix}_TEST_APP_ID`] = appId;
@@ -95,7 +105,7 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   env[`${prefix}_STRICT_LOCAL_INSETS`] = '1';
   contract([resolve(root, 'host/apple/tests/fixtures/lazy-tab-title.contract'), '-o', env[`${prefix}_LAZY_TAB_TITLE_PLAN`] = resolve(dir, 'lazy-tab-title.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/headless-reply.contract'), '-o', env[`${prefix}_HEADLESS_REPLY_PLAN`] = resolve(dir, 'headless-reply.plan')]);
-  for (const [name, key] of [['saved-scheme', 'SAVED_SCHEME'], ['grouped-card', 'GROUPED_CARD'], ['frame-health', 'FRAME_HEALTH'], ['store-refresh', 'STORE_REFRESH'], ['headless', 'HEADLESS'], ['headless-markdown', 'HEADLESS_MARKDOWN'], ['headless-hidden-markdown', 'HEADLESS_HIDDEN_MARKDOWN'], ['headless-live', 'HEADLESS_LIVE'], ['headless-back', 'HEADLESS_BACK'], ['native-navigation-scroll', 'NATIVE_SCROLL'], ['intersect', 'INTERSECT'], ['native-buttons', 'BUTTONS'], ['keyboard-form', 'KEYBOARD'], ['tab-edge', 'TAB_EDGE'], ['repaint', 'REPAINT'], ['still-title', 'STILL_TITLE'], ['navigation-bars', 'NAVIGATION_BARS'], ['large-title', 'LARGE_TITLE'], ['transparent-bar', 'TRANSPARENT_BAR'], ['bar-band', 'BAR_BAND'], ['pad-bar', 'PAD_BAR'], ['pushed-title', 'PUSHED_TITLE'], ['inline-frame', 'INLINE_FRAME'], ['fieldless', 'FIELDLESS'], ['web-documents', 'WEB_DOCUMENTS'], ['iframe-post-messages', 'IFRAME_POST_MESSAGES'], ['iframe-partition', 'IFRAME_PARTITION'], ['iframe-windows', 'IFRAME_WINDOWS'], ['iframe-pdf', 'IFRAME_PDF'], ['iframe-resident-popover', 'IFRAME_RESIDENT_POPOVER'], ['tab-owner', 'TAB_OWNER'], ['grouped-list-reveal', 'GROUPED_REVEAL'], ['due-now', 'DUE_NOW'], ['caret-reveal', 'CARET_REVEAL'], ['cover-scroll', 'COVER_SCROLL'], ['page-edges', 'PAGE_EDGES'], ['barless-route', 'BARLESS_ROUTE'], ['page-edges-grouped', 'PAGE_EDGES_GROUPED'], ['control-bars', 'CONTROL_BARS'], ['cover-tabs', 'COVER_TABS'], ['root-tabs-order', 'ROOT_TABS_ORDER'], ['layout-insert', 'LAYOUT_INSERT'], ['search-scope', 'SEARCH_SCOPE'], ['barless-tab', 'BARLESS_TAB'], ['pull-refresh', 'PULL_REFRESH'], ['edge-effect', 'EDGE_EFFECT'], ['sticky-bar', 'STICKY_BAR'], ['glass-press', 'GLASS_PRESS'], ['surface-pairs', 'SURFACE_PAIRS'], ['prevent-focus', 'PREVENT_FOCUS'], ['accent-bars', 'ACCENT_BARS'], ['accent-tabs', 'ACCENT_TABS'], ['search-tabs', 'SEARCH_TABS'], ['beside-routes', 'BESIDE_ROUTES'], ['bar-insets', 'BAR_INSETS'], ['bar-hero', 'BAR_HERO'], ['bar-control', 'BAR_CONTROL'], ['tips', 'TIPS'], ['boot-control-top', 'BOOT_CONTROL_TOP'], ['boot-control-bottom', 'BOOT_CONTROL_BOTTOM'], ['boot-control-tab', 'BOOT_CONTROL_TAB'], ['boot-dialog', 'BOOT_DIALOG'], ['boot-tabs', 'BOOT_TABS'], ['boot-clipboard', 'BOOT_CLIPBOARD'], ['boot-motion', 'BOOT_MOTION'], ['boot-plain', 'BOOT_PLAIN'], ['boot-padded', 'BOOT_PADDED'], ['boot-transform', 'BOOT_TRANSFORM'], ['boot-tip', 'BOOT_TIP']]) {
+  for (const [name, key] of [['saved-scheme', 'SAVED_SCHEME'], ['grouped-card', 'GROUPED_CARD'], ['frame-health', 'FRAME_HEALTH'], ['store-refresh', 'STORE_REFRESH'], ['headless', 'HEADLESS'], ['headless-markdown', 'HEADLESS_MARKDOWN'], ['headless-hidden-markdown', 'HEADLESS_HIDDEN_MARKDOWN'], ['headless-live', 'HEADLESS_LIVE'], ['headless-back', 'HEADLESS_BACK'], ['native-navigation-scroll', 'NATIVE_SCROLL'], ['intersect', 'INTERSECT'], ['native-buttons', 'BUTTONS'], ['keyboard-form', 'KEYBOARD'], ['tab-edge', 'TAB_EDGE'], ['repaint', 'REPAINT'], ['still-title', 'STILL_TITLE'], ['navigation-bars', 'NAVIGATION_BARS'], ['large-title', 'LARGE_TITLE'], ['transparent-bar', 'TRANSPARENT_BAR'], ['bar-band', 'BAR_BAND'], ['pad-bar', 'PAD_BAR'], ['pushed-title', 'PUSHED_TITLE'], ['inline-frame', 'INLINE_FRAME'], ['fieldless', 'FIELDLESS'], ['web-documents', 'WEB_DOCUMENTS'], ['iframe-post-messages', 'IFRAME_POST_MESSAGES'], ['iframe-partition', 'IFRAME_PARTITION'], ['iframe-windows', 'IFRAME_WINDOWS'], ['iframe-pdf', 'IFRAME_PDF'], ['iframe-resident-popover', 'IFRAME_RESIDENT_POPOVER'], ['tab-owner', 'TAB_OWNER'], ['grouped-list-reveal', 'GROUPED_REVEAL'], ['due-now', 'DUE_NOW'], ['caret-reveal', 'CARET_REVEAL'], ['cover-scroll', 'COVER_SCROLL'], ['page-edges', 'PAGE_EDGES'], ['barless-route', 'BARLESS_ROUTE'], ['page-edges-grouped', 'PAGE_EDGES_GROUPED'], ['control-bars', 'CONTROL_BARS'], ['cover-tabs', 'COVER_TABS'], ['root-tabs-order', 'ROOT_TABS_ORDER'], ['layout-insert', 'LAYOUT_INSERT'], ['search-scope', 'SEARCH_SCOPE'], ['barless-tab', 'BARLESS_TAB'], ['pull-refresh', 'PULL_REFRESH'], ['edge-effect', 'EDGE_EFFECT'], ['sticky-bar', 'STICKY_BAR'], ['glass-press', 'GLASS_PRESS'], ['surface-pairs', 'SURFACE_PAIRS'], ['prevent-focus', 'PREVENT_FOCUS'], ['accent-bars', 'ACCENT_BARS'], ['accent-tabs', 'ACCENT_TABS'], ['search-tabs', 'SEARCH_TABS'], ['beside-routes', 'BESIDE_ROUTES'], ['bar-insets', 'BAR_INSETS'], ['bar-hero', 'BAR_HERO'], ['bar-control', 'BAR_CONTROL'], ['tips', 'TIPS'], ['boot-control-top', 'BOOT_CONTROL_TOP'], ['boot-control-bottom', 'BOOT_CONTROL_BOTTOM'], ['boot-control-tab', 'BOOT_CONTROL_TAB'], ['boot-dialog', 'BOOT_DIALOG'], ['boot-tabs', 'BOOT_TABS'], ['boot-clipboard', 'BOOT_CLIPBOARD'], ['boot-motion', 'BOOT_MOTION'], ['boot-plain', 'BOOT_PLAIN'], ['boot-padded', 'BOOT_PADDED'], ['boot-transform', 'BOOT_TRANSFORM'], ['boot-tip', 'BOOT_TIP'], ['split-back', 'SPLIT_BACK'], ['split-boot', 'SPLIT_BOOT'], ['split-change', 'SPLIT_CHANGE']]) {
     contract([resolve(root, `scripts/fixtures/${name}.contract`), '-o', env[`${prefix}_${key}_PLAN`] = resolve(dir, `${name}.plan`)]);
   }
   // NamedWindowsTests' links that name a window (LLP 1030.004).
@@ -113,6 +123,8 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   contract([resolve(root, 'host/apple/tests/fixtures/scroll-timelines.contract'), '-o', env[`${prefix}_SCROLL_TIMELINES_PLAN`] = resolve(dir, 'scroll-timelines.plan')]);
   // AgentStickyReveal{Mac,IOS}Tests': rows under a sticky header and dock.
   contract([resolve(root, 'host/apple/tests/fixtures/sticky-tap.contract'), '-o', env[`${prefix}_STICKY_TAP_PLAN`] = resolve(dir, 'sticky-tap.plan')]);
+  // GroupedCustomHeadersIOSTests': section headers of an avatar beside a name.
+  contract([resolve(root, 'host/apple/tests/fixtures/grouped-header.contract'), '-o', env[`${prefix}_GROUPED_HEADER_PLAN`] = resolve(dir, 'grouped-header.plan')]);
   // RestartListIOSTests': a restart over a route whose bar covers a virtualized list.
   contract([resolve(root, 'host/apple/tests/fixtures/restart-list.contract'), '-o', env[`${prefix}_RESTART_LIST_PLAN`] = resolve(dir, 'restart-list.plan')]);
   // NavigationTabsIOSTests': the selected tab tapped again over a list its press asks a row of.
@@ -135,6 +147,8 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   contract([resolve(root, 'host/apple/tests/fixtures/async-advance.contract'), '-o', env[`${prefix}_ASYNC_ADVANCE_PLAN`] = resolve(dir, 'async-advance.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/save-text.contract'), '-o', env[`${prefix}_SAVE_TEXT_PLAN`] = resolve(dir, 'save-text.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/timer-admission.contract'), '-o', env[`${prefix}_TIMER_ADMISSION_PLAN`] = resolve(dir, 'timer-admission.plan')]);
+  // NativeTargetIOSTests': four boxes, each padding one edge by a registered target's inset.
+  contract([resolve(root, 'host/apple/tests/fixtures/registered-target.contract'), '-o', env[`${prefix}_REGISTERED_TARGET_PLAN`] = resolve(dir, 'registered-target.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/reset-gate.contract'), '-o', env[`${prefix}_RESET_GATE_PLAN`] = resolve(dir, 'reset-gate.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/still-page.contract'), '-o', env[`${prefix}_STILL_PAGE_PLAN`] = resolve(dir, 'still-page.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/reset-gate-admission.contract'), '-o', env[`${prefix}_RESET_GATE_ADMISSION_PLAN`] = resolve(dir, 'reset-gate-admission.plan')]);
@@ -156,6 +170,7 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   contract([resolve(root, 'host/apple/tests/fixtures/intersect-route.contract'), '-o', env[`${prefix}_INTERSECT_ROUTE_PLAN`] = resolve(dir, 'intersect-route.plan')]);
   // KeyboardSheetIOSTests': a sheet's field, its keyboard toolbar and the keyboard's overlap as a value.
   contract([resolve(root, 'host/apple/tests/fixtures/keyboard-sheet.contract'), '-o', env[`${prefix}_KEYBOARD_SHEET_PLAN`] = resolve(dir, 'keyboard-sheet.plan')]);
+  contract([resolve(root, 'host/apple/tests/fixtures/view-transition.contract'), '-o', env[`${prefix}_VIEW_TRANSITION_PLAN`] = resolve(dir, 'view-transition.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/route-overflow.contract'), '-o', env[`${prefix}_ROUTE_OVERFLOW_PLAN`] = resolve(dir, 'route-overflow.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/progress-contexts.contract'), '-o', env[`${prefix}_PROGRESS_CONTEXTS_PLAN`] = resolve(dir, 'progress-contexts.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/agent-unmounted.contract'), '-o', env[`${prefix}_AGENT_UNMOUNTED_PLAN`] = resolve(dir, 'agent-unmounted.plan')]);
@@ -320,8 +335,10 @@ export async function macTests(pkg, scratch, env, canvasGpu, only = null) {
  *  failure, and `runApple` refuses a mixed deployment target. `only`, when
  *  given, names the classes to run, and a run with none of them is left out. Tests needing
  *  real touches run without simulator clones, beside the existing XCTest touch runner. Every run
- *  writes its result bundle into `derived`, beside the build. */
-export async function iosTestRuns({ pkg, derived, destination, udid, env, canvasGpu, hostSource, triple, runApple, run, only = null }) {
+ *  writes its result bundle into `derived`, beside the build. After the last run, the simulator's
+ *  clones left over from test runs in the device set `testingDevices` are deleted
+ *  (`deleteLeftoverClones`). */
+export async function iosTestRuns({ pkg, derived, destination, udid, env, canvasGpu, hostSource, triple, runApple, run, only = null, testingDevices = TESTING_DEVICES }) {
   // Build without code coverage, which the package's generated scheme turns on: instrumented tests
   // write tens of megabytes of profiles per run, and nothing in Exact reads them
   runApple('xcodebuild', ['build-for-testing', '-scheme', 'Exact-Package', '-destination', destination, '-derivedDataPath', derived, '-enableCodeCoverage', 'NO'], { cwd: pkg, stdio: 'inherit', env });
@@ -397,8 +414,55 @@ export async function iosTestRuns({ pkg, derived, destination, udid, env, canvas
     }
   }
   if (!classes || classes.includes(gpuTests)) testRun(bare, [`-only-testing:${gpuTests}`], { ...env, TEST_RUNNER_EXACT_CANVAS_GPU_DYLIB: canvasGpu });
+  // Warn of clones left over rather than fail: they fail no test
+  try {
+    deleteLeftoverClones(testingDevices, udid);
+  } catch (e) {
+    console.warn(`host/apple: leftover clones of the iOS tests' simulator may remain in ${testingDevices}: ${e.message}. List them with \`xcrun simctl --set ${testingDevices} list devices\` and delete one with \`xcrun simctl --set ${testingDevices} delete <udid>\`, or the next iOS test run on this simulator tries again`);
+  }
   if (failures.length === 1) throw failures[0];
   if (failures.length) throw new AggregateError(failures, `iOS tests failed:\n  ${failures.map(e => e.message).join('\n  ')}`);
+}
+
+/** Deletes the clones of the simulator `udid` left over from test runs in the device set at `set`.
+ *  xcodebuild clones its destination for each parallel test runner while the tests run, and
+ *  CoreSimulator deletes those clones once xcodebuild exits, but not one still being made then:
+ *  CoreSimulator finishes that one after xcodebuild has gone, and it stays (Xcode 27.1). A clone
+ *  has its simulator's runtime and device type and is named `Clone <n> of <the simulator's name>`.
+ *  Another run may be testing on this simulator: xcodebuild shuts its destination down while it
+ *  tests on the clones, and `build.mjs` chooses a simulator that is not booted. That run's clones
+ *  can be shut down too: a clone is shut down before its runner starts and after it finishes, and
+ *  goes only when xcodebuild exits. So nothing is deleted while an xcodebuild that may clone
+ *  (`mayClone`) names the simulator, by its UDID or its name, or another simulator with its name,
+ *  runtime and type, whose clones look the same. Otherwise every shut-down clone of the simulator
+ *  is left over. A parallel test run in Xcode itself is not seen, and it can lose a shut-down
+ *  clone if it overlaps an iOS test run of `build.mjs` on the same simulator. A clone still being
+ *  made as the last run ends is not listed yet, so a later run on the simulator deletes it, and the
+ *  last clone of a simulator that is then deleted or renamed stays. */
+function deleteLeftoverClones(set, udid) {
+  if (!existsSync(set)) return;
+  const defaults = simulators(), simulator = defaults.find(d => d.udid === udid);
+  if (!simulator) return;
+  const alike = d => d.runtime === simulator.runtime && d.type === simulator.type;
+  const named = [simulator.name, ...defaults.filter(d => d.name === simulator.name && alike(d)).map(d => d.udid)];
+  const processes = read('ps', ['-axww', '-o', 'command=']);
+  if (processes.status !== 0) throw new Error(`\`ps\` could not list the running xcodebuilds: ${processes.stderr || processes.error?.message}`);
+  if (processes.stdout.split('\n').some(command => mayClone(command) && named.some(word => command.includes(word)))) return;
+  const failed = [];
+  for (const clone of simulators(set).filter(d => d.state === 'Shutdown' && alike(d) && /^Clone \d+ of (.*)$/.exec(d.name)?.[1] === simulator.name)) {
+    const deleted = read('xcrun', ['simctl', '--set', set, 'delete', clone.udid]);
+    // Skip a clone another run's cleanup deleted meanwhile
+    if (deleted.status !== 0 && existsSync(resolve(set, clone.udid))) failed.push(`${clone.udid} (${(deleted.stderr || deleted.error?.message || '').trim()})`);
+  }
+  if (failed.length) throw new Error(`\`xcrun simctl delete\` failed for ${failed.join(', ')}`);
+}
+
+/** Whether the command line `command` is an xcodebuild that may clone its destination: a test
+ *  action without parallel testing turned off. */
+function mayClone(command) {
+  const words = command.split(/\s+/), parallel = words.lastIndexOf('-parallel-testing-enabled');
+  return words.some(word => word === 'xcodebuild' || word.endsWith('/xcodebuild')) && (words.includes('test') || words.includes('test-without-building'))
+    && !(parallel >= 0 && words[parallel + 1] === 'NO');
 }
 
 /** The newest `.xctestrun` `build-for-testing` wrote in `products`, as

@@ -2,9 +2,9 @@
 //! `hold` and the agent's `holdState` hold one state on one node as this
 //! host's own, on its own tracking, with no handler told. `active` is the
 //! press of the node the press resolves to (the innermost at or above it
-//! with a `press` handler, as theme2's 07:48 says): its press paint and scale
-//! ease as a real press's, at once on the agent's clock, and a real press's
-//! release leaves it (`Host::press_feedback`). `hover` and `focus-visible`
+//! with a `press` handler, as theme2's 07:48 says). Its paint and scale ease
+//! like a real press, or land at once on a held clock. Releasing a real press
+//! leaves the held press in place (`Host::press_feedback`). `hover` and `focus-visible`
 //! are that node's look, which the held node keeps beside the pointer's and
 //! the focus's (`Shown::on`). One at a time (`Host::looks_shown`, so a new
 //! generation's host holds none and nothing is said); a disabled node
@@ -95,7 +95,7 @@ impl<D: DataSource> Presenter<D> {
         if state == HoldState::Active {
             let now = self.host.now();
             self.host.press_feedback(key, true, now);
-            if self.agent {
+            if self.agent && self.live_clock.is_none() {
                 self.host.land_presses();
             }
         }
@@ -114,7 +114,7 @@ impl<D: DataSource> Presenter<D> {
         if held.state == HoldState::Active && self.contact_press() != Some(held.key) {
             let now = self.host.now();
             self.host.press_feedback(held.key, false, now);
-            if self.agent {
+            if self.agent && self.live_clock.is_none() {
                 self.host.land_presses();
             }
         }

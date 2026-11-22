@@ -338,24 +338,16 @@ extension NodeView {
     private var imagePlan: (shown: CGRect, unit: CGRect, radius: CGFloat, corners: CACornerMask)? {
         guard kind == "image", !hasSymbolLeaf, style["image_rendering"]?.string != "pixelated", style["tint_color"] == nil, let bitmap = raster?.image else { return nil }
         let content = contentBox()
-        let rect = RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: style["object_fit"]?.string ?? "fill")
-        let shown = rect.intersection(content)
+        let rect = RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: style["object_fit"]?.string ?? "fill", position: style["object_position"]?.array)
+        guard let crop = RasterGeometry.crop(rect, to: content, flipped: layer?.contentsAreFlipped() ?? true) else { return nil }
         let radii = cornerRadii(in: bounds)
         let radius = radii.max() ?? 0
         let oneRadius = cornerSizes(in: bounds).allSatisfy { abs($0.width - $0.height) < 0.01 } && radii.allSatisfy { $0 == 0 || abs($0 - radius) < 0.01 }
             && radius <= min(bounds.width, bounds.height) / 2 + 0.01
         // A shape the layer's radius cannot say draws (LLP 1077 D1).
         let shape = CornerShape(style["corner_shape"])
-        let fits = radius == 0 || (oneRadius && content == bounds && shown == content && (shape == nil || shape?.isAppleContinuous == true))
-        guard fits, !shown.isNull, !shown.isEmpty, rect.width > 0, rect.height > 0 else { return nil }
-        // `contentsRect` is in the image's unit space, y up from its bottom
-        // edge in an unflipped layer; the fitted image is centred, so a
-        // flipped layer selects the same band either way except for
-        // `object-fit: none` past an edge, where the origin is mirrored.
-        var unit = CGRect(x: (shown.minX - rect.minX) / rect.width, y: (shown.minY - rect.minY) / rect.height,
-                          width: shown.width / rect.width, height: shown.height / rect.height)
-        if !(layer?.contentsAreFlipped() ?? true) { unit.origin.y = 1 - unit.maxY }
-        return (shown, unit, radius, cornerMask(radii))
+        let fits = radius == 0 || (oneRadius && content == bounds && crop.shown == content && (shape == nil || shape?.isAppleContinuous == true))
+        return fits ? (crop.shown, crop.unit, radius, cornerMask(radii)) : nil
     }
 
     /// An image whose pixels normally come from a sublayer.
@@ -367,15 +359,16 @@ extension NodeView {
         if ImageLink.pixelated?.owns(imageLayer) == true { imageLayer?.removeFromSuperlayer(); imageLayer = nil }
         if cssVisibilityHidden || style["image_rendering"]?.string == "pixelated" { imageLayer?.removeFromSuperlayer(); imageLayer = nil; return }
         if let look = flightLook, let layer, kind == "image", !hasSymbolLeaf, style["tint_color"] == nil, let bitmap = raster?.image ?? look.stand?.image {
-            // Flying (LLP 1013.000 D4): the whole image where the flight
-            // puts it; the view's own bounds and radius clip it.
+            guard let crop = RasterGeometry.crop(look.image, to: look.contentClip ?? bounds, flipped: layer.contentsAreFlipped()) else {
+                imageLayer?.removeFromSuperlayer(); imageLayer = nil; return
+            }
             CATransaction.begin(); CATransaction.setDisableActions(true)
             defer { CATransaction.commit() }
             let l = imageLayer ?? CALayer()
             imageLayer = l
             if l.superlayer !== layer { insertBoxSublayer(l) }
-            l.frame = look.image
-            l.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+            l.frame = crop.shown
+            l.contentsRect = crop.unit
             l.contentsGravity = .resize
             let frame = ImageLink.animated?.frame(for: self) ?? bitmap.image
             if (l.contents as AnyObject?) !== frame { l.contents = frame }
@@ -456,7 +449,7 @@ extension NodeView {
     var standsOnSplitGround: Bool {
         guard !wrote("background_color"), case .object(let role)? = style["background_color"],
               role["sys"]?.string == "windowBackgroundColor", let presenter,
-              presenter.navigation.stackSplit.active else { return false }
+              presenter.navigation.stackSplit.active || presenter.navigation.stackSplit.hasInspector else { return false }
         return isDescendant(of: presenter.viewport) || presenter.navigation.stackSplit.pane(holding: self) != nil
     }
 }

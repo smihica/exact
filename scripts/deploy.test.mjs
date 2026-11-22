@@ -20,13 +20,99 @@ import { captureAssets, assetCards, copyStaticTreeIfPresent, webEnvelope, public
 import { resolveApp, webGpuArtifacts, withAppFixture } from './app.mjs';
 import { streamBundle } from './texture-families.mjs';
 import { bake, sealEnvelope, canonicalBytes, classify, classifyArtifacts, cohortReceipt, deployRun, holdBundles, inspectHead, disposeSnapshot, materializeSnapshot, readAssetIndex, portableAssetNames, publishRoot, renderTable, snapshotOf as capturedSnapshotOf } from './deploy.mjs';
-import { defaultRelease, publishStream, streamHead, streamIndex } from './publisher.mjs';
-import { blobPath, DirectoryOrigin, HttpsOrigin, OriginUnavailable, sha256, webReleasePath, webRootPath } from './origin.mjs';
+import { defaultRelease, publishStream, streamHead, streamIndex, streams } from './publisher.mjs';
+import { admitHead, binaryInputFile, cohortFiles, latestRecord } from './deploy-heads.mjs';
+import { envelopeBytes } from './deploy-signing.mjs';
+import { blobPath, DirectoryOrigin, HttpsOrigin, OriginUnavailable, sha256, streamPath, webReleasePath, webRootPath } from './origin.mjs';
 // Minimal compiler receipts for origin protocol fixtures below; capability
 // behavior is tested independently with declared requirements.
 const fixtureBuild = (id, bundle) => ({version:1,compat:{id,inputs:{store:{L:'A'},executors:[]},target:'fixture'},
   graph:{version:1,sources:{},artifacts:[{name:'app.plan',requires:{},sha256:bundle.plan.sha256,bytes:bundle.plan.bytes?.length??0}]},binary:{sha256:'0'.repeat(64)}});
 const DEPLOY = join(dirname(fileURLToPath(import.meta.url)), 'deploy.mjs');
+
+test.each([false, true])('a first push publishes a small head for 137 native sources (over the file cap: %s)', async (large) => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-large-cohort-'));
+  try {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const key = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+    const signer = { keyId: 'test', sign: head => ({
+      keyId: 'test', ed25519: cryptoSign(null, canonicalBytes(head), privateKey).toString('base64'),
+    }) };
+    const app = { id: 'com.exact.large-cohort', displayName: 'Large Cohort',
+      manifest: { deploy: { signing: { key: 'test', keys: { test: key } } } } };
+    const stream = { channel: 'prod', compatibilityId: 'a'.repeat(32) };
+    const plan = Buffer.from('small update');
+    const bundle = { plan: { bytes: plan, sha256: sha256(plan), formatVersion: 4, kernelSchema: '0'.repeat(16) }, assets: [] };
+    const build = fixtureBuild(stream.compatibilityId, bundle);
+    build.compat.inputs.platform = 'ios';
+    let result = Object.fromEntries(Array.from({ length: 32 }, (_, n) => [`field${n}`, 'String']));
+    if (large) {
+      result = { ['field'.repeat(13_000)]: 'String' };
+      for (let depth = 0; depth < 3; depth++) result = { left: result, right: result };
+    }
+    build.graph.sources = Object.fromEntries(Array.from({ length: 137 }, (_, i) => [`nativeSource${i}`, { params: [], result }]));
+    const objects = new Map();
+    const origin = large ? {
+      kind: 'directory', describe: () => dir, withLock: (_, run) => run(),
+      list: async () => [],
+      head: async () => null,
+      putHead: async (_, bytes) => objects.set('head', bytes),
+      put: async (path, bytes) => objects.set(path, bytes),
+      get: async (path) => {
+        const bytes = objects.get(path);
+        if (bytes?.length > 64 * 1024 * 1024) throw new Error('the response exceeds 64 MiB');
+        return bytes ?? null;
+      },
+    } : new DirectoryOrigin(dir);
+    const published = await publishStream({ origin, row: { ...stream, platform: 'ios', action: 'bundle' },
+      bundle, compat: build.compat, app, signer, release: 'first', snapshot: {}, opts: {}, log() {}, build });
+    expect(published.action).toBe('published');
+    const bytes = objects.get('head');
+    const found = large ? { bytes, json: JSON.parse(bytes) } : await origin.head(stream);
+    expect(found.bytes.length).toBeLessThan(2048);
+    expect(found.json.cohort).toBeUndefined();
+    const card = found.json.cohortReceipt;
+    const path = blobPath(card.sha256);
+    const receipt = await origin.get(path);
+    expect(card).toMatchObject({ url: `../../blobs/${sha256(receipt)}`, sha256: sha256(receipt), bytes: receipt.length });
+    if (large) {
+      const chunks = JSON.parse(receipt).chunks;
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.reduce((sum, chunk) => sum + chunk.bytes, 0)).toBeGreaterThan(64 * 1024 * 1024);
+      const admitted = await admitHead(origin, found, app, stream);
+      expect(admitted.cohort.compat).toEqual(build.compat);
+      expect(Object.keys(admitted.cohort.sources).sort()).toEqual(Object.keys(build.graph.sources).sort());
+      const path = blobPath(chunks.at(-1).sha256);
+      const chunk = objects.get(path);
+      objects.set(path, Buffer.alloc(chunk.length));
+      expect(await admitHead(origin, found, app, stream)).toMatchObject({
+        usable: false, problem: expect.stringContaining('cohort receipt chunk'),
+      });
+      return;
+    }
+    expect(receipt.length).toBeGreaterThan(64 * 1024);
+    const admitted = await admitHead(origin, found, app, stream);
+    expect(admitted.authenticated).toBe(true);
+    expect(admitted.cohort).toEqual(cohortReceipt(build));
+    expect(await latestRecord(origin, app, stream)).toMatchObject({ cohort: admitted.cohort });
+
+    writeFileSync(resolve(dir, path), Buffer.alloc(receipt.length));
+    expect(await admitHead(origin, found, app, stream)).toMatchObject({
+      usable: false, problem: 'the cohort receipt is not the bytes its envelope names',
+    });
+    expect(await latestRecord(origin, app, stream)).toMatchObject({
+      cohort: null, cohortProblem: 'the cohort receipt is not the bytes its envelope names',
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an oversized envelope names the inline part that made it large', () => {
+  const message = 'x'.repeat(65 * 1024);
+  expect(() => envelopeBytes({ sunset: { message }, assets: { count: 22 } }))
+    .toThrow(/the most is 64\.0 KiB \(largest part: sunset is 65\.0 KiB\)/);
+  expect(() => envelopeBytes({ cohort: { sources: { source: message } } }))
+    .toThrow(/the cohort's sources are 65\.0 KiB/);
+});
 
 test('deployment ships the web GPU product with an inherited gpu-dev proof profile', async () => {
   const root = resolve(import.meta.dir, '..'), app = resolveApp('beacons');
@@ -78,9 +164,8 @@ async function rejects(action, matches) {
     && stream.app.name === web.app.name && mismatchedPlanRefused);
 }
 // "Current" means the production client admits the complete authenticated
-// head. An unusable head contributes no rollback floor: repair advances from
-// the largest immutable record whose embedded envelope verifies, or refuses
-// when no such history exists. Raw JSON spellings rejected by Rust are also
+// head. Repair advances above the largest verified sequence from the head or
+// immutable records. Raw JSON spellings rejected by Rust are also
 // rejected before JavaScript can normalize them. The locked publisher repeats
 // the same admission in case the head changed after the table was printed.
 {
@@ -272,6 +357,18 @@ async function rejects(action, matches) {
     bundle, compat: { id: compatibilityId, inputs: {} }, app, signer, release: 'locked-repair',
     snapshot: { commit: '0'.repeat(40), dirty: false, changes: [] }, opts: {}, log: () => {} });
   const repairedHead = await origin.head(stream);
+  const missingReceipt = signed((head) => {
+    head.stream.seq = 10;
+    head.cohortReceipt = cohortFiles(head.cohort)[0].card;
+    delete head.cohort;
+  });
+  await origin.putHead(stream, found(missingReceipt).bytes, { previousDigest: repairedHead.sha256 });
+  const repairRow = (await tableFor(missingReceipt)).rows[0];
+  const receiptRepair = await publishStream({ origin,
+    row: repairRow,
+    bundle, compat: build.compat, app, signer, release: 'repair-receipt',
+    snapshot: {}, opts: {}, log() {}, build });
+  result('deploy repairs a missing receipt above the verified head', repairRow.seq === 11 && receiptRepair.seq === 11);
   const missingDir = mkdtempSync(join(tmpdir(), 'exact-missing-head-'));
   const missingOrigin = new DirectoryOrigin(missingDir);
   await missingOrigin.put(`.exact/${stream.channel}/${compatibilityId}/releases/old.json`, history, { immutable: true });
@@ -1309,43 +1406,90 @@ test('adding editing and removing only a sunset publishes a new signed sequence'
   }
 });
 
-// The captured deploy with producer boundaries doubled: an existing iOS stream must reach classification on Linux.
-test.each(['new', 'invalid', 'authenticated'])('deploy skips a native bake only for an authenticated cohort (%s)', async state => {
+// Double the producers so that only a deploy with a verified cohort can skip the iOS bake.
+test.each(['new', 'missing receipt', 'authenticated', 'interrupted repair'])('deploy uses a fresh iOS bake only when needed (%s)', async state => {
   const root = mkdtempSync(resolve(import.meta.dir, '../target/deploy-bundle-'));
   const sourceRoot = resolve(root, 'exact-source-capture-fixture/source'), exactRoot = resolve(sourceRoot, 'exact');
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const key = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+  const signer = { keyId: 'test', sign: head => ({ keyId: 'test', ed25519: cryptoSign(null, canonicalBytes(head), privateKey).toString('base64') }) };
   const app = { id: 'com.exact.bundle', name: 'bundle', displayName: 'Bundle', dir: exactRoot, workspace: exactRoot, target: root,
-    manifest: { host: { ios: {} }, deploy: { signing: { key: 'test', keys: { test: 'public' } } } } };
+    manifest: { host: { ios: {} }, deploy: { signing: { key: 'test', keys: { test: key } } } } };
   const bundle = { plan: { bytes: Buffer.from('plan'), sha256: sha256(Buffer.from('plan')), formatVersion: 4, kernelSchema: '0'.repeat(16) }, assets: [] };
   const build = fixtureBuild('a'.repeat(32), bundle);
   build.trust = 'production';
-  build.compat.inputs = { platform: 'ios', store: { L: 'A' }, keys: { test: 'public' }, executors: [] };
-  const cohort = cohortReceipt(build), stream = { channel: 'prod', compatibilityId: build.compat.id };
+  build.binary.sourceInputs = { version: 1, files: [] };
+  Object.assign(build.compat.inputs, { platform: 'ios', keys: { test: key } });
+  const stream = { channel: 'prod', compatibilityId: build.compat.id };
+  const [receipt] = cohortFiles(cohortReceipt(build));
+  const evidence = binaryInputFile(build);
+  const origin = new DirectoryOrigin(resolve(root, 'origin'));
   const calls = [], output = [];
   const bindings = {
     ROOT: exactRoot, canonicalPath: x => x, basename: path => path.split('/').at(-1), dirname, inside: (parent, child) => child.startsWith(parent + '/'),
     process: { env: {}, stderr: { write() {} } }, console: { log: text => output.push(text) },
     resolveApp: selector => { expect(selector).toBe(state === 'new' ? 'bundle' : app.dir); return app; }, requireReleasePins() {}, channelOf: () => 'prod', validateChannel: x => x,
-    channelOrigin: () => root, openOrigin: () => ({ writable: true, describe: () => root }), nativePlatforms: () => ['ios'],
-    loadSigner: () => ({ keyId: 'test' }), namesNative: () => true,
+    channelOrigin: () => root, openOrigin: () => origin, nativePlatforms: () => ['ios'],
+    loadSigner: () => signer, namesNative: () => true,
     bake: () => root, bakeJs: () => root, readBundle: () => bundle, readBuilds: () => [{ ...build, compat: { ...build.compat, inputs: { ...build.compat.inputs, platform: 'web' } } }],
     buildFor: () => { calls.push('native bake'); return build; },
     holdBundles() {}, rustPackage: () => false, resolve, sealedSourceEnv: (_, env) => env,
-    streams: async () => state === 'authenticated' ? [{ stream, head: {}, cohort, platform: 'ios' }] : state === 'new' ? [] : [{ stream, platform: 'ios', problem: 'unauthenticated' }],
-    streamCandidates: async () => [{ row: { kind: 'stream', platform: 'ios', ...stream }, compat: build.compat, build, bundle }],
-    classify: async () => ({ snapshot: {}, rows: [{ kind: 'stream', platform: 'ios', ...stream, receipt: cohort, action: 'bundle' }] }),
-    streamBundle, publishStream: async () => { calls.push('publish'); return { kind: 'stream', action: 'published', seq: 8, head: { sha256: 'b'.repeat(64) } }; },
+    streams, streamCandidates: async (_, __, found) => found.map(() => ({ row: stream, build, bundle })),
+    classify, streamBundle, publishStream,
     refuse: message => { throw Error(message); },
   };
   const source = readFileSync(DEPLOY, 'utf8');
   const fn = source.slice(source.indexOf('async function deployCaptured('), source.indexOf('/** An explicitly supplied'));
   const deploy = new Function(...Object.keys(bindings), fn + ';return deployCaptured;')(...Object.values(bindings));
   try {
-    const selector = state === 'new' ? 'bundle' : state === 'invalid' ? '.' : resolve(root, 'live/app');
-    expect(await deploy({ _: [selector], platform: ['ios'], keys: root, yes: true, json: true }, {
+    const selector = state === 'new' ? 'bundle' : state === 'missing receipt' ? '.' : resolve(root, 'live/app');
+    if (state !== 'new') {
+      const bytes = Buffer.from('old plan');
+      const previous = state === 'interrupted repair' ? bundle : { ...bundle, plan: { ...bundle.plan, bytes, sha256: sha256(bytes) } };
+      const head = { ...streamHead({ app, bundle: previous, stream, seq: 7, release: 'initial' }), cohortReceipt: receipt.card };
+      head.signature = signer.sign(head);
+      await origin.putHead(stream, envelopeBytes(head), { previousDigest: null });
+      if (state === 'authenticated') for (const file of [receipt, evidence]) {
+        await origin.put(blobPath(file.sha256), file.bytes, { immutable: true });
+      }
+    }
+    const opts = { _: [selector], platform: ['ios'], keys: root, json: true };
+    const capsule = {
       version: 1, run: resolve(root, 'run'), sourceRoot, exactRoot, release: 'update', app,
       snapshot: { id: 'snapshot', sources: [{ repo: resolve(root, 'live'), roles: ['exact'], commit: 'a'.repeat(40) }] }, receipts: [],
-    })).toBe(0);
-    expect(calls).toEqual(state === 'authenticated' ? ['publish'] : ['native bake', 'publish']);
-    expect(JSON.parse(output.at(-1)).published[0].seq).toBe(8);
+    };
+    if (state === 'missing receipt') {
+      expect(await deploy({ ...opts, yes: false }, capsule)).toBe(0);
+      expect(JSON.parse(output.at(-1)).rows[0]).toMatchObject({ action: 'bundle', seq: 8 });
+      expect(await origin.get(blobPath(receipt.sha256))).toBeNull();
+      calls.length = 0;
+    }
+    const interrupted = state === 'interrupted repair';
+    const oldHead = interrupted ? (await origin.head(stream)).bytes : null;
+    if (interrupted) {
+      const put = origin.put.bind(origin);
+      origin.put = (...args) => {
+        if (args[0] === blobPath(evidence.sha256)) throw new Error('interrupted binary input write');
+        return put(...args);
+      };
+      expect(await deploy({ ...opts, yes: true }, capsule)).toBe(1);
+      expect(JSON.parse(output.at(-1)).failed[0].error).toBe('interrupted binary input write');
+      expect(await origin.get(blobPath(receipt.sha256))).toEqual(receipt.bytes);
+      expect(await origin.get(blobPath(evidence.sha256))).toBeNull();
+      origin.put = put;
+      expect(await deploy({ ...opts, yes: false }, capsule)).toBe(0);
+      expect(await origin.get(blobPath(evidence.sha256))).toBeNull();
+      calls.length = 0;
+    }
+    const status = await deploy({ ...opts, yes: true }, capsule);
+    const outcome = JSON.parse(output.at(-1)), seq = state === 'new' ? 1 : interrupted ? 7 : 8;
+    expect(outcome.rows[0]).toMatchObject({ action: interrupted ? 'current' : 'bundle', seq });
+    expect(outcome.failed).toEqual([]);
+    expect(status).toBe(0);
+    expect(calls).toEqual(state === 'authenticated' ? [] : ['native bake']);
+    expect(outcome.published[0]).toMatchObject({ action: interrupted ? 'current' : 'published', seq });
+    if (oldHead) expect((await origin.head(stream)).bytes).toEqual(oldHead);
+    expect(await origin.get(blobPath(receipt.sha256))).toEqual(receipt.bytes);
+    expect(await origin.get(blobPath(evidence.sha256))).toEqual(evidence.bytes);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

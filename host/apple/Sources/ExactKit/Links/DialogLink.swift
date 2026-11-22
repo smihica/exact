@@ -4,9 +4,12 @@
 // out by the kernel. Which dialogs are sheets and which are confirmations
 // is decided outside it, from their shape (`DialogShape`).
 //
-// Without the family the presenter holds `NoDialogs`, which answers what a
-// plan with no sheet observes: nothing is presented, owned or retiring. A
-// `dialog` that would be a sheet is not presented, and the journal says so.
+// The family is `ExactDialogs`, whose install fills the slot. Without it the
+// presenter holds `NoDialogs`, which answers what a plan with no sheet
+// observes: nothing is presented, owned or retiring. The roster links the
+// family for any plan that can have a `dialog`, so a plan whose `dialog`
+// would be a sheet is refused on a binary without it; were one opened,
+// nothing would be presented.
 #if os(iOS) || os(tvOS)
 import UIKit
 
@@ -56,9 +59,10 @@ extension DialogHosting {
     package func close(_ dialog: NodeView) { close(dialog, animated: !ExactEnv.agentFreezes) }
 }
 
-/// The slot is set before any session is made, and read on the main thread.
+/// Filled by `ExactDialogs.install()` before any session is made, and read
+/// on the main thread.
 package enum DialogLink {
-    package static var make: ((Presenter) -> any DialogHosting)? = { DialogSheets(presenter: $0) }
+    package static var make: ((Presenter) -> any DialogHosting)?
 }
 
 /// Dialog sheets where the composition links none.
@@ -78,7 +82,7 @@ package final class NoDialogs: DialogHosting {
     package var topDialog: NodeView? { nil }
     package var inTransition: Bool { false }
     package func authoredParent(of node: NodeView) -> UIView? { nil }
-    /// A view in a popover's surface is this session's too, as `DialogSheets.shows` answers it.
+    /// A view in a popover's surface is this session's too, as the family's `shows` answers it.
     package func shows(_ view: UIView) -> Bool {
         guard let surface = presenter.surface(containing: view) else { return false }
         return surface.kind == .dialog || surface.kind == .popover

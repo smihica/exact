@@ -708,6 +708,14 @@ test('watchFamilies admits only the four accessory families', async () => {
     for (const family of ['systemSmall','systemMedium','systemLarge','systemExtraLarge']) {
       write([family]); assert.throws(() => readManifest(dir,'watch'), /watchFamilies/);
     }
+    // iOS 27 portrait extra-large is admitted in families, guarded in Swift source, and omitted on watchOS (LLP 1156.007 §5.1).
+    const { platformWidgetEntries, widgetBundleSource } = await import('../host/apple/widgets.mjs');
+    writeFileSync(resolve(dir,'app.json'), JSON.stringify({name:'XL', app:{id:'com.exact.xl', name:'XL'}, widgets:[{kind:'board',families:['systemExtraLarge','systemExtraLargePortrait'],component:'Card',props:'Props',refresh:'refresh',preview:{}}]}));
+    const xl = { id: 'com.exact.xl', manifest: readManifest(dir, 'xl') };
+    assert.deepEqual(platformWidgetEntries(xl, 'ios').map(e => e.families), [['systemExtraLarge', 'systemExtraLargePortrait']]);
+    assert.deepEqual(platformWidgetEntries(xl, 'macos').map(e => e.families), [['systemExtraLarge', 'systemExtraLargePortrait']]);
+    assert.deepEqual(platformWidgetEntries(xl, 'watchos'), []);
+    assert.match(widgetBundleSource(platformWidgetEntries(xl, 'ios'), { platform: 'ios' }), /if #available\(iOS 27\.0, macOS 27\.0, \*\) \{ families\.append\(\.systemExtraLargePortrait\) \}/);
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
@@ -925,7 +933,11 @@ test('a launch colour of a host\'s own or Expo\'s splash is refused for backgrou
       assert.throws(() => read(extra), new RegExp(`${key.replaceAll('.', '\\.')}: not a known key; what shows before the first frame is background_color.*host\\.android\\.launchImage add a picture`));
     }
     assert.equal(read({ background_color: '#102839', color_scheme_dark: { background_color: '#000' } }).background_color, '#102839');
-    assert.throws(() => read({ color_scheme_dark: { background_color: 'navy' } }), /color_scheme_dark\.background_color: "navy" does not match/);
+    assert.throws(() => read({ color_scheme_dark: { background_color: 'navy' } }), /color_scheme_dark\.background_color: "navy" does not match.*: write #RGB, #RRGGBB or #RRGGBBAA, or a Display P3 colour/);
+    // LLP 1163 D2: one scheme's colours under its own member, Display P3 among them
+    assert.deepEqual(read({ color_scheme_light: { background_color: 'color(display-p3 1 0.5 0)', theme_color: '#eee' } }).color_scheme_light, { background_color: 'color(display-p3 1 0.5 0)', theme_color: '#eee' });
+    assert.throws(() => read({ color_scheme_light: { background_color: 'color(display-p3 1.5 0 0)' } }), /color_scheme_light\.background_color: .* does not match/);
+    assert.throws(() => read({ color_scheme_light: { icons: [] } }), /color_scheme_light\.icons/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

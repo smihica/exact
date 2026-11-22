@@ -1,5 +1,5 @@
 import { viewChildren, unwrapListItem, viewParent } from "./lists.js";
-import { fold, launched, onFold, launchLocation, launchVisits } from "./environment.js";
+import { fold, foldColumns, launched, onFold, launchLocation, launchVisits } from "./environment.js";
 import { agentParameters } from "./agent-parameters.js";
 import { inertAncestor } from "./layers.js";
 import { popoverObservation } from "./popover.js";
@@ -13,7 +13,7 @@ const AGENT_ADMITTED = true; // false in a release, as the release gate writes i
 const TABS = true, SPLITS = true, SHEETS = true, BARS = true, CLEAR_BARS = true;
 let last = null, refused = new WeakMap();
 // The tabpanels each root last hid or showed (one it stops naming shows again); the keys of the stack it last showed.
-let managed = new WeakMap(), shown = new WeakMap(), placed = new WeakMap();
+let managed = new WeakMap(), shown = new WeakMap();
 let written = [], gone = new Set(), cursor = 0, first = null, originIndex = null, echo = null, pop = null, draining = false;
 const queue = [], waiters = new Set();
 let root, navigate, log, hostBack, hostGo, routeMatches = () => false, canonicalOf = (location) => location;
@@ -117,6 +117,41 @@ export function sheetLeaves(el) {
   return true;
 }
 // @ref LLP 1115.000 D4.8 — a sheet the look draws (fixed to the window) slides back down as it closes, as it slid up (neutral.css), unless the person asks for less motion. A runtime asks this before it removes a modal route (glue.js's `destroy`; rt.js's `clear`, `each` and presence's `Leave`); a sheet that leaves stays whole until it is off the window, from where it stands, out of input, accessibility and the routes as presence-glue.js's leaving views are (LLP 1063), the focus leaving it as a removed one's would (input-glue.js's `arrive` takes one a blur does not reach). One holding media or a field whose decorations the browser paints closes at once, as its runtime empties those with the commit, and so does one holding an open dialog or popover, which the top layer would leave frozen on the window; a native view slides, showing what its module left in it. It keeps its ids for what it draws, though a command by id passes over it (`liveById`), and its stack's projection ends it on showing a sheet that was not beneath it, which may share them (compared as elements: a replace keeps its key).
+const placed = new WeakMap();
+const flow = style => /^(static|relative)$/.test(style.position);
+const column = style => /flex/.test(style.display) && style.flexDirection.startsWith("column");
+
+// LLP 1115.002 item 5. Only the nav containing the root tabs and their footer belongs to
+// the sidebar. Another nav, or a footer inside a route, keeps its place in the document.
+function placeTabBar(root, list, wide) {
+  const parent = viewParent(list);
+  const children = parent?.localName === "nav" && viewParent(parent) === root ? viewChildren(parent) : [];
+  const footer = children.length === 2 ? children.find(el => el !== list && el.localName === "footer") : null;
+  const wrapper = footer ? parent : null;
+  const orientation = list?.getAttribute("aria-orientation");
+  const placement = [wide, parent === root, orientation, ...[root, wrapper, list, footer].map(el => el && [
+    el.className, el.style.display, el.style.flexDirection, el.style.position, el.style.appearance
+  ].join("|"))].join("/");
+  const last = placed.get(root);
+  if (last?.placement === placement && last.list === list && last.wrapper === wrapper) return;
+
+  // Read authored placement without our own CSS. An unrelated commit must not restyle the page.
+  root.removeAttribute("data-exact-sidebar");
+  last?.list?.removeAttribute("data-exact-sidebar-tabs");
+  last?.wrapper?.removeAttribute("data-exact-tab-navigation");
+  placed.set(root, { placement, list, wrapper });
+  if ((!wide && !wrapper) || (!wrapper && parent !== root) || orientation === "vertical") return;
+  const bar = getComputedStyle(list);
+  if (bar.appearance === "none" || !flow(bar) || !bar.flexDirection?.startsWith("row") || !column(getComputedStyle(root))) return;
+  if (wrapper) {
+    const style = getComputedStyle(wrapper);
+    if (!flow(style) || !(style.display === "block" || style.display === "contents" || column(style)) || !flow(getComputedStyle(footer))) return;
+    wrapper.setAttribute("data-exact-tab-navigation", bar.display === "none" ? "hidden" : wide ? "sidebar" : "bar");
+  }
+  root.toggleAttribute("data-exact-sidebar", wide);
+  list.toggleAttribute("data-exact-sidebar-tabs", wide);
+}
+
 // @ref LLP 1075.003 §3.7 — tabs name their kept panels with aria-controls; each panel holds a route stack.
 // Attribute and parent walks also work in the server renderer's DOM, which has no selector engine.
 const tabsOf = (nav) => {
@@ -191,6 +226,42 @@ function selectedDetent(route) {
   }
   return chosen;
 }
+// Keep the scrim on its stack's parent so it can fade out after the last sheet leaves.
+function setScrim(parent, modal) {
+  const value = modal ? "on" : "off", previous = parent.getAttribute("data-exact-scrim");
+  if (value !== previous && (modal || previous !== null)) {
+    parent.setAttribute("data-exact-scrim", value);
+  }
+}
+// The first vertical scroller on the last in-flow child's chain owns the bottom inset, as in
+// kernel/cover.rs (LLP 1116 D2). A form control scrolls its own value.
+const bottomScrollers = new WeakMap();
+function bottomScroller(route) {
+  let el = route.lastElementChild;
+  while (el) {
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.position === "absolute" || style.position === "fixed") {
+      el = el.previousElementSibling;
+      continue;
+    }
+    if (el.matches("textarea, select")) return null;
+    if (style.overflowY === "auto" || style.overflowY === "scroll") return el;
+    el = el.lastElementChild;
+  }
+  return null;
+}
+function sheetScroller(route, inSheet) {
+  const previous = bottomScrollers.get(route), current = inSheet ? bottomScroller(route) : null;
+  if (previous === current || (!previous && !current)) return;
+  previous?.removeAttribute("data-exact-bottom-inset");
+  if (current) {
+    bottomScrollers.set(route, current);
+    current.setAttribute("data-exact-bottom-inset", "");
+  } else {
+    bottomScrollers.delete(route);
+  }
+  route.toggleAttribute("data-exact-bottom-scroller", !!current);
+}
 /** The frame of `routes[index]`: its own detent, or its sheet's when it was pushed inside one; written only where it
  * changed. `shownIn` is the sheet each route shows in (`sheetAt`), `inUse` the sheets something shown is in,
  * `selected` the stack's shown route. The projection frames a stack's routes in order, and with the last one the
@@ -222,6 +293,7 @@ function sheetFrame(routes, index, shownIn, inUse, selected) {
   if (route.style.getPropertyValue("--exact-sheet-detent") !== (chosen?.css ?? "")) {
     route.style.setProperty("--exact-sheet-detent", chosen?.css ?? "");
   }
+  sheetScroller(route, inUse.has(at));
   if (index === routes.length - 1) {
     stackSheets(routes, shownIn, inUse, selected);
   }
@@ -261,8 +333,11 @@ const linked = (href) => href?.startsWith("/") && !href.startsWith("//") && rout
 /** Outermost press owners; unlike candidate discovery, this walk crosses a navigationKey. */
 function listRows(list) {
   const rows = [], walk = (parent) => {
+    const container = parent.parentElement;
+    const section = parent.localName === "section" && (container === list ||
+      container?.parentElement === list && container.matches("[data-exact-list-item], [data-listitemkey]"));
     for (const el of parent.children) {
-      if (excluded(el)) {
+      if (section && (el.localName === "header" || el.localName === "footer") || excluded(el)) {
         continue;
       }
       const press = rowPress(el), href = rowHref(el);
@@ -338,9 +413,11 @@ export function splitOf([route]) {
       rows: []
     };
   }
-  const said = route?.getAttribute("navigationSplit"), explicit = Number(said);
+  const said = route?.getAttribute("navigationSplit"), explicit = Number(said), named = Number.isFinite(explicit) && explicit > 0;
   const found = route && said !== "none" && !sheet(route) ? pushingList(route) : null;
-  const width = route && said !== "none" && !sheet(route) && wide() && /^(absolute|fixed)$/.test(getComputedStyle(route).position) ? Number.isFinite(explicit) && explicit > 0 ? explicit : found ? 320 : 0 : 0;
+  const placed = route && said !== "none" && !sheet(route) && /^(absolute|fixed)$/.test(getComputedStyle(route).position);
+  const atFold = placed && (found || named) ? foldColumns(route) : null;
+  const width = atFold ? atFold.list : placed && wide() ? named ? explicit : found ? 320 : 0 : 0;
   if (route) {
     if (found && (width || splitLists.has(route))) {
       splitLists.set(route, found.list);
@@ -350,6 +427,8 @@ export function splitOf([route]) {
   }
   return {
     width,
+    // Where the detail starts: after the fold's gap at the fold, else beside the list
+    detail: atFold?.detail ?? width,
     list: found?.list,
     rows: found?.rows ?? []
   };
@@ -413,8 +492,6 @@ function detailRows(routes, found) {
     }
   }
 }
-/** Whether a root's tablist is a bar whose placement the app left unsaid, read while the root is not yet a sidebar. */
-const unsaidBar = (nav, list) => viewParent(list) === nav && getComputedStyle(list).appearance !== "none" && list.getAttribute("aria-orientation") !== "vertical" && (([n, l]) => /flex/.test(n.display) && n.flexDirection.startsWith("column") && /^(static|relative)$/.test(l.position) && l.flexDirection.startsWith("row"))([getComputedStyle(nav), getComputedStyle(list)]);
 /** Routes and panels excluded from input or document fields. Only input keeps a visible split list live. */
 function unselectedWithin(nav, keepList) {
   const key = nav.getAttribute("navigationKey"), panels = panelsOf(nav), stacks = panels.length ? panels.map(routesIn) : [routesIn(nav)];
@@ -444,6 +521,16 @@ export function routeFlags(root) {
 }
 // LLP 1153 D8 — both runtimes' agent `tree` flags an element as the projection left the page, for one read: 1 (`inactive`) under a route or panel `unselected` names, which a split's list beside its detail is not; 2 (`hidden` too) where the projection hid that route, every one but a page a sheet covers
 const routesOf = (nav) => stacksOf(nav).find((routes) => routes.some((r) => r.getAttribute("navigationKey") === nav.getAttribute("navigationKey"))) ?? [];
+/** The selected stack through its top. Inputs can read it before this module has projected the tree. */
+export function focusStack(nav) {
+  const key = nav.getAttribute("navigationKey"), projected = shownRoutes.get(nav), top = projected?.at(-1);
+  if (top && top.getAttribute("navigationKey") === key &&
+      projected.every((route) => route.isConnected && nav.contains(route) && !route.hasAttribute("data-exiting"))) {
+    return projected;
+  }
+  const routes = routesOf(nav);
+  return routes.slice(0, routes.findIndex((route) => route.getAttribute("navigationKey") === key) + 1);
+}
 const selectedRoute = (nav) => routesOf(nav).find((r) => r.getAttribute("navigationKey") === nav.getAttribute("navigationKey"));
 const browserIndex = () => globalThis.navigation?.currentEntry?.index ?? null;
 export function historyURL(path) {
@@ -711,25 +798,7 @@ function watchClearBars() {
 function readProjections(root, log) {
   const projections = [...root.querySelectorAll("[navigationBack]")].map((nav) => {
     const [list, panels] = tabsOf(nav);
-    if (TABS) {
-      // The authored placement is read with the sidebar's own rules lifted, which restyles the page (an embedded frame re-centres), so only when what places the bar may have changed: the wide breakpoint, the bar's parent or orientation, or the root's or the bar's class or inline display, flex direction, position or appearance (their class rules and inline style are what place them).
-      const isWide = wide(), said = [
-        isWide,
-        viewParent(list) === nav && list.getAttribute("aria-orientation"),
-        ...[nav, list].map((el) => el && [
-          el.className,
-          el.style.display,
-          el.style.flexDirection,
-          el.style.position,
-          el.style.appearance
-        ].join("|"))
-      ].join("/");
-      if (placed.get(nav) !== said) {
-        nav.removeAttribute("data-exact-sidebar");
-        nav.toggleAttribute("data-exact-sidebar", isWide && unsaidBar(nav, list));
-        placed.set(nav, said);
-      }
-    }
+    if (TABS) placeTabBar(nav, list, wide());
     return { nav, list, panels, stacks: panels.length ? panels.map(routesIn) : [routesIn(nav)], leaving: [] };
   });
   // Placing a root's bar restyles the page, so every root is placed before any computed style is read.
@@ -1085,7 +1154,11 @@ export const navigation = {
     }
     document.addEventListener("click", captureLink, true);
     document.addEventListener("dragstart", (event) => {
-      if (root.contains(event.target) && event.target.matches?.("img[data-symbol-source], :is(button, a[href], [data-exact-on~=\"press\"]) img")) {
+      // A node an author made draggable, an SVG element's mark skipped as drag-out.js skips it, drags with what is inside it, unless a press lies between (LLP 1094.000 D6, D8).
+      let source = event.target.closest?.('[draggable="true" i]'), press = event.target.closest?.('button, a[href], [data-exact-on~="press"]');
+      while (source?.namespaceURI === "http://www.w3.org/2000/svg") source = source.parentElement?.closest('[draggable="true" i]');
+      const spared = source && (!press || press === source || press.contains(source));
+      if (root.contains(event.target) && event.target.matches?.("img[data-symbol-source], :is(button, a[href], [data-exact-on~=\"press\"]) img") && !spared) {
         event.preventDefault();
       }
     });
@@ -1234,8 +1307,13 @@ export const navigation = {
     }
     for (const { nav, key, at, list, panels, stacks, facts } of projections) {
       if (TABS) {
-        for (const panel of managed.get(nav) ?? []) {
+        const previous = managed.get(nav) ?? [];
+        if (SHEETS && panels.length && !previous.length) {
+          setScrim(nav, false);
+        }
+        for (const panel of previous) {
           if (!panels.includes(panel)) {
+            SHEETS && setScrim(panel, false);
             panel.style.visibility = "";
             setInert(panel, !!panel.authoredInert);
           }
@@ -1243,8 +1321,16 @@ export const navigation = {
         managed.set(nav, panels);
       }
       if (key === undefined) {
+        shownRoutes.delete(nav);
         // No route is framed, so no stack of sheets is reached: one whose routes have left this root goes here.
-        SHEETS && sheetsLeft();
+        if (SHEETS) {
+          for (const [stack, routes] of stacks.entries()) {
+            if (!routes.length) {
+              setScrim(panels[stack] ?? nav, false);
+            }
+          }
+          sheetsLeft();
+        }
         continue;
       }
       // Every tab but the selected one stays mounted, hidden and inert.
@@ -1271,11 +1357,8 @@ export const navigation = {
           }
         }
         const modal = over[presented], beneath = routes.findLastIndex((r, i) => i < presented && !over[i]);
-        // The scrim under a presented sheet is its stack's parent's (neutral.css): written once a sheet has shown, so
-        // it fades out as the last one leaves.
-        const scrim = routes[presented]?.getAttribute("navigationPresentation") === "modal" ? "on" : "off", parent = viewParent(routes[0]);
-        if (SHEETS && parent && parent.getAttribute("data-exact-scrim") !== scrim && (scrim === "on" || parent.hasAttribute("data-exact-scrim"))) {
-          parent.setAttribute("data-exact-scrim", scrim);
+        if (SHEETS) {
+          setScrim(panels[stack] ?? nav, routes[presented]?.getAttribute("navigationPresentation") === "modal");
         }
         detailRows(routes, found);
         if (stack === at && list) {
@@ -1297,6 +1380,7 @@ export const navigation = {
             column ? route.setAttribute("data-exact-split", column) : route.removeAttribute("data-exact-split");
           }
           route.style.setProperty("--exact-split", column ? `${split}px` : "");
+          route.style.setProperty("--exact-split-detail", column ? `${found.detail}px` : "");
           sheetFrame(routes, index, shownIn, inUse, selected);
           appBarBack(nav, routes, index, split > 0, active || covered, headers[index]);
           clearBar(route);
@@ -1329,7 +1413,9 @@ export const navigation = {
         box?.toggleAttribute("data-exact-split-empty", empty && !own);
         if (empty) {
           box.style.setProperty("--exact-split", `${split}px`);
-          own && routes[0].style.setProperty("--exact-split-pane", `${(routes[0].offsetParent ?? box).clientWidth - split}px`);
+          box.style.setProperty("--exact-split-detail", `${found.detail}px`);
+          own && routes[0].style.setProperty("--exact-split-gap", `${found.detail - split}px`);
+          own && routes[0].style.setProperty("--exact-split-pane", `${(routes[0].offsetParent ?? box).clientWidth - found.detail}px`);
         }
       }
     }

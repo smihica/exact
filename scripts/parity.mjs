@@ -1,15 +1,13 @@
 // The parity comparator, generalised from scripts/svgparity.mjs (LLP 1055.000
 // §5, LLP 1056 §4): a gallery app's `fx-*` boxes cropped from each host's
-// screenshots by that host's own layout and compared with Chrome's. The
-// SVG smoke keeps its own copy until the SVG stages 8–10 lane lands (QUEUE);
-// the canvas smoke (scripts/canvasparity.mjs) uses this one.
+// screenshots by that host's own layout and compared with Chrome's.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { appleArtifacts, appleRunBinary } from '../host/apple/build.mjs';
 import { linuxRebuild, ownVerb, rebuildCommand } from './agent-build.mjs';
 import { linuxBinary, resolveApp } from './app.mjs';
-import { crop, decodePng } from './png.mjs';
+import { crop, readSrgbPng, shrink } from './png.mjs';
 
 const ROOT = resolve(import.meta.dir, '..');
 
@@ -46,21 +44,6 @@ export function webBuild(app) {
   return dist;
 }
 
-/** An RGBA image averaged down by an integer factor. */
-export function shrink(img, k) {
-  if (k === 1) return img;
-  const width = Math.floor(img.width / k), height = Math.floor(img.height / k);
-  const data = new Uint8Array(width * height * 4);
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-    for (let c = 0; c < 4; c++) {
-      let sum = 0;
-      for (let j = 0; j < k; j++) for (let i = 0; i < k; i++) sum += img.data[((y * k + j) * img.width + x * k + i) * 4 + c];
-      data[(y * width + x) * 4 + c] = Math.round(sum / (k * k));
-    }
-  }
-  return { width, height, data };
-}
-
 /** Mean |Δ| over RGB and the share of pixels off by more than `band`, `b`
  * shifted by (dx, dy) over `a`'s interior (`slop` px of margin). */
 export function compare(a, b, dx, dy, { slop, band }) {
@@ -85,38 +68,40 @@ export function register(a, b, { slop, band }) {
   return best;
 }
 
-/** One screenshot of a session, in sRGB, with its device scale `k` and the
- * rows above the viewport (a window capture's title bar). `film`: a film's
- * frame, which shows finite motion where the clock is rather than held at
- * its end (LLP 1116.003 D8). */
+/** One sRGB screenshot with its device scale `k` and the viewport's origin
+ * in the image. `film` samples finite motion at the clock (LLP 1116.003 D8). */
 export async function shot(s, host, dir, name, film = false) {
+  const path = resolve(dir, `${host}-${name}.png`);
+  const reply = await s.screenshot(path, host === 'macos', undefined, film);
+  if (reply.captureSpace === 'screen' && reply.scale === null) throw new Error(`${host} parity: ${reply.note}`);
   const layout = await s.layout();
-  let path = resolve(dir, `${host}-${name}.png`);
-  await s.screenshot(path, host === 'macos', undefined, film);
-  if (host === 'macos' || host === 'ios') {
-    // A native capture is in the display's profile (Display P3 on a Mac);
-    // Chrome's is sRGB.
-    const srgb = resolve(dir, `${host}-${name}.srgb.png`);
-    const r = spawnSync('sips', ['--matchTo', '/System/Library/ColorSync/Profiles/sRGB Profile.icc', path, '--out', srgb], { encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`sips: ${r.stderr}`);
-    path = srgb;
+  const img = readSrgbPng(path);
+  if (reply.captureSpace === 'screen') {
+    const { x, y } = layout.screen ?? {};
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`${host} parity: the viewport has no screen origin`);
+    return { img, k: reply.scale ?? img.width / reply.w, screen: { w: reply.w, h: reply.h }, origin: { x, y }, layout };
   }
-  const img = decodePng(readFileSync(path));
   const k = Math.round(img.width / layout.viewport.w);
   const top = Math.max(0, Math.round(img.height / k - layout.viewport.h));
-  return { img, k, top, layout };
+  return { img, k, origin: { x: 0, y: top }, layout };
 }
 
 /** Every box whose testId matches `prefix`, cropped from a shot at 1 px per
  * point (`native` keeps the device scale), `slop` px of margin around it. */
-export function boxes({ img, k, top, layout }, { prefix = 'fx-', slop, native = false }) {
-  const scale = native ? k : 1;
-  const full = native ? img : shrink(img, k);
+export function boxes({ img, k, screen, origin, layout }, { prefix = 'fx-', slop, native = false }) {
+  const sx = native ? (screen ? img.width / screen.w : k) : 1;
+  const sy = native ? (screen ? img.height / screen.h : k) : 1;
+  const w1 = Math.round(screen?.w ?? Math.floor(img.width / k));
+  const h1 = Math.round(screen?.h ?? Math.floor(img.height / k));
+  const full = native || (w1 === img.width && h1 === img.height) ? img : shrink(img, w1, h1);
   const out = {};
   for (const n of layout.nodes.filter((n) => n.testId?.startsWith(prefix))) {
-    const x = Math.round(n.x * scale) - slop, y = Math.round((n.y + top) * scale) - slop;
-    const w = Math.round(n.w * scale) + 2 * slop, h = Math.round(n.h * scale) + 2 * slop;
-    out[n.testId] = x < 0 || y < 0 || x + w > full.width || y + h > full.height ? null : crop(full, x, y, w, h);
+    const left = n.x + origin.x, top = n.y + origin.y;
+    const x = Math.round(left * sx), y = Math.round(top * sy);
+    const w = native && screen ? Math.round((left + n.w) * sx) - x : Math.round(n.w * sx);
+    const h = native && screen ? Math.round((top + n.h) * sy) - y : Math.round(n.h * sy);
+    out[n.testId] = x < slop || y < slop || x + w + slop > full.width || y + h + slop > full.height
+      ? null : crop(full, x - slop, y - slop, w + 2 * slop, h + 2 * slop);
   }
   return out;
 }

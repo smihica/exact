@@ -786,7 +786,7 @@ fn bound_transition_stacking_matches_kernel() {
             expr: Default::default(),
             written: true,
         },
-        crate::paint::transitions,
+        |parser| parser.source(&plan, &crate::paint::motion_words()),
     )
     .unwrap();
     let script = format!(
@@ -854,13 +854,11 @@ impl exact_runner::DataSource for ManyItems {
     }
 }
 
-/// theme2 2026-10-23 (after `lower-symbol-tint`): on this target too a symbol's own `-exact-tint-color` is no paint of
-/// it: its class says `currentcolor`, a state's row folded under it, which symbols.js's mask paints in its `color`; a native
-/// button's face keeps its tint (LLP 1115 D4), as a raster does.
+/// A standalone symbol takes its ink from `color`. A native button face and a raster take their tint (LLP 1115 D4).
 #[test]
-fn a_symbols_own_tint_is_its_colour_here_too_a_states_as_well() {
+fn symbols_use_the_current_colour_and_native_faces_and_rasters_keep_their_tint() {
     let plan = contract::compile(
-        "component App\n  state off = false\n  action go\n  view\n    column color=\"#0000ff\"\n      image \"symbol:search\" testId=\"symbol\" -exact-tint-color=\"#ff0000\"\n      button press=go testId=\"drawn\" appearance=\"none\"\n        image \"symbol:star\" testId=\"stated\" disabled=off -exact-tint-color=\"#ff0000\"\n          :disabled\n            -exact-tint-color=\"#00ff00\"\n      button press=go testId=\"lock\"\n        image \"symbol:lock\" testId=\"face\" -exact-tint-color=\"#ff0000\"\n        text \"Lock\"\n      image \"assets/mark.png\" testId=\"raster\" -exact-tint-color=\"#ff0000\"\n",
+        "component App\n  action go\n  view\n    column color=\"#0000ff\"\n      image \"symbol:search\" testId=\"symbol\" -exact-tint-color=\"#ff0000\"\n      button press=go testId=\"lock\"\n        image \"symbol:lock\" testId=\"face\" -exact-tint-color=\"#ff0000\"\n        text \"Lock\"\n      image \"assets/mark.png\" testId=\"raster\" -exact-tint-color=\"#ff0000\"\n",
     )
     .unwrap();
     let sites = crate::emit::Sites::new(&plan).unwrap();
@@ -880,22 +878,6 @@ fn a_symbols_own_tint_is_its_colour_here_too_a_states_as_well() {
         symbol.css
     );
     assert!(!symbol.css.contains("255,0,0"), "{}", symbol.css);
-    // Its `:disabled` row, live on the image, folds into a binding whose disabled arm the answer takes first
-    // (`disabled ? currentcolor : …`): the program's first arm for it is `currentcolor` (its value at run time
-    // is proven in contract's symbol_ink.rs).
-    let emitted = crate::emit::emit(&plan, false, false).unwrap();
-    let stated = emitted
-        .js
-        .find("\"data-testid\":\"stated\"")
-        .expect("stated");
-    let chain = &emitted.js[stated..];
-    let first = chain.find("s0=\"").map(|i| &chain[i..i + 18]).unwrap_or("");
-    assert_eq!(
-        first,
-        "s0=\"currentcolor\";",
-        "{}",
-        &chain[..chain.len().min(600)]
-    );
     for kept in ["face", "raster"] {
         let made = by(kept);
         assert!(
@@ -914,9 +896,14 @@ fn a_symbols_own_tint_is_its_colour_here_too_a_states_as_well() {
 #[test]
 fn bound_animation_stacking_matches_kernel() {
     let plan = contract::compile(
-        "keyframes EASE\n  from opacity=0\n  to opacity=1\nkeyframes linear\n  to opacity=0\nkeyframes spin\n  to rotate=360\nkeyframes Fade\n  to color=\"red\"\nkeyframes infs\n  to scale=2\nkeyframes MAX_ANIMATIONS\n  to opacity=0\nkeyframes MAX_LINEAR_STOPS\n  to opacity=0\nkeyframes WORDS\n  to opacity=0\nkeyframes NAMES\n  to opacity=0\ncomponent App\n  state a = \"spin 1s\"\n  view\n    view animation=a\n",
+        "keyframes EASE\n  from opacity=0\n  to opacity=1\nkeyframes linear\n  to opacity=0\nkeyframes spin\n  to rotate=360\nkeyframes Fade\n  to color=\"red\"\nkeyframes infs\n  to scale=2\nkeyframes MAX_ANIMATIONS\n  to opacity=0\nkeyframes MAX_LINEAR_STOPS\n  to opacity=0\nkeyframes WORDS\n  to opacity=0\nkeyframes NAMES\n  to opacity=0\ncomponent App\n  state a = \"spin 1s\"\n  state t = \"opacity 1s\"\n  view\n    column\n      view animation=a transition=t\n      view animation=a transition=t\n      view transition=t -exact-press-scale=0.92\n",
     )
     .unwrap();
+    let js = crate::emit::emit(&plan, false, false).unwrap().js;
+    assert_eq!(js.matches("const cssNumber = value =>").count(), 1);
+    assert_eq!(js.matches("const maxStops =").count(), 1);
+    assert_eq!(js.matches("const easingWord =").count(), 1);
+    assert_eq!(js.matches("($animationStacks)(v)").count(), 1);
     let mut values: Vec<String> = [
         "1s EASE",
         "EASE 1s",
@@ -1015,7 +1002,7 @@ fn bound_animation_stacking_matches_kernel() {
             expr: Default::default(),
             written: true,
         },
-        crate::paint::transitions,
+        |parser| parser.source(&plan, &crate::paint::motion_words()),
     )
     .unwrap();
     let script = format!(

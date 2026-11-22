@@ -47,7 +47,7 @@ extension NodeView {
         #endif
     }
     // Accessibility needs the source, not a colour-resolved layout specification.
-    var paragraphText: String {
+    package var paragraphText: String {
         props["text"] ?? inlineText.lazy.filter(\.paints).map(\.text).joined()
     }
     /// What is spoken: hidden inline runs are omitted. `paragraphText` stays
@@ -62,7 +62,7 @@ extension NodeView {
     /// `text`, the slice of this paragraph's shaped text (`paragraphSpec`)
     /// from UTF-16 offset `start`, as it is copied: each image's U+FFFC its
     /// `aria-label` (LLP 1011.002 D4), omitting atom icons and their joiners.
-    func copiedText(_ text: String, from start: Int) -> String {
+    package func copiedText(_ text: String, from start: Int) -> String {
         let runs = paragraphSpec().runs
         guard runs.contains(where: { $0.box != nil }) else { return text }
         var labels = inlineText.filter { $0.lightRun.box != nil }.map(\.spoken).makeIterator()
@@ -145,9 +145,10 @@ extension NodeView {
         lastAccessibilityWrite.text = written
         #else
         // UIKit does not visit a container's children when it is itself an
-        // accessibility element. Expose the paragraph plus its link targets.
+        // accessibility element. Expose the paragraph plus its link/atom targets.
         // An image in the text is read in its words (LLP 1011.002 D4): no run of its own.
-        isAccessibilityElement = !inlineText.contains(where: { $0.lightRun.box == nil && (!($0.props["href"] ?? "").isEmpty || !$0.handlers.isEmpty || $0.props["accessibilityLabel"] != nil) })
+        let hasInline = inlineText.contains(where: { $0.lightRun.box == nil && (!($0.props["href"] ?? "").isEmpty || !$0.handlers.isEmpty || $0.props["accessibilityLabel"] != nil || ["link", "button"].contains($0.props["accessibilityRole"] ?? "")) })
+        isAccessibilityElement = !hasInline && !hasReaderAtoms
         accessibilityTraits.insert(.staticText)
         // A heading says so, as on the web and macOS (found by `tree --ax` parity, LLP 1080.002).
         if headingLevel != nil { accessibilityTraits.insert(.header) } else { accessibilityTraits.remove(.header) }
@@ -165,24 +166,24 @@ extension NodeView {
         let key = inlineAccessibilityKey
         let children: [NSAccessibilityElement]
         if let kept = inlineAccessibility, kept.key == key { children = kept.elements } else {
-            children = key == nil ? inlineElements() : groupElements()
+            children = key == nil ? (inlineElements() + readerAtomElements()) : groupElements()
             inlineAccessibility = (key, children)
         }
         return children.isEmpty && key == nil ? nil : children
         #else
-        let children: [Any] = inlineElements()
+        let children: [Any] = inlineElements() + readerAtomElements()
         guard !children.isEmpty else { return nil }
-        let paragraph = UIAccessibilityElement(accessibilityContainer: self)
+        let paragraph = ParagraphAccessibility(owner: self)
         paragraph.accessibilityLabel = props["accessibilityLabel"] ?? visibleParagraphText
         paragraph.accessibilityValue = spokenValue
         paragraph.accessibilityLanguage = presenter?.documentLanguage
-        paragraph.accessibilityTraits = .staticText
+        paragraph.accessibilityTraits = headingLevel != nil ? [.staticText, .header] : .staticText
         paragraph.accessibilityFrameInContainerSpace = contentBox()
         return [paragraph] + children
         #endif
     }
     private var interactiveRuns: [InlineText] {
-        inlineText.filter { !$0.run(dark: drawsDark).hidden && (!($0.props["href"] ?? "").isEmpty || !$0.handlers.isEmpty || $0.props["accessibilityLabel"] != nil || ownsMenu($0)) }
+        inlineText.filter { !$0.run(dark: drawsDark).hidden && (!($0.props["href"] ?? "").isEmpty || !$0.handlers.isEmpty || $0.props["accessibilityLabel"] != nil || ["link", "button"].contains($0.props["accessibilityRole"] ?? "") || ownsMenu($0)) }
     }
     /// A run with its own `contextPopover` is an element on macOS, whose
     /// show menu opens it (X77), as one with its own `contextmenu` is.
@@ -211,7 +212,7 @@ extension NodeView {
     /// its links and the links themselves, in reading order, so no word is
     /// read twice.
     private func groupElements() -> [NSAccessibilityElement] {
-        guard !inlineText.isEmpty else { return [ParagraphWords(owner: self, text: visibleParagraphText, runs: [])] }
+        guard !inlineText.isEmpty else { return [ParagraphWords(owner: self, text: visibleParagraphText, runs: [])] + readerAtomElements() }
         let text = paragraphText as NSString
         let links = Set(interactiveRuns.map(\.id))
         var children: [NSAccessibilityElement] = [], words: [InlineText] = []
@@ -268,7 +269,7 @@ private final class InlineAccessibility: NSAccessibilityElement, InspectionOwned
         self.owner = owner; id = run.id
         super.init()
         setAccessibilityParent(owner)
-        setAccessibilityRole((run.props["href"] ?? "").isEmpty ? .staticText : .link)
+        setAccessibilityRole(!(run.props["href"] ?? "").isEmpty || run.props["accessibilityRole"] == "link" ? .link : run.props["accessibilityRole"] == "button" ? .button : .staticText)
         setAccessibilityIdentifier(run.props["testId"])
         setAccessibilityLabel(run.props["accessibilityLabel"] ?? owner.visibleInlineText(in: run.range, source: text))
         if let href = run.props["href"] { setAccessibilityURL(URL(string: href)) }
@@ -316,7 +317,7 @@ private final class InlineAccessibility: UIAccessibilityElement, InspectionOwned
         accessibilityIdentifier = run.props["testId"]
         accessibilityLanguage = owner.presenter?.documentLanguage
         accessibilityLabel = run.props["accessibilityLabel"] ?? owner.visibleInlineText(in: run.range, source: text)
-        accessibilityTraits = (run.props["href"] ?? "").isEmpty ? .staticText : .link
+        accessibilityTraits = !(run.props["href"] ?? "").isEmpty || run.props["accessibilityRole"] == "link" ? .link : run.props["accessibilityRole"] == "button" ? .button : .staticText
         if owner.presenter?.inlineAriaUnavailable(id) == true { accessibilityTraits.insert(.notEnabled) }
     }
     override var accessibilityFrame: CGRect {
@@ -328,5 +329,25 @@ private final class InlineAccessibility: UIAccessibilityElement, InspectionOwned
         set { }
     }
     override func accessibilityActivate() -> Bool { owner?.activateInline(id) ?? false }
+    #if os(iOS)
+    /// A draggable node's drag around its paragraph (D9)
+    override var accessibilityDragSourceDescriptors: [UIAccessibilityLocationDescriptor]? {
+        get { owner.flatMap { $0.presenter?.dragOut?.descriptors(of: $0, isElement: false) } }
+        set { }
+    }
+    #endif
+}
+
+/// A paragraph's words beside its links, which UIKit makes no view for.
+private final class ParagraphAccessibility: UIAccessibilityElement {
+    weak var owner: NodeView?
+    init(owner: NodeView) { self.owner = owner; super.init(accessibilityContainer: owner) }
+    #if os(iOS)
+    /// A draggable node's drag around the paragraph (D9)
+    override var accessibilityDragSourceDescriptors: [UIAccessibilityLocationDescriptor]? {
+        get { owner.flatMap { $0.presenter?.dragOut?.descriptors(of: $0, isElement: false) } }
+        set { }
+    }
+    #endif
 }
 #endif

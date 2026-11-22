@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { decodePng, encodePng } from '../../scripts/png.mjs';
-import { chooseSimulator, crashReports, crashSummary, crashWatch, forwardedEnv, installedAlready, simulator, withDisplay, withMaterials, phoneBridge, phoneStartupFailure, softwareKeyboard, replacedNote, keepInstalledRelease } from './devices.mjs';
+import { chooseSimulator, crashReports, crashSummary, crashWatch, displayAsIs, forwardedEnv, phoneLaunch, installedAlready, simulator, withDisplay, withMaterials, phoneBridge, phoneStartupFailure, softwareKeyboard, replacedNote, keepInstalledRelease } from './devices.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { once } from 'node:events';
@@ -542,6 +542,23 @@ const shoot = async (dir, r, appTop, options) => {
   return [await withDisplay(r, shot, 'UDID', appTop, options), rows(shot)];
 };
 
+test('an explicit simulator display capture uses screen and keyboard metadata during a held contact', async () => {
+  const display = paint([[8, 16, GREY]]), asked = [];
+  const keyboardOnScreen = { ...keyboard, captured: true };
+  await withFakeSimctl(display, async dir => {
+    const path = resolve(dir, 'screen.png');
+    const reply = await displayAsIs(async req => {
+      asked.push(req);
+      return { screen: { w: 4, h: 8 }, front: true, keyboard: keyboardOnScreen, ...marked };
+    }, path, 'UDID', { skipMotion: true });
+    expect(asked).toEqual([{ op: 'screenshot', window: 'display', skipMotion: true }, { op: 'screenshot', window: 'display', probe: true }]);
+    expect(reply).toMatchObject({ screenshot: path, w: 4, h: 8, scale: 2, captureSpace: 'screen', pixels: 'display', keyboard: keyboardOnScreen, ...marked });
+    expect(reply.statusBar).toBeUndefined();
+    expect(readFileSync(path)).toEqual(display);
+    expect(reads(dir)).toBe(1);
+  });
+});
+
 // drawHierarchy draws Liquid Glass roughly: a tab bar's glass left the rows under it legible (the euxy port).
 test('a window capture is the display\'s, the status bar too when asked', async () => {
   await withFakeSimctl(DISPLAY, async (dir) => {
@@ -833,6 +850,9 @@ test('a page capture with no glass in it reads nothing of the display', async ()
 });
 // simctl and devicectl hand the app none of the drive's environment: EXACT_STORE=real must be passed by name.
 test('an iOS drive passes EXACT_STORE on to the app it launches, and nothing else of its environment', () => {
+  expect(phoneLaunch({}, { EXACT_AGENT: 'live', HOME: '/h' })).toEqual({ EXACT_AGENT: '1' });
+  expect(phoneLaunch({ EXACT_AGENT: 'live', EXACT_AGENT_CONNECT: 'endpoint' }, { EXACT_STORE: 'real' }))
+    .toEqual({ EXACT_AGENT: 'live', EXACT_AGENT_CONNECT: 'endpoint', EXACT_STORE: 'real' });
   expect(forwardedEnv({ EXACT_STORE: 'real', HOME: '/h' })).toEqual({ EXACT_STORE: 'real' });
   expect(forwardedEnv({ HOME: '/h' })).toEqual({});
 });

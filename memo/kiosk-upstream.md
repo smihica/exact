@@ -1,6 +1,7 @@
 # Kiosk changes and upstream assessment
 
-Updated 2026-11-13: `kiosk` integrates upstream `221e551bf`, including `8c742e6a9`.
+The [frame-pacing measurements](frame-pacing.md) cover the fixed Ink programs, solid fills, retained rows, rotated scanout and image downsampling together.
+
 This fork evaluates Exact on a Raspberry Pi 4 touchscreen kiosk, using Ink and
 DRM/KMS without a desktop environment. The aim is responsive UI, camera preview
 and touch scrolling on a small GPU. The changes are experiments with measured
@@ -10,15 +11,103 @@ Read [KIOSK.md](../KIOSK.md) for runtime switches, prototype limits and checks.
 This memo maps the changes to their code and assesses what is worth sharing
 upstream. The assessments are the fork's, not acceptance decisions by Exact's maintainers.
 
-## Changes and value
+## Upstream and Pi 4 status on 2026-11-22
+
+The fork merged upstream `9c348ab33` into the work based on `295e852a3`.
+Before this merge, the fork and `kiosk` (`c45a69086`) shared upstream history
+through `bba0b3a7d`. The stock-host panel test used `5f28513a4`, the revision
+named in [issue #145](https://github.com/expo/exact/issues/145#issuecomment-7068414558).
+
+| Change | Upstream status | Pi 4 evidence |
+| --- | --- | --- |
+| Clamp GPU limits to the adapter | Landed in `44395c82` | Previously verified with Ink on Vulkan and GLES, and Vello on Vulkan. |
+| Skip full-coverage and hidden-shadow calculations | Landed in `110439978` with upstream guards | Earlier upstream A/B reduced render time at 200 ms into opening on both backends. |
+| Eight fixed Ink programs at startup and general fallback | Landed in `b2a7e278c` | Both fixed-program pixel tests passed on Vulkan and both passed on GLES at `5f28513a4` with `--features wgpu/gles`. |
+| Holes in masked fills with the GLES general program | The single WGSL reduction in `060b9f988` matches the earlier fork fix `76c5d695c` | The previously failing general/fixed comparison passed in the run above. |
+| Output rotation and absolute input mapping | Landed in `b2a7e278c` | Earlier upstream run covered 0°, 90°, 180°, 270° and unset. New direct path exercised at 90°. |
+| Repeated tap at the same point after a relative mouse click | Landed in `9985713ed` | Three confirmations at 90° with injected evdev input, including two taps with no coordinate events. |
+| Find the Vulkan display through its DRM connector across separate render and display devices | Landed in `c75288253` | Stock host opened direct Vulkan on the Pi’s V3D and KMS devices. |
+| Direct Vulkan presentation with GPU rotation | Landed in `5f28513a4` | Static pixels, startup, final frame and page flips checked below. VNC capture and forced fallback were tested by upstream on x86; the Pi timing run used no VNC viewer. |
+| Defer clipped-row repainting and handle sticky headings separately | Independent upstream changes `e18de7e97` and `fc49f60b6` | Fork `adb9add81` was tested by comparing retained rendering with fresh paints. The same rich-list benchmark still needs a stock-upstream run. |
+| Five more fixed programs, flat interiors and less shape-distance work | Fork only | Pixel and timing checks on the fork, measured with the other rendering changes. |
+| Cache shadow geometry and draw exterior bands | Fork only | Shadow scenes, card lists and moving dialogs tested on the fork. Upstream’s shadow early return is a separate change. |
+| Fuse rotation into the final scanout copy and allow two outstanding frames | Earlier fork experiment, retired in this integration | Four fork orientations matched reference pixels before integration. The integrated build uses upstream presentation and its single outstanding frame. |
+| Downsample images without per-mip vertex and uniform buffers | Fork only | Fork mip readbacks matched the reference filter at five sizes on both Pi backends. |
+| Bounded reuse of idle bitmap textures | Fork only, opt-in | List A/Bs with 32 and 160 photos, plus a ten-minute reuse-on run. See [frame pacing](frame-pacing.md#fast-flicks-through-photographs). |
+| Connect hatches when a display receipt activates the session, including when newer input is dirty | Fork only | Fork regression tests and direct-display QR flow passed. |
+| Live camera preview and shared luminance frames for QR | Fork only for this Linux camera path | Preview, scanner transition and camera lifecycle exercised in the fork app. |
+| Linux KMS touch drag, inertia, rubber-band movement and cursor hiding | Fork only for these KMS behaviors | Touch scrolling and mixed input exercised on the fork. Upstream’s repeated-tap repair has its own row above. |
+| Dialog scrim override and FPS diagnostics | Fork comparison aids | Used on the fork. The app supplies dialog motion. |
+
+### Rich list and dialog after merging upstream
+
+We ran the same release app and assets on the same Pi 4 with Ink/Vulkan,
+90° rotation and VNC off. The order was previous fork, integrated fork,
+integrated fork, previous fork. Both builds kept the fork's extra shader
+programs, shadow optimizations and bitmap reuse enabled. The integration uses
+upstream's display selection, GPU rotation, Vulkan presentation and completion
+handling, and clipped-row rendering. It logged `direct Vulkan`.
+
+| Physical panel, mean fps during motion | Previous fork | With upstream `9c348ab33` |
+| --- | ---: | ---: |
+| Drag the photo list for 16 seconds near row 20 | 59.9 | 29.8 |
+| Coast after a fast flick, 12 gestures per build | 59.7 | 28.1 |
+| Open / close the dialog | 60.0 / 60.0 | 30.0 / 30.0 |
+| Live camera preview (30 fps source) | 30.1 | 29.9 |
+| Open / close the dialog over live video | 60.0 / 57.5 | 30.0 / 30.0 |
+
+During the two sustained drags per build, the previous fork missed 3 of
+1,913 refreshes and the integration missed 963 of 1,913. The previous build
+recovered its earlier pace in the last block. The Pi reported no throttling.
+Across those same windows, V3D render-engine time divided by completed frames
+rose from about 15.1 to 18.2 ms. Upstream's separate rotation pass and its wait
+for actual presentation before the next paint both differ from the earlier
+fork. These timings do not isolate their individual costs.
+
+### Stock direct presentation on the physical panel
+
+We built the unchanged `app.contract` from the [public dialog fixture](https://gist.github.com/smihica/43fc09c307fa2968cee057483c86c99f)
+in release mode with stock upstream `5f28513a4` and its immediate parent
+`c75288253`. Both used Ink/Vulkan and `EXACT_ROTATE=90` on the same
+1280 × 800, 60 Hz panel. The new host logged `direct Vulkan` and stayed on
+that path. The driver was Mesa 26.2.6 on V3D. The fixture enables wgpu’s GLES backend for the separate headless comparison.
+
+- Physical scanout pixels matched at startup, with the dialog fully open,
+  and after closing across all four launches. The first frame was visible before input. The final
+  image remained in scanout after a further 2.2 seconds without input.
+- Separately, 29 fixed-clock headless captures matched the parent byte for
+  byte on each of Vulkan and GLES. These include intermediate animation frames.
+- On the panel, a touch opened the dialog and a relative mouse clicked
+  Confirm. The next two touches sent only a press and release at the first
+  touch’s position. All three counter values matched the counter pixels from a
+  touch-only reference run.
+
+| Completed page-flip intervals after release | KMS parent mean | Stock Vulkan direct mean | Parent / direct fps |
+| --- | ---: | ---: | ---: |
+| Opening, 60 intervals per build | 50.0 ms | 46.7 ms | 20.0 / 21.4 |
+| Closing, 33 intervals per build | 49.0 ms | 41.9 ms | 20.4 / 23.9 |
+
+We read the active KMS framebuffer and recorded `drm_vblank_event_delivered`
+on the idle kiosk during motion. There were no events after each animation settled.
+The run order was direct, parent, parent, direct with four open/close cycles
+per launch. The table includes the last three cycles from each launch.
+The median interval was 50.0 ms in all four cases. During opening, direct
+presentation reduced the first two intervals of each warm transition to two
+refreshes. The remaining eight took three refreshes, as on the parent.
+The startup log reported 606 ms on each timed direct launch and 458–462 ms
+on the parent. VNC was disabled. The fork's [earlier near-60 Hz runs](frame-pacing.md)
+used a different app scene and additional renderer changes.
+
+## Fork implementations and earlier assessments
 
 | Change | Current implementation | Value to upstream | Work before general adoption |
 | --- | --- | --- | --- |
-| [Shader specialization](../host/ink/src/device/wgpu/programs.rs) | Eight fixed programs at startup and a general fallback. | Incorporated upstream in `b2a7e278c`. | Validate GLES mask parity on V3D and compare startup and frame time. |
-| [Direct output](../host/ink/src/device/wgpu/scanout.rs) | Present through a Vulkan DRM surface instead of reading every frame back to the CPU. | Very high: this follows the [Linux host's stated direction](../host/linux/src/display.rs). | Select it when available with an appropriate fallback; preserve pixel capture/VNC semantics and investigate the three presents currently used when attaching the display. The current [finish path](../host/painted/src/ink.rs) presents even for a pixel-only request on an attached painter. |
-| [GPU rotation](../host/linux/src/rotation.rs) | Upstream rotates the final image before either readback or scanout. Touch uses the same transform. | Incorporated upstream in `b2a7e278c`. | Exercise both presentation paths on rotated displays. |
+| [Shader specialization](../host/ink/src/device/wgpu/programs.rs) | Upstream compiles eight material programs at startup. The fork adds five material programs and a flat fill for the interior of large solid shapes. | The original eight landed in `b2a7e278c`. The additions are candidates for measurement on other GPUs. | Compare startup, frame times and pixel parity before expanding the fixed set. |
+| [Idle bitmap reuse](../host/painted/src/ink/images.rs) | An opt-in cache keeps textures for still-owned decodes up to 8 MiB or 64 idle entries per painter. | Repeated photos in a virtual list can skip uploading the pixels and rebuilding mips. | Upstream chose immediate retirement in `f4ba5552c`. Compare reuse and memory costs on another host before proposing a default. See the [fast-flick results](frame-pacing.md#fast-flicks-through-photographs). |
+| [Direct output](../host/ink/src/device/wgpu/scanout.rs) | The integrated fork uses upstream's Vulkan DRM surface, presentation IDs and completion waits. The host can mirror to VNC or repaint via ordinary KMS after a failed presentation. | Landed in upstream and replaced the fork's original direct path. | VNC capture and forced fallback on the physical Pi are open checks. |
+| [GPU rotation](../host/linux/src/rotation.rs) | The integrated build uses upstream's GPU rotation and absolute input mapping. The earlier fork fused rotation into its final presentation copy. | GPU rotation landed in `b2a7e278c` and works with upstream direct presentation. | Measure any future fused-copy candidate against the upstream host on the same workload. |
 | [GPU limits](../host/ink/src/device/wgpu.rs) | Use upstream `requested_limits` in Ink and [Vello](../host/painted/src/gpu.rs); clamp defaults to adapter capacities and validate renderer requirements. | Already incorporated upstream in `44395c82`. | Confirmed on Pi 4 with Ink/Vulkan, Ink/GLES and Vello/Vulkan; the fork uses the upstream implementation. |
-| [Split render/display devices](../vendor/wgpu-hal/src/vulkan/drm.rs) | Match the Pi's display connector to a different rendering device. | High beyond the Pi; also relevant to gfx-rs/wgpu. | Keep the dependency fix separate, verify device selection on other configurations and preserve the [vendor patch record](../vendor/wgpu-hal/EXACT-PATCHES.md). |
+| [Split render/display devices](../vendor/wgpu-hal/src/vulkan/drm.rs) | Match the Pi's display connector to a different rendering device. | Integrated in Exact’s vendored wgpu in `c75288253`; also relevant to gfx-rs/wgpu. | The integrated fork uses the upstream [vendor changes 18 and 19](../vendor/wgpu-hal/EXACT-PATCHES.md). |
 | [Shadow cache](../host/painted/src/ink/shadows.rs) | Raster eligible fixed geometry once, then reuse alpha with live position, color and opacity. | High: useful for repeated cards and moving dialogs. | Evaluate cache lifetime, changing geometry, allocation failure and first-use work. The current cache has a 16 MiB non-evicting budget and falls back to analytic drawing for uncached geometry after the budget is exhausted. |
 | [Outer shadow bands](../host/painted/src/ink/shadows.rs) | Draw the visible bands around the excluded border box. | Useful: reduces the area drawn for outer shadows. | Fix the extra combined-mask work with nested rounded clips or fractional rectangular clips, then measure broader scenes. |
 | [Display hatch activation](../host/painted/src/presenter/display_frame.rs) | Connect hatches when a successful display receipt activates the session, including when newer input is dirty. | Correctness fix: real display sessions can otherwise omit hatches that work under the headless agent. | Regression tests cover first display, one-time connection and a stale receipt after reload; the Pi direct-display QR fixture also reaches its next screen. |
@@ -28,7 +117,7 @@ upstream. The assessments are the fork's, not acceptance decisions by Exact's ma
 | [Touch cursor behavior](../host/linux/src/display/pointer.rs) | Hide the cursor for touch; reveal it on mouse movement. | High, and relatively independent of renderer changes. | Build on the existing [Pointing and touch_only classification](../host/painted/src/presenter/device.rs) to distinguish direct touch from pen/touchpad reports, and handle initial mouse visibility. |
 | [Dialog backdrop fade](../host/painted/src/paint/alert.rs) | Under `KIOSK_DIALOG_FADE=1`, replace the scrim with black at `72% × presented dialog opacity`. | Low for this patch as written; useful as a backdrop styling/animation use case. | Put the application's color, opacity and transition choices at the authoring boundary. The fixed black 72% value exists to match the comparison app. |
 | Virtual-list comparison | An external app combines images, SVG, Japanese text, rounded corners, shadows and append batches using Exact's existing virtual list. | High as a benchmark or sample, not as a new list implementation. | Publish a small self-contained fixture with matching input and capture procedures. The list and virtualization primitives already belong to upstream. |
-| [FPS overlay](../host/painted/src/paint/kiosk.rs) and [timing](../host/linux/src/display.rs) | Show submitted-frame rate and log timing for local comparisons. | Useful measurements; low value for the dedicated overlay as written. | Use existing performance tooling where possible. Actual presented FPS comes from DRM page-flip completion events, not this counter. |
+| [FPS overlay](../host/painted/src/paint/kiosk.rs) and [timing](../host/linux/src/display/event_loop.rs) | Show submitted-frame rate and log timing for local comparisons. | Useful measurements; low value for the dedicated overlay as written. | Use existing performance tooling where possible. Actual presented FPS comes from DRM page-flip completion events, not this counter. |
 
 The app owns dialog translation, opacity, duration and easing. The backdrop
 override above is the host-side exception, not the implementation of the app's
@@ -47,8 +136,7 @@ the camera, touch-scroll and shadow-cache experiments.
   distinguishes the useful shader diagnosis from the cost of open-ended,
   first-use pipelines. It also names direct presentation as the planned Linux
   direction, asks for capture/fallback cleanup, and points to the existing
-  GPU-limit selection code. The table's proposed changes address that feedback;
-  they are not an agreed implementation plan.
+  GPU-limit selection code. The status table above records subsequent decisions.
 - The [two general early returns were accepted](https://github.com/expo/exact/issues/145#issuecomment-6799709624)
   in [`11043997`](https://github.com/expo/exact/commit/110439978ef35965e79e5842986413fed19a79a7): full coverage deep inside a shape, and skipping the shadow
   integral under a fully covered border box. Upstream rewrote the guards and
@@ -56,7 +144,7 @@ the camera, touch-scroll and shadow-cache experiments.
   already integrated, rather than pending local proposals.
 - The fork's [Pi retest](https://github.com/expo/exact/issues/145#issuecomment-6814656945)
   confirms the device-creation failure without the limits adjustment and the
-  remaining register spills after the early returns. Specialization is still
+  remaining register spills after the early returns. At the time of that retest, specialization was
   a separate local experiment.
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) currently directs contributions through

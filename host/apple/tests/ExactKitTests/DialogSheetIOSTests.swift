@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactDialogs
 
 /// LLP 1115.000 D11.5, the other half of LLP 1115 D6's split by shape: a
 /// `dialog` whose rows are a confirmation's is the platform's alert, and any

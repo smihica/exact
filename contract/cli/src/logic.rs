@@ -391,6 +391,11 @@ pub(crate) fn painted_launch_parts(
     })
     .to_string();
     let (mut mods, mut calls) = (String::new(), String::new());
+    let compat = if platform == "android" {
+        "exact_compat()"
+    } else {
+        "COMPAT"
+    };
     let names = match manifest.json.get("launch") {
         Some(value) => value
             .as_array()
@@ -436,7 +441,7 @@ pub(crate) fn painted_launch_parts(
             file.canonicalize().map_err(|e| e.to_string())?
         ));
         calls.push_str(&format!(
-            "    {ident}::launch(exact_painted::journal::LaunchContext::new({name:?}, {config:?}, {app:?}, COMPAT));\n"
+            "    {ident}::launch(exact_painted::journal::LaunchContext::new({name:?}, {config:?}, {app:?}, {compat}));\n"
         ));
     }
     if calls.is_empty() {
@@ -546,8 +551,9 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
     // input is the media picker, `auth` below is the sign-in sheet, and its
     // numerals roll in the runtime's text (LLP 1077 D15), its date and
     // time controls are the browser's own (LLP 1115.001.000 D2), and it
-    // shows no tips (LLP 1035.006.000 D4). The native roster's entries are
-    // never the web's.
+    // shows no tips (LLP 1035.006.000 D4); a drag out of the page is the
+    // browser's own, its data in the page's glue (LLP 1094.000 D6). The
+    // native roster's entries are never the web's.
     let names: Vec<&str> = uses
         .iter()
         .filter(|c| !Uses::NATIVE.has(*c))
@@ -564,6 +570,7 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
                     | Capability::Dates
                     | Capability::Sqlite
                     | Capability::Tips
+                    | Capability::DragOut
             )
         })
         .map(|c| c.name())
@@ -642,7 +649,12 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
             | Capability::WebViews
             | Capability::Sound
             | Capability::Midi
-            | Capability::Navigation => {}
+            | Capability::Navigation
+            | Capability::TextSelection
+            | Capability::Widgets
+            | Capability::ContentIndex
+            | Capability::Dialogs
+            | Capability::DragOut => {}
         }
     }
     entry
@@ -673,6 +685,7 @@ pub fn apple_linked(uses: exact_runner::Uses, host: &str) -> String {
         (Capability::Presence, "presence_exports"),
         (Capability::Svg, "svg_exports"),
         (Capability::ContentRegions, "content_region_exports"),
+        (Capability::Surfaces, "canvas_exports"),
     ] {
         if uses.has(capability) {
             entry.push_str(&format!("{apple}::{group}!();\n"));
@@ -896,6 +909,11 @@ mod tests {
             regions.contains("::exact_apple::content_region_exports!();"),
             "{regions}"
         );
+        let canvas = super::apple_linked(Uses::NONE.with(Capability::Surfaces), "exact_apple");
+        assert!(
+            canvas.contains("::exact_apple::canvas_exports!();"),
+            "{canvas}"
+        );
         let markdown = super::apple_linked(Uses::NONE.with(Capability::Markdown), "exact_apple");
         assert!(
             markdown.contains("::exact_apple::markup_exports!();"),
@@ -963,6 +981,7 @@ mod launch_tests {
         let entry = app.generate(json!(["observe"])).unwrap();
         assert!(entry.contains("/observe/android/launch.rs"), "{entry}");
         assert!(entry.contains("launch_observe::launch("), "{entry}");
+        assert!(entry.contains(", exact_compat()));"), "{entry}");
         assert!(entry.contains("projectId\\\":\\\"local"), "{entry}");
         assert!(entry.contains("test.launch"), "{entry}");
         let second = app.0.join("modules/second/android");
@@ -1003,6 +1022,7 @@ mod launch_tests {
             declared: true,
         };
         let linux = super::painted_launch_parts(&app.0, &manifest, "linux").unwrap();
+        assert!(linux.contains(", COMPAT));"), "{linux}");
         assert!(linux.contains("/modules/observe/linux/launch.rs"));
         std::fs::remove_dir_all(own).unwrap();
         assert!(super::painted_launch_parts(&app.0, &manifest, "linux")

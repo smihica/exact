@@ -5,9 +5,9 @@
 //! here they cross by `Native.agent`, on the thread that holds the host,
 //! from a socket the shell opens for adb (`host/android`, `AgentDrive`).
 //!
-//! Nothing is a second protocol: [`CanvasHost::agent`] hands the line to
-//! [`crate::agent::handle`]. What this host adds is what that handler
-//! assumes of a host with no display and this one has:
+//! [`CanvasHost::agent`] uses the shared agent handlers. A live request
+//! leaves painting to the reader's normal turn, which publishes layer
+//! recordings with their tracks. In a seekable drive:
 //!
 //! - **Its paints reach the reader.** The handler paints as it goes (a
 //!   `clock` may paint several times), each paint a stream that defines
@@ -18,35 +18,32 @@
 //!   what its last displayed frame showed, and the handler's own paints
 //!   are not displayed frames. After each request the host takes one
 //!   display turn, so the next request finds what this one made.
-//! - **The clock is the driver's.** From the first request the host's
-//!   turns run at the runner's clock, which only a `clock` request moves
-//!   ([`clock`]): no timer fires and no motion advances between requests.
-//!   A reply that lands between them still commits when the reader's turn
-//!   finds it, where the stdio carrier commits it with the next request.
+//! - **The clock belongs to the driver by default.** Only a `clock` request
+//!   moves the runner's clock. With `--live`, the display owns time from
+//!   boot and the reader plays its layers as it does in an ordinary launch.
 //!
 //! A frame capture's lease (`perf frames capture start`, `perf frames
 //! live`) lends the clock to the display until it ends ([`lend`]): its
 //! frames are measured as they come (LLP 1079.000 §7.1, `canvas/frames.rs`),
 //! and a request that would take the clock back is refused meanwhile.
 //!
-//! What the reader plays by itself is outside that clock: a layer it
-//! animates (a drive launches with `lower=0`, so the engine samples
-//! every one), a fling, the keyboard's slide. A `screenshot` is not
-//! answered here: the picture is the device's, and the carrier takes it.
+//! A `screenshot` is answered by the carrier, which takes the device's picture.
 //!
 //! Only a launch that is a driver's is answered: one whose environment
-//! says `EXACT_AGENT=1`, as the stdio carrier's does. A production bake
+//! says `EXACT_AGENT=1` or `EXACT_AGENT=live`. A production bake
 //! drops that variable before anything reads it (LLP 1069.007 D2), so it
 //! answers no request whatever its shell attaches.
 
 use super::{CanvasHost, FINISHED};
+use crate::agent::{handle, handle_for_window};
+use exact_runner::agent::carried;
 use exact_runner::json::{error, field_bool, field_str};
 use exact_runner::DataSource;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// A driver has asked: the host's turns run at the runner's clock.
+/// Keep the driver's streams in order while it seeks.
 static DRIVEN: AtomicBool = AtomicBool::new(false);
-/// A driver's launch: the runner's clock from the boot, before any request.
+/// A seekable drive holds the runner's clock from boot.
 static SEEK: AtomicBool = AtomicBool::new(false);
 
 /// A frame capture's lease lent the display the clock ([`lend`]), and how far
@@ -99,9 +96,14 @@ pub(super) fn unlend<D: DataSource>(p: &mut crate::presenter::Presenter<D>) {
     }
 }
 
-/// Whether a driver drives the reader (its first request has come).
+/// Whether the recorder queues every stream for the driver.
 pub(crate) fn driven() -> bool {
     DRIVEN.load(Ordering::Relaxed)
+}
+
+/// Whether the drive launched with a seekable clock, even while it is lent.
+pub(super) fn seekable() -> bool {
+    SEEK.load(Ordering::Relaxed)
 }
 
 /// Who owns time from the boot. A driver's launch (`EXACT_AGENT=1`, the
@@ -115,8 +117,9 @@ pub(crate) fn own_time<D: DataSource + Default>(
     p: &mut crate::presenter::Presenter<D>,
     started: std::time::Instant,
 ) {
-    if std::env::var("EXACT_AGENT").as_deref() == Ok("1") {
-        SEEK.store(true, Ordering::Relaxed);
+    let seek = std::env::var("EXACT_AGENT").as_deref() == Ok("1");
+    SEEK.store(seek, Ordering::Relaxed);
+    if seek {
         super::clock::set(super::clock::Clock::Held(p.host().now()));
     } else {
         p.set_live_clock(Some(crate::presenter::wall_since(started)));
@@ -130,7 +133,7 @@ pub(crate) fn own_time<D: DataSource + Default>(
 /// run at the driver's clock steps, as virtual frames, not once per display
 /// refresh at an unmoved time.
 pub(super) fn clock<D: DataSource>(p: &crate::presenter::Presenter<D>) -> Option<f64> {
-    ((driven() || SEEK.load(Ordering::Relaxed)) && !lent()).then(|| p.host().now())
+    (seekable() && !lent()).then(|| p.host().now())
 }
 
 /// A recording finished over `older`, which the reader never took. With a
@@ -168,11 +171,11 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// One request of the agent API, answered: a JSON line in, a JSON line
     /// out. `{"op":"ready"}` is the line the stdio carrier writes first.
     pub fn agent(&mut self, line: &str) -> String {
-        if std::env::var("EXACT_AGENT").as_deref() != Ok("1") {
-            return error("this launch is not a driver's: EXACT_AGENT is not 1");
+        if !carried() {
+            return error("this launch does not carry the agent");
         }
-        // The driver's clock owns time from its first request (the timers RFC, D1)
-        if !DRIVEN.swap(true, Ordering::Relaxed) {
+        let live = !seekable();
+        if !live && !DRIVEN.swap(true, Ordering::Relaxed) {
             self.p.set_live_clock(None);
         }
         match field_str(line, "op").as_deref() {
@@ -190,7 +193,11 @@ impl<D: DataSource + Default> CanvasHost<D> {
                     return reply;
                 }
             }
-            // An input's landing takes nothing from a lent clock; any other clock request would take it back.
+            // An input's landing leaves the display's clock running.
+            Some("clock") if live && !field_bool(line, "land") => {
+                return serde_json::json!({"error": "--live runs the app on the wall clock, which the driver does not hold. Let real time pass between operations (perf frames live <ms> waits and measures), or drive without --live to move the clock.",
+                    "code": "live-clock"}).to_string();
+            }
             Some("clock") if lent() && !field_bool(line, "land") => {
                 return serde_json::json!({"error": "Live frame capture holds the display's clock. Stop it with perf frames capture stop before using clock, held-clock or virtual-film operations.",
                     "code": "frame-health-clock-takeover"}).to_string();
@@ -201,18 +208,26 @@ impl<D: DataSource + Default> CanvasHost<D> {
             .ok()
             .filter(|r| r["op"] == "tap" && r.get("scrollDrag").is_some());
         let reply = match scroll {
-            Some(request) => self
-                .p
-                .agent_scroll_drag(&request)
-                .unwrap_or_else(|e| error(&e)),
-            None => crate::agent::handle(&mut self.p, line),
+            Some(request) => {
+                if live && request["probe"] != true {
+                    self.p.tick(self.now());
+                }
+                self.p
+                    .agent_scroll_drag(&request)
+                    .unwrap_or_else(|e| error(&e))
+            }
+            None if live => handle_for_window(&mut self.p, line),
+            None => handle(&mut self.p, line),
         };
+        if live {
+            return reply;
+        }
         // One display turn, a paint whatever changed: what the request made
         // is admitted to the next one, and its stream follows the handler's.
         self.p.repaint();
         self.force = true;
         let now = self.now();
-        let turn = self.frame_held(now);
+        let turn = self.frame_held(now, false);
         // The handler's last stream, when the turn painted nothing over it.
         kept(FINISHED.with(|f| f.borrow_mut().take()));
         kept(turn);

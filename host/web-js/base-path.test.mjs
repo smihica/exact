@@ -126,6 +126,8 @@ engineTest.chromium('build, request and cached pages, generation assets and inst
       page.on('pageerror', error => errors.push(error.message)); page.on('request', request => requests.push(new URL(request.url()).pathname));
       await page.goto(origin + '/app/item'); await page.getByTestId('name-item').waitFor();
       await page.getByTestId('replace-item').click(); await page.waitForURL('**/app/kept?q=1#part');
+      // The page at its own location under the mount is adopted (LLP 1048.000 D6)
+      expect(await page.evaluate(() => exact.journal.filter(l => / document: | adopted the document$/.test(l)).map(l => l.slice(l.indexOf(' ') + 1)))).toEqual(['adopted the document']);
       await page.getByTestId('back-kept').click(); await page.waitForURL('**/app/');
       await page.getByTestId('item-home').click(); await page.waitForURL('**/app/item');
       await page.goBack(); await page.waitForURL('**/app/');
@@ -221,7 +223,7 @@ test('an explicit root base produces exactly the default build bytes', async () 
 engineTest.chromium('Shelf deep links, path links and pushes work under /app/, and an outside location draws notfound', async () => {
   const dir = workspace(); let browser;
   try {
-    for (const name of ['app.json', 'app.contract', 'app.ts']) cpSync(resolve(root, 'apps/shelf', name), resolve(dir, name));
+    for (const name of ['app.json', 'app.contract', 'app.ts', 'assets']) cpSync(resolve(root, 'apps/shelf', name), resolve(dir, name), { recursive: true });
     const app = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')); app.host.web.base = '/app/'; delete app.preload;
     save(dir, 'app.json', JSON.stringify(app));
     const made = await build(dir, ['--render', 'none']); expect(made.status, made.output).toBe(0);

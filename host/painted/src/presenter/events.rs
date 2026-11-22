@@ -89,6 +89,36 @@ impl<D: DataSource> Presenter<D> {
         true
     }
 
+    /// A document finished in the iframe for this session and allocation.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn reader_frame_loaded(
+        &mut self,
+        id: ViewId,
+        key: exact_kernel::NodeKey,
+        session: u64,
+    ) -> bool {
+        if session != self.brush.native_session
+            || !self
+                .host
+                .kernel()
+                .node(id)
+                .is_some_and(|node| node.node_type == NodeType::WebView && node.key == key)
+            || !self
+                .host
+                .runner()
+                .handlers_of(id)
+                .contains(&EventKind::Load)
+        {
+            return false;
+        }
+        let dispatched = self.host.dispatch_now(id, Event::Load);
+        let committed = self.after_commit();
+        if let Some(error) = dispatched.or(committed) {
+            self.host.log(error);
+        }
+        true
+    }
+
     /// A restart with carried state (a dev reload, a delivered update)
     /// replaces the tree. Focus follows the focused node's place in the
     /// runner's tree — its index among its siblings at each level, and its
@@ -227,7 +257,7 @@ impl<D: DataSource> Presenter<D> {
         self.disabled_blur.push(id);
         let now = self.host.now();
         // Every event first, then one servicing, as a removed focus's path.
-        let (sent, mut error) = self.move_focus_serviced(None, now, false, None);
+        let (sent, mut error) = self.move_focus_serviced(None, now, false, None, true);
         if sent {
             error = error.or(self.sync_commit());
         }
@@ -383,7 +413,7 @@ impl<D: DataSource> Presenter<D> {
                     self.host.log(format!("focus \"{name}\" refused: {reason}"));
                     return None;
                 }
-                if let Some(e) = self.set_focus(Some(id), self.host.now()) {
+                if let Some(e) = self.focus_and_reveal(id) {
                     eprintln!("exact: {e}");
                 }
                 return (self.focus == Some(id)).then_some(id);
@@ -393,12 +423,26 @@ impl<D: DataSource> Presenter<D> {
         None
     }
 
+    pub(super) fn focus_and_reveal(&mut self, id: ViewId) -> Option<String> {
+        let before = self.focus;
+        let error = self.set_focus(Some(id), self.host.now());
+        if before != Some(id) && self.focus == Some(id) {
+            if self.display.allows(self.host.kernel(), id) {
+                self.keep_in_view(id, reveal::Cause::FocusMove);
+            } else {
+                self.focus_reveal = self.host.kernel().node(id).map(|n| n.key);
+            }
+        }
+        error
+    }
+
     /// `id` as the focus no ring marks, unless it is a text field, which
-    /// matches `:focus-visible` however it was focused.
+    /// matches `:focus-visible` however it was focused, as in Chrome. In
+    /// Android's touch mode a text field too shows no ring (LLP 1115.001 D7.6).
     pub(crate) fn unringed(&self, id: ViewId) -> Option<ViewId> {
         let field =
             (self.host.kernel().node(id)).is_some_and(|n| n.node_type == NodeType::TextInput);
-        (!field).then_some(id)
+        (!field || self.brush.touch_mode).then_some(id)
     }
 
     /// A script focus follows input modality. Chrome also carries a visible
@@ -416,7 +460,7 @@ impl<D: DataSource> Presenter<D> {
     /// Move the focus in DOM order, with both bubbling paths fixed before an
     /// action on either path can change the tree.
     pub(crate) fn set_focus(&mut self, next: Option<ViewId>, now_ms: f64) -> Option<String> {
-        self.move_focus_serviced(next, now_ms, true, None).1
+        self.move_focus_serviced(next, now_ms, true, None, true).1
     }
 
     pub(crate) fn set_focus_ring(
@@ -425,7 +469,21 @@ impl<D: DataSource> Presenter<D> {
         now_ms: f64,
         ring: bool,
     ) -> Option<String> {
-        self.move_focus_serviced(next, now_ms, true, Some(ring)).1
+        self.move_focus_serviced(next, now_ms, true, Some(ring), true)
+            .1
+    }
+
+    /// Pointer focus onto a painted field defers caret reveal until `press_field`
+    /// places the caret at the clicked point, so a horizontally scrolled field
+    /// does not jump to its previous caret before hit-testing.
+    pub(crate) fn set_focus_press(
+        &mut self,
+        next: Option<ViewId>,
+        now_ms: f64,
+        reveal: bool,
+    ) -> Option<String> {
+        self.move_focus_serviced(next, now_ms, true, Some(false), reveal)
+            .1
     }
 
     /// [`Self::set_focus`]; `service` false leaves its handlers' commits to the
@@ -438,6 +496,7 @@ impl<D: DataSource> Presenter<D> {
         now_ms: f64,
         service: bool,
         ring: Option<bool>,
+        reveal: bool,
     ) -> (bool, Option<String>) {
         if next.is_some_and(|id| !self.alert_allows(id)) {
             return (
@@ -474,7 +533,10 @@ impl<D: DataSource> Presenter<D> {
             .map(|id| self.host.runner().focus_bubble(id, previous, true))
             .unwrap_or_default();
         self.focus = next;
-        self.field_reveal = true;
+        self.focus_reveal = None;
+        if reveal {
+            self.field_reveal = true;
+        }
         if next.is_some() {
             self.pads_follow_focus();
         }
@@ -729,6 +791,7 @@ impl<D: DataSource> Presenter<D> {
         self.hover_point = at;
         let mut under = Vec::new();
         let hit = at.and_then(|(x, y)| self.hit(x, y));
+        self.refresh_scrollbar_hover();
         // Its `:hover` looks follow the same point, a resting one's too (LLP 1121 D8).
         self.refresh_looks(Some(hit));
         let mut node = hit;
@@ -932,7 +995,11 @@ impl<D: DataSource> Presenter<D> {
         ))
     }
 
-    fn pointer_target(&mut self, id: ViewId, at: Option<(f32, f32)>) -> Result<(f32, f32), String> {
+    pub(super) fn pointer_target(
+        &mut self,
+        id: ViewId,
+        at: Option<(f32, f32)>,
+    ) -> Result<(f32, f32), String> {
         self.boxes();
         if self.host.route_visibility(id).1 || self.placement_hidden(id) {
             return Err(format!("view {id} is hidden or inert"));

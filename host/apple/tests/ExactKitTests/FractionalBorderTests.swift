@@ -1,6 +1,7 @@
 import XCTest
 import CoreGraphics
 import ExactCore
+import ExactSnapshot
 #if os(macOS)
 import AppKit
 #else

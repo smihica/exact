@@ -125,9 +125,11 @@ impl Painter {
         let mut picture: Box<dyn Backend> =
             Box::new(crate::raster::Raster::transparent_at((x0, y0)));
         picture.begin(cw / s, ch / s, s);
-        let frame = std::mem::replace(&mut self.backend, picture);
+        let frame = self.replace_picture_backend(walk.scene.kernel, picture);
         self.content(walk, node, rect, ts, offset, clip_rect);
-        let painted = std::mem::replace(&mut self.backend, frame).finish();
+        let painted = self
+            .restore_picture_backend(walk.scene.kernel, frame)
+            .finish();
         let Ok(mut pixels) = painted else {
             return;
         };

@@ -188,6 +188,17 @@ extension NavigationHost {
             }
             return
         }
+        #if os(iOS)
+        // The app's container holds no accessory of Exact's, and the hatch hears the end of Exact's after its last
+        // write; no pass claims one there meanwhile, and the block may go back as soon as the row is back home
+        tabAccessoryHandingOff = true
+        releaseTabAccessory(animated: false, publish: false)
+        // The release's UIKit calls reach only the covers, which retire no tabs; the handoff ends if they ever do
+        guard tabController === container, self.container === root else {
+            tabAccessoryHandingOff = false
+            return
+        }
+        #endif
         natives.tabsHatch(container, event: 1)
         // Release More with Exact's container. The routes UIKit moved into it go first to their tab's own controller,
         // which the app's container now shows; a plain tab More showed is the app's container's already
@@ -206,6 +217,10 @@ extension NavigationHost {
         tabController = nil
         tabOwner = owned
         mount(owned, in: parent, at: root)
+        #if os(iOS)
+        tabAccessoryHandingOff = false
+        #endif
+        presenter.owners.publish()
         if heldInMore { syncNextTurn() }
         presenter.session?.log("hatch: the app's \(type(of: owned)) holds the tabs; the content moved after the first frame")
     }
@@ -218,7 +233,9 @@ extension NavigationHost {
     /// `text`, as the bar's item presses it.
     /// Queued on the hatch act queue, it runs on a later turn and only in the
     /// term of the container that sent it. False when it cannot be queued:
-    /// Exact's own container, text that is no URL, a full queue.
+    /// Exact's own container, a URL that is empty, over 64 KB or that
+    /// `URL(string:)` does not parse (such as one with a malformed host), a
+    /// full queue. Its refusals name a URL as `urlName` does.
     func tabIntent(_ kind: UInt32, _ text: String) -> Bool {
         guard tabController == nil, tabOwner != nil else { return false }
         let term = tabOwnerTerm
@@ -234,10 +251,12 @@ extension NavigationHost {
                 }
             }
         case 1:
+            let call = "open(\(Self.urlName(text)))", bytes = text.utf8.count
+            if presenter.elements.refusedOverBound("tabs", call, bytes: bytes) { return false }
             guard !text.isEmpty, let url = URL(string: text) else { return false }
-            return presenter.elements.later("tabs", "open(\(text))", bytes: text.utf8.count) { [weak self] in
+            return presenter.elements.later("tabs", call, bytes: bytes) { [weak self] in
                 guard let self, inTerm(term), let session = presenter.session else { return }
-                if !session.openURL(url) { session.log("hatch tabs: open(\(text)) refused: the session did not take it") }
+                if !session.openURL(url) { session.log("hatch tabs: \(call) refused: the session did not take it") }
             }
         case 2:
             guard let index = Int(text) else { return false }
@@ -254,6 +273,17 @@ extension NavigationHost {
         }
     }
 
+    /// A URL as an intent's refusal names it: without its query and
+    /// fragment, where tokens usually travel, as an image's source is named
+    /// (a path and user info stay as given); one that begins with them by
+    /// its `?` or `#`; and one whose part before them is over 64 KB by its
+    /// whole length. `ExactTabContents.open` names it the same way.
+    static func urlName(_ text: String) -> String {
+        let cut = sourceWithoutQuery(text)
+        if cut.utf8.count > hatchTextBytes { return "\(text.utf8.count) bytes" }
+        return cut.isEmpty ? text.unicodeScalars.first.map(String.init) ?? "" : cut
+    }
+
     private func backRefused(_ why: String) { presenter.session?.log("hatch tabs: back() refused: \(why)") }
 
     /// Whether the container that sent an intent in `term` still holds the
@@ -267,36 +297,6 @@ extension NavigationHost {
     private func hideTabBar(_ container: UITabBarController) {
         if #available(iOS 18.0, tvOS 18.0, *) { container.setTabBarHidden(true, animated: false) } else { container.tabBar.isHidden = true }
         (container as? TabController)?.syncBarAccessibility()
-    }
-
-    /// Rows below the panels stay in CSS flow while UIKit's container fills the page: the root's
-    /// children and, within each child that holds panels, the panels' siblings, at any depth.
-    /// The highest top of those rows, rather than the hidden native bar, bounds the routes'
-    /// bottom safe area. `rows` are those of them that are the root's children, which
-    /// `clearBesideRoutes` paints over the container.
-    func rowsBelowTabs(in area: CGRect, routes: [CGRect], skipping owned: Set<UInt32>, hidden: Bool? = nil) -> (bottom: CGFloat, rows: [NodeView]) {
-        guard !ExactEnv.authoredChrome, let tabs = tabController, tabOwner === tabs, let root = container, !routes.isEmpty else { return (0, []) }
-        if #available(iOS 18.0, tvOS 18.0, *) {
-            guard hidden ?? tabs.isTabBarHidden else { return (0, []) }
-        } else if !(hidden ?? tabs.tabBar.isHidden) { return (0, []) }
-        let panels = tabPanels.compactMap { presenter.views[$0] }
-        var bottom: CGFloat = 0, rows: [NodeView] = []
-        func visit(_ children: [NodeView]) {
-            let holding = children.filter { child in panels.contains { $0 === child || $0.isDescendant(of: child) } }
-            guard let end = holding.map({ $0.convert($0.bounds, to: root).maxY }).max() else { return }
-            for child in children where !holding.contains(child) && !owned.contains(child.id) && RouteGeometry.inFlow(child) && !child.isHidden {
-                let box = child.convert(child.bounds, to: root)
-                guard !box.isEmpty, box.intersects(area), box.minY >= end - 0.5,
-                      routes.contains(where: { $0.minX < box.maxX && $0.maxX > box.minX }) else { continue }
-                bottom = max(bottom, area.maxY - box.minY)
-                if child.superview === ownerMount(root) { rows.append(child) }
-            }
-            for branch in holding where !panels.contains(branch) {
-                visit(branch.container.subviews.compactMap { $0 as? NodeView })
-            }
-        }
-        visit(ownerMount(root).subviews.compactMap { $0 as? NodeView })
-        return (bottom, rows)
     }
 
     /// Swap a replacement row's clearance with the native bar in one layout.
@@ -318,19 +318,47 @@ extension NavigationHost {
         (tabs as? TabController)?.syncBarAccessibility()
     }
 
-    /// Before installing: a root that gains, loses or changes its tabs gets
-    /// its containers again (the router's stacks are untouched).
+    /// Before installing: a root that gains, loses or changes its tabs, or a
+    /// stack that starts or stops splitting (its list's rows came later, or
+    /// its root says `navigationSplit="none"` now; LLP 1127 D2), gets its
+    /// containers again (the router's stacks are untouched). While the
+    /// runner cannot say whether the stack splits (a sync inside a callback
+    /// it waits on), the containers stay, and the stack is asked again on
+    /// the main queue's next turn.
     func reshape(_ p: Projection) {
         let panels = p.tabs?.panels.map(\.id) ?? []
-        guard primaryOwner != nil, panels != tabPanels || builtTabsChanged(p) else { return }
-        presenter.session?.log("navigation: the tabs changed; the containers are built again")
-        if tabOwner != nil { retireTabs() } else if let nav = primaryNavigation {
+        guard primaryOwner != nil else { return }
+        let tabsChanged = panels != tabPanels || builtTabsChanged(p)
+        var startsOrStops = false
+        if !tabsChanged, p.tabs == nil {
+            guard let rule = splitRule(p.chosen.first) else { return askSplitNextTurn() }
+            if let list = rule?.list { split?.listNode = list }
+            split?.rule = rule
+            startsOrStops = (rule != nil) != (split != nil)
+        }
+        guard tabsChanged || startsOrStops else { return }
+        presenter.session?.log(tabsChanged ? "navigation: the tabs changed; the containers are built again"
+            : "navigation: the stack \(split == nil ? "splits" : "no longer splits"); its containers are built again")
+        if tabOwner != nil { retireTabs() } else if split != nil { retireSplit(releasing: true) } else if let nav = primaryNavigation {
             release(nav)
             nav.willMove(toParent: nil)
             nav.view.removeFromSuperview()
             nav.removeFromParent()
         }
         primaryNavigation = nil
+    }
+
+    /// One sync on the main queue's next turn, which asks the runner again
+    /// whether the stack splits (`reshape`); a turn already owed reads the
+    /// tree as it is then, so a second asks nothing more.
+    func askSplitNextTurn() {
+        guard !splitAskOwed else { return }
+        splitAskOwed = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            splitAskOwed = false
+            resync()
+        }
     }
 
     /// Each batch: every other tab's stack, the selected tab, its items.
@@ -443,8 +471,10 @@ extension NavigationHost {
             // Title the tab's controller, which titles its item and its navigation item (`UIViewController.title`):
             // More's bar shows a plain tab's when More pushes the tab.
             nav.title = face.title
-            item.image = image
-            item.selectedImage = face.base.flatMap(TabFace.filled) ?? image
+            // UIKit's own tab bar draws the `.fill` variant selected or not.
+            let filled = face.base.flatMap(TabFace.filled)
+            item.image = filled ?? image
+            item.selectedImage = filled ?? image
             item.accessibilityIdentifier = ids[index]
             item.isEnabled = !face.disabled
             if face.disabled || face.accessibilityDisabled { item.accessibilityTraits.insert(.notEnabled) }
@@ -683,7 +713,13 @@ extension NavigationHost {
             tapping = nil
             return reportCovers()
         }
-        guard let index = tabIndex(of: tabs.selectedViewController) else { return }
+        guard let index = tabIndex(of: tabs.selectedViewController) else {
+            // More's list now shows inside the container, where no route is shown: report the covers before its first
+            // frame, which put back what was lifted over the panels (LLP 1083.000 D4); More's `didShow` reports them
+            // when it pops to its list
+            if let more, tabs.selectedViewController === more { reportCovers() }
+            return
+        }
         if index == routerTab, screen == nil, !popped { return refollowFloatingBar() }
         guard let tab = authoredTab(index) else { return }
         let again = index == routerTab
@@ -813,6 +849,13 @@ extension NavigationHost {
     /// What holds the tabs goes: its stacks are retired, the authored
     /// tablist paints again.
     func retireTabs() {
+        projectSidebarFooter(nil)
+        #if os(iOS)
+        // The retiring container shows no accessory again, whatever UIKit calls back during the release
+        tabAccessoryHandingOff = true
+        releaseTabAccessory(animated: false)
+        #endif
+        siblings.putAllBack()
         // The tablist's hold on the bar goes with its container (§3.7).
         tablistRoot = nil
         tablistOwed = nil
@@ -823,6 +866,10 @@ extension NavigationHost {
         releaseMore()
         if tabsHatched, tabController != nil { presenter.session?.natives.tabsHatch(tabController, event: 1) }
         if tabController == nil, tabOwner != nil { presenter.session?.natives.tabsHatch(nil, event: 3) }
+        // Let the selected tab's stack, which `primaryNavigation` names while there are tabs, go with its container,
+        // as the other tabs' stacks do: until a projection installs a new primary owner, `fitOwner` has none to take
+        // out of the retired container
+        if tabOwner != nil { primaryNavigation = nil }
         // Leave the slot of a container the app owns as it is; Exact's own container's is emptied as
         // `tabController` changes
         if let holder = tabOwner {
@@ -832,6 +879,9 @@ extension NavigationHost {
         }
         tabController = nil
         tabOwner = nil
+        #if os(iOS)
+        tabAccessoryHandingOff = false
+        #endif
         builtTabs = []
         tabsHatched = false
         tabContainerAsked = false
@@ -847,8 +897,9 @@ extension NavigationHost {
     }
 
     /// After a batch: the projection, unless the batch only moved a list's
-    /// rows and nothing is owed; then what presentations inherit and the
-    /// authored tablist's covers.
+    /// rows and nothing is owed; then what presentations inherit, the
+    /// authored tablist's covers, and, while the tab bar shows an accessory or
+    /// the tablist names one, its pass once the batch ends.
     func batchApplied(_ batch: Batch, rowsOnly: Bool) {
         if !rowsOnly || syncOwed { sync(batch) }
         else if batch.ops.isEmpty {
@@ -857,6 +908,13 @@ extension NavigationHost {
         }
         presenter.modalHost.inheritFromAncestors()
         followAuthoredTablist()
+        #if os(iOS)
+        // A batch that projects nothing (a scroller's rows, a pane given back) can change the accessory's authored
+        // ancestors or free a named element another host held, and no picture drawn for a batch outlives it: while
+        // an accessory is claimed or named, unless the covers already owe a pass, one runs once the batch ends
+        let named = container.flatMap { presenter.rootTabs[$0.id]?.accessory } != nil
+        if tabAccessory != nil || named, !tabAccessoryOwed { presenter.afterBatch { [weak self] in self?.projectTabAccessory() } }
+        #endif
     }
 
     /// The authored tablist moved or changed size since its covers were
@@ -869,6 +927,101 @@ extension NavigationHost {
         guard tablistAppearanceNone, !syncing, let view = presenter.session?.view,
               let list = adoptedTablist.flatMap({ presenter.views[$0] }) else { return }
         if list.convert(list.bounds, to: view) != measuredTablist { reportCovers() }
+    }
+
+    /// A footer accompanies the root's tabs only while UIKit owns their presentation (LLP 1115.002 item 5).
+    func sidebarFooter() -> NodeView? {
+        guard [.phone, .pad].contains(UIDevice.current.userInterfaceIdiom), let tabs = tabController, tabOwner === tabs,
+              let root = container, let shape = presenter.rootTabs[root.id], let footer = shape.footer,
+              let list = presenter.views[shape.tablist], adopts(tablist: list) else { return nil }
+        return presenter.views[footer]
+    }
+
+    func projectSidebarFooter(_ node: NodeView?) {
+        #if os(iOS)
+        if #available(iOS 18.0, *), let tabs = tabController, tabs.mode == .tabSidebar, let node {
+            hideSidebarFooter(nil)
+            if sidebarFooterPane?.node !== node || sidebarFooterPane?.node.superview !== sidebarFooterPane {
+                releaseSidebarPane()
+                guard let home = node.authoredLine.first(where: { $0 !== node }) else { return }
+                let pane = MeasuredPaneView(node: node, room: { [weak tabs] in tabs?.view.bounds.size ?? .zero })
+                sidebarFooterPane = pane
+                sidebarFooterHome = home
+                pane.addSubview(node)
+                pane.layoutChanged = { [weak presenter] in presenter?.owners.publish() }
+                tabs.sidebar.bottomBarView = pane
+                presenter.owners.publish()
+            }
+            if let pane = sidebarFooterPane, pane.refresh() {
+                pane.invalidateIntrinsicContentSize()
+                pane.superview?.setNeedsLayout()
+            }
+            return
+        }
+        releaseSidebarPane()
+        #endif
+        hideSidebarFooter(node)
+    }
+
+    /// The authored parent of a node UIKit holds in a view of its own: the
+    /// sidebar's footer, the tab bar's accessory.
+    func paneParent(of view: UIView) -> NodeView? {
+        #if os(iOS)
+        if let pane = sidebarFooterPane, pane.node === view, view.superview === pane { return sidebarFooterHome }
+        return tabAccessoryParent(of: view)
+        #else
+        return nil
+        #endif
+    }
+
+    var paneBlocks: [(id: UInt32, block: HostBlock, placement: BlockPlacement?)] {
+        var blocks: [(id: UInt32, block: HostBlock, placement: BlockPlacement?)] = []
+        #if os(iOS)
+        if let pane = sidebarFooterPane, let root = container, presenter.views[pane.node.id] === pane.node {
+            let rect = pane.window == nil ? CGRect.zero : pane.convert(pane.bounds, to: root.container)
+            blocks.append((pane.node.id, .size(pane.bounds.size), BlockPlacement(rect: rect, within: root.id)))
+        }
+        if let accessory = tabAccessoryBlock { blocks.append(accessory) }
+        #endif
+        return blocks
+    }
+
+    var topLayerBoxes: [TopLayerBox] {
+        #if os(iOS)
+        return tabAccessoryBox.map { [$0] } ?? []
+        #else
+        return []
+        #endif
+    }
+
+    #if os(iOS)
+    var relayMounts: [(mount: any RelayMount, node: NodeView)] {
+        guard let content = tabAccessory, let node = content.node, content.holds else { return [] }
+        return [(content, node)]
+    }
+    #endif
+
+    #if os(iOS)
+    private func releaseSidebarPane() {
+        guard let pane = sidebarFooterPane else { return }
+        let home = sidebarFooterHome
+        pane.layoutChanged = nil
+        sidebarFooterPane = nil
+        sidebarFooterHome = nil
+        if #available(iOS 18.0, *), tabController?.sidebar.bottomBarView === pane { tabController?.sidebar.bottomBarView = nil }
+        if pane.node.superview === pane {
+            if let home, presenter.views[home.id] === home, presenter.views[pane.node.id] === pane.node { siblings.putBack(pane.node, into: home) }
+            else { pane.node.removeFromSuperview() }
+        }
+        presenter.owners.publish()
+    }
+    #endif
+
+    func hideSidebarFooter(_ node: NodeView?) {
+        guard hiddenSidebarFooter !== node else { return }
+        if let old = hiddenSidebarFooter, presenter.views[old.id] === old { old.hiddenByHost = false }
+        node?.hiddenByHost = true
+        hiddenSidebarFooter = node
     }
 
     /// Whether a tab container takes this tablist's place.

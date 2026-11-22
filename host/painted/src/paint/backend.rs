@@ -1,6 +1,17 @@
 //! What the paint walk draws through.
 use super::*;
 
+/// The pointer arrow's outline, at the origin, in points.
+pub const POINTER: [(f32, f32); 7] = [
+    (0.0, 0.0),
+    (0.0, 16.0),
+    (4.0, 12.5),
+    (7.0, 19.0),
+    (9.5, 18.0),
+    (6.5, 11.5),
+    (11.5, 11.5),
+];
+
 /// The consumer of a completed paint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameTarget {
@@ -8,6 +19,12 @@ pub enum FrameTarget {
     Pixels,
     /// Present to the window, or return pixels for its carrier to present.
     Window,
+    /// Keep the finished Ink texture for the Linux display, with pixels if a reader needs them.
+    #[cfg(target_os = "linux")]
+    Scanout {
+        /// Also return panel-oriented pixels for a mirror of this picture.
+        readback: bool,
+    },
     /// Refresh painted geometry without changing the visible window image.
     Geometry,
 }
@@ -131,28 +148,6 @@ pub trait Backend {
     ) -> Result<bool, String> {
         Ok(false)
     }
-    /// Present to the KMS display directly from now on: later frames return no pixels.
-    ///
-    /// # Safety
-    /// `fd` is the DRM master of the card that scans the connector out and
-    /// outlives the painter; nothing else reads its events or flips its planes
-    /// afterwards, also when this fails.
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    #[allow(unsafe_code)]
-    unsafe fn attach_scanout(
-        &mut self,
-        _fd: i32,
-        _connector: u32,
-        _size: [u32; 2],
-        _refresh: u32,
-    ) -> Result<(), String> {
-        Err("this painter cannot present to a KMS display".into())
-    }
-    /// Whether frames go to the KMS display instead of coming back as pixels.
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    fn presents(&self) -> bool {
-        false
-    }
     /// The selected backend's name.
     fn name(&self) -> &'static str;
     /// Whether geometry queries must draw through this backend to keep its
@@ -210,7 +205,7 @@ pub trait Backend {
     ) -> bool {
         false
     }
-    /// One outer `box-shadow`: through [`Self::blurred_shadow`] when it can
+    /// One `box-shadow`: through [`Self::blurred_shadow`] when it can
     /// be blurred (`blurred`: its colour, sigma and shape) and the backend
     /// draws it, else as `bands`' fills.
     fn box_shadow(
@@ -225,7 +220,12 @@ pub trait Backend {
                 return;
             }
         }
-        for band in bands() {
+        self.shadow_bands(bands(), ts);
+    }
+
+    /// Composite the contours of one shadow in their shared colour.
+    fn shadow_bands(&mut self, bands: Vec<border::BorderFill>, ts: Transform) {
+        for band in bands {
             self.fill_border(&band, ts);
         }
     }
@@ -288,6 +288,17 @@ pub trait Backend {
     fn surface_image(&mut self, pixels: Arc<Pixmap>, dst: Rect4);
     /// Composite a 2D canvas's bitmap into `dst`, clipped (LLP 1056 D7).
     fn canvas(&mut self, pixels: &Arc<Pixmap>, dst: Rect4, clips: &[Shape], ts: Transform);
+    /// Composite a canvas snapshot whose changed backing pixels are known.
+    fn canvas_frame(
+        &mut self,
+        pixels: &Arc<Pixmap>,
+        _update: Option<CanvasUpdate>,
+        dst: Rect4,
+        clips: &[Shape],
+        ts: Transform,
+    ) {
+        self.canvas(pixels, dst, clips, ts);
+    }
     /// Split an untransformed full-window canvas from the UI, if supported.
     /// A refusal leaves the painter unchanged.
     fn split_window_canvas(&mut self, _dst: Rect4, _clips: &[Shape], _ts: Transform) -> bool {
@@ -320,6 +331,17 @@ pub trait Backend {
         _props: &str,
         _direct: bool,
     ) {
+    }
+    /// An audio player whose element has no visible controls to place.
+    fn boxless_audio(&mut self, id: ViewId, props: &str) {
+        self.native(
+            id,
+            NativeKind::Video,
+            &Shape::rect((0., 0., 0., 0.)),
+            Transform::identity(),
+            props,
+            false,
+        );
     }
     /// Paint a paragraph with its top-left at `origin`.
     fn text(
@@ -363,6 +385,15 @@ pub trait Backend {
     fn finish_rotated(&mut self, _rotation: exact_ink::Rotation) -> Option<Result<Pixmap, String>> {
         None
     }
+    /// Finish in panel orientation on the GPU. A VNC mirror reads the same image.
+    #[cfg(target_os = "linux")]
+    fn finish_scanout(
+        &mut self,
+        _rotation: exact_ink::Rotation,
+        _readback: bool,
+    ) -> Option<Result<(wgpu::TextureView, Option<Pixmap>), String>> {
+        None
+    }
     /// Complete a paint for its consumer. `Pixels` requires an image; `Window`
     /// permits `None` after submission. `Geometry` updates only geometry.
     /// CPU backends return pixels.
@@ -371,6 +402,19 @@ pub trait Backend {
     }
     /// Whether this backend keeps rows' recordings ([`rows`]).
     fn rows(&self) -> bool {
+        false
+    }
+    /// Whether this geometry walk can read existing row metadata without
+    /// recording, drawing or freeing rows on the backend.
+    fn geometry_rows(&self) -> bool {
+        false
+    }
+
+    /// Whether a sticky section's children are rows of their own, and a walk
+    /// that paints nothing moves a kept row's saved hits instead of walking
+    /// it. A row moved thousands of points is walked again where it can be
+    /// hit, as its moved hits would round.
+    fn independent_section_rows(&self) -> bool {
         false
     }
     /// Whether a kept drawing ([`tape`](super::tape)) may hold this
@@ -387,6 +431,13 @@ pub trait Backend {
     /// Whether a retained recording remains usable at this viewport origin.
     fn row_reusable(&self, _id: u32, _origin: (f32, f32)) -> bool {
         true
+    }
+    /// Whether an existing recording may stay in cache while fully clipped,
+    /// even when it would have to be recorded again to draw at this origin.
+    /// Only used when `rows_through()` is false: a retained drawing must not
+    /// hold a reference to a recording that needs to be made again.
+    fn can_keep_clipped_row(&self, _id: u32, _bounds: Rect4) -> bool {
+        false
     }
     /// Record row `id`, whose ops are relative to `origin` (viewport points;
     /// zero when the row is walked in its own coordinates); the row was
@@ -434,7 +485,8 @@ pub trait Backend {
     fn layer_recolored(&mut self) {}
     /// A node its reader animates (`crate::host::lower`): what follows, to
     /// [`Backend::layer_end`], is its layer `key`, moved and faded about
-    /// `pivot` in `ts`'s space from `base` (translate x, y, scale, rotate,
+    /// `pivot` in `ts`'s space. Percentage translations use the width and height
+    /// of `reference`. The layer starts from `base` (translate x, y, scale, rotate,
     /// opacity, a circle's radius, path units per dash offset unit). False:
     /// drawn where it is.
     fn layer_begin(
@@ -442,6 +494,7 @@ pub trait Backend {
         _key: u64,
         _ts: Transform,
         _pivot: (f32, f32),
+        _reference: (f32, f32),
         _base: [f32; 7],
     ) -> bool {
         false
@@ -464,6 +517,27 @@ pub trait Backend {
 }
 
 impl super::Painter {
+    pub(crate) fn recycle_frame(&mut self, pixels: Arc<Pixmap>) {
+        if let Ok(pixels) = Arc::try_unwrap(pixels) {
+            self.backend.recycle_frame(pixels);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn recycle_window_layers(
+        &mut self,
+        below: Pixmap,
+        above: Arc<Pixmap>,
+        rows: (u32, u32),
+    ) {
+        // Damage snapshots contain only the overlay after a split, not a
+        // complete CPU picture. A window repaint rebuilds both layers.
+        self.damage.pixels = None;
+        self.damage.next.clear();
+        self.backend
+            .recycle_window_layers(below, Arc::try_unwrap(above).ok(), Some(rows));
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn attach_apple_layer(
         &mut self,
@@ -493,24 +567,6 @@ impl super::Painter {
     #[cfg(windows)]
     pub(crate) fn prepare_window_frame(&mut self, size: [u32; 2]) -> Result<bool, String> {
         self.backend.prepare_window_frame(size)
-    }
-    /// # Safety
-    /// See [`Backend::attach_scanout`].
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    #[allow(unsafe_code)]
-    pub(crate) unsafe fn attach_scanout(
-        &mut self,
-        fd: i32,
-        connector: u32,
-        size: [u32; 2],
-        refresh: u32,
-    ) -> Result<(), String> {
-        // SAFETY: the caller's contract.
-        unsafe { self.backend.attach_scanout(fd, connector, size, refresh) }
-    }
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub(crate) fn presents(&self) -> bool {
-        self.backend.presents()
     }
     #[cfg(windows)]
     pub(crate) fn device_lost(&self) -> bool {

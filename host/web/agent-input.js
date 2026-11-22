@@ -41,19 +41,43 @@ export function guestTap(frame, request) {
   if (access.error) return { guest: true, error: access.error };
   const { document } = access;
   const guest = document.defaultView;
-  const x = Number.isFinite(request.x) ? request.x : guest.innerWidth / 2;
-  const y = Number.isFinite(request.y) ? request.y : guest.innerHeight / 2;
   let target;
   try { target = request.selector ? document.querySelector(request.selector) : null; }
   catch { return { guest: true, malformed: true, error: "guest tap has an invalid selector" }; }
-  target ||= document.elementFromPoint(x, y) || document.body;
+  const box = target?.getBoundingClientRect();
+  let x = request.x ?? (box ? box.left + box.width / 2 : guest.innerWidth / 2);
+  let y = request.y ?? (box ? box.top + box.height / 2 : guest.innerHeight / 2);
+  if (request.at && !request.selector && request.x == null && request.y == null) {
+    // The driver measures from the displayed border box. elementFromPoint
+    // takes CSS pixels from the guest viewport, inside the padding and border.
+    for (let el = frame; el; el = el.parentElement ?? el.getRootNode().host) {
+      const style = getComputedStyle(el);
+      const m = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+      if (!m.is2D || m.b || m.c || m.a <= 0 || m.d <= 0 || style.rotate !== "none" ||
+          style.perspective !== "none" || style.offsetPath !== "none" || style.scale.split(" ").some(n => parseFloat(n) <= 0))
+        return { guest: true, error: "guest tap cannot map the frame's transform" };
+    }
+    const rect = frame.getBoundingClientRect(), style = getComputedStyle(frame);
+    const px = name => parseFloat(style[name]);
+    const left = px("borderLeftWidth") + px("paddingLeft"), top = px("borderTopWidth") + px("paddingTop");
+    const borderBox = style.boxSizing === "border-box";
+    const width = px("width") + (borderBox ? 0 : left + px("borderRightWidth") + px("paddingRight"));
+    const height = px("height") + (borderBox ? 0 : top + px("borderBottomWidth") + px("paddingBottom"));
+    x = request.at[0] * width / rect.width - left;
+    y = request.at[1] * height / rect.height - top;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= guest.innerWidth || y >= guest.innerHeight)
+      return { guest: true, error: "guest tap point is outside the frame's viewport" };
+    target = document.elementFromPoint(x, y);
+  } else {
+    target ||= document.elementFromPoint(x, y) || document.body;
+  }
   if (!target) return { guest: true, error: "guest tap found no target" };
   // Script input is intentionally untrusted (@ref LLP 1020 D4;
   // exact1 20260806-webview-frame-guest-click-delivery).
   target.dispatchEvent(new guest.PointerEvent("pointerdown", { bubbles: true, composed: true, clientX: x, clientY: y, button: 0, buttons: 1 }));
   target.dispatchEvent(new guest.PointerEvent("pointerup", { bubbles: true, composed: true, clientX: x, clientY: y, button: 0, buttons: 0 }));
   target.dispatchEvent(new guest.MouseEvent("click", { bubbles: true, composed: true, clientX: x, clientY: y, button: 0 }));
-  return { tapped: request.id, guest: true };
+  return { tapped: request.id, guest: true, delivery: "synthetic", inputPath: "dispatchEvent" };
 }
 export function guestType(frame, request) {
   const access = guestDocument(frame);
@@ -181,6 +205,24 @@ export function viewBox(el) {
   const stretch = !flex || /normal|stretch/.test(cs.alignItems);
   if (row) return stretch ? new DOMRect(t.x, top, t.width, bottom - top) : t;
   return stretch ? new DOMRect(left, t.y, right - left, t.height) : t;
+}
+
+// An empty inline block's bottom margin edge is its CSS baseline. Put it in
+// the first text run's line box so mixed font sizes and line heights are included.
+export function textBaseline(el) {
+  const text = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let node; (node = text.nextNode());) {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    if (![...range.getClientRects()].some(r => r.width && r.height)) continue;
+    const parent = node.parentElement;
+    if (!parent || /flex|grid/.test(getComputedStyle(parent).display)) return undefined;
+    const marker = document.createElement('span');
+    marker.style.cssText = 'all: initial !important; display: inline-block !important; width: 0 !important; height: 0 !important; overflow: hidden !important; vertical-align: baseline !important';
+    parent.insertBefore(marker, node);
+    try { return Math.round(marker.getBoundingClientRect().bottom * 100) / 100; }
+    finally { marker.remove(); }
+  }
 }
 
 // How far a scroller's offset travels on each axis from one end to the other (LLP 1012 `rx`/`ry`), whether or not the

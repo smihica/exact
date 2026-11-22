@@ -25,18 +25,33 @@ assesses its value to upstream, and records the measurements and open questions.
 
 ## Runtime switches
 
-Build the consuming app with the Linux host's `scanout` feature for direct
-presentation. Set `EXACT_PAINTER=ink`, `WGPU_BACKEND=vulkan` and
-`KIOSK_DIRECT=1`; select the display device with `EXACT_DRM`.
+Set `EXACT_PAINTER=ink` and `WGPU_BACKEND=vulkan` for Linux direct
+presentation. Select the display device with `EXACT_DRM` to use the direct
+host even when launching from a Wayland session. The host reports
+`direct Vulkan` at startup when the driver supports presentation IDs and
+waits. On failure it reports the reason and uses KMS dumb buffers.
+Existing app manifests can keep their `scanout` feature.
 Use `EXACT_ROTATE=0|90|180|270` to orient the picture and absolute input.
 Older launchers can still select 90 degrees with `KIOSK_PORTRAIT=1`. GLES comparisons use `WGPU_BACKEND=gl` in a build
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
-Ink uses upstream’s eight fixed shader programs compiled at device creation.
+Ink compiles thirteen fixed material and clip combinations at device creation.
+Large unclipped solid fills use a flat-color pipeline for their interior.
+The upstream display host tracks completed presentations and rotates on the GPU.
+With this integration, a Pi 4 on a 60 Hz portrait panel averaged 29.8 fps
+on the same photo-list drag that reached 59.9 fps with the previous fork.
+See the [matched integration runs](memo/kiosk-upstream.md#rich-list-and-dialog-after-merging-upstream).
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
 `KIOSK_SHADOW_BANDS=1`. `KIOSK_FPS=1` adds an on-screen counter;
 `KIOSK_TIMING=1` logs frame submission timings.
+
+Set `KIOSK_BITMAP_CACHE=1` to reuse a GPU texture at the decoded picture's
+own dimensions while another owner holds the decoded pixels. Each Ink painter
+can keep up to 64 idle textures and 8 MiB including mip levels. A single
+texture larger than the budget is released when it becomes idle. When the
+host signals memory pressure, window hiding or focus loss, the painter drops
+its idle entries. The default releases unused, unpinned images at frame end.
 
 Camera capture runs while an image using `kiosk-camera:preview` is mounted.
 The probe reads tightly packed 640×480 YUV420 at 30fps, converts it to RGBA,
@@ -58,6 +73,9 @@ Subscriptions do not start capture or change preview ownership.
   are not wired.
   It is single-finger and vertical. It is not a general gesture
   recognizer for every Linux input device or nested scroll hierarchy.
+- The Linux DRM host does not signal memory pressure, window hiding or focus
+  loss. Idle textures stay within the budget. The next frame retires entries
+  whose decoded picture has been released.
 - Shadow textures share a 16 MiB non-evicting budget. Animated dimensions,
   scale or blur create new geometries; after the budget is reached, new shapes
   use analytic drawing. Texture allocation failure still uses the renderer's
@@ -66,10 +84,6 @@ Subscriptions do not start capture or change preview ownership.
   clips can repeat the combined-mask fallback for each band. Fractional-edge
   rectangular clips can also take that path. Keep this optimization opt-in
   until splitting happens after clip handling, including retained-row replay.
-- Direct presentation currently completes in the painter's finish path, so a
-  pixel-only request on that attached painter would present too. Its internal
-  boot/flip measurements also lack Vulkan presentation-completion events; use
-  DRM page flips for device measurements.
 - New shadow geometries incur first-use work. Warm-frame
   throughput does not measure that cost or long-running stability.
 
@@ -83,7 +97,7 @@ cargo test --locked -p exact-linux --lib kiosk
 cargo test --locked -p exact-painted --lib kiosk
 cargo test --locked -p exact-painted --lib ink::
 cargo test --locked -p exact-ink --lib
-cargo clippy --locked -p exact-linux -p exact-painted -p exact-ink --lib --tests --features exact-linux/scanout -- -D warnings
+cargo clippy --locked -p exact-linux -p exact-painted -p exact-ink --lib --tests -- -D warnings
 ```
 
 Run `bun scripts/affected.mjs` for the full affected suite list. Compare rendered

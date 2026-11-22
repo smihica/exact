@@ -1,12 +1,12 @@
 //! The driver's requests, one JSON line each on stdin. While the loop waits
 //! for the next one, a reply the executor queues commits when it lands, as
 //! on the other hosts: the app goes on with what the reply starts (a renewal
-//! after a 401) while the driver talks to a server, and the clock still
-//! moves only by `clock`.
+//! after a 401) while the driver talks to a server. A seekable drive's
+//! clock moves by request.
 
 use super::{answer, refusal, tagged};
 use crate::presenter::Presenter;
-use exact_runner::DataSource;
+use exact_runner::{json::field_str, DataSource};
 
 /// Answer one request.
 pub fn handle<D: DataSource + Default>(p: &mut Presenter<D>, line: &str) -> String {
@@ -35,7 +35,8 @@ fn handle_request<D: DataSource + Default>(
     // operation (the loop applies the others as they land) — a
     // finished update check likewise, and the commands the last
     // operation's commits asked for run before this one is answered.
-    if let Some(e) = p.pump(p.host().now()) {
+    let now = p.live_time().unwrap_or_else(|| p.host().now());
+    if let Some(e) = p.pump(now) {
         eprintln!("exact: {e}");
     }
     p.poll_update();
@@ -47,6 +48,14 @@ fn handle_request<D: DataSource + Default>(
     // this one, a snapshot of it, and its caps start at nothing.
     p.hatch_command();
     p.hatch_turn();
+    if matches!(
+        field_str(line, "op").as_deref(),
+        Some("tap" | "type" | "share" | "prefer" | "midi")
+    ) {
+        if let Some(now) = p.live_time() {
+            p.tick(now);
+        }
+    }
     let reply = answer(p, line);
     p.sync_surfaces();
     let reply = p.merge_surfaces(line, reply);

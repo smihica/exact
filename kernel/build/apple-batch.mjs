@@ -33,8 +33,10 @@ const codecs = {
   modes: ['[String: String]?', 'nil', 'batchModes()'],
   stringValue: ['String?', 'nil', 'value().string'],
   orientation: ['OrientationRequest?', 'nil', 'batchOrientation()'],
+  routeInspectors: ['[RouteInspector]?', 'nil', 'batchRouteInspectors()'],
   rootTabs: ['[RootTabs]?', 'nil', 'batchRootTabs()'],
   sequence: ['(UInt64, UInt64)?', 'nil', 'batchSequence()'],
+  sectionTables: ['[BatchValue]?', 'nil', 'array { try $0.value() }'],
   collectionSnapshots: ['[CollectionSnapshot]?', 'nil', 'linkedCollectionSnapshots()'],
 };
 const identifier = name => name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());

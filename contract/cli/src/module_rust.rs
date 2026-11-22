@@ -14,6 +14,19 @@ use crate::rust::{check_fields, field_name, reach, type_name};
 use exact_plan::{ModulesRow, Plan, TypeKind, TypesId};
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::path::Path;
+
+/// Generate the module bindings for a Contract entry.
+pub fn module_rust_path(path: &Path) -> Result<String, String> {
+    let plan = crate::compile_path(path).map_err(|e| e.to_string())?;
+    module_rust(&plan).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Generate `OUT_DIR/modules.rs` for a data crate. Exact refreshes it before
+/// Cargo. Direct Cargo builds watch the Contract source graph.
+pub fn build_module_rust(path: &Path) -> Result<(), String> {
+    crate::rust::build_rust_output(path, "modules", module_rust_path)
+}
 
 /// The binding of every module `plan` names, one `pub mod <extension>` each.
 pub fn module_rust(plan: &Plan) -> Result<String, String> {

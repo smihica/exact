@@ -35,8 +35,8 @@ use crate::error::{KernelError, LayoutError};
 use crate::generated::SafeAreaIgnore;
 use crate::id::{NodeFlags, Offer, ViewId};
 use crate::layout::{self, LayoutMirror, LayoutReceipt};
-use crate::style::resolve_calc;
-use taffy::style::{BoxSizing, LengthPercentageAuto as Lpa, Position};
+use crate::style::{calc_has_percent, resolve_calc};
+use taffy::style::{BoxSizing, CompactLength, LengthPercentageAuto as Lpa, Position};
 use taffy::util::{MaybeResolve, ResolveOrZero};
 
 #[path = "reservation.rs"]
@@ -47,6 +47,8 @@ pub(crate) mod reservation;
 pub enum BlockAxis {
     /// The block is this long: a pane's side.
     Is(f32),
+    /// The host sizes the root's border box to this allocation, as a resizable pane does.
+    Fill(f32),
     /// The block is at most this long, and as long as its content: a sheet's.
     AtMost(f32),
     /// An automatic size fits its content under this limit. An authored
@@ -59,13 +61,25 @@ pub enum BlockAxis {
     /// overflow it (whether it does is what picks the option). Percentages
     /// use it, and an authored size is the author's.
     Region(f32),
+    /// The axis a host sizes to the box's content (an arranged pane's, LLP
+    /// 1123 D7), measured as `Region` is. The size this answers is the basis
+    /// of the box's own percentages on the axis, so they are cyclic (CSS
+    /// Sizing 3 §5.2.1): `auto` for a preferred size and `none` for a maximum
+    /// that holds one, and a minimum's percentage terms resolved against
+    /// zero; the size the host then gives is their basis.
+    Content(f32),
 }
 
 impl BlockAxis {
     /// The length the host gave, the size or the maximum.
     pub fn length(self) -> f32 {
         match self {
-            BlockAxis::Is(v) | BlockAxis::AtMost(v) | BlockAxis::Fit(v) | BlockAxis::Region(v) => v,
+            Self::Is(v)
+            | Self::Fill(v)
+            | Self::AtMost(v)
+            | Self::Fit(v)
+            | Self::Region(v)
+            | Self::Content(v) => v,
         }
     }
 
@@ -74,9 +88,11 @@ impl BlockAxis {
         let v = (self.length() - by).max(0.0);
         match self {
             BlockAxis::Is(_) => BlockAxis::Is(v),
+            BlockAxis::Fill(_) => BlockAxis::Fill(v),
             BlockAxis::AtMost(_) => BlockAxis::AtMost(v),
             BlockAxis::Fit(_) => BlockAxis::Fit(v),
             BlockAxis::Region(_) => BlockAxis::Region(v),
+            BlockAxis::Content(_) => BlockAxis::Content(v),
         }
     }
 }
@@ -90,6 +106,20 @@ pub struct HostBlock {
     pub width: BlockAxis,
     /// Its height.
     pub height: BlockAxis,
+}
+
+/// How a host shows a block's route against the route its stack has on top
+/// (LLP 1127 D8), which the runner's liveness reads and layout does not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockShown {
+    /// As its stack shows it: live when it is the top.
+    #[default]
+    InStack,
+    /// Beside the top, live: a split's list column beside its detail.
+    Beside,
+    /// Under a pane shown over it, not live though shown: a split's detail
+    /// under the list that overlays it, and a split's columns under a sheet.
+    Under,
 }
 
 impl HostBlock {
@@ -121,11 +151,34 @@ pub(crate) fn clearance(arena: &NodeArena, slot: u32) -> [f32; 4] {
 
 /// [`clearance`] for `held`'s root, with no search of the blocks.
 fn cleared(arena: &NodeArena, held: &Held) -> [f32; 4] {
+    cleared_taking(arena, held, true)
+}
+
+/// How far past its content root's edge `held`'s root begins its bars'
+/// slots (LLP 1123 D12), given its clearance `clear`: on an edge it takes,
+/// past what its host would clear there had it not taken it, as a bar
+/// pinned to the controller view's safe-area guide lies past the band its
+/// content reaches under; 0 on every other edge, and for a root with no
+/// bars.
+fn bar_slots(arena: &NodeArena, held: &Held, clear: [f32; 4]) -> [f32; 4] {
+    if !is_owner(arena, held) || !super::bar::has_bars(arena, held.slot) {
+        return [0.0; 4];
+    }
+    let untaken = cleared_taking(arena, held, false);
+    std::array::from_fn(|e| (untaken[e] - clear[e]).max(0.0))
+}
+
+/// [`cleared`] with the edges its root takes of the container region taken,
+/// where `taking`, or none of them.
+fn cleared_taking(arena: &NodeArena, held: &Held, taking: bool) -> [f32; 4] {
     if !is_owner(arena, held) {
         return [0.0; 4];
     }
     let band = arena.observations.band(held.slot).unwrap_or([0.0; 4]);
-    let taken = super::ignore::edges(arena, held.slot, SafeAreaIgnore::Container);
+    let taken = match taking {
+        true => super::ignore::edges(arena, held.slot, SafeAreaIgnore::Container),
+        false => [false; 4],
+    };
     let band = std::array::from_fn(|e| if taken[e] { 0.0 } else { band[e] });
     let cover = super::keyboard::cover(arena, held.slot);
     match reservation::reserved(arena, held.slot) {
@@ -141,7 +194,7 @@ fn cleared(arena: &NodeArena, held: &Held) -> [f32; 4] {
 fn fixed_lengths(arena: &NodeArena, held: &Held, clear: [f32; 4]) -> [Option<f32>; 2] {
     let given = held.given.filter(|_| is_owner(arena, held));
     let fixed = |axis: Option<BlockAxis>, by: f32| match axis {
-        Some(BlockAxis::Is(length)) => Some((length - by).max(0.0)),
+        Some(BlockAxis::Is(length) | BlockAxis::Fill(length)) => Some((length - by).max(0.0)),
         _ => None,
     };
     [
@@ -199,9 +252,14 @@ pub(crate) struct Held {
     /// Whether a box above it was replaced whole when it was last styled
     /// (`apply` makes it `display: none` then).
     buried: bool,
+    /// How its host shows it against its stack's top.
+    shown: BlockShown,
     /// What the host cleared of it for its content root when it was last
     /// laid out (`clearance`).
     cleared: [f32; 4],
+    /// How far past its content root's edge its bars' slots began when it
+    /// was last laid out (`bar_slots`).
+    slots: [f32; 4],
     /// Its content root's width and height where its host fixes them, as
     /// they were when it was last laid out: what container units below read
     /// (`owner::container_at`, LLP 1123 D16).
@@ -220,6 +278,20 @@ impl Blocks {
     /// The block `slot`'s host gave it: a content owner's (LLP 1123 D2).
     pub(crate) fn given(&self, slot: u32) -> Option<HostBlock> {
         self.held(slot).and_then(|b| b.given)
+    }
+
+    /// How far past its content root's edge `slot`'s bars' slots begin, as
+    /// it was last laid out (LLP 1123 D12): 0 but on an edge an owner's root
+    /// takes.
+    pub(crate) fn bar_slots(&self, slot: u32) -> [f32; 4] {
+        self.held(slot).map_or([0.0; 4], |b| b.slots)
+    }
+
+    /// Whether `slot`'s bars' slots would begin elsewhere than at its last
+    /// layout (`bar_slots`): a band's change on an edge an owner's root takes
+    /// moves them though its clearance stays.
+    pub(crate) fn slots_moved(arena: &NodeArena, slot: u32) -> bool {
+        (arena.blocks.held(slot)).is_some_and(|b| b.slots != bar_slots(arena, b, cleared(arena, b)))
     }
 
     /// Whether `slot` is the root of a layout of its own.
@@ -264,6 +336,23 @@ impl Blocks {
     pub(crate) fn implied_slots(&self) -> Vec<u32> {
         let implied = self.0.iter().filter(|b| b.implied.is_some());
         implied.map(|b| b.slot).collect()
+    }
+
+    /// How `slot`'s host shows it against its stack's top (`Held::shown`).
+    pub(crate) fn shown(&self, slot: u32) -> BlockShown {
+        self.held(slot).map_or(BlockShown::InStack, |b| b.shown)
+    }
+
+    /// Say how `slot`'s block is shown against its stack's top; whether that
+    /// changed. A slot with no block is shown in the page, and keeps none.
+    pub(crate) fn set_shown(&mut self, slot: u32, shown: BlockShown) -> bool {
+        match self.held_mut(slot) {
+            Some(held) if held.shown != shown => {
+                held.shown = shown;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `slot` gone: neither block stands, nor its local insets.
@@ -316,7 +405,9 @@ impl Blocks {
                 given,
                 implied,
                 buried: false,
+                shown: BlockShown::InStack,
                 cleared: [0.0; 4],
+                slots: [0.0; 4],
                 content: [None; 2],
                 read_off: Default::default(),
             }),
@@ -397,6 +488,7 @@ pub(crate) fn apply(arena: &NodeArena, slot: u32, s: &mut taffy::style::Style) {
     let block = block.less(clearance(arena, slot));
     block.tactic.apply(s);
     let _env = crate::style::LayoutEnv::set(arena.env());
+    cyclic(block, s);
     let in_flow = s.position != Position::Absolute;
     if s.position == Position::Static {
         s.position = Position::Relative;
@@ -405,6 +497,19 @@ pub(crate) fn apply(arena: &NodeArena, slot: u32, s: &mut taffy::style::Style) {
     let edges = s.padding.resolve_or_zero(basis, resolve_calc)
         + s.border.resolve_or_zero(basis, resolve_calc);
     let content_box = s.box_sizing == BoxSizing::ContentBox;
+    let fill = |length: f32, edges: f32| {
+        taffy::Dimension::length((length - if content_box { edges } else { 0.0 }).max(0.0))
+    };
+    if let BlockAxis::Fill(width) = block.width {
+        s.size.width = fill(width, edges.horizontal_axis_sum());
+        s.min_size.width = s.size.width;
+        s.max_size.width = s.size.width;
+    }
+    if let BlockAxis::Fill(height) = block.height {
+        s.size.height = fill(height, edges.vertical_axis_sum());
+        s.min_size.height = s.size.height;
+        s.max_size.height = s.size.height;
+    }
     let ceiling = |most: f32, edges: f32, own: taffy::Dimension, basis: f32| {
         let most = (most - if content_box { edges } else { 0.0 }).max(0.0);
         let own = own.maybe_resolve(Some(basis), resolve_calc);
@@ -422,9 +527,15 @@ pub(crate) fn apply(arena: &NodeArena, slot: u32, s: &mut taffy::style::Style) {
     let capped = |axis: BlockAxis, auto: bool| match axis {
         BlockAxis::AtMost(_) => true,
         BlockAxis::Fit(_) => auto,
-        BlockAxis::Is(_) | BlockAxis::Region(_) => false,
+        BlockAxis::Is(_) | BlockAxis::Fill(_) | BlockAxis::Region(_) | BlockAxis::Content(_) => {
+            false
+        }
     };
-    if let BlockAxis::AtMost(most) | BlockAxis::Fit(most) | BlockAxis::Region(most) = block.width {
+    if let BlockAxis::AtMost(most)
+    | BlockAxis::Fit(most)
+    | BlockAxis::Region(most)
+    | BlockAxis::Content(most) = block.width
+    {
         unplaced(&mut s.inset.left, &mut s.margin.left);
         unplaced(&mut s.inset.right, &mut s.margin.right);
         if in_flow {
@@ -435,12 +546,57 @@ pub(crate) fn apply(arena: &NodeArena, slot: u32, s: &mut taffy::style::Style) {
             s.max_size.width = ceiling(most, edges.horizontal_axis_sum(), s.max_size.width, most);
         }
     }
-    if let BlockAxis::AtMost(most) | BlockAxis::Fit(most) | BlockAxis::Region(most) = block.height {
+    if let BlockAxis::AtMost(most)
+    | BlockAxis::Fit(most)
+    | BlockAxis::Region(most)
+    | BlockAxis::Content(most) = block.height
+    {
         unplaced(&mut s.inset.top, &mut s.margin.top);
         unplaced(&mut s.inset.bottom, &mut s.margin.bottom);
         if capped(block.height, s.size.height.is_auto()) {
             s.max_size.height = ceiling(most, edges.vertical_axis_sum(), s.max_size.height, most);
         }
+    }
+}
+
+/// A `Content` axis's root percentages, which its answer would decide, as
+/// CSS takes a cyclic percentage (CSS Sizing 3 §5.2.1): `auto` for a
+/// preferred size and `none` for a maximum that holds one, and a minimum's
+/// percentage terms resolved against zero. A length and a sizing keyword
+/// keep theirs.
+fn cyclic(block: HostBlock, s: &mut taffy::style::Style) {
+    let cyclic = |d: taffy::Dimension| {
+        let raw = d.into_raw();
+        raw.tag() == CompactLength::PERCENT_TAG
+            || (raw.is_calc() && calc_has_percent(raw.calc_value()))
+    };
+    let clear =
+        |size: &mut taffy::Dimension, min: &mut taffy::Dimension, max: &mut taffy::Dimension| {
+            if cyclic(*size) {
+                *size = taffy::Dimension::auto();
+            }
+            if cyclic(*min) {
+                // A length, zero included: `auto` would let an aspect ratio's automatic minimum grow the box to its content
+                let floor = min.maybe_resolve(Some(0.0), resolve_calc).unwrap_or(0.0);
+                *min = taffy::Dimension::length(floor.max(0.0));
+            }
+            if cyclic(*max) {
+                *max = taffy::Dimension::auto();
+            }
+        };
+    if let BlockAxis::Content(_) = block.width {
+        clear(
+            &mut s.size.width,
+            &mut s.min_size.width,
+            &mut s.max_size.width,
+        );
+    }
+    if let BlockAxis::Content(_) = block.height {
+        clear(
+            &mut s.size.height,
+            &mut s.min_size.height,
+            &mut s.max_size.height,
+        );
     }
 }
 
@@ -482,11 +638,17 @@ impl Kernel {
         // Measure the readers under a box that gains or gives back a block again, which
         // changes the band they observe; a reader elsewhere that this moves has a frame
         // that moved
-        if self.arena.blocks.given(slot).is_some() != block.is_some() {
+        let placed = self.arena.blocks.given(slot).is_some() != block.is_some();
+        if placed {
             self.arena.observations.moved(slot);
         }
         self.arena.blocks.set(slot, block);
         self.block_changed(slot, before);
+        // Derive the owner segments' readers below a box whose host starts or stops placing
+        // it while its implied block stands
+        if placed && before.is_some() && self.arena.blocks.get(slot).is_some() {
+            self.segments_moved(slot);
+        }
         Ok(())
     }
 
@@ -509,7 +671,8 @@ impl Kernel {
         for slot in moved {
             self.restyle_block(slot);
         }
-        // Derive the raw readers again below each box that joined or left the top layer
+        // Derive the raw readers and the owner segments' readers again below
+        // each box that joined or left the top layer
         for slot in std::mem::take(&mut self.arena.observations.targets.moved) {
             if self.arena.is_live(slot) {
                 self.targets_moved(slot);
@@ -624,6 +787,24 @@ impl Kernel {
     /// top-layer box the viewport, as of the last layout.
     pub fn host_block(&self, view: ViewId) -> Option<HostBlock> {
         self.arena.blocks.get(self.arena.slot_of(view)?)
+    }
+
+    /// How `view`'s host shows its block against the route its stack has on
+    /// top (LLP 1127): beside it as a split's list column, under it as a
+    /// split's detail under the list that overlays it, or in its stack.
+    pub fn host_block_shown(&self, view: ViewId) -> BlockShown {
+        self.arena
+            .slot_of(view)
+            .map_or(BlockShown::InStack, |slot| self.arena.blocks.shown(slot))
+    }
+
+    /// Say how `view`'s block is shown against its stack's top; whether that
+    /// changed. Layout does not read it: the runner's liveness does.
+    pub fn set_host_block_shown(&mut self, view: ViewId, shown: BlockShown) -> bool {
+        match self.arena.slot_of(view) {
+            Some(slot) => self.arena.blocks.set_shown(slot, shown),
+            None => false,
+        }
     }
 
     /// Where a top-layer box laid out in the viewport's block sits in a
@@ -759,10 +940,10 @@ impl Kernel {
 
     /// The blocks under `root`, each with its offer: the lengths the host
     /// gave less what it clears for a content root, which a maximum's root
-    /// is sized inside (`apply`). A block whose clearance changed since its
-    /// last layout, a band or what its root takes of it, is restyled, and
-    /// published whole where its content root's corner moved, which moves
-    /// every frame in it (@ref LLP 1123 D3).
+    /// is sized inside (`apply`). A block whose clearance or bars' slots
+    /// changed since its last layout, by a band or what its root takes of it,
+    /// is restyled, and published whole where its content root's corner
+    /// moved, which moves every frame in it (@ref LLP 1123 D3).
     fn blocks_under(&mut self, root: u32) -> Vec<(u32, Offer)> {
         let arena = &self.arena;
         let under = |b: &&Held| b.slot != root && arena.is_ancestor(root, b.slot);
@@ -777,19 +958,21 @@ impl Kernel {
     }
 
     /// Give the `i`th block its clearance `clear`, and return its root and
-    /// offer: the block less the clearance. A clearance that changed
-    /// restyles the block, and one that moved the content root's corner
-    /// publishes it whole.
+    /// offer: the block less the clearance. A clearance or bars' slots that
+    /// changed restyle the block, and a clearance that moved the content
+    /// root's corner publishes it whole.
     fn clear_block(&mut self, i: usize, clear: [f32; 4]) -> (u32, Offer) {
         let content = fixed_lengths(&self.arena, &self.arena.blocks.0[i], clear);
+        let slots = bar_slots(&self.arena, &self.arena.blocks.0[i], clear);
         let held = &mut self.arena.blocks.0[i];
         let (slot, inner) = (held.slot, held.block.less(clear));
         let was = std::mem::replace(&mut held.cleared, clear);
+        let slotted = std::mem::replace(&mut held.slots, slots) != slots;
         // Derive the container readers again where the content root's fixed lengths
         // moved, or where one was derived against others since the last layout
         let moved = std::mem::replace(&mut held.content, content) != content;
         let resized = held.read_off.replace(false) || moved;
-        if was != clear {
+        if was != clear || slotted {
             self.restyle_block(slot);
         }
         if resized {
@@ -939,7 +1122,8 @@ impl Kernel {
         // the host places by the last one.
         let (wants, moved) = self.implied_changes();
         let clear = clearance(&self.arena, slot);
-        let restyle = (self.arena.blocks.held(slot)).is_some_and(|b| b.cleared != clear);
+        let restyle = (self.arena.blocks.held(slot)).is_some_and(|b| b.cleared != clear)
+            || Blocks::slots_moved(&self.arena, slot);
         if restyle
             || !self.readers_measured(slot)
             || !wants.is_empty()
@@ -949,6 +1133,7 @@ impl Kernel {
         {
             return Err(LayoutError::HostBlock("a layout is due first").into());
         }
+        let placing = self.arena.blocks.given(slot).is_none();
         let (mut arena, mut trial) = (self.arena.trial_copy(), tree.clone());
         arena.blocks.set(slot, Some(block));
         trial.restyle(&arena, slot, node);
@@ -962,6 +1147,11 @@ impl Kernel {
             self.layout.replace(Box::new(trial)),
             self.region.take(),
         );
+        // Derive in the copies the owner segments' readers below a box the trial starts
+        // placing, as giving it the block does
+        if placing {
+            self.segments_moved(slot);
+        }
         let measured = self.measure_trial(slot, node, block);
         let trial = std::mem::replace(&mut self.arena, kept.0);
         (self.layout, self.region) = (kept.1, kept.2);
@@ -1032,9 +1222,9 @@ pub struct BlockMeasure {
 fn used_in(block: HostBlock, clear: [f32; 4], l: &taffy::tree::Layout) -> (f32, f32) {
     let [top, right, bottom, left] = clear;
     let axis = |axis: BlockAxis, end: f32| match axis {
-        BlockAxis::Is(length) => length,
+        BlockAxis::Is(length) | BlockAxis::Fill(length) => length,
         BlockAxis::AtMost(most) => end.clamp(0.0, most),
-        BlockAxis::Fit(_) | BlockAxis::Region(_) => end.max(0.0),
+        BlockAxis::Fit(_) | BlockAxis::Region(_) | BlockAxis::Content(_) => end.max(0.0),
     };
     (
         axis(

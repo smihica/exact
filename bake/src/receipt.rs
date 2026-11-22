@@ -165,6 +165,9 @@ pub(crate) fn emit(
     compat.embedded = json!({"seq":0,"plan":plan_card,"assets":assets,"entryDigest":null,
         "genesis":true,"trust":trust,
         "version":compat.embedded["version"],"buildNumber":compat.embedded["buildNumber"]});
+    if platform == "linux" {
+        compat.embedded["displayName"] = json!(manifest.name);
+    }
     if plans.as_object().is_some_and(|p| !p.is_empty()) {
         compat.embedded["plans"] = plans;
     }
@@ -873,7 +876,7 @@ fn artifact_graph(
         }
     }
     Ok(
-        json!({"version":1,"appleIcons":icons,"sources":sources,"extensions":extensions,"surfaceCalls":calls,"loads":loads,"uses":uses,"mediaSession":media_session,"launchBackground":launch_background(plan),"artifacts":artifacts}),
+        json!({"version":1,"appleIcons":icons,"sources":sources,"extensions":extensions,"surfaceCalls":calls,"loads":loads,"uses":uses,"mediaSession":media_session,"launchBackground":launch::launch_background(plan),"launchGround":launch::launch_ground(plan),"artifacts":artifacts}),
     )
 }
 
@@ -896,43 +899,18 @@ fn listens(inputs: &Value) -> bool {
     })
 }
 
-/// LLP 1116.011 D2.3: the ground the app's first route stands on, which the
-/// iOS launch screen shows until its first frame: `"grouped"` where the first
-/// route's `background-color` is the metric the compiler gives a route that
-/// scrolls a grouped list (`-exact-grouped-page-ground`, LLP 1116.007 D5),
-/// iOS's grouped grey, or that role written (`-exact-grouped-background`),
-/// `"system"` for any other (the platform's page, `systemBackground`). A route
-/// is a node with a `navigationKey` and no `navigationBack` (the navigation
-/// root has both); the first in the plan's order, past the page the compiler
-/// writes for an unknown address (its test id `not-found`), is the first one
-/// the author declared. A route whose background is written or computed is
-/// the author's: the manifest's `background_color` names its launch colour.
-fn launch_background(plan: &exact_plan::Plan) -> &'static str {
-    use exact_kernel::PropId;
-    use exact_plan::BindingKind::{Prop, Style};
-    let literal = |node: &exact_plan::NodesRow, kind, id: u16| {
-        node.bindings.iter().find_map(|b| {
-            let b = plan.binding(b);
-            (b.kind == kind && b.id == id).then(|| crate::colors::literal(plan, &b))
-        })
-    };
-    let route = plan.nodes.iter().find(|node| {
-        let has = |id: PropId| literal(node, Prop, id as u16).is_some();
-        has(PropId::NavigationKey)
-            && !has(PropId::NavigationBack)
-            && literal(node, Prop, PropId::TestId as u16) != Some(Some("not-found"))
-    });
-    let ground = route.and_then(|node| {
-        literal(&node, Style, exact_kernel::StyleId::BackgroundColor as u16).flatten()
-    });
-    if matches!(
-        ground,
-        Some("-exact-grouped-page-ground" | "-exact-grouped-background")
-    ) {
-        "grouped"
-    } else {
-        "system"
-    }
+/// The literal a node's binding of `kind` and `id` holds: none where the
+/// node has no such binding, `Some(None)` where its value is computed.
+fn literal<'p>(
+    plan: &'p exact_plan::Plan,
+    node: &exact_plan::NodesRow,
+    kind: exact_plan::BindingKind,
+    id: u16,
+) -> Option<Option<&'p str>> {
+    node.bindings.iter().find_map(|b| {
+        let b = plan.binding(b);
+        (b.kind == kind && b.id == id).then(|| crate::colors::literal(plan, &b))
+    })
 }
 
 /// Refresh the resident compiler's candidate graph beside its plan. The
@@ -1088,5 +1066,8 @@ fn hash(bytes: &[u8]) -> String {
     exact_update::sha256_hex(bytes)
 }
 
+mod launch;
+#[cfg(test)]
+mod launch_tests;
 #[cfg(test)]
 mod tests;

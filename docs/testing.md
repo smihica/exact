@@ -81,7 +81,9 @@ test or drive to investigate; it does not add another blocking check.
   diary's Checkpoints or a PR's Test Plan. `evidence.mjs note <host> "<what>"
   [--device "<model, OS>"]` records something seen by hand. Web, macOS and
   iOS-simulator builds are identified; other hosts' runs are listed as
-  unchecked.
+  unchecked. Each identified run keeps its build receipt in
+  `<app>/.exact/receipts/`. Traces saved by the web dev server or copied from
+  a running app by the driver go in `<app>/.exact/traces/`.
 
 ## Waiting
 
@@ -130,6 +132,12 @@ test or drive to investigate; it does not add another blocking check.
   observing an event needs a new hook, the hook is small and read-only (for
   example `Module::storage_in_flight`).
 
+On iOS, `background 1000` in a drive or an authored test opens Settings,
+waits one second after the app reports leaving the foreground, and brings
+the same app back. The next step runs after its foreground notification.
+This exercises UIKit's scene callbacks on the system clock. A drive on the
+virtual clock retains its virtual time.
+
 ## Structure and isolation
 
 - **Spread independent cases across the CPU cores.** When a test checks many
@@ -140,9 +148,12 @@ test or drive to investigate; it does not add another blocking check.
   many threads check them. Independent fixtures (runners, kernels) each run on a
   thread of their own.
 - **Each test sets up what it uses.** macOS XCTest classes run one per process
-  (`host/apple/xctest.mjs`) and iOS classes one per simulator clone, so a class
-  cannot rely on an earlier class. The bundle installs the development
-  composition as it loads (`TestsInstall.swift`), so the capabilities a
+  (`host/apple/xctest.mjs`). iOS classes share processes: the bare and hosted
+  runs each divide their classes between two simulator clones, and the touch
+  run uses one app. A class's tests can fall in more than one run, and the
+  classes that precede a class differ from run to run, so a class cannot rely
+  on an earlier class. The bundle installs the development composition as it
+  loads (`TestsInstall.swift`), so the capabilities a
   development app links are installed before any test; a class that uses one
   development links only by use (media picker, sign-in sheet, numerals, tips)
   installs it in `class func setUp`, and creates what it reads
@@ -150,6 +161,19 @@ test or drive to investigate; it does not add another blocking check.
   domain for every macOS XCTest process (`com.apple.dt.xctest.tool`): a
   test that sets a key the host also writes gives the host a suite of its
   own (`DeclaredCategories.defaults`).
+- **A test's iOS windows end with it.** XCTest keeps every test case, and any
+  window it holds, until the process exits, and a hidden window stays in its
+  scene, where UIKit still lays it out. As each iOS test ends, after its
+  `tearDown`, `TestWindows` takes each window the test showed or added to a scene
+  out of its scene and lets go of its root view controller, so a test need not
+  hide its windows at its end. A window that has to stay shown for all of a
+  class's tests is shown in a scene in `class func setUp` and taken out of it
+  in `class func tearDown`.
+- **A test puts back the process state it changes.** `AppBackground` keeps
+  the last application lifecycle edge it heard for the whole process, so a test
+  that posts `UIApplication.didEnterBackgroundNotification` posts
+  `willEnterForegroundNotification` as it ends and clears the cache
+  (`AppBackground.invalidate()`).
 - **Run the classes a change touches.** `bun host/apple/build.mjs --test --only
   FrameHealthMetricsTests,FrameHealthMacTests` builds as a full run does and runs
   only the classes named, on macOS; `--test --ios --only

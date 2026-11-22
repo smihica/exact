@@ -23,7 +23,7 @@ internal class SharedElements(
 ) {
     internal data class Pose(val box: RectF, val radius: Float, val crop: RectF,
         val image: Int = 0, val naturalW: Float = 0f, val naturalH: Float = 0f,
-        val unit: RectF = RectF(0f, 0f, 1f, 1f))
+        val unit: RectF = RectF(0f, 0f, 1f, 1f), val contentBox: RectF = box)
 
     private class Element(val key: Long) {
         val content = RenderNode("exact shared content").apply { setClipToBounds(false) }
@@ -86,7 +86,10 @@ internal class SharedElements(
     }
 
     private fun capture(key: Long): Pose? {
-        flights[key]?.let { return it.shown.copy(box = RectF(it.shown.box), crop = RectF(it.shown.crop)) }
+        flights[key]?.let {
+            val shown = it.shown
+            return shown.copy(box = RectF(shown.box), crop = RectF(shown.crop), contentBox = RectF(shown.contentBox))
+        }
         val element = elements[key] ?: return null
         val pose = placed(element)
         // A child not flying by itself is displayed inside its flying parent's content.
@@ -98,7 +101,8 @@ internal class SharedElements(
                 flight.shown.box.top + (r.top - slot.top) * scale,
                 flight.shown.box.left + (r.right - slot.left) * scale,
                 flight.shown.box.top + (r.bottom - slot.top) * scale)
-            return pose.copy(box = map(pose.box), crop = map(pose.crop), radius = pose.radius * scale)
+            return pose.copy(box = map(pose.box), crop = map(pose.crop), contentBox = map(pose.contentBox),
+                radius = pose.radius * scale)
         }
         return pose
     }
@@ -172,17 +176,13 @@ internal class SharedElements(
     private fun placed(e: Element): Pose {
         val box = map(e, e.box)
         val scale = box.width() / e.box.width().coerceAtLeast(0.001f)
-        return Pose(box, e.radius * scale, map(e, e.crop), e.image, e.naturalW, e.naturalH, e.unit)
+        return Pose(box, e.radius * scale, map(e, e.crop), e.image, e.naturalW, e.naturalH, e.unit, map(e, e.contentBox))
     }
 
     private fun target(e: Element, from: Pose): Pose {
         val placed = placed(e)
         if (e.fit == 0 || e.image != 0) return placed
-        val content = map(e, e.contentBox)
-        // Natural sizes are in points; the content box is in device pixels under its live layers.
-        val scale = e.scale * content.width() / e.contentBox.width().coerceAtLeast(0.001f)
-        val crop = fitted(from.naturalW * scale, from.naturalH * scale, e.fit, content)
-        return placed.copy(crop = crop, image = from.image, naturalW = from.naturalW,
+        return placed.copy(image = from.image, naturalW = from.naturalW,
             naturalH = from.naturalH, unit = from.unit)
     }
 
@@ -209,6 +209,7 @@ internal class SharedElements(
             canvas.clipPath(clip)
             val opacity = ancestorOpacity(element, flight)
             if (element.fit != 0) {
+                canvas.clipRect(pose.contentBox)
                 paint.alpha = (element.opacity.coerceIn(0f, 1f) * opacity * 255f + 0.5f).toInt()
                 pictures(pose.image)?.let { canvas.drawBitmap(it, null, rasterRect(pose), paint) }
             } else {
@@ -232,30 +233,15 @@ internal class SharedElements(
         private fun rect(b: IntBuffer, at: Int): RectF = RectF(f(b, at), f(b, at + 1), f(b, at) + f(b, at + 2), f(b, at + 1) + f(b, at + 3))
         private fun mix(a: Float, b: Float, p: Float) = a + (b - a) * p
         internal fun interpolate(from: Pose, to: Pose, p: Float): Pose {
-            val box = RectF(mix(from.box.left, to.box.left, p), mix(from.box.top, to.box.top, p),
-                mix(from.box.right, to.box.right, p), mix(from.box.bottom, to.box.bottom, p))
-            // Crop offsets and sizes are interpolated in points, independently of the box.
-            val crop = RectF(box.left + mix(from.crop.left - from.box.left, to.crop.left - to.box.left, p),
-                box.top + mix(from.crop.top - from.box.top, to.crop.top - to.box.top, p), 0f, 0f)
-            crop.right = crop.left + mix(from.crop.width(), to.crop.width(), p)
-            crop.bottom = crop.top + mix(from.crop.height(), to.crop.height(), p)
-            return Pose(box, mix(from.radius, to.radius, p), crop, to.image,
-                to.naturalW, to.naturalH, to.unit)
+            fun rect(a: RectF, b: RectF) = RectF(mix(a.left, b.left, p), mix(a.top, b.top, p),
+                mix(a.right, b.right, p), mix(a.bottom, b.bottom, p))
+            return Pose(rect(from.box, to.box), mix(from.radius, to.radius, p), rect(from.crop, to.crop),
+                to.image, to.naturalW, to.naturalH, to.unit, rect(from.contentBox, to.contentBox))
         }
         internal fun rasterRect(pose: Pose): RectF = RectF(
             pose.crop.left + pose.unit.left * pose.crop.width(),
             pose.crop.top + pose.unit.top * pose.crop.height(),
             pose.crop.left + pose.unit.right * pose.crop.width(),
             pose.crop.top + pose.unit.bottom * pose.crop.height())
-
-        internal fun fitted(w: Float, h: Float, fit: Int, box: RectF): RectF {
-            if (w <= 0f || h <= 0f) return RectF(box)
-            val sx = box.width() / w; val sy = box.height() / h
-            val scale = when (fit) { 2 -> min(sx, sy); 3 -> max(sx, sy); 4 -> 1f; 5 -> min(1f, min(sx, sy)); else -> 0f }
-            val width = if (fit == 1) box.width() else w * scale
-            val height = if (fit == 1) box.height() else h * scale
-            val left = box.centerX() - width / 2f; val top = box.centerY() - height / 2f
-            return RectF(left, top, left + width, top + height)
-        }
     }
 }

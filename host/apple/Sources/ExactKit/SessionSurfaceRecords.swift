@@ -1,21 +1,16 @@
+import ExactCore
 import Foundation
 
 extension ExactSession {
     package func surfaceRecord(_ name: String, _ json: String?) {
-        publishSurfaceRecord(name, json, performance: false)
+        publishSurfaceRecord { $0.surfaceRecord(name, json) }
     }
 
-    package func canvasPerformanceRequested(_ name: String) -> Bool {
-        state != .destroyed && runtime.canvasPerformanceRequested(name)
-    }
-
-    package func canvasPerformanceRecord(_ name: String, _ json: String?) {
-        publishSurfaceRecord(name, json, performance: true)
-    }
-
-    private func publishSurfaceRecord(_ name: String, _ json: String?, performance: Bool) {
+    /// A surface's record for the runtime, now or, while a batch is being
+    /// applied, once it is in.
+    package func publishSurfaceRecord(_ record: @escaping (Runtime) -> Batch) {
         guard state != .destroyed else { return }
-        if applying { pendingSurfaceRecords.append((name, json, performance)); return }
-        apply(performance ? runtime.canvasPerformanceRecord(name, json) : runtime.surfaceRecord(name, json))
+        if applying { pendingSurfaceRecords.append(record); return }
+        apply(record(runtime))
     }
 }

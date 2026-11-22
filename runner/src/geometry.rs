@@ -25,6 +25,7 @@
 //! compiler requires `measure`'s id to be a literal, which is what lets the
 //! runner find them all first.
 
+mod hit_order;
 #[cfg(test)]
 mod hit_slop_tests;
 #[cfg(test)]
@@ -109,6 +110,16 @@ pub type Measured = Vec<(StrId, GeometryAnswer)>;
 pub trait InlineGeometry: std::fmt::Debug {
     /// The last presented run, or `UNAVAILABLE` when it is not mounted.
     fn frame(&self, view: ViewId) -> GeometryAnswer;
+
+    /// A textarea’s CSSOM offsets, scroll size and client size, in CSS pixels.
+    fn scroll_metrics(
+        &self,
+        _kernel: &Kernel,
+        _view: ViewId,
+        _offset: (f64, f64),
+    ) -> Option<[f64; 6]> {
+        None
+    }
 
     /// `rangeFrame`: a text field's UTF-16 range `start..end` as its field
     /// last drew it, in viewport coordinates (LLP 1114.007): a collapsed
@@ -422,6 +433,7 @@ impl Scrolled {
 /// geometry carries none of it (LLP 1047 D3).
 #[derive(Clone, Copy)]
 pub struct GeometryLinks {
+    scroll_metrics: fn(&Kernel, &Scrolled, ViewId) -> Option<[f64; 6]>,
     range_frame: fn(&Kernel, &Scrolled, ViewId, u32, u32) -> GeometryAnswer,
     frame: fn(&Kernel, &Scrolled, ViewId) -> GeometryAnswer,
     measure: fn(&mut Kernel, &Scrolled, ViewId) -> GeometryAnswer,
@@ -447,6 +459,14 @@ impl GeometryLinks {
         shown: fn(&Kernel, &Scrolled, ViewId, bool) -> bool,
     ) -> GeometryLinks {
         GeometryLinks {
+            scroll_metrics: |kernel, scrolled, view| {
+                let key = kernel.node(view)?.key;
+                kernel.laid_out_frame(key)?;
+                scrolled
+                    .inline
+                    .as_ref()?
+                    .scroll_metrics(kernel, view, scrolled.offset(key))
+            },
             range_frame: kernel_range_frame,
             frame,
             measure,
@@ -465,6 +485,15 @@ impl GeometryLinks {
         range_frame: fn(&Kernel, &Scrolled, ViewId, u32, u32) -> GeometryAnswer,
     ) -> Self {
         self.range_frame = range_frame;
+        self
+    }
+
+    /// A page that owns layout can read the textarea directly.
+    pub const fn with_scroll_metrics(
+        mut self,
+        read: fn(&Kernel, &Scrolled, ViewId) -> Option<[f64; 6]>,
+    ) -> Self {
+        self.scroll_metrics = read;
         self
     }
 
@@ -879,6 +908,18 @@ fn read(env: &GeometryEnv<'_>, plan: &Plan, f: Stdlib, args: &[Value]) -> Option
         ));
     }
     let id = args.first()?.as_str()?;
+    if f == Stdlib::ScrollMetrics {
+        let metrics = view_of(env.kernel, id)
+            .and_then(|view| env.kernel.node(view))
+            .filter(|node| {
+                node.node_type == exact_kernel::NodeType::TextInput
+                    && node.props.str(exact_kernel::PropId::SemanticTag) == Some("textarea")
+            })
+            .and_then(|node| (env.links.scroll_metrics)(env.kernel, env.scrolled, node.id));
+        return Some(metrics.map_or(Value::NONE, |values| {
+            Value::some(Value::record(values.map(Value::Number).into()))
+        }));
+    }
     if f == Stdlib::RangeFrame {
         let (start, end) = (args.get(1)?.as_number()?, args.get(2)?.as_number()?);
         let answer = view_of(env.kernel, id).map_or(GeometryAnswer::UNAVAILABLE, |view| {
@@ -1364,18 +1405,8 @@ impl Point<'_> {
         }
         let clipped = (x_clips || y_clips) && !inside(clip);
         if (!clipped || self.escapes.contains(&slot)) && native.is_none() {
-            let mut children: Vec<(i64, usize, u32)> = arena
-                .children(slot)
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| {
-                    let rank = self.ranks.get(&arena.local_id(c)).copied().unwrap_or(0);
-                    (rank, i, c)
-                })
-                .collect();
-            children.sort_unstable();
             above.push((slot, m.filter(|_| !clipped)));
-            for &(_, _, child) in children.iter().rev() {
+            for child in hit_order::hit_order(self.kernel, &self.ranks, slot) {
                 // Where the child is shown, in this box or the one above that
                 // holds it; a top-layer child is tested in the top layer instead
                 let Shown::Parent(holder, local) =
@@ -1418,7 +1449,7 @@ impl Point<'_> {
 
 /// The view an id names: the first live node whose `id` prop it is, as
 /// `showPicker` and `scrollIntoView` resolve names.
-fn view_of(kernel: &Kernel, id: &str) -> Option<ViewId> {
+pub(crate) fn view_of(kernel: &Kernel, id: &str) -> Option<ViewId> {
     kernel
         .find_by_id(id)
         .first()

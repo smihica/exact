@@ -48,6 +48,7 @@ pub mod kernel;
 pub mod layout;
 pub mod motion;
 pub mod node;
+pub mod object;
 pub mod paint_order;
 pub mod position_try;
 pub mod props;
@@ -69,7 +70,7 @@ pub mod txn;
 pub mod wire;
 
 pub use arena::text_style::bolder;
-pub use bars::{Bar, HeaderShape, RootTabs};
+pub use bars::{AccessoryRefusal, Bar, HeaderShape, RootTabs};
 pub use control::{Choice, ControlKind, PressFace, Progress, Range, RoleStep, RoleStop, TypeAhead};
 pub use control_measurement::{
     ButtonFaceStyle, ButtonFonts, ButtonImagePlacement, ButtonMeasure, ButtonMeasureRequest,
@@ -87,8 +88,9 @@ pub use handoff::Handoff;
 pub use id::{AxisOffer, Frame, NodeFlags, NodeKey, Offer, ViewId};
 pub use invocation::Invocation;
 pub use kernel::{
-    credited_edges, BlockAxis, BlockMeasure, HostBlock, HostCover, Kernel, Keyboard,
-    KeyboardPolicy, NodeRef, PresentedHeight, StickyConstraint, TablePlace,
+    credited_edges, decode_registration, encode_registration, BlockAxis, BlockMeasure, BlockShown,
+    HostBlock, HostCover, Kernel, Keyboard, KeyboardPolicy, NodeRef, OwnerMargins, OwnerUpdate,
+    PresentedHeight, ScrollTerms, StickyConstraint, TablePlace,
 };
 pub use layout::LayoutReceipt;
 pub use motion::{motion_node, MotionSync};

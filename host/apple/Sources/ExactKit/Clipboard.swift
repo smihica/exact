@@ -146,7 +146,7 @@ extension NodeView {
     // UIView implements none of the three: forwarding an unheard one to
     // super raised doesNotRecognizeSelector (a field's Cut, empty, crashed).
     /// Unheard, a copy is the text selection's, as on the Mac: the edit
-    /// menu's Copy over text its author made selectable (`TextSelectionIOS`).
+    /// menu's Copy over text its author made selectable (`ExactTextSelection`).
     package override func copy(_ sender: Any?) { if !clipboard(#selector(copy(_:))) { copySelectedText() } }
     package override func cut(_ sender: Any?) { clipboard(#selector(cut(_:))) }
     package override func paste(_ sender: Any?) { clipboard(#selector(paste(_:))) }
@@ -167,7 +167,7 @@ extension NodeView {
         // UIKit writes both web and file URLs as public.url.
         return board.hasImages || (board.hasURLs && board.urls?.contains(where: \.isFileURL) == true)
     }
-    private var hasSelectedText: Bool { presenter?.textSelection.text(for: self)?.selected.length ?? 0 > 0 }
+    private var hasSelectedText: Bool { presenter?.textSelection.hasSelection(in: self) == true }
     private func copySelectedText() { presenter?.textSelection.copy(self) }
     #else
     private var hasSelectedText: Bool { false } // tvOS has no text selection

@@ -292,7 +292,46 @@ pub struct TurnLinks<D: DataSource> {
     /// Linked by `drag`; where it is not, no handle is ever registered, so
     /// the turn has none to reconcile or emit and an entry point refuses.
     pub drag: Option<DragLinks<D>>,
+    /// Canvas 2D and canvas captures (LLP 1056; `canvas2d.rs`,
+    /// `canvas_capture.rs`). Linked by `surfaces`; where it is not, a plan
+    /// has no canvas, so a turn has no canvas work and surface work is the
+    /// presenter's alone.
+    pub canvas: Option<CanvasLinks<D>>,
 }
+
+/// [`TurnLinks::canvas`]'s parts, each where the host reaches it.
+pub struct CanvasLinks<D: DataSource> {
+    /// After a turn's layout: geometry, due draws and their lists, or the
+    /// word that a deferred draw is owed.
+    pub turn: fn(&mut crate::Host<D>, &mut crate::batch::Batch),
+    /// A frame's tick: geometry, due draws and their lists.
+    pub draw_turn: fn(&mut crate::Host<D>, &mut crate::batch::Batch),
+    /// A display frame reached the canvases that asked for one.
+    pub frame: fn(&mut crate::Host<D>),
+    /// Whether a canvas wants the next frame and a deferred draw is owed,
+    /// onto every batch.
+    pub onto: fn(&crate::Host<D>, &mut crate::batch::Batch),
+    /// At boot: this device's canvas limits.
+    pub limits: fn(&mut crate::Host<D>),
+    /// At boot: the app's Core Text measurer for Canvas 2D, with its context.
+    pub text: fn(&mut crate::Host<D>, crate::canvas_text::CanvasTextFn, *mut std::ffi::c_void),
+    /// Surface work for the presenter, a canvas capture as its own op.
+    pub surface_work:
+        fn(&mut crate::Host<D>, &mut crate::batch::Batch, &exact_runner::RequestOut, Option<&str>),
+    /// At a turn's end: the captures that waited, and those let go.
+    pub captures: fn(&mut crate::Host<D>, &mut crate::batch::Batch),
+    /// The presenter's image for a capture (`fulfill_surface` kind 8).
+    pub captured:
+        fn(&mut crate::Host<D>, u64, &[u8], Option<AppFileWrite>) -> exact_runner::Outcome,
+}
+
+impl<D: DataSource> Clone for CanvasLinks<D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D: DataSource> Copy for CanvasLinks<D> {}
 
 /// [`TurnLinks::drag`]'s parts, each where the host reaches it.
 pub struct DragLinks<D: DataSource> {
@@ -441,6 +480,21 @@ impl<D: DataSource> TurnLinks<D> {
                     height_begin: crate::Host::<D>::height_drag_begin_linked,
                     height_update: crate::Host::<D>::height_drag_update_linked,
                     height_release: crate::Host::<D>::dispatch_height_measured_linked,
+                })
+            } else {
+                None
+            },
+            canvas: if uses.has(Capability::Surfaces) {
+                Some(CanvasLinks {
+                    turn: crate::Host::<D>::canvas_turn,
+                    draw_turn: crate::Host::<D>::canvas_draw_turn,
+                    frame: crate::Host::<D>::canvas_frame,
+                    onto: crate::Host::<D>::canvas_onto,
+                    limits: crate::Host::<D>::canvas_limits,
+                    text: crate::Host::<D>::set_canvas_text,
+                    surface_work: crate::Host::<D>::canvas_surface_work,
+                    captures: crate::Host::<D>::canvas_captures_turn,
+                    captured: crate::Host::<D>::canvas_captured,
                 })
             } else {
                 None
@@ -597,6 +651,7 @@ impl<D: DataSource> Links<D> {
                 &exact_motion::EngineLinks::SETTLE
             },
             modules: exact_runner::ModuleLinks {
+                source_answer: None,
                 modules: if uses.has(Capability::Modules) {
                     exact_runner::ModuleLinks::<D>::ALL.modules
                 } else {
@@ -646,9 +701,13 @@ impl<D: DataSource> Links<D> {
 /// The capabilities `plan` uses that `linked` lacks, by name; `None` when
 /// it links them all. A `data:` image that is an SVG uses SVG, as the bake
 /// counts it, so a plan applied after the bake is held to the same rule; a
-/// bundled asset's bytes are the bake's alone to read.
+/// bundled asset's bytes are the bake's alone to read. On the Mac, what its
+/// core presents itself ([`Uses::MAC_CORE`]) is never missing.
 pub fn missing(plan: &exact_plan::Plan, linked: Uses) -> Option<String> {
     let mut uses = exact_runner::uses::apple_uses(plan);
+    if cfg!(target_os = "macos") {
+        uses = uses.beyond(Uses::MAC_CORE);
+    }
     let data_svg = exact_runner::uses::image_sources(plan)
         .iter()
         .any(|source| {
@@ -810,6 +869,10 @@ mod tests {
             "column navigationKey=\"a\" navigationPresentation=\"modal\"",
             "on = false",
         );
+        let selectable = compile(
+            "text \"a\" user-select=(on ? \"text\" : \"auto\")",
+            "on = false",
+        );
         let placed = compile(
             "box grid-column=(on ? \"1 / span 2\" : \"auto\")",
             "on = false",
@@ -822,6 +885,29 @@ mod tests {
         let frame = compile("iframe src=\"https://example.test\"", "on = false");
         let sound = compile("button \"b\" press=go", "stopSounds()");
         let midi = compile("button \"b\" press=go", "requestMIDIAccess()");
+        let widget = contract::Widget {
+            kind: "card".into(),
+            title: None,
+            description: None,
+            families: vec!["systemSmall".into()],
+            watch_families: vec![],
+            component: "Card".into(),
+            props: "Props".into(),
+            refresh: "refresh".into(),
+            requires_secrets: false,
+            preview: serde_json::json!({"title": "preview"}),
+            configuration: None,
+        };
+        let entry = contract::snapshot::compile(
+            "shape Props\n  title: string\ncomponent Card\n  props\n    title: string\n  view\n    text title\n",
+            &widget,
+        )
+        .unwrap();
+        let canvas = compile("canvas surface=dot() width=40 height=40", "on = false");
+        let searched = contract::compile(
+            "shape E\n  id: string\ncomponent A\n  resource all = contentIndexEntries() as shape E\n  view\n    text \"a\"\n",
+        )
+        .unwrap();
         for (plan, name) in [
             (&tools, "tools"),
             (&view, "modules, native_views"),
@@ -840,16 +926,32 @@ mod tests {
             (&routed, "navigation"),
             (&sheet, "navigation"),
             (&placed, "grid"),
-            (&activity, "activities"),
+            (&activity, "activities, widgets"),
             (&awake, "wake_lock"),
             (&video, "video"),
             (&frame, "web_views"),
             (&sound, "sound"),
             (&midi, "midi"),
+            (&selectable, "text_selection"),
+            (&entry, "widgets"),
+            (&canvas, "surfaces"),
+            (&searched, "content_index"),
         ] {
             assert_eq!(missing(plan, Uses::NONE).as_deref(), Some(name));
             assert_eq!(missing(plan, ALL), None);
         }
+    }
+
+    /// A `dialog` is the dialogs family's on iOS and tvOS; the Mac's core
+    /// presents it in its top layer.
+    #[test]
+    fn a_dialog_is_missing_only_where_its_family_presents_it() {
+        let dialog =
+            contract::compile("component A\n  view\n    dialog id=\"d\"\n      text \"a\"\n")
+                .unwrap();
+        let expected = (!cfg!(target_os = "macos")).then_some("dialogs");
+        assert_eq!(missing(&dialog, Uses::NONE).as_deref(), expected);
+        assert_eq!(missing(&dialog, ALL), None);
     }
 
     /// The grammars a native artifact links by use follow the use-set; Apple

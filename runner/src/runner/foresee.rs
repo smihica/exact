@@ -9,7 +9,7 @@
 //! ([`crate::instance::Tree::foresee`]).
 
 use super::*;
-use crate::instance::{Ids, Mount, Update};
+use crate::instance::Mount;
 
 /// What [`Runner::foresee`] found.
 #[derive(Debug, Default)]
@@ -66,11 +66,11 @@ impl<D: DataSource> Runner<D> {
             *slots.get_mut(slot as usize)? = value;
         }
         let mut ids = Ids::after(&self.ids);
-        let env = vm::Env {
+        let mut u = self.instance_update(&mut ids);
+        u.env = vm::Env {
             slots: &slots,
-            ..self.env(&[], &[])
+            ..u.env
         };
-        let mut u = Update::new(env, &self.sites, &mut ids);
         u.fonts = Some(std::rc::Rc::new(std::cell::RefCell::new(
             self.fonts.borrow().clone(),
         )));

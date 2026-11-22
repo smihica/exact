@@ -27,6 +27,7 @@ pub(crate) use presentation::Presentation;
 pub mod border;
 mod shape;
 pub use shape::Shape;
+pub(crate) use shape::{bezier_outline, bezier_path, svg_bezier_path};
 use space::sticky;
 mod box_filter;
 pub(crate) mod button;
@@ -63,12 +64,15 @@ mod native;
 pub(crate) mod neutral;
 pub(crate) mod numerals;
 pub(crate) mod ripple;
+pub(crate) use native::object_fit_of;
 pub use native::NativeKind;
+mod bleed;
 mod order;
 mod placed;
 mod presented;
 mod shared;
 pub use shared::{SharedElement, SharedState};
+mod prose;
 mod region;
 pub mod rows;
 mod shadow;
@@ -118,6 +122,8 @@ struct BoxGeometry {
     // Left and top padding + border, summed as the kernel's measure closure
     // sums them: flowed text is measured and painted around the same bits.
     inset: (f32, f32),
+    /// How far its background reaches into the window's bands (`bleed.rs`).
+    bleed: [f32; 4],
 }
 impl BoxGeometry {
     /// The content box on the content edge's curve: where a picture or a
@@ -207,6 +213,7 @@ impl BoxPaint {
         let pad = self.padding;
         BoxGeometry {
             inset: (pad[3] + widths[3], pad[0] + widths[0]),
+            bleed: [0.0; 4],
             outer: Shape::elliptical(
                 rect,
                 border::resolve_radii(self.radii.clone(), &self.env, w, h),
@@ -231,16 +238,18 @@ impl BoxPaint {
         if !self.backdrop.is_none() {
             backend.backdrop_filter(&geometry.outer, &self.backdrop, ts);
         }
-        self.emit(geometry, |shape, color| backend.fill(&shape, color, ts));
+        let back = bleed::geometry(geometry);
+        self.emit(&back, |shape, color| backend.fill(&shape, color, ts));
         // The last layer first, so the first is on top (LLP 1077 D5), within
         // the background's clip (D6).
-        if let Some(clip) = self.background_shape(geometry) {
+        if let Some(clip) = self.background_shape(&back) {
             for g in self.gradients.iter().rev() {
-                gradient::paint(g, &geometry.outer, &clip, self.widths, backend, ts);
+                gradient::paint(g, &back.outer, &clip, self.widths, backend, ts);
             }
         }
-        for band in self.inset_shadow_fills(geometry) {
-            backend.fill_border(&band, ts);
+        for s in self.shadows.iter().rev().filter(|s| s.inset()) {
+            let bands = || s.fills(&geometry.outer, self.widths);
+            backend.box_shadow(None, &geometry.outer, &bands, ts);
         }
         for part in self.borders(geometry) {
             backend.fill_border(&part, ts);
@@ -298,12 +307,16 @@ pub struct PaintedBox {
     pub id: ViewId,
     /// The box.
     pub rect: Rect4,
+    /// The first text baseline in the scroll plane of this painted box.
+    pub(crate) baseline: Option<(f32, f32)>,
     /// The clip, `None` when unclipped.
     pub clip: Option<Rect4>,
     /// The scroll offset for a scroll container.
     pub scroll: Option<(f32, f32)>,
     /// Generic pointer eligibility of this painted scene, including inheritance.
     pub(crate) pointer_hit: bool,
+    /// Rounded box or control face in local space, used for scrollbar coverage.
+    rounded_border: Option<Rc<exact_kernel::svg::Path>>,
     shape_clips: Vec<shape::HitClip>,
     projective: Option<ProjectiveHit>,
     affine: Option<(Transform, Rect4)>,
@@ -359,7 +372,8 @@ pub struct Scene<'a> {
 }
 
 mod frame;
-pub use backend::{Backend, FrameTarget, WindowLayer};
+pub use crate::canvas2d::CanvasUpdate;
+pub use backend::{Backend, FrameTarget, WindowLayer, POINTER};
 pub use exact_ink::Rotation;
 pub use frame::Frame;
 
@@ -374,8 +388,10 @@ pub struct Painter {
     pub(crate) window_canvas: Option<ViewId>,
     pub(crate) direct_canvases: std::collections::BTreeSet<ViewId>,
     pub(crate) media: native::Media,
+    boxless_audio: Option<Vec<ViewId>>,
     pub(crate) alert: Option<alert::Picture>,
-    /// The text engine, shared with the kernel's measurer.
+    markers: HashMap<ViewId, HashMap<ViewId, String>>,
+    /// Shared with the kernel measurer.
     pub text: Shared,
     /// Device pixels per point.
     pub scale: f32,
@@ -399,19 +415,23 @@ pub struct Painter {
     pub(crate) placements: BTreeMap<ViewId, crate::placement::Placement>,
     /// The canvases whose children their surfaces composite, and their pictures.
     pub(crate) composites: composite::Composites,
-    /// Each 2D canvas's latest bitmap (LLP 1056).
-    pub(crate) canvases: BTreeMap<ViewId, crate::canvas2d::CanvasPaint>,
+    /// Canvas 2D snapshots and GPU readbacks.
+    pub(crate) canvases: crate::canvas2d::CanvasPictures,
     /// Each hatched node's overlay as last published (LLP 1075.003.000.001 §2.2.1).
     pub(crate) overlays: BTreeMap<ViewId, Arc<Pixmap>>,
     pub(crate) top_surface: Option<TopSurface>,
     pub(crate) scrollbars: scrollbar::State,
     viewport: (f32, f32),
+    /// How far the window reaches past each edge of the viewport (`bleed.rs`).
+    pub(crate) bands: [f32; 4],
     cpu_ms: Option<f64>,
     /// What a reorder lifts: a row in its list, or a ghost over everything.
     pub(crate) lift: Lift,
     pub(crate) shared: SharedState,
     // Accepted owners retain their paragraph leases while a subsequent backend frame fails.
     accepted_text: BTreeMap<exact_kernel::NodeKey, Rc<Paragraph>>,
+    pub(crate) reader_highlights:
+        BTreeMap<exact_kernel::NodeKey, inline_frame::selection::Highlight>,
     pub(crate) field_text: HashMap<ViewId, Rc<field::PaintedField>>,
     pub(crate) caret_hidden: bool,
     pub(crate) composition: Option<Rc<field::Composition>>,
@@ -443,6 +463,9 @@ pub struct Painter {
     pub(crate) feedback: (Option<ViewId>, Option<ViewId>),
     /// The control a held `active` presses (`presenter/held.rs`), beside a contact's.
     pub(crate) held_press: Option<ViewId>,
+    /// The focus is on something that presses, which Material shows by its
+    /// state layer (`ripple.rs`).
+    pub(crate) focus_presses: bool,
     /// Material's ripples, each from its press's touch (`ripple.rs`).
     pub(crate) ripples: ripple::Ripples,
     /// The background the last box painted shows, its states' over its own,
@@ -469,6 +492,8 @@ pub struct Painter {
 
 struct Walk<'a, 'b> {
     scene: &'b Scene<'a>,
+    /// Offscreen boxes can cover the frame's scrollbars too.
+    scrollbar_cover: bool,
     hit_space: Option<(Transform, Option<Rect4>)>,
     boxes: Vec<PaintedBox>,
     text: BTreeMap<exact_kernel::NodeKey, Rc<Paragraph>>,
@@ -483,6 +508,7 @@ struct Walk<'a, 'b> {
     /// row inherits from its wrapper shows, one its own nodes set does not
     /// (`lift.rs`; b6 review B4).
     reveal: Option<ViewId>,
+    alert: Option<exact_kernel::NodeKey>,
     dialog: Option<ViewId>,
 }
 
@@ -506,19 +532,6 @@ impl Painter {
         std::mem::take(&mut self.notes)
     }
 
-    pub(crate) fn replaced(&mut self) {
-        self.native_session = native::new_session();
-        // A fresh kernel can reuse both epochs and node keys: a row kept by
-        // key would replay the old tree's drawing.
-        self.paint_epoch = None;
-        self.discard_rows();
-        self.shared = SharedState::default();
-        self.svg_warned.clear();
-        // The old tree's presses: its view ids are another tree's now.
-        self.ripples.clear();
-        self.zoom.clear();
-    }
-
     /// A painter over a backend.
     pub fn new(text: Shared, scale: f32, backend: Box<dyn Backend>) -> Painter {
         Painter {
@@ -529,6 +542,8 @@ impl Painter {
             window_canvas: None,
             direct_canvases: Default::default(),
             media: Default::default(),
+            boxless_audio: None,
+            markers: HashMap::new(),
             text,
             scale,
             dark: false,
@@ -554,11 +569,12 @@ impl Painter {
             decoration_warning: false,
             placements: BTreeMap::new(),
             composites: Default::default(),
-            canvases: BTreeMap::new(),
+            canvases: Default::default(),
             overlays: BTreeMap::new(),
             top_surface: None,
             scrollbars: Default::default(),
             viewport: (0., 0.),
+            bands: [0.0; 4],
             cpu_ms: None,
             flatten: None,
             ringless: None,
@@ -568,10 +584,12 @@ impl Painter {
             symbols: look::symbols(),
             feedback: (None, None),
             held_press: None,
+            focus_presses: false,
             ripples: Default::default(),
             clipped: None,
             field_content: HashMap::new(),
             field_text: HashMap::new(),
+            reader_highlights: BTreeMap::new(),
             caret_hidden: false,
             composition: None,
             inline_text: HashMap::new(),
@@ -586,30 +604,9 @@ impl Painter {
         }
     }
 
-    /// The backend's name.
+    /// The active backend's name.
     pub fn backend(&self) -> &'static str {
         self.backend.name()
-    }
-
-    pub(crate) fn recycle_frame(&mut self, pixels: Arc<Pixmap>) {
-        if let Ok(pixels) = Arc::try_unwrap(pixels) {
-            self.backend.recycle_frame(pixels);
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn recycle_window_layers(
-        &mut self,
-        below: Pixmap,
-        above: Arc<Pixmap>,
-        rows: (u32, u32),
-    ) {
-        // Damage snapshots contain only the overlay after a split, not a
-        // complete CPU picture. A window repaint rebuilds both layers.
-        self.damage.pixels = None;
-        self.damage.next.clear();
-        self.backend
-            .recycle_window_layers(below, Arc::try_unwrap(above).ok(), Some(rows));
     }
 
     #[cfg(windows)]
@@ -791,6 +788,7 @@ impl Painter {
         if self.paint_epoch != Some(scene.kernel.epoch()) {
             self.svg_warned
                 .retain(|key| scene.kernel.node_by_key(*key).is_some());
+            self.markers.clear();
             self.refresh_ranks(scene.kernel);
             self.order_shared(scene);
             self.paint_epoch = Some(scene.kernel.epoch());
@@ -803,6 +801,7 @@ impl Painter {
         self.backend.shared_frame(&self.shared);
         let mut walk = Walk {
             scene,
+            scrollbar_cover: self.scrollbars.enabled,
             hit_space: None,
             boxes: Vec::with_capacity(self.boxes_hint),
             text: BTreeMap::new(),
@@ -812,8 +811,10 @@ impl Painter {
             replay,
             ranks: self.ranks.clone(),
             reveal: None,
+            alert: self.alert.as_ref().map(|a| a.key),
             dialog: None,
         };
+        let old_bars = std::mem::take(&mut self.scrollbars.bars);
         self.rows_begin(&walk);
         let kept = self.kept_places(&walk, None, scene.roots);
         let space = Transform::from_translate(-scene.page.0, -scene.page.1);
@@ -824,10 +825,10 @@ impl Painter {
             self.paint_stage(&mut walk, *root, Some(*root) == last);
         }
         self.replay_kept(walk.scene, &kept, scene.roots.len(), space);
+        self.paint_sheets(&mut walk);
         self.paint_ghost(&mut walk);
         self.paint_alert(&mut walk);
         self.rows_end();
-        self.paint_scrollbars(&walk);
         if let Some(menu) = &scene.menu {
             self.menu(menu);
         }
@@ -862,6 +863,7 @@ impl Painter {
             self.field_text = walk.fields;
             self.inline_text = walk.inline;
         } else {
+            self.scrollbars.bars = old_bars;
             self.discard_rows();
             drop(walk.text);
         }
@@ -914,12 +916,13 @@ impl Painter {
         if walk.skip == Some(node.key) || node.node_type.is_svg_element() {
             return;
         }
-        if (walk.scene.hidden)(id)
-            || (self.alert.as_ref().is_some_and(|a| a.key == node.key) && walk.dialog != Some(id))
-            || node.is_inline_run()
-            || node.style.display == Display::None
+        if (walk.scene.hidden)(id) || walk.draws_alert_elsewhere(&node) || node.is_inline_run() {
+            return;
+        }
+        if node.style.display == Display::None
             || (node.props.str(PropId::SemanticTag) == Some("dialog") && walk.dialog != Some(id))
         {
+            self.boxless_audio(walk, &node);
             return;
         }
         // The roles drawn in the accent read the nearest authored
@@ -928,7 +931,7 @@ impl Painter {
         let f = node.frame;
         let (x, y, w, h) = paint_rect(f, offset);
         let p = (walk.scene.presented)(id);
-        self.row_node(walk.scene.kernel, node.key, f, &p);
+        self.row_node(walk.scene.kernel, &node, &p);
         // @ref LLP 1077 D8 — turned or moved in space: painted apart, warped.
         if self.spatial(walk, &node, &p, (x, y, w, h), ts, offset, clip_rect) {
             self.row_refuse();
@@ -977,15 +980,13 @@ impl Painter {
             let (ox, oy) = effective_overflow(&node);
             ox != Overflow::Visible || oy != Overflow::Visible
         };
-        // CSS `visibility` is inherited and per element: a hidden box keeps
-        // its geometry, paints nothing of its own, and is not a hit. A
-        // descendant that computes `visible` still paints and is hit.
-        // `opacity: 0` is the one that blanks the group. A ghost asks
-        // `revealed` (LLP 1094): the wrapper's inherited hidden shows, and
-        // a node that sets its own hidden does not.
+        // A hidden box keeps its geometry. A visible descendant still paints and takes hits.
+        // A ghost reveals the wrapper's inherited visibility (LLP 1094).
         let visible = paints(walk.scene.kernel, id, walk.reveal);
         let hit_start = walk.boxes.len();
         walk.boxes.push(PaintedBox {
+            baseline: None,
+            rounded_border: None,
             shape_clips: Vec::new(),
             id,
             pointer_hit: node
@@ -1026,8 +1027,9 @@ impl Painter {
         // CSS opacity is paint only: a transparent subtree is still hit (the
         // walk records its boxes) and draws through a backend that draws nothing.
         // Visibility is not that: only this box's own paint is skipped.
-        let drawn = (opacity <= 0.0)
-            .then(|| std::mem::replace(&mut self.backend, Box::new(layer::Unpainted)));
+        let drawn = (opacity <= 0.0).then(|| {
+            self.replace_picture_backend(walk.scene.kernel, Box::new(layer::Unpainted::<false>))
+        });
         if drawn.is_none() && opacity < 1.0 {
             self.backend.push_opacity(opacity);
         }
@@ -1060,7 +1062,7 @@ impl Painter {
             self.backend.pop_mask(&Shape::rect((x, y, w, h)), mask, ts);
         }
         match drawn {
-            Some(backend) => self.backend = backend,
+            Some(picture) => drop(self.restore_picture_backend(walk.scene.kernel, picture)),
             None if opacity < 1.0 => self.backend.pop_opacity(),
             None => {}
         }
@@ -1076,6 +1078,7 @@ impl Painter {
         offset: (f32, f32),
         clip_rect: Option<Rect4>,
     ) {
+        let owner = walk.boxes.len() - 1;
         let paints_self = paints(walk.scene.kernel, node.id, walk.reveal);
         let shown = (walk.scene.presented)(node.id);
         // Paint motion's values over the captured box (LLP 1055.000 D6,
@@ -1083,14 +1086,8 @@ impl Painter {
         // its looks and a press's background (LLP 1061 D7, LLP 1121 D8).
         let mut paint = BoxPaint::capture(node, walk.scene.kernel, self.dark)
             .presented(&shown.colors)
-            .states(node, &shown, self.dark);
-        if let Some(section) = walk.scene.kernel.grouped_card_section(node.id) {
-            if let Some(owner) = walk.scene.kernel.node(section) {
-                paint = paint.section_shadow(&owner, &(walk.scene.presented)(section), self.dark);
-            }
-        } else if walk.scene.kernel.grouped_section_card(node.id).is_some() {
-            paint.shadows.clear();
-        }
+            .states(node, &shown, self.dark)
+            .grouped(walk, node.id, self.dark);
         self.split_row(node, &mut paint);
         if self.bare(node) {
             paint.background = [0; 4];
@@ -1104,8 +1101,11 @@ impl Painter {
         // A hidden box paints none of its own chrome. Children still do,
         // and a text node still walks its runs so a visible inline paints.
         if paints_self {
+            surface.bleed = self.bleed(walk.scene.kernel, node.id, &surface.outer, ts);
+            self.row_box_reach(&paint.shadows, surface.outer.rect, geometry.outer.rect, ts);
             paint.paint(self.backend.as_mut(), &surface, ts);
             self.column_rules(walk.scene.kernel, node, rect, ts);
+            self.prose_marker(walk, node, rect, ts);
             let (dark, feedback) = (
                 self.dark,
                 (self.feedback.0, self.presses(node.id).then_some(node.id)),
@@ -1120,7 +1120,8 @@ impl Painter {
                 dark,
                 feedback,
             );
-            self.pressable(node, &surface.outer, ts);
+            let focused = walk.scene.focus == Some(node.id);
+            self.pressable(node, &surface.outer, focused, ts);
         }
         let outer = geometry.outer;
         let content = geometry.content;
@@ -1128,12 +1129,18 @@ impl Painter {
         // and a text's own lines (CSS Overflow 3 §3).
         let (ox, oy) = effective_overflow(node);
         let clip = field::overflow_clip(&surface.outer, paint.widths, (ox, oy));
+        let mut cover = surface.outer;
         match node.node_type {
+            NodeType::Video if native::is_audio(node) && (content.2 <= 0.0 || content.3 <= 0.0) => {
+                self.record_boxless_audio(node);
+            }
             NodeType::Text => {
                 if let Some(clip) = &clip {
                     self.backend.push_clip(clip, ts);
                 }
-                self.text_node(walk, node, &geometry, rect, ts);
+                let clips = (clip.as_ref().map(|c| c.rect), clip_rect);
+                let baseline = self.text_node(walk, node, &geometry, rect, clips, ts);
+                walk.boxes[owner].baseline = baseline;
                 if clip.is_some() {
                     self.backend.pop_clip();
                 }
@@ -1147,9 +1154,18 @@ impl Painter {
                 if self.window_canvas == Some(node.id) {
                     self.backend.split_window_canvas(content, &clips, ts);
                 } else if let Some(c) = self.canvases.get(&node.id) {
-                    self.backend.canvas(&c.pixels, content, &clips, ts);
+                    if let Some(rect) = object_fit(
+                        (c.pixels.width(), c.pixels.height()),
+                        node.style.object_fit,
+                        &node.style.object_position,
+                        content,
+                        &walk.scene.kernel.env_of(node.id),
+                    ) {
+                        self.backend
+                            .canvas_frame(&c.pixels, c.update, rect, &clips, ts);
+                    }
                 } else {
-                    self.native(node, &clips[0], ts);
+                    self.native(walk, node, &clips[0], ts);
                 }
             }
             NodeType::Image => {
@@ -1169,7 +1185,13 @@ impl Painter {
                     } else {
                         presented_color(walk, node, self.dark)
                     };
-                    self.symbol(node, content, ink, ts);
+                    self.symbol(
+                        node,
+                        geometry.content_edge(),
+                        ink,
+                        ts,
+                        &walk.scene.kernel.env_of(node.id),
+                    );
                 } else {
                     let edge = geometry.content_edge();
                     self.row_slot(node.id, content, edge, ts);
@@ -1191,17 +1213,19 @@ impl Painter {
                 if !self.media.framed.contains(&node.key) {
                     self.picture(walk, node, content, edge, ts);
                 }
-                self.native(node, &edge, ts)
+                self.native(walk, node, &edge, ts)
             }
             NodeType::WebView | NodeType::NativeView => {
-                self.native(node, &geometry.content_edge(), ts)
+                self.native(walk, node, &geometry.content_edge(), ts)
             }
             NodeType::Control if node.props.str(PropId::Type) == Some("select") => {
                 let label =
                     control::select_label(walk.scene.kernel, node, walk.scene.chosen.get(&node.id));
                 let focused = walk.scene.focus == Some(node.id);
                 let label = label.as_deref().unwrap_or("");
-                self.field_control(walk, node, content, &outer, focused, ts, label, true);
+                cover = self
+                    .field_control(walk, node, content, &outer, focused, ts, label, true)
+                    .unwrap_or(cover);
             }
             // @ref LLP 1069.001 D7 — a date control is a field showing its
             // value (`control::date_text`); `type` sets it.
@@ -1214,7 +1238,9 @@ impl Painter {
                 let chosen = walk.scene.chosen.get(&node.id);
                 let shown = control::date_text(node, chosen, self.dates.as_ref());
                 let focused = walk.scene.focus == Some(node.id);
-                self.field_control(walk, node, content, &outer, focused, ts, &shown, false);
+                cover = self
+                    .field_control(walk, node, content, &outer, focused, ts, &shown, false)
+                    .unwrap_or(cover);
             }
             NodeType::Control if node.props.str(PropId::Type) == Some("range") => {
                 self.range_control(node, content, ts, walk.scene.chosen.get(&node.id))
@@ -1233,7 +1259,7 @@ impl Painter {
                     .kernel
                     .button_face_style(node.id)
                     .expect("button");
-                self.button_control(node, surface.outer.rect, ts, &face, &rows, walk);
+                cover = self.button_control(node, surface.outer.rect, ts, &face, &rows, walk);
             }
             NodeType::Control
                 if look::neutral() && node.props.str(PropId::Type) == Some("file") =>
@@ -1247,9 +1273,13 @@ impl Painter {
                 control::paint(
                     backend, node, content, ts, self.dark, held, hovered, self.scale,
                 );
-                self.mark_ripple(node, content, held, ts);
+                let focused = walk.scene.focus == Some(node.id);
+                self.mark_ripple(node, content, held, focused, ts);
             }
             _ => {}
+        }
+        if walk.scrollbar_cover {
+            walk.boxes[owner].rounded_border = cover.rounded_outline();
         }
         // Children, moved by this box's scroll offset when it scrolls.
         if let Some((hit_ts, hit_clip)) = walk.hit_space.as_mut() {
@@ -1306,41 +1336,29 @@ impl Painter {
             self.backend.canvas(&pixels, rect, &clips, ts);
         }
         self.hosted_view(node, rect, ts);
+        self.paint_scrollbars(walk, node, owner, (ox, oy));
     }
 }
 
-/// Where a picture goes under CSS `object-fit`, centred in the content box:
-/// `fill` stretches, `contain`/`cover` keep the ratio, `none` is the natural
-/// size, `scale-down` the smaller of none and contain (LLP 1011 §4).
-pub fn object_fit(natural: (u32, u32), fit: ObjectFit, content: Rect4) -> Option<Rect4> {
-    let (nw, nh) = (natural.0 as f32, natural.1 as f32);
-    if nw <= 0.0 || nh <= 0.0 || content.2 <= 0.0 || content.3 <= 0.0 {
-        return None;
-    }
-    let (sx, sy) = (content.2 / nw, content.3 / nh);
-    let s = match fit {
-        ObjectFit::Contain => Some(sx.min(sy)),
-        ObjectFit::Cover => Some(sx.max(sy)),
-        ObjectFit::None => Some(1.0),
-        ObjectFit::ScaleDown => Some(sx.min(sy).min(1.0)),
-        ObjectFit::Fill => None,
-    };
-    let (dw, dh) = match s {
-        Some(s) => (nw * s, nh * s),
-        None => (content.2, content.3),
-    };
-    Some((
-        content.0 + (content.2 - dw) / 2.0,
-        content.1 + (content.3 - dh) / 2.0,
-        dw,
-        dh,
-    ))
+/// CSS object-fit and object-position in the content box (LLP 1011 §4).
+pub fn object_fit(
+    natural: (u32, u32),
+    fit: ObjectFit,
+    position: &exact_kernel::object::Position,
+    content: Rect4,
+    env: &exact_kernel::Env,
+) -> Option<Rect4> {
+    exact_kernel::object::placed(
+        (natural.0 as f32, natural.1 as f32),
+        fit,
+        position,
+        content,
+        env,
+    )
 }
 
-/// A text node's paragraph spec from its rows (the kernel's defaults are
-/// CSS's, so every row reads directly).
-/// Its white space is collapsed per CSS unless the row preserves it; the
-/// caller that replaces the runs collapses again ([`Spec::collapse_white_space`]).
+/// Paragraph style and CSS white-space handling for a text node. A caller that
+/// replaces its runs must repeat [`Spec::collapse_white_space`].
 pub fn text_spec(s: &StyleProps, text: &str) -> Spec {
     Spec {
         strut: Run::from_style("", exact_kernel::TextStyle::from_style(s)),
@@ -1421,24 +1439,13 @@ pub fn bbox(ts: Transform, r: Rect4) -> Rect4 {
     (x0, y0, x1 - x0, y1 - y0)
 }
 
-fn intersect(a: Rect4, b: Rect4) -> Rect4 {
+pub(crate) fn intersect(a: Rect4, b: Rect4) -> Rect4 {
     let x0 = a.0.max(b.0);
     let y0 = a.1.max(b.1);
     let x1 = (a.0 + a.2).min(b.0 + b.2);
     let y1 = (a.1 + a.3).min(b.1 + b.3);
     (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
-
-/// The pointer arrow's outline, at the origin, in points.
-pub const POINTER: [(f32, f32); 7] = [
-    (0.0, 0.0),
-    (0.0, 16.0),
-    (4.0, 12.5),
-    (7.0, 19.0),
-    (9.5, 18.0),
-    (6.5, 11.5),
-    (11.5, 11.5),
-];
 
 #[cfg(test)]
 mod inline_image_tests;

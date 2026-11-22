@@ -2,8 +2,8 @@
 //! reads it — the last 64 voices (each with `playbackRate` and `pan` only
 //! when not 1 and 0), or the whole record when the request asks
 //! `"sounds":"all"` (what `expect sound` reads), how many are live, how many
-//! the record holds, and the output. The runner says `"agent"`: under the
-//! driver no host plays, and a host that plays outside it fills in its own.
+//! the record holds, and the output. Hosts that play supply their own output
+//! state over the runner's `"agent"`.
 
 use crate::json::{field_str, num, quote};
 use crate::{DataSource, Runner};
@@ -13,12 +13,11 @@ use std::fmt::Write as _;
 const SHOWN: usize = 64;
 
 /// `,"sounds":{…}`, for a plan that declares a sound.
-pub(super) fn state<D: DataSource>(runner: &Runner<D>, request: &str, s: &mut String) {
+pub(super) fn state<D: DataSource>(runner: &Runner<D>, request: &str, now: f64, s: &mut String) {
     if runner.plan().sounds.is_empty() || !runner.plays_audio() {
         return;
     }
     let table = runner.sounds();
-    let now = runner.now_ms();
     let all = field_str(request, "sounds").as_deref() == Some("all");
     let skip = if all {
         0

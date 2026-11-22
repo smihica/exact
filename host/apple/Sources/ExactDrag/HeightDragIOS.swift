@@ -21,6 +21,15 @@ extension NodeView {
             heightRecognizer = nil
         }
     }
+    /// Whether the height drag's recognizer begins; nil when `gesture` is another.
+    func heightShouldBegin(_ gesture: UIGestureRecognizer) -> Bool? {
+        guard gesture === heightRecognizer, let pan = gesture as? UIPanGestureRecognizer else { return nil }
+        let velocity = pan.velocity(in: window), translation = pan.translation(in: window)
+        return SwipeInput.allows(self) && HeightDragDirection.accepts(
+            velocityX: Double(velocity.x), velocityY: Double(velocity.y),
+            translationX: Double(translation.x), translationY: Double(translation.y))
+            && presenter?.heightBindings[id]?.target != nil
+    }
     @objc func heightDragging(_ pan: UIPanGestureRecognizer) {
         let translation = Double(pan.translation(in: window).y)
         let time = CACurrentMediaTime()

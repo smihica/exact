@@ -529,10 +529,10 @@ int exact_js_call(void *h, const char *name, const char *a, const char *b, const
     // collection may be old generation now, promoted while its answer was
     // pending, and once sent it is garbage that no later collection frees
     // while the module is idle (euxy's QR path: 376 KB). The prelude owes a
-    // full collection for it, asked for once no answer awaits a reply:
-    // asked at each reply, one collection would mark the answers still
-    // pending, whose replies would ask again. A string made and sent with no
-    // collection between, as a frame's answer is, waits for collect_if_due.
+    // full collection for it on the reply and re-stamps pending answers'
+    // epochs afterward so replies alternating with new answers do not cascade.
+    // A string made and sent with no collection between, as a frame's answer
+    // is, waits for collect_if_due.
     if (state->collect_owed) {
       state->collect_owed = false;
       collect_garbage(state, "owed after a large reply");

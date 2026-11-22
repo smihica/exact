@@ -8,11 +8,26 @@ import ExactCore
 
 final class SharedStoreRefresh {
     var replicate: (() -> Void)?
-    var observer: WidgetStoreObserver?
+    /// The widgets family's store observer, kept for the app's lifetime.
+    var observer: AnyObject?
+    var observing = false
     private var drawn = false
     private var reloads: [() -> Void] = []
     func firstPixel() { drawn = true; let work = reloads; reloads = []; work.forEach { $0() } }
     func reloadAfterPixel(_ work: @escaping () -> Void) { if drawn { work() } else { reloads.append(work) } }
+    /// A launch writes several values within a fraction of a second. Reloading the widgets once the
+    /// store has been quiet for `quiet` seconds starts their refresh after the burst, not inside it,
+    /// where a later write would refuse its answer.
+    var quiet: TimeInterval = 0.5
+    private var settling: DispatchWorkItem?
+    func reloadWhenQuiet(_ work: @escaping () -> Void) {
+        reloadAfterPixel { [self] in
+            settling?.cancel()
+            let item = DispatchWorkItem(block: work)
+            settling = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + quiet, execute: item)
+        }
+    }
 }
 
 extension ExactApp {
@@ -22,22 +37,30 @@ extension ExactApp {
         set { sharedStore.replicate = newValue }
     }
 
+    /// The store's observer is asked of the widgets family as the first session is made: an
+    /// embedder installs its capabilities before it makes sessions, not before it first reads
+    /// `ExactApp.shared`.
+    func observeSharedStoreOnce() {
+        if !sharedStore.observing { observeSharedStore() }
+    }
+
     func observeSharedStore(root: URL? = nil, appID: String? = nil, kinds: [String]? = nil, reload: (([String]?) -> Void)? = nil) {
         #if canImport(UIKit)
         let foreground = [UIApplication.willEnterForegroundNotification, UIApplication.didBecomeActiveNotification]
         #else
         let foreground = [NSApplication.didBecomeActiveNotification]
         #endif
+        sharedStore.observing = true
         let writtenKinds = kinds ?? Bundle.main.object(forInfoDictionaryKey: "ExactWidgetKinds") as? [String]
-        sharedStore.observer = WidgetContainer.observeStore(root: root, appID: appID, kinds: kinds, foreground: foreground, needsRefresh: { [weak self] in
+        sharedStore.observer = WidgetLink.publication?.observeStore(root: root, appID: appID, kinds: kinds, foreground: foreground, needsRefresh: { [weak self] in
             self?.sessions.contains { $0.booted && $0.state != .destroyed && $0.storeRefresh.pending } ?? false
         }) { [weak self] retryOnly, finished in
             guard let self else { finished(true); return }
             let after = { (success: Bool) in
                 if success {
-                    self.sharedStore.reloadAfterPixel {
-                        DispatchQueue.main.async {
-                            if let reload { reload(writtenKinds) } else { WidgetContainer.reloadAfterStoreChange(kinds: writtenKinds) }
+                    self.sharedStore.reloadWhenQuiet {
+                        MainActor.assumeIsolated {
+                            if let reload { reload(writtenKinds) } else { WidgetLink.publication?.reloadAfterStoreChange(kinds: writtenKinds) }
                         }
                     }
                 }
@@ -83,12 +106,22 @@ extension ExactSession {
     /// in all; and they hear the topics its SQLite and file writes announced
     /// (LLP 1030.004 D2).
     func relayStore(_ batch: Batch) {
+        if let archive = batch.windowState, archive != windowState {
+            windowState = archive
+            windowStateDidChange?()
+        }
         guard batch.stored || !batch.announced.isEmpty else { return }
         if batch.stored { app.replicateStore?() }
         for peer in app.sessions where peer !== self && peer.booted && peer.state != .destroyed {
             if batch.stored { peer.refreshSharedStore { _ in } }
             for topic in batch.announced { peer.runtime.peerChanged(topic) }
         }
+    }
+
+    /// Seed this window before its first frame when the platform restores it.
+    public func restoreWindowState(_ archive: [String: String]) {
+        guard !booted, state != .destroyed else { return }
+        runtime.restoreWindowState(archive)
     }
 
     func retryStoreActivation(attempts: Int = 3) {

@@ -218,7 +218,7 @@ extension NodeView {
     /// The ARIA roles that make a box an AppKit container of its own
     /// (Core-AAM): a `menu` is `AXMenu`, as WebKit serves one, so VoiceOver
     /// says "menu" as it does for AppKit's.
-    static let containerRoles: [String: NSAccessibility.Role] = ["group": .group, "radiogroup": .radioGroup, "menu": .menu, "menubar": .menuBar]
+    static let containerRoles: [String: NSAccessibility.Role] = ["group": .group, "list": .list, "radiogroup": .radioGroup, "menu": .menu, "menubar": .menuBar]
     /// A pressable's AppKit role when it is no toggle: a link, a menu item, else a button.
     var buttonRole: NSAccessibility.Role { props["accessibilityRole"] == "link" ? .link : isMenuItem ? .menuItem : .button }
     var isMenu: Bool { ["menu", "menubar"].contains(props["accessibilityRole"] ?? "") }
@@ -783,7 +783,7 @@ extension Presenter {
     /// Native presentations carry views out of their authored ancestry.
     func accessibilityParent(of view: UIView) -> UIView? {
         menus.logicalParent(of: view) ?? groupedLists?.logicalParent(of: view)
-            ?? (view as? NodeView).flatMap { navigation.logicalParent(of: $0) } ?? view.superview
+            ?? (view as? NodeView).flatMap { navigation.logicalParent(of: $0) } ?? navigation.lifted?.parent(of: view) ?? view.superview
     }
     #endif
     /// What `syncAccessibility` writes of a node a staged batch made, while
@@ -857,6 +857,7 @@ extension Presenter {
                 if control.accessibilityLabel() != node.authoredLabel { control.setAccessibilityLabel(node.authoredLabel) }
                 #else
                 if control.accessibilityLabel != node.authoredLabel { control.accessibilityLabel = node.authoredLabel }
+                if node.props["type"] == "select" { assign(control, \.accessibilityValue, controls.selectValue(for: node)) }
                 #endif
             } else {
                 #if os(macOS)
@@ -865,6 +866,7 @@ extension Presenter {
                 if node.accessibilityLabel != node.accessibleName { node.accessibilityLabel = node.accessibleName }
                 node.updateImageAccessibility()
                 #endif
+                node.video?.update()
             }
         }
         for node in nodes {
@@ -1209,7 +1211,7 @@ private struct FocusTree {
 extension Presenter {
     /// The node holding the focus: itself, its field (through its editor on
     /// AppKit) or its text area.
-    var focusedNode: NodeView? {
+    package var focusedNode: NodeView? {
         views.values.filter { node in
             #if os(macOS)
             guard let responder = node.window?.firstResponder else { return false }

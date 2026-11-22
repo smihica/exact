@@ -8,11 +8,28 @@
 //! iterator (6–20× slower per glyph; the spike), and placed as its
 //! `positioned_glyphs` places them: each glyph at the pen plus its offset,
 //! the pen moved by its advance.
+#[path = "field_lines.rs"]
+mod field_lines;
+pub use field_lines::Glyphs;
+pub(super) use field_lines::{Block, FieldLines};
+
 use super::catalog::FaceId;
 use parley::FontData;
 use std::sync::Arc;
 
 impl super::Paragraph {
+    pub(crate) fn baseline_at(&self, origin: (f32, f32)) -> Option<(f32, f32)> {
+        let lines = self.lines();
+        lines
+            .lines
+            .iter()
+            .zip(self.baselines())
+            .find_map(|(line, y)| {
+                let glyph = lines.glyphs_of(line).first()?;
+                Some((origin.0 + glyph.x, origin.1 + y))
+            })
+    }
+
     /// A fragment's ink, retaining original line indices and coordinates.
     /// Lines assigned to other columns have no glyphs or inline boxes.
     pub(crate) fn line_fragment(&self, range: std::ops::Range<usize>) -> Self {
@@ -36,8 +53,11 @@ impl super::Paragraph {
                     line
                 })
                 .collect(),
-            glyphs: source.glyphs[glyph_start as usize..glyph_end as usize].to_vec(),
+            glyphs: source.glyphs[glyph_start as usize..glyph_end as usize]
+                .to_vec()
+                .into(),
             faces: source.faces.clone(),
+            field_metrics: Vec::new(),
             boxes: source
                 .boxes
                 .iter()
@@ -90,8 +110,7 @@ pub struct LayoutGlyph {
     pub font_size: f32,
     /// In its face.
     pub glyph_id: u32,
-    /// The canonical run index ([`super::Spec`]'s runs), kept across font
-    /// fallback and wrapping.
+    /// The glyph's run relative to the hard line's first run.
     pub metadata: u32,
     /// Its face, an index into [`Lines::faces`].
     pub face: u16,
@@ -101,19 +120,19 @@ pub struct LayoutGlyph {
 
 impl LayoutGlyph {
     /// The canonical run index.
-    pub fn run(&self) -> usize {
-        self.metadata as usize
+    pub fn run(&self, run_base: u32) -> usize {
+        (run_base + self.metadata) as usize
     }
     /// The cluster's byte range in [`super::LayoutRun::text`].
     pub fn range(&self) -> std::ops::Range<usize> {
         self.start as usize..self.end as usize
     }
     /// Where the CPU raster places it with the pen at `offset` (device
-    /// pixels) at `scale`: whole pixel x, its quarter-pixel phase, and
-    /// whole pixel y.
+    /// pixels) at `scale`: whole pixel x and its quarter-pixel phase, and
+    /// whole pixel y rounded down.
     pub fn pixel(&self, offset: (f32, f32), scale: f32) -> (i32, u8, i32) {
         let (x, bin) = super::catalog::subpixel(self.x.mul_add(scale, offset.0));
-        let (y, _) = super::catalog::subpixel(self.y.mul_add(scale, offset.1).trunc());
+        let (y, _) = super::catalog::subpixel(self.y.mul_add(scale, offset.1).floor());
         (x, bin, y)
     }
 }
@@ -147,6 +166,8 @@ impl Face {
 /// One visual line.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutLine {
+    /// The canonical run of a glyph whose brush is zero.
+    pub run_base: u32,
     /// The hard line (text between line feeds) it belongs to.
     pub hard: u32,
     /// Its glyphs, a range of [`Lines::glyphs`], in visual order.
@@ -179,28 +200,32 @@ pub struct Lines {
     /// Visual lines, top to bottom.
     pub lines: Vec<LayoutLine>,
     /// Every line's glyphs.
-    pub glyphs: Vec<LayoutGlyph>,
+    pub glyphs: Glyphs,
     /// The faces the glyphs name.
     pub faces: Vec<Face>,
     /// Every line's inline boxes, in visual order.
     pub boxes: Vec<LayoutBox>,
     /// Every line's inline-box room, by line.
     pub rooms: Vec<LayoutRoom>,
+    /// The unrounded ascent, descent and explicit-height flag before paragraph trimming.
+    /// Editable lines carry these across revisions even when their vertical origin moves.
+    pub(super) field_metrics: Vec<Option<(f32, f32, bool)>>,
 }
 
 impl Lines {
     /// A line's glyphs.
     pub fn glyphs_of(&self, line: &LayoutLine) -> &[LayoutGlyph] {
-        &self.glyphs[line.glyphs.0 as usize..line.glyphs.1 as usize]
+        self.glyphs.line(line)
     }
     /// Exact accessible capacities, bytes.
     pub fn capacity_bytes(&self) -> usize {
         use std::mem::size_of;
         self.lines.capacity() * size_of::<LayoutLine>()
-            + self.glyphs.capacity() * size_of::<LayoutGlyph>()
+            + self.glyphs.bytes()
             + self.faces.capacity() * size_of::<Face>()
             + self.boxes.capacity() * size_of::<LayoutBox>()
             + self.rooms.capacity() * size_of::<LayoutRoom>()
+            + self.field_metrics.capacity() * size_of::<Option<(f32, f32, bool)>>()
             + self
                 .faces
                 .iter()
@@ -341,6 +366,9 @@ fn place(order: &[Placed], ends: &[usize], rooms: &[Room], rtl: bool) -> Vec<(us
     out
 }
 
+#[cfg(test)]
+thread_local! { pub(super) static EXTRACTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// One Parley line's glyphs, appended in visual order with `shift` added
 /// to every x (`styles` is the layout's, whose brushes are run indices),
 /// and its inline boxes and rooms as the next line's (a box's id is its run
@@ -355,6 +383,8 @@ pub(super) fn extract(
     out: &mut Lines,
 ) -> f32 {
     let m = line.metrics();
+    #[cfg(test)]
+    let before = out.glyphs.len();
     let line_index = out.lines.len() as u32;
     // The rooms shaped on this line, and where each is drawn.
     let mut placed = Vec::new();
@@ -479,5 +509,7 @@ pub(super) fn extract(
             k += 1;
         }
     }
+    #[cfg(test)]
+    EXTRACTED.with(|n| n.set(n.get() + out.glyphs.len() - before));
     content
 }

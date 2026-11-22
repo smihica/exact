@@ -272,7 +272,7 @@ public final class ExactView: NSView {
         session.rasters?.fit(size: size, scale: scale)
         if scale != lastDisplayScale {
             lastDisplayScale = scale
-            session.apply(session.runtime.canvasDisplay(scale: scale, memory: ProcessInfo.processInfo.physicalMemory))
+            if let surfaces = SurfacesLink.installed { session.apply(surfaces.display(session.runtime, scale: scale)) }
             session.rasters?.displayChanged()
             session.controlTextChanged() // text line boxes round to the page's device pixels (LLP 1008 §3)
             session.tellDisplayScale() // a hairline is one device pixel of the page (LLP 1115.000 D10.3)

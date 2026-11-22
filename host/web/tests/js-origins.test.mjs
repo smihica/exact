@@ -2,7 +2,9 @@
 // calls a module under (LLP 1133.002 D12), over the runtime's own modules in Bun (js-runtime-harness.mjs).
 import { expect, test } from 'bun:test';
 import { resolve } from 'node:path';
-import { freshRuntime, root } from './js-runtime-harness.mjs';
+import { runtimeHarness } from './js-runtime-harness.mjs';
+
+const { freshRuntime, root } = runtimeHarness();
 
 const flush = async () => { for (let i = 0; i < 32; i++) await Promise.resolve(); };
 

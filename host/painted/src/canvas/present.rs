@@ -96,7 +96,7 @@ impl<D: exact_runner::DataSource + Default> super::CanvasHost<D> {
         if let Some(e) = self.p.picture_presented(carried, at) {
             eprintln!("exact: {e}");
         }
-        self.animating()
+        self.animating(false)
     }
 }
 

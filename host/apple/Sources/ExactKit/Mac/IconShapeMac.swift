@@ -12,7 +12,7 @@ import ExactCore
 /// The leaf in a symbol's clip that fills an icon's paths: top-left origin,
 /// never hit, never an accessibility element (the node is the image).
 ///
-/// The shapes sit in one group layer the size of the em square placed in
+/// The shapes sit in one group layer the size of the placed viewport placed in
 /// the box, clipped to it as the template image's own bounds clipped it.
 /// Each path is filled in the tint's colour opaque, and the tint's alpha is
 /// this view's layer opacity (`alphaValue`), applied once over the union:
@@ -24,7 +24,7 @@ final class IconShapeView: NSView {
     /// The icon's paths in viewBox units, one shape layer each.
     private(set) var paths: [CGPath] = []
     private(set) var shapes: [CAShapeLayer] = []
-    /// The em square's layer: clips the shapes.
+    /// The placed viewport's layer: clips the shapes.
     let group: CALayer = {
         let layer = CALayer()
         layer.masksToBounds = true
@@ -77,7 +77,7 @@ final class IconShapeView: NSView {
     private func redraw() {
         let scale = pixelScale ?? NSScreen.main?.backingScaleFactor ?? 2
         group.frame = square; group.contentsScale = scale
-        // The group's own coordinates start at the square's corner.
+        // The group's own coordinates start at the viewport's corner.
         let local = placement.concatenating(CGAffineTransform(translationX: -square.minX, y: -square.minY))
         for (shape, path) in zip(shapes, paths) {
             var transform = local
@@ -101,10 +101,9 @@ extension NodeView {
         shape.paint(fill)
     }
 
-    /// The icon's paths placed by `object-fit` over the content box: its em
-    /// square (`font-size` points) by `IconPath.placed`, the viewBox met in it.
+    /// The viewBox placed by CSS object fit and position in the content box.
     func placeIconShape(_ shape: IconShapeView) {
-        let square = IconPath.placed(em: number("font_size", PageFacts.defaultRootFontSize), fit: style["object_fit"]?.string ?? "fill", in: shape.bounds)
+        let square = IconPath.placed(viewBox: IconPath.viewBox(props["symbolViewBox"] ?? ""), em: number("font_size", PageFacts.defaultRootFontSize), fit: style["object_fit"]?.string ?? "fill", position: style["object_position"]?.array, in: shape.bounds)
         shape.place(IconPath.fitted(IconPath.viewBox(props["symbolViewBox"] ?? ""), in: square), in: square)
     }
 }

@@ -78,13 +78,6 @@ pub(crate) fn without_queries(text: &str) -> String {
     out
 }
 
-/// Whether `name` is fetched rather than read: an `http:` or `https:` URL.
-pub(super) fn is_remote(name: &str) -> bool {
-    name.split_once(':').is_some_and(|(scheme, _)| {
-        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-    })
-}
-
 /// How many downloads run at once in the process: a browser's connections
 /// to one host over HTTP/1.1, which is what this transport speaks.
 const THREADS: usize = 6;
@@ -259,7 +252,7 @@ const URGENT_STREAK: usize = 2;
 /// The process's image downloads.
 pub(super) struct Downloads {
     policy: Policy,
-    transport: RustlsHttpTransport,
+    transport: Box<dyn Transport>,
     queue: Mutex<VecDeque<Job>>,
     queued: Condvar,
     running: AtomicUsize,
@@ -283,7 +276,7 @@ impl Downloads {
     pub fn new(policy: Policy) -> Arc<Self> {
         Arc::new(Self {
             policy,
-            transport: RustlsHttpTransport::new(),
+            transport: Box::new(RustlsHttpTransport::new()),
             queue: Mutex::new(VecDeque::new()),
             queued: Condvar::new(),
             running: AtomicUsize::new(0),

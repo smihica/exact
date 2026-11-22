@@ -87,6 +87,14 @@ impl<D: DataSource> Runner<D> {
     ) -> Result<Answer, DataError> {
         self.store.set_socket_call(crate::SocketCall::Mutation);
         let answer = self.data.answer_for(target, &mut self.store, source, args);
+        let answer = answer.map_err(|error| match error {
+            DataError::BadArguments(why) | DataError::Unavailable(why)
+                if !exact_plan::runner_owned_source(source) =>
+            {
+                DataError::Failed(crate::failure::FailureCode::Error, why, String::new())
+            }
+            other => other,
+        });
         self.store.end_socket_call(answer)
     }
 

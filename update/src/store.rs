@@ -44,7 +44,7 @@
 mod disk;
 mod record;
 
-use crate::envelope::{resolve_url, safe_name, sha256_hex, Card, Envelope, FileCard};
+use crate::envelope::{safe_name, Card, Envelope, FileCard};
 use disk::{
     hold_entry, read_bounded, read_card, regular_file, remove_entry, sweep, sync_dir,
     temporary_name, write_atomic, write_file, Blobs,
@@ -750,10 +750,14 @@ impl Store {
         self.embedded.verify(&envelope)?;
         // Its index from the blob store when an earlier check kept it.
         if let Some(card) = envelope.index.as_ref().map(|index| index.card.clone()) {
-            self.obtain(&card, head_url, fetch, &mut |_| None)?;
+            self.blobs().obtain(&card, head_url, fetch, &mut |_| None)?;
             envelope.read_index(&read_card(&self.blobs().dir().join(&card.sha256), &card)?)?;
         }
-        if !self.admit_check(&envelope, head_url, embedded_asset)? {
+        let current = self.admit_check(&envelope, head_url, embedded_asset)?;
+        if let Some(receipt) = &envelope.cohort_receipt {
+            self.blobs().obtain_cohort(receipt, head_url, fetch)?;
+        }
+        if !current {
             self.write_entry(&envelope, head_url, fetch, embedded_asset)?;
         }
         Ok(envelope)
@@ -869,7 +873,7 @@ impl Store {
         // card whose bytes are already embedded or present in a whole entry.
         // Check the entire roster before Current can advance the observed
         // floor and before either whole-entry or digest reuse can return.
-        validate_card_urls(head_url, envelope)?;
+        envelope.validate_card_urls(head_url)?;
         let floor = self
             .embedded
             .seq
@@ -1338,7 +1342,7 @@ impl Store {
         std::fs::create_dir_all(tmp).map_err(|e| format!("cannot make {}: {e}", tmp.display()))?;
         let blobs = self.blobs();
         // Only assets are taken from the binary, never a plan.
-        self.obtain(&envelope.plan, head_url, fetch, &mut |_| None)?;
+        blobs.obtain(&envelope.plan, head_url, fetch, &mut |_| None)?;
         blobs.place(&envelope.plan.sha256, &tmp.join("app.plan"))?;
         if let Some(index) = &envelope.index {
             // Read already, so its blob is here and verified.
@@ -1348,7 +1352,7 @@ impl Store {
         let base = envelope.asset_base(head_url)?;
         for asset in envelope.assets()? {
             safe_name(&asset.name)?;
-            self.obtain(asset, &base, fetch, embedded_asset)?;
+            blobs.obtain(asset, &base, fetch, embedded_asset)?;
             let path = tmp.join("assets").join(&asset.name);
             blobs.place(&asset.sha256, &path)?;
             directories.extend(
@@ -1364,50 +1368,6 @@ impl Store {
             sync_dir(&directory)?;
         }
         Ok(())
-    }
-
-    /// One file into the blob store: kept already under its digest, else
-    /// copied from the binary's embedded file of that name, else fetched.
-    /// In each case the digest and the byte count are what the head declared,
-    /// or nothing is written (LLP 1026 D11, assets by digest).
-    fn obtain(
-        &self,
-        card: &crate::envelope::FileCard,
-        base: &str,
-        fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
-        embedded_asset: &mut dyn FnMut(&str) -> Option<EmbeddedAsset>,
-    ) -> Result<(), String> {
-        let url = resolve_url(base, &card.url)?;
-        let blobs = self.blobs();
-        if blobs.holds(card) {
-            return Ok(());
-        }
-        // The host's digest only rules a file out; its bytes are read again,
-        // since the file may have changed after the host hashed it.
-        if let Some(embedded) = embedded_asset(&card.name).filter(|e| e.sha256 == card.sha256) {
-            if let Ok(bytes) = read_card(&embedded.path, card) {
-                return blobs.put(&card.sha256, &bytes);
-            }
-        }
-        let bytes = fetch(&url)?;
-        // The closure hands back a whole body, so the declared length is
-        // checked here; a host that streams bounds the read by it as it goes.
-        if bytes.len() as u64 != card.bytes {
-            return Err(format!(
-                "{} is {} bytes; the head declared {}",
-                card.name,
-                bytes.len(),
-                card.bytes
-            ));
-        }
-        let digest = sha256_hex(&bytes);
-        if digest != card.sha256 {
-            return Err(format!(
-                "{} hashes to {digest}; the head declared {}",
-                card.name, card.sha256
-            ));
-        }
-        blobs.put(&card.sha256, &bytes)
     }
 
     fn blobs(&self) -> Blobs {
@@ -1465,6 +1425,9 @@ impl Store {
             .and_then(|raw| Envelope::parse(&raw))
             {
                 digests.insert(envelope.plan.sha256.clone());
+                if let Some(receipt) = &envelope.cohort_receipt {
+                    self.blobs().keep_cohort(receipt, &mut digests);
+                }
                 // A witness holds no index file, and so names no asset blobs.
                 if let Some(card) = envelope.index.as_ref().map(|index| index.card.clone()) {
                     digests.insert(card.sha256.clone());
@@ -1488,13 +1451,4 @@ pub fn head_url(origin: &str, channel: &str, compatibility_id: &str) -> String {
         "{}/.exact/{channel}/{compatibility_id}/exact.json",
         origin.trim_end_matches('/')
     )
-}
-
-fn validate_card_urls(head_url: &str, envelope: &Envelope) -> Result<(), String> {
-    resolve_url(head_url, &envelope.plan.url)?;
-    let base = envelope.asset_base(head_url)?;
-    for card in envelope.assets()? {
-        resolve_url(&base, &card.url)?;
-    }
-    Ok(())
 }

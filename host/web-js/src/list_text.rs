@@ -58,7 +58,9 @@ impl Em<'_> {
                             }
                             _ => continue,
                         };
-                        let value = code::called_expression(self.bound(i, "{}", &b, scope)?);
+                        // Logical text has its own item and match bindings outside the DOM mount.
+                        let f = self.binding_value(i, "{}", &b, scope, false)?;
+                        let value = code::called_expression(self.status_read(i, "{}", &b, f));
                         props.push(format!("{name}:{value}"));
                     }
                     let children = self.logical_children(self.sites.of_node(i), scope)?;
@@ -72,18 +74,19 @@ impl Em<'_> {
                         scope,
                         &mut self.uses,
                     )?;
+                    let depth = scope.frames.len();
                     let arms: Vec<_> = row.arms.iter().map(|a| a.0).collect();
                     let mut bodies = Vec::new();
                     for (k, arm) in arms.iter().enumerate() {
                         let mut inner = scope.clone();
                         inner.frames.push(match row.kind {
                             RegionKind::Each => Frame {
-                                item: Some(format!("i{r}")),
-                                index: Some(format!("x{r}")),
+                                item: Some(format!("i{depth}")),
+                                index: Some(format!("x{depth}")),
                                 bound: None,
                             },
                             RegionKind::Match if k == 0 => Frame {
-                                bound: Some(format!("b{r}")),
+                                bound: Some(format!("b{depth}")),
                                 ..Frame::default()
                             },
                             _ => Frame::default(),
@@ -94,7 +97,7 @@ impl Em<'_> {
                     }
                     let value = match row.kind {
                         RegionKind::Each => format!(
-                            "({subject}).flatMap(($i,$x)=>{{const i{r}=()=>$i,x{r}=()=>$x;{}}})",
+                            "({subject}).flatMap(($i,$x)=>{{const i{depth}=()=>$i,x{depth}=()=>$x;{}}})",
                             bodies[0]
                         ),
                         RegionKind::When => format!(
@@ -103,7 +106,7 @@ impl Em<'_> {
                             bodies.get(1).cloned().unwrap_or("return [];".into())
                         ),
                         RegionKind::Match => format!(
-                            "(($b)=>{{if($b!==null){{const b{r}=()=>$b;{}}}{} }})({subject})",
+                            "(($b)=>{{if($b!==null){{const b{depth}=()=>$b;{}}}{} }})({subject})",
                             bodies[0],
                             bodies.get(1).cloned().unwrap_or("return [];".into())
                         ),

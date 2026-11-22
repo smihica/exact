@@ -6,9 +6,12 @@ import { test as bunTest, expect } from 'bun:test';
 import { EXE } from '../../scripts/paths.mjs';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { resolve } from 'node:path';
+import { open } from '../../scripts/agent.mjs';
 import { chromium, suiteBrowser } from '../../scripts/agent-launch.mjs';
 import { withLook } from '../web/look.mjs';
+import { serveBuildTree } from '../web/serve.mjs';
 import { engineTests, need } from '../../scripts/coverage.mjs';
 
 const engineTest = await engineTests(['chromium', 'webkit']);
@@ -848,6 +851,65 @@ test('a resizing box\'s stand-in paints at its translate, resolved in the box\'s
     expect(at.height).toBeCloseTo(130, 1);
     expect(at.surface).toBeCloseTo(at.card, 1);
   } finally { await app.close(); }
+}, 30000);
+
+test('a resized box accepts presses after its spring ends on either clock', async () => {
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/clip-repro-'));
+  const dist = resolve(dir, 'dist');
+  let server, browser;
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Clip Repro', app: { id: 'test.clip-repro', name: 'Clip Repro' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `component ClipRepro
+  state wide = false
+  state said = ""
+  action grow
+    wide = true
+  action pressed
+    said = "Pressed"
+  view
+    column gap=8
+      button press=grow testId="repro-grow"
+        text "Grow"
+      column overflow="hidden" width=(wide ? "420px" : "260px") height=(wide ? "92px" : "44px")
+        -exact-layout-transition="-exact-spring(560, 45, 1)" testId="repro-box"
+        button press=pressed testId="repro-inner"
+          text "Press me"
+      text \`Last: \${said}\` testId="repro-said"
+`);
+    const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'clip-repro', '--out', dist, '--render', 'none'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8',
+    });
+    expect(build.status, build.stdout + build.stderr).toBe(0);
+    server = createServer((req, res) => serveBuildTree(dist, req, res));
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${server.address().port}/`;
+    for (const [start, end] of [[0, 'settle'], [4000, 'settle'], [4000, '+1500']]) {
+      const s = await open({ host: 'web', url });
+      try {
+        expect((await s.clock(start)).clock).toBe(start);
+        await s.tap('repro-grow');
+        expect(await s.carrier.evaluate('document.querySelector("[data-testid=repro-box]").getAnimations().length')).toBeGreaterThan(0);
+        const landed = await s.clock(end);
+        if (end === 'settle') expect(landed.settled).toBe(true);
+        expect(landed.clock).toBeGreaterThan(start);
+        const clip = await s.carrier.evaluate('getComputedStyle(document.querySelector("[data-testid=repro-box]")).clipPath');
+        await s.tap('repro-inner');
+        expect({ clip, said: (await s.state()).slots.said }, `resize at ${start} ms, clock ${end}`).toEqual({ clip: 'none', said: 'Pressed' });
+      } finally { await s.close(); }
+    }
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.goto(url);
+    await page.waitForFunction(() => globalThis.exact?.presenceLive);
+    expect(await page.evaluate(() => {
+      document.querySelector('[data-testid=repro-grow]').click();
+      return document.querySelector('[data-testid=repro-box]').getAnimations().length;
+    })).toBeGreaterThan(0);
+    await page.waitForFunction(() => !document.querySelector('[data-exiting]'));
+    expect(await page.locator('[data-testid=repro-box]').evaluate(el => getComputedStyle(el).clipPath)).toBe('none');
+    await page.getByText('Press me', { exact: true }).click();
+    expect(await page.locator('[data-testid=repro-said]').textContent()).toBe('Last: Pressed');
+  } finally { await browser?.close(); server?.close(); rmSync(dir, { recursive: true, force: true }); }
 }, 30000);
 
 /** `source` compiled to the JS target and opened in `engine` with presence loaded. `drop(button)` presses `button`,

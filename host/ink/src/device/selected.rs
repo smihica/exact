@@ -2,7 +2,11 @@ use super::*;
 
 /// The boot choice; both layers consume the same core's frames and resources.
 pub enum Selected {
+    #[cfg(not(windows))]
     Wgpu(Box<wgpu::Wgpu>),
+    // Only the Windows constructor for the wgpu override links its device implementation.
+    #[cfg(windows)]
+    Wgpu(Box<dyn Device<Buffer = wgpu::Buffer>>),
     #[cfg(windows)]
     D3d11(Box<d3d11::D3d11>),
     #[cfg(exact_ink_metal)]
@@ -44,34 +48,6 @@ impl Selected {
             Self::Metal(device) => device.present(texture),
         }
     }
-    /// # Safety
-    /// See [`wgpu::Wgpu::attach_scanout`].
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub unsafe fn attach_scanout(
-        &mut self,
-        fd: i32,
-        connector: u32,
-        size: [u32; 2],
-        refresh: u32,
-    ) -> Result<()> {
-        // Linux has the one device layer.
-        let Self::Wgpu(device) = self;
-        // SAFETY: the caller's contract.
-        unsafe { device.attach_scanout(fd, connector, size, refresh) }
-    }
-
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn has_scanout(&self) -> bool {
-        let Self::Wgpu(device) = self;
-        device.has_scanout()
-    }
-
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn scan_out(&mut self, texture: TextureId) -> Result<()> {
-        let Self::Wgpu(device) = self;
-        device.scan_out(texture)
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_env() -> Result<Self> {
         let value = std::env::var("EXACT_INK_DEVICE").ok();

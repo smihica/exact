@@ -100,6 +100,16 @@ impl Clip {
 }
 
 impl Recorder {
+    pub(super) fn rect_radii(&mut self, s: &Shape) {
+        for v in [s.rect.0, s.rect.1, s.rect.2, s.rect.3] {
+            self.f(v);
+        }
+        for (rx, ry) in s.radii {
+            self.f(rx);
+            self.f(ry);
+        }
+    }
+
     pub(super) fn native_element(
         &mut self,
         id: ViewId,
@@ -139,6 +149,16 @@ impl Recorder {
                 self.direct.at = Some(self.ops.len());
             }
         }
+        self.record_native(id, kind, shape, props);
+    }
+
+    pub(super) fn record_native(
+        &mut self,
+        id: ViewId,
+        kind: crate::paint::NativeKind,
+        shape: &Shape,
+        props: &str,
+    ) {
         self.ops.extend([NATIVE, id, kind as u32]);
         self.rect_radii(shape);
         self.string(props);
@@ -289,13 +309,16 @@ impl Recorder {
         }
     }
 
-    /// Whether a drawing within `bounds` (page space) would be clipped away
-    /// entirely: outside some clip's rectangle (the list's overscan rows, out
-    /// of its viewport). Such drawings are not recorded at all.
+    /// The reader can move a retained layer past a clip around it. Only clips
+    /// recorded inside the layer can permanently hide its content.
+    fn recording_clips(&self) -> impl Iterator<Item = &Clip> {
+        self.clips.iter().skip(self.layers.clips_outside())
+    }
+
+    /// Whether the drawing's page bounds lie outside a recorded clip.
     pub(super) fn culled(&self, bounds: Option<Rect4>) -> bool {
         let Some(b) = bounds else { return false };
-        self.clips
-            .iter()
+        self.recording_clips()
             .any(|c| c.page.is_some_and(|(r, _)| !overlaps(b, r)))
     }
 
@@ -303,7 +326,7 @@ impl Recorder {
     /// scroller moved out of its page's view).
     pub(super) fn clipped_out(&self) -> bool {
         let mut left: Option<Rect4> = None;
-        for (r, _) in self.clips.iter().filter_map(|c| c.page) {
+        for (r, _) in self.recording_clips().filter_map(|c| c.page) {
             let meet = left.map_or(r, |l| intersect(l, r));
             if meet.2 <= 0.0 || meet.3 <= 0.0 {
                 return true;
@@ -585,6 +608,24 @@ mod direct_tests {
     fn surface(r: &mut Recorder, shape: &Shape, ts: Transform, opaque_sdr: bool) {
         r.native(91, NativeKind::Surface, shape, ts, "{}", opaque_sdr);
     }
+
+    #[test]
+    fn a_clipped_empty_hatch_does_not_make_a_native_view() {
+        let mut r = Recorder::new();
+        r.begin(300., 300., 1.);
+        let ts = Transform::identity();
+        r.push_clip(&Shape::rect((0., 0., 100., 100.)), ts);
+        let before = r.ops.len();
+        r.native(
+            91,
+            NativeKind::Hatch,
+            &Shape::rect((200., 200., 0., 0.)),
+            ts,
+            "{}",
+            false,
+        );
+        assert_eq!(r.ops.len(), before);
+    }
     fn direct(r: &mut Recorder) -> bool {
         r.finish().unwrap();
         let ops = FINISHED.with(|f| f.borrow_mut().take().unwrap());
@@ -612,7 +653,7 @@ mod direct_tests {
                 4 => r.push_clip(&Shape::new(full.rect, [10.; 4]), ts),
                 5 => r.group_begin(7, (0., 0.)),
                 6 => {
-                    r.layer_begin(7, ts, (0., 0.), [0., 0., 1., 0., 1., 0., 0.]);
+                    r.layer_begin(7, ts, (0., 0.), (0., 0.), [0., 0., 1., 0., 1., 0., 0.]);
                 }
                 _ => (),
             }

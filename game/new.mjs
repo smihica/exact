@@ -6,7 +6,7 @@ import { basename, dirname, relative, resolve } from 'node:path';
 import { capturedLockDrift, gameDefaults, gameShells, prepareGame, sdkFetch } from './app/shells.mjs';
 import { checkoutLocation, checkoutPath, checkoutSeed, linkCheckout, pathFrom, preservePaths, within, worktreePaths } from '../scripts/paths.mjs';
 import { cargoEnvironment, lockedMetadata, patchLines } from '../scripts/app.mjs';
-import { PLATFORMS, SDK_CRATES, appCrateName, authoredCrate, copiedBuildScripts, namePlatform, withoutPlatformKeys } from '../scripts/app-shells.mjs';
+import { PLATFORMS, SDK_CRATES, appCrateName, authoredCrates, copiedBuildScripts, namePlatform, withoutPlatformKeys } from '../scripts/app-shells.mjs';
 import { updateManifests, updateScaffold } from './update-manifests.mjs';
 import { rustListing, writeRustApp } from '../scripts/app-rust.mjs';
 export { exact2Placeholders } from './update-manifests.mjs';
@@ -57,8 +57,9 @@ function withModel(destination, directory) {
  * below what it prints after the game, so it is the last thing said. */
 export const UNCACHED_CRATES = "Cargo's cache lacks the game SDK's crates.";
 /** Cargo's words for a crate an offline cache lacks: an index never fetched has no match for the package, a cached
- * index without the .crate stopped the download. */
-const MISSING_CRATE = /no matching package named|attempting to make an HTTP request|in the offline mode|--offline was specified|failed to download/;
+ * index older than the lock has no version matching the locked one, a cached index without the .crate stopped the
+ * download. */
+const MISSING_CRATE = /no matching package named|\(locked to [^)\n]+\)\ncandidate versions found which didn't match|attempting to make an HTTP request|in the offline mode|--offline was specified|failed to download/;
 /** Whether a new game's Cargo graph error (`message`) is only a cache without the SDK's crates, so exact new can
  * make the game and leave the fetch to a build. Both must say so: the error itself, and fetching the SDK lock
  * offline (`fetch`, sdkFetch, as exact setup --check asks), since that wording is also a stale SDK lock's. No Cargo,
@@ -1378,12 +1379,20 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
   }
   if (!existsSync(resolve(dir, 'Cargo.toml'))) throw new Error(notAMember(appCrates(dir).find(crate => !crate.joins)));
   // Before anything is written: a host crate update would add needs the root the copied-up workspace has.
+  let hosts = {};
   {
     let m = {}; try { m = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')); } catch {}
     const ships = (p) => p !== without && (p in (m.host ?? {}) || platforms.includes(p));
-    const adds = (ships('linux') || ships('android') || 'linux' in (m.deploy?.store ?? {}) && without !== 'linux') && !existsSync(resolve(dir, 'linux')) || ships('android') && !existsSync(resolve(dir, 'android'));
-    const refused = adds && rootRefusal(resolve(dir, 'Cargo.toml'));
-    if (refused) throw new Error(`update: ${refused} (docs/reference.md, "An authored workspace", lists what the root holds)`);
+    // Older scaffolds declared Linux only through their update store. Dropping Android also drops that store
+    // when no host.linux remains (dropPlatform below).
+    const linuxStore = !['linux', 'android'].includes(without) && 'linux' in (m.deploy?.store ?? {});
+    const linux = ships('linux') || ships('android') || linuxStore;
+    const kinds = ['linux', 'android'].filter(p => (p === 'linux' ? linux : ships(p)) && !existsSync(resolve(dir, p)));
+    if (kinds.length) {
+      const refused = rootRefusal(resolve(dir, 'Cargo.toml'));
+      if (refused) throw new Error(`update: ${refused} (docs/reference.md, "An authored workspace", lists what the root holds)`);
+      hosts = authoredCrates(dir, m, name, kinds);
+    }
   }
   writeFileSync(resolve(dir, 'rust-toolchain.toml'), readFileSync(resolve(ROOT, 'rust-toolchain.toml')));
   mkdirSync(resolve(dir, '.cargo'), { recursive: true });
@@ -1405,31 +1414,16 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
   const section = /^\[patch\.crates-io\]\n(?:(?!\[)[^\n]*\n?)*/m, at = manifest.search(section);
   let rootText = at < 0 ? `${manifest.trimEnd()}\n\n${block}`
     : manifest.replace(section, table => block + (at + table.length < manifest.length ? '\n' : ''));
-  // An app made before the scaffold wrote a Linux host gains one (LLP 1086), unless it has its own or ships
-  // neither Linux nor Android (the crate serves both, LLP 1107): app.json's `host` keys, or the store key the
-  // scaffold wrote for Linux, say which.
-  let shipsLinux = false;
-  try { const m = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')); shipsLinux = 'linux' in (m.host ?? {}) || 'android' in (m.host ?? {}) || 'linux' in (m.deploy?.store ?? {}); } catch {}
-  const addedLinux = shipsLinux && !existsSync(resolve(dir, 'linux'));
-  if (addedLinux) {
-    mkdirSync(resolve(dir, 'linux'));
-    for (const [path, text] of Object.entries(authoredCrate(dir, 'linux', name, titleOf(name)))) {
-      mkdirSync(dirname(resolve(dir, path)), { recursive: true });
-      writeFileSync(resolve(dir, path), text);
+  for (const [kind, files] of Object.entries(hosts)) {
+    for (const [path, text] of Object.entries(files)) {
+      const file = resolve(dir, kind, path);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, text);
     }
-    rootText = rootText.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) =>
-      /"linux"/.test(list) ? line : `members = [${[...list.split(',').map(m => m.trim()).filter(Boolean), '"linux"'].sort().join(', ')}]`);
-  }
-  // And one that names Android gains the library its APK loads (LLP 1107), as the generated workspace has it.
-  const addedAndroid = named('android') && !existsSync(resolve(dir, 'android'));
-  if (addedAndroid) {
-    mkdirSync(resolve(dir, 'android'));
-    for (const [path, text] of Object.entries(authoredCrate(dir, 'android', name, titleOf(name)))) {
-      mkdirSync(dirname(resolve(dir, path)), { recursive: true });
-      writeFileSync(resolve(dir, path), text);
-    }
-    rootText = rootText.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) =>
-      /"android"/.test(list) ? line : `members = [${[...list.split(',').map(m => m.trim()).filter(Boolean), '"android"'].sort().join(', ')}]`);
+    rootText = rootText.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) => {
+      const members = list.split(',').map(m => m.trim()).filter(Boolean), member = JSON.stringify(kind);
+      return members.includes(member) ? line : `members = [${[...members, member].sort().join(', ')}]`;
+    });
   }
   const notes = [...commands, ...updateScaffold(dir), ...updateNotes(dir, name)];
   if (editorTasks(dir)) notes.push('.vscode/tasks.json');
@@ -1457,7 +1451,7 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
   const crates = new Map(JSON.parse(metadata.stdout).packages.map(p => [p.name, dirname(p.manifest_path)]));
   crates.set('ibex2-sqlite', resolve(ROOT, 'vendor/ibex/crates/ibex2-sqlite'));
   const { changed, unresolved } = updateManifests(dir, crates, rootText);
-  const said = `Updated ${dir}: patches, toolchain, exact.mjs${addedLinux ? ', a linux/ host crate' : ''}${addedAndroid ? ', an android/ crate (bun exact.mjs android builds the APK)' : ''}${edits.length ? `, ${edits.join(', ')}` : ''}${without && ['linux', 'android'].includes(without) ? ', Cargo.lock' : ''}${notes.length ? `, ${notes.join(', ')}` : ''}${changed.length ? `, exact2 paths in ${changed.join(', ')}` : ''}${unresolved.length ? `\n<exact2> left unresolved in ${unresolved.join(', ')}: a path into exact2 is written \`<exact2>/\` and then forward slashes` : ''}${unmounted ? `\n${unmounted}` : ''}`;
+  const said = `Updated ${dir}: patches, toolchain, exact.mjs${hosts.linux ? ', a linux/ host crate' : ''}${hosts.android ? ', an android/ crate (bun exact.mjs android builds the APK)' : ''}${edits.length ? `, ${edits.join(', ')}` : ''}${without && ['linux', 'android'].includes(without) ? ', Cargo.lock' : ''}${notes.length ? `, ${notes.join(', ')}` : ''}${changed.length ? `, exact2 paths in ${changed.join(', ')}` : ''}${unresolved.length ? `\n<exact2> left unresolved in ${unresolved.join(', ')}: a path into exact2 is written \`<exact2>/\` and then forward slashes` : ''}${unmounted ? `\n${unmounted}` : ''}`;
   // Whether the workspace loads: every member's manifest read, nothing resolved or fetched, so only the app's files can
   // fail it. One that does not load builds nothing, so the update failed, though its files are written.
   const loads = spawnSync('cargo', ['metadata', '--no-deps', '--offline', '--format-version', '1'], { cwd: dir, env: cargoEnvironment(), stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });

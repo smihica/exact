@@ -72,7 +72,7 @@ const content = (root) => `${authored}<div style="display:flex;flex-direction:co
 </div>`;
 // Each runtime's painter, its module's other parts stood in for.
 const RUNTIMES = {
-  'host/web/glue.js': ['const views = new Map([...document.querySelectorAll("#exact-root img")].entries()), log = () => {}, tintFit = () => {};', ['refreshSymbols'], 'refreshSymbols();'],
+  'host/web/glue.js': ['const views = new Map([...document.querySelectorAll("#exact-root img")].entries()), log = () => {};', ['refreshSymbols'], 'refreshSymbols();'],
   'host/web-js/symbols.js': ['const All = true, journal = [], clock = { now: 0 }, appSource = () => {}, Images = new Set(document.querySelectorAll("#exact-root img")), image = e => Images.add(e);', ['refresh'], 'refresh();'],
 };
 
@@ -86,17 +86,22 @@ for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) engineTest.c
     await page.setContent(`<div id="exact-root">${content}</div><script>${stand} ${glueDeclarations(source, names)} globalThis.paint = () => { ${run} };</script>`);
     const result = await page.evaluate(() => {
       const images = [...document.images], reads = images.map(() => 0);
-      for (const [i, image] of images.entries()) for (const property of ['clientWidth', 'clientHeight']) {
-        const get = Object.getOwnPropertyDescriptor(Element.prototype, property).get;
-        Object.defineProperty(image, property, { get() { reads[i]++; return get.call(this); } });
-      }
+      const computedStyle = window.getComputedStyle;
+      window.getComputedStyle = (el, pseudo) => {
+        const style = computedStyle(el, pseudo), i = images.indexOf(el);
+        return i < 0 ? style : new Proxy(style, { get(target, property) {
+          if (property === 'width' || property === 'height') reads[i]++;
+          const value = target[property];
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      };
       globalThis.paint();
       return { reads, fits:images.map(image => image.style.getPropertyValue('--exact-symbol-fit')) };
     });
     expect(result.reads.slice(0, 4)).toEqual([0, 0, 0, 0]);
     expect(result.reads[4]).toBeGreaterThan(0);
     expect(result.reads[5]).toBeGreaterThan(0);
-    expect(result.fits).toEqual(['contain', 'contain', 'cover', '20px 20px', '20px 20px', 'contain']);
+    expect(result.fits).toEqual(['100% 100%', 'contain', 'cover', '20px 20px', '20px 20px', 'contain']);
   } finally { await suite.close(); }
 }, 30000);
 

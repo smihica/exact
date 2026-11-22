@@ -37,6 +37,7 @@ macro_rules! host {
         $crate::presence_exports!();
         $crate::svg_exports!();
         $crate::content_region_exports!();
+        $crate::canvas_exports!();
 
         $crate::host!(@core $data, $plan, $compat, $delivery, $api, $new, $region, $crate::link::ALL);
     };
@@ -208,23 +209,6 @@ macro_rules! host {
         #[no_mangle]
         pub extern "C" fn exact_set_console(rt: u32, console: Option<extern "C" fn(u8, *const u8, usize)>) {
             $crate::abi::with_entry(&EXACT_RUNTIMES, rt, |e| { e.hooks.console = console; });
-        }
-
-        /// The Canvas 2D text measurer (LLP 1056 D8): called on the runtime's
-        /// thread with the context `exact_set_measure` was given.
-        #[no_mangle]
-        pub extern "C" fn exact_set_canvas_text(
-            rt: u32,
-            measure: ::std::option::Option<$crate::canvas_text::CanvasTextFn>,
-        ) {
-            $crate::abi::with_entry(&EXACT_RUNTIMES, rt, |e| { e.hooks.canvas_text = measure; });
-        }
-
-        /// A Canvas 2D image handle decoded (LLP 1056 D9): the handle is
-        /// the input buffer's first `len` bytes; the batch's length.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_image(rt: u32, len: usize, width: u32, height: u32, ok: u32) -> u32 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_image(len, width, height, ok != 0), |n| n)
         }
 
         /// The wake for a request's reply (LLP 1016 D2), called on the
@@ -481,12 +465,6 @@ macro_rules! host {
             $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| u8::from(b.request_active(ticket)), |_| 0)
         }
 
-        /// Mark an owned pixel copy before the presenter starts encoding it.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_snapshotted(rt: u32, ticket: u64) -> u8 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| u8::from(b.canvas_snapshotted(ticket)), |_| 0)
-        }
-
         /// Complete presenter-owned surface work; the input is bytes or a failure message.
         #[no_mangle]
         pub extern "C" fn exact_fulfill_surface(rt: u32, ticket: u64, kind: u32, len: usize, now_ms: f64) -> u32 {
@@ -620,10 +598,10 @@ macro_rules! host {
             $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.scrolled(page, view, left, top), |_| ())
         }
 
-        /// The presenter's synchronous viewport union for an inline run.
+        /// The presenter's inline, text range and textarea scroll geometry.
         #[no_mangle]
-        pub extern "C" fn exact_set_inline_geometry(rt: u32, read: Option<$crate::geometry::InlineFrameFn>, range: Option<$crate::geometry::RangeFrameFn>, ctx: *mut ::std::ffi::c_void) {
-            $crate::abi::with_entry(&EXACT_RUNTIMES, rt, |e| e.bridge.set_inline_geometry(read, range, ctx));
+        pub extern "C" fn exact_set_text_geometry(rt: u32, read: Option<$crate::geometry::InlineFrameFn>, range: Option<$crate::geometry::RangeFrameFn>, metrics: Option<$crate::geometry::ScrollMetricsFn>, ctx: *mut ::std::ffi::c_void) {
+            $crate::abi::with_entry(&EXACT_RUNTIMES, rt, |e| e.bridge.set_inline_geometry(read, range, metrics, ctx));
         }
 
         /// The open top-layer nodes before a native action read. No batch.
@@ -886,17 +864,6 @@ macro_rules! host {
             $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.surface_record(len), |n| n)
         }
 
-        /// Whether this canvas name is read by a performance resource.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_performance_requested(rt: u32, len: usize) -> u32 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_performance_requested(len), |n| n)
-        }
-        /// Publish or clear a canvas's performance record.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_performance_record(rt: u32, len: usize) -> u32 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_performance_record(len), |n| n)
-        }
-
         /// The date: Unix ms at clock zero and minutes east of UTC.
         #[no_mangle]
         pub extern "C" fn exact_set_time(rt: u32, epoch_at_zero: f64, utc_offset: f64) -> u32 {
@@ -911,8 +878,8 @@ macro_rules! host {
 
         /// The window's name (UTF-8 input) and whether it launches rooted, for the next boot. @ref LLP 1030.004 D2
         #[no_mangle]
-        pub extern "C" fn exact_set_launch_window(rt: u32, len: usize, rooted: u32) -> u32 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| { b.set_launch_window(len, rooted != 0); 0 }, |n| n)
+        pub extern "C" fn exact_set_launch_window(rt: u32, name: usize, rooted: u32, archive: usize) -> u32 {
+            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| { b.set_launch_window(name, rooted != 0, archive); 0 }, |n| n)
         }
 
         /// The platform's layout direction for every boot from here: 0 ltr, 1 rtl, else the strings table's.
@@ -1066,27 +1033,6 @@ macro_rules! host {
         #[no_mangle]
         pub extern "C" fn exact_set_place(rt: u32, len: usize) -> u32 {
             $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.set_place(len), |n| n)
-        }
-
-        /// The display's scale and physical memory for Canvas 2D (LLP 1056
-        /// D4); callable before boot. Returns the batch length.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_display(rt: u32, scale: f64, memory: f64) -> u32 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_display(scale, memory), |n| n)
-        }
-
-        /// A Canvas 2D image handle the presenter let go (LLP 1056 D9): the
-        /// handle is the input buffer's first `len` bytes.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_image_released(rt: u32, len: usize) {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_image_released(len), |_| ())
-        }
-
-        /// A 2D canvas's replay is behind (`held` 1) or caught up (0): a
-        /// frame request for it waits while held (LLP 1056 D5).
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_held(rt: u32, view: u32, held: u32) {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_held(view, held != 0), |_| ())
         }
 
         /// The viewport changed; returns the batch length.
@@ -1263,14 +1209,6 @@ macro_rules! host {
             $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.list_covered(view, start, end), |_| ())
         }
 
-        /// Canvas draws in a turn of their own (`deferred` nonzero), or in every
-        /// turn (LLP 1072 §8.5): the batch says `canvasOwed` and
-        /// `exact_canvas_draw` runs them, off the turns main waits on.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_defer(rt: u32, deferred: u32) {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_defer(deferred != 0), |_| ())
-        }
-
         /// Runtimes booted from now count each plan site's work for `perf`
         /// (LLP 1079 D1) from the first ask, `exact_measure_work`, not from
         /// boot: a release build's choice.
@@ -1283,12 +1221,6 @@ macro_rules! host {
         #[no_mangle]
         pub extern "C" fn exact_measure_work(rt: u32) -> u32 {
             $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.measure_work(), |n| n)
-        }
-
-        /// The canvas draws owed (LLP 1072 §8.5); returns the batch's length.
-        #[no_mangle]
-        pub extern "C" fn exact_canvas_draw(rt: u32) -> u32 {
-            $crate::abi::with_runtime(&EXACT_RUNTIMES, rt, false, |b, _| b.canvas_draw(), |n| n)
         }
 
         /// A motion frame; returns the batch's length.

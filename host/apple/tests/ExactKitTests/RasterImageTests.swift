@@ -12,6 +12,7 @@ import UIKit
 @testable import ExactEffects
 @testable import ExactSvg
 @testable import ExactImages
+@testable import ExactFlights
 
 final class RasterImageTests: XCTestCase {
     func testSVGPictureFontsUseTheirNamesWeightAndStyle() {
@@ -41,6 +42,59 @@ final class RasterImageTests: XCTestCase {
         XCTAssertTrue(CGImageDestinationFinalize(destination))
         return bytes as Data
     }
+    func testFlyingRasterClipsAtTheInterpolatedContentEdge() throws {
+        #if os(macOS)
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 160, height: 280), styleMask: [], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        #else
+        let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: .zero)
+        window.frame = CGRect(x: 0, y: 0, width: 160, height: 280)
+        defer { window.isHidden = true }
+        #endif
+        let p = Presenter()
+        p.viewport.frame = CGRect(x: 0, y: 0, width: 160, height: 280)
+        #if os(macOS)
+        window.contentView = p.viewport
+        #else
+        let controller = UIViewController()
+        controller.view = p.viewport
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        #endif
+        let style: [String: Any] = ["object_fit": "none", "object_position": [40.0, 0.0]]
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view", "props": ["testId": "root"]],
+            ["op": "create", "id": 2, "kind": "image", "props": ["testId": "from"], "style": style],
+            ["op": "create", "id": 3, "kind": "image", "props": ["testId": "to"], "style": style],
+            ["op": "children", "id": 1, "ids": [2, 3]], ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 160, "h": 280],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 120, "h": 120],
+            ["op": "frame", "id": 3, "x": 0, "y": 140, "w": 120, "h": 120],
+            contentOp(3, 120, 120, padding: [10, 10, 10, 10]),
+        ]))
+        let from = try XCTUnwrap(p.views[2]), to = try XCTUnwrap(p.views[3])
+        let loader = RasterLoader(), resolver = AssetResolver(root: URL(fileURLWithPath: "/"))
+        defer { loader.shutdown(); withExtendedLifetime(resolver) {} }
+        let source = "data:image/png;base64," + (try fixture(80, 20)).base64EncodedString()
+        for node in [from, to] { XCTAssertTrue(loader.load(node, source: source, resolver: resolver)) }
+        waitFor("both flight rasters") { loader.reconcile(); return from.raster != nil && to.raster != nil }
+        _ = try XCTUnwrap(to.raster)
+        _ = try XCTUnwrap(from.raster)
+        p.apply(wireBatch([["op": "flight", "id": 3, "from": 2]]))
+        let flight = try XCTUnwrap(p.flights[3], "the destination lifted into its window")
+        for (progress, wanted) in [(0.5, CGRect(x: 45, y: 5, width: 70, height: 20)),
+                                   (1.0, CGRect(x: 50, y: 10, width: 60, height: 20))] {
+            p.apply(wireBatch([["op": "present", "id": 3, "property": "flight", "x": progress, "y": 0.0]]))
+            XCTAssertEqual(to.imageLayer?.frame, wanted, "at \(progress)")
+            XCTAssertEqual(to.imageLayer?.contentsRect, CGRect(x: 0, y: 0, width: wanted.width / 80, height: 1))
+        }
+        p.landFlight(flight)
+        XCTAssertEqual(to.imageLayer?.frame, CGRect(x: 50, y: 10, width: 60, height: 20))
+    }
+
     func testHalfAlphaPNGViewOverWhiteMatchesChrome() throws {
         // Unassociated RGBA(80, 120, 160, 128), encoded independently of ImageIO.
         let source = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMIqFjQAAAEbQHpbOjxOAAAAABJRU5ErkJggg=="
@@ -147,6 +201,17 @@ final class RasterImageTests: XCTestCase {
         XCTAssertEqual(RasterGeometry.rect(natural: image.naturalSize, content: box, fit: "scale-down").size, CGSize(width: 200, height: 100))
         XCTAssertEqual(RasterGeometry.rect(natural: image.naturalSize, content: box, fit: "cover").size, CGSize(width: 400, height: 200))
     }
+    func testRasterPositionUsesTheSpaceLeftByEveryFit() {
+        let box = CGRect(x: 3, y: 5, width: 160, height: 80)
+        let natural = CGSize(width: 40, height: 20)
+        let position: [BatchValue] = [.object(["pct": .number(0)]), .object(["pct": .number(100)])]
+        for (fit, size) in [("fill", CGSize(width: 160, height: 80)), ("contain", CGSize(width: 160, height: 80)),
+                            ("cover", CGSize(width: 160, height: 80)), ("none", natural), ("scale-down", natural)] {
+            XCTAssertEqual(RasterGeometry.rect(natural: natural, content: box, fit: fit, position: position),
+                           CGRect(x: 3, y: 85 - size.height, width: size.width, height: size.height))
+        }
+    }
+
     /// A tint draws the bitmap as a template: every pixel takes the tint at
     /// the pixel's own alpha; no tint draws the pixels themselves.
     func testATintDrawsTheBitmapsAlphaInTheTint() throws {

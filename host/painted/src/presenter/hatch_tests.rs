@@ -842,9 +842,11 @@ fn a_command_runs_at_most_4096_ticks_and_says_so() {
     notes();
     agent(&mut p, json!({"op": "clock", "to": 100.0}));
     assert_eq!(notes().len(), 4096);
-    // On the wall no cap applies: each presented frame ticks every ticket.
+    // A live drive still ticks every ticket on each presented frame.
     let mut wall = boot::<Flood>(STORM, &["storm"]);
     first_pixel(&mut wall);
+    wall.set_live_clock(Some(std::rc::Rc::new(|| 16.0)));
+    crate::agent::handle_for_window(&mut wall, r#"{"op":"tags"}"#);
     assert!(wall.wants_frames() && wall.wants_display_frames() && wall.needs_animation_frame());
     assert!(wall.animation_frame(16.0).is_none());
     assert_eq!(notes().len(), 5000);

@@ -104,12 +104,12 @@ fn a_large_reply_held_past_a_collection_is_collected_after_it() {
 }
 
 /// Two answers in flight at once, each replying with a large string after
-/// a collection began while it waited: the collection a reply owes waits
-/// until no answer awaits one, so replies alternating with new answers do
-/// not collect each time (each collected the next one's value had marked),
-/// and the last reply makes it.
+/// a collection began while it waited: the owed collection runs on the
+/// reply even while another fetch stays pending (so a hanging fetch cannot
+/// pin a dropped buffer), and re-stamps pending calls' epochs so
+/// overlapping replies do not cascade into a collection per reply.
 #[test]
-fn overlapping_large_replies_collect_once_none_is_pending() {
+fn overlapping_large_replies_collect_without_cascading_or_starving() {
     let mut m = module();
     let mut s = Store::new(GRANTS, []);
     state(&mut m, &mut s, "atInit");
@@ -121,11 +121,28 @@ fn overlapping_large_replies_collect_once_none_is_pending() {
         })
     };
     let n = |i: u32| [Value::Number(f64::from(i))];
+    let cleared = |m: &mut Module, s: &mut Store, i: u32| match m.answer(s, "overlapCleared", &n(i))
+    {
+        Ok(Answer::Now(v)) => v.as_str().unwrap_or("").to_string(),
+        other => panic!("expected a string, got {other:?}"),
+    };
     assert!(matches!(
         m.answer(&mut s, "overlap", &n(0)),
         Ok(Answer::Later(_))
     ));
-    for i in 1..=20 {
+    assert!(matches!(
+        m.answer(&mut s, "overlap", &n(1)),
+        Ok(Answer::Later(_))
+    ));
+    assert!(matches!(
+        m.parse(&mut s, "overlap", &n(0), ok()),
+        Ok(Answer::Now(_))
+    ));
+    // Overlap 1 is still pending, yet overlap 0's owed collection has already
+    // run on its reply (finalizers drain on the next call).
+    cleared(&mut m, &mut s, 0);
+    assert_eq!(cleared(&mut m, &mut s, 0), "cleared");
+    for i in 2..=20 {
         assert!(matches!(
             m.answer(&mut s, "overlap", &n(i)),
             Ok(Answer::Later(_))
@@ -137,21 +154,13 @@ fn overlapping_large_replies_collect_once_none_is_pending() {
     }
     let collected: u32 = state(&mut m, &mut s, "overlapCollected").parse().unwrap();
     assert!(
-        collected <= 2,
+        collected <= 6,
         "{collected} of 20 overlapping replies followed a collection"
     );
     assert!(matches!(
         m.parse(&mut s, "overlap", &n(20), ok()),
         Ok(Answer::Now(_))
     ));
-    // The registry reports at the drain that ends the call after the
-    // collection; with none, the second call still finds the sentinel held.
-    let cleared = |m: &mut Module, s: &mut Store| match m.answer(s, "overlapCleared", &n(20)) {
-        Ok(Answer::Now(v)) => v.as_str().unwrap_or("").to_string(),
-        other => panic!("expected a string, got {other:?}"),
-    };
-    cleared(&mut m, &mut s);
-    assert_eq!(cleared(&mut m, &mut s), "cleared");
 }
 
 #[test]

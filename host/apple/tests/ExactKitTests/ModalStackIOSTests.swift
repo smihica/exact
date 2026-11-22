@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactDialogs
 @testable import ExactNavigation
 
 /// Sheets and their navigation stacks (LLP 1075.003 §9, LLP 1035.003 D5):

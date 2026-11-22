@@ -72,6 +72,15 @@ open class ExactActivity : Activity() {
         pads.key(event, requests.padInput) || super.dispatchKeyEvent(event)
     override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean =
         pads.motion(event, requests.padInput) || super.dispatchGenericMotionEvent(event)
+    /** Every touch of the window, seen by a drag out of the app first ([DragOut.touched]). */
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        DragOut.touched(event)
+        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && ::root.isInitialized) {
+            root.access.touched()
+            requests.surfaces?.answers?.touched()
+        }
+        return super.dispatchTouchEvent(event)
+    }
 
     override fun onCreate(state: Bundle?) {
         // An activity made again in a process whose host runs (LLP 1115.001 D15.1: a configuration change this
@@ -180,7 +189,7 @@ open class ExactActivity : Activity() {
     internal fun ax(limit: Int): org.json.JSONObject {
         val surface = requests.surfaces?.answers
         val elements = org.json.JSONArray()
-        val more = (surface ?: root.access).ax(elements, limit)
+        val more = access.ax(elements, limit)
         val ax = org.json.JSONObject().put("source", "android")
             .put("platform", "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})").put("order", "tree")
             .put("observes", org.json.JSONArray(listOf("checked", "disabled", "expanded")))
@@ -191,6 +200,12 @@ open class ExactActivity : Activity() {
         if (more > 0) ax.put("truncated", org.json.JSONObject().put("elements", more).put("fields", 0))
         return ax
     }
+
+    /** The accessibility tree in front: the open surface's, or the page's. */
+    internal val access: Access get() = requests.surfaces?.answers ?: root.access
+
+    /** Whether the window has heard a drag start and not yet its end ([Root.dragging]). */
+    internal val windowDragging: Boolean get() = ::root.isInitialized && root.dragging
 
     /** A service came on, or the last one went; or this activity's reader was made ([read]) and is told which. */
     private fun accessible(on: Boolean) {
@@ -212,6 +227,7 @@ open class ExactActivity : Activity() {
     }
 
     private lateinit var requests: Requests
+    internal fun soundState() = requests.soundState()
 
     /** System Back goes where the app's routes send it ([Native.back], LLP 1115.001 D6). The callback is registered
      * only while the host says Back has somewhere to go in the app ([Requests.back]): at the first screen there is
@@ -296,7 +312,10 @@ open class ExactActivity : Activity() {
      * sent it. A new one adopts the host, which paints everything again for it; the app is as it was.
      */
     private fun read() {
-        natives?.let { nativeState = it.lifecycle.save(); it.destroyAll() }
+        natives?.let {
+            nativeState = it.lifecycle.save()
+            it.destroyAll(keepPlayback = true)
+        }
         fields?.leaving()
         root.removeAllViews()
         // Before the host boots: its first layout measures the app's text fields in a field of this activity's
@@ -385,7 +404,7 @@ open class ExactActivity : Activity() {
         view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         view.access = { words -> accessTold(words) }
         root.access.fields = hosted
-        root.access.others = { if (elements.childCount > 0) listOf<View>(elements) else emptyList() }
+        root.access.others = { listOfNotNull(elements.takeIf { it.childCount > 0 }, loopNotice?.label?.takeIf { it.isShown }) }
         root.access.controller = { elements.controller(it) }
         root.addView(elements, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(hosted, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -403,9 +422,11 @@ open class ExactActivity : Activity() {
         // The app's bars (LLP 1115.001 D11), over the page and everything it hosts. The host tells this reader its
         // bars anew, as it paints everything again for it.
         view.bars = Bars(this, root)
+        loopNotice = android.system.Os.getenv("EXACT_DEV_PLAN")?.let { DevLoop.Notice(this, root, it) }
         accessible(accessibility.isEnabled || asked)
     }
 
+    private var loopNotice: DevLoop.Notice? = null
     private lateinit var root: Root
 
     /** The app is edge to edge (LLP 1115.001 D3.4): the window reaches under transparent system bars and into the
@@ -457,6 +478,7 @@ open class ExactActivity : Activity() {
         val size = if (root.width > 0 && root.height > 0) root.width to root.height else windowSize()
         val density = Device.scale(this)
         val edges = edges(insets)
+        loopNotice?.place(maxOf(edges[0], edges[4]), maxOf(edges[1], edges[5]))
         val now = Triple(size, density, edges.toList())
         if (now == toldWindow) return
         toldWindow = now
@@ -470,6 +492,7 @@ open class ExactActivity : Activity() {
      * edges it keeps out of, which is the window's background; the two bars' icon appearances; and whether the bars
      * give way to the page (LLP 1105 D7). */
     private fun chrome(c: IntArray) {
+        loopNotice?.show(c[5] ushr 3)
         for (child in listOfNotNull<View>(view, natives ?: return, fields)) {
             child.layoutParams = FrameLayout.LayoutParams(c[2], c[3]).apply {
                 gravity = android.view.Gravity.TOP or android.view.Gravity.LEFT
@@ -570,7 +593,7 @@ open class ExactActivity : Activity() {
     }
 
     /** A driver's launch: the window's frames are measured for `perf frames` while it shows (LLP 1079.000 §6.2). */
-    private val measured by lazy { android.system.Os.getenv("EXACT_AGENT") == "1" }
+    private val measured by lazy { agentCarried() }
 
     /** The device a `perf frames report` names. */
     private fun frameIdentity(owner: Owner) {
@@ -601,8 +624,7 @@ open class ExactActivity : Activity() {
         if (reads()) Extensions.stopped(isChangingConfigurations)
         view.running(false, reads())
         natives?.lifecycle?.event(ViewLifecycle.STOP)
-        // Videos pause and let go of their decoders; each keeps its place for the reader made at the next start.
-        natives?.stopMedia()
+        natives?.stopMedia(allowBackground = !isFinishing && reads())
         // Behind the hide, the pads' release and the stop of the turns (none queued after it), what they and anything
         // since the pause committed is on disk before Android may kill it.
         if (!Exact.drainStore()) android.util.Log.w("exact", "the store's writes did not finish before the stop")
@@ -698,11 +720,12 @@ open class ExactActivity : Activity() {
     private fun release() {
         hatchReader?.takeIf { it.activity === this }?.activity = null
         requests.surfaces?.destroy()
-        natives?.destroyAll()
+        natives?.destroyAll(keepPlayback = !isFinishing)
         natives = null
         fields?.leaving()
         if (Fields.context === this) Fields.context = null
         if (!reads()) return
+        if (::view.isInitialized) view.stopMainWakes()
         Exact.reader = null
         Exact.owner?.let { it.published = {}; it.asked = null; it.chrome = {} }
         Exact.answered = {}
@@ -712,7 +735,7 @@ open class ExactActivity : Activity() {
     /** The launch extras that reach exact2 as its environment, written before its library loads; the launching
      * intent's URL or share only when it [arrived] now. */
     private fun environment(arrived: Boolean) {
-        val meta = Setup.environment(applicationContext)
+        val meta = Setup.environment(applicationContext, intent)
         if (arrived) {
             launchUrl()?.let { android.system.Os.setenv("EXACT_LAUNCH_URL", it, true) }
             // A share that starts the app is its launch location, claimed before the boot (LLP 1133.024 D5).
@@ -737,7 +760,7 @@ open class ExactActivity : Activity() {
         listOf("mi_purge_delay", "mi_eager_commit", "mi_arena_eager_commit").forEach { k ->
             intent.getStringExtra(k)?.let { android.system.Os.setenv("MIMALLOC_" + k.removePrefix("mi_").uppercase(), it, true) }
         }
-        listOf("x_agent", "x_auth_fixture", "x_hatches", "x_agent_storage", "x_agent_storage_fresh", "x_plan", "x_dev_plan", "x_store",
+        listOf("x_agent", "x_auth_fixture", "x_hatches", "x_agent_storage", "x_agent_storage_fresh", "x_agent_stored", "x_plan", "x_store",
             "x_agent_epoch", "x_agent_seed", "x_agent_locale", "x_agent_format_locale", "x_agent_time_zone",
             "x_agent_fail_fetch", "x_agent_process", "x_agent_home", "x_agent_login_env",
             "x_agent_share", "x_agent_bind", "x_agent_pads", "x_agent_timing", "x_agent_presentation", "x_agent_chrome",

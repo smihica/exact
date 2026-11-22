@@ -58,8 +58,9 @@ struct CaptureTests {
         precondition(captures.count == 2)
         precondition(captures[0]["width"] as? Int == 160 && captures[0]["height"] as? Int == 80)
         precondition(captures[1]["width"] as? Int == 80 && captures[1]["height"] as? Int == 50)
-        precondition(pictures == ["app:/tmp/freeze/screen-0.png", "app:/tmp/freeze/screen-1.png"], "published files must refresh images")
-        let first = root.appendingPathComponent("freeze/screen-0.png")
+        let paths = captures.compactMap { $0["path"] as? String }
+        precondition(paths.count == 2 && Set(paths).count == 2 && pictures == paths)
+        let first = AppFileWalk.openRootDestination(paths[0], root: root)!
         let bytes = try Data(contentsOf: first)
         let source = CGImageSourceCreateWithData(bytes as CFData, nil)!
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)! as NSDictionary
@@ -77,10 +78,13 @@ struct CaptureTests {
         precondition(afterCancel == bytes)
         precondition(pictures.count == 2, "cancelled captures publish no image changes")
         module.preferred(["screens":[["left":0,"top":0,"width":32,"height":32,"devicePixelRatio":1]]])
-        precondition(capture()["captures"] != nil)
-        let replaced = try Data(contentsOf: first)
-        precondition(replaced != bytes)
-        precondition(pictures == ["app:/tmp/freeze/screen-0.png", "app:/tmp/freeze/screen-1.png", "app:/tmp/freeze/screen-0.png"])
+        let next = capture()["captures"] as! [[String: Any]]
+        let nextPath = next[0]["path"] as! String
+        precondition(next.count == 1 && !paths.contains(nextPath))
+        let earlier = try Data(contentsOf: first)
+        let later = try Data(contentsOf: AppFileWalk.openRootDestination(nextPath, root: root)!)
+        precondition(earlier == bytes && later != bytes)
+        precondition(pictures == paths + [nextPath])
         module.preferred(["screens":screens])
         let jpeg = capture(args: ["type":"image/jpeg", "quality":0.5])
         precondition((jpeg["captures"] as? [[String: Any]])?[0]["type"] as? String == "image/jpeg")

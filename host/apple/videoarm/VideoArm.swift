@@ -124,13 +124,20 @@ private enum SharedAssets {
     static func forget(_ url: URL) { if let key = key(url) { cache.removeObject(forKey: key) } }
 }
 
+public typealias VideoPlacement = @convention(c) (UnsafeMutableRawPointer?, Double, Double, Double, Double, UnsafeMutablePointer<Double>?) -> Void
+
 private final class VideoArm: NSObject, NowPlayingPlayer {
     /// A queue player: with loop it runs on into a copy of the item queued
     /// behind it (`queueLoop`).
     let player = AVQueuePlayer()
+    var placement: VideoPlacement?
     var configuringHook: VideoConfiguring?
     let container = VideoContainer(frame: .zero)
     let poster = PlatformImageView(frame: .zero)
+    var positionedPicture: AVPlayerLayer?
+    var positionedObservation: NSKeyValueObservation?
+    weak var pictureOverlay: PlatformView?
+    var nativeFullscreen = false
     #if os(macOS)
     let presentation = AVPlayerView(frame: .zero)
     /// The full-screen window `requestFullscreen` opened, while it shows.
@@ -214,6 +221,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         #if os(macOS)
         container.wantsLayer = true; container.layer?.masksToBounds = true
         presentation.player = player
+        presentation.delegate = self
         poster.imageScaling = .scaleAxesIndependently
         #else
         container.clipsToBounds = true
@@ -520,6 +528,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         configureItem()
         queueLoop()
         if let error = props["sourceError"], error != old["sourceError"] { fail("src-not-supported", error) }
+        applyAccessibility()
         layout()
         NowPlaying.shared.updated(self)
         // The driver's `tap … mediasession` (LLP 1098 D10): `<n> <action> [seconds]`,
@@ -656,7 +665,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         let scale = container.window?.screen.scale ?? container.traitCollection.displayScale
         #endif
         let box = CGSize(width: container.bounds.width * scale, height: container.bounds.height * scale)
-        let fit = props["objectFit"] ?? "contain"
+        let fit = props["objectFit"] ?? "fill"
         guard fit != "none", box.width > 0, box.height > 0 else { return nil }
         let usable = sizes.filter { $0.width > 0 && $0.height > 0 }.sorted { $0.width * $0.height < $1.width * $1.height }
         let fills = { (size: CGSize) -> Bool in
@@ -793,6 +802,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
     }
     /// Whether the presentation has the item's first frame to show.
     var frameReady: Bool {
+        if let positionedPicture { return positionedPicture.isReadyForDisplay }
         #if os(macOS)
         return presentation.isReadyForDisplay
         #else
@@ -811,17 +821,13 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
     var posterFrame: CGRect {
         let bounds = container.bounds
         guard let size = poster.image?.size, size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
-        let x = bounds.width / size.width, y = bounds.height / size.height
-        let scale: CGFloat
-        switch props["objectFit"] ?? "contain" {
-        case "fill": return bounds
-        case "cover": scale = max(x, y)
-        case "none": scale = 1
-        case "scale-down": scale = min(1, min(x, y))
-        default: scale = min(x, y)
-        }
-        let width = size.width * scale, height = size.height * scale
-        return CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+        return placed(size, in: bounds)
+    }
+    func placed(_ natural: CGSize, in box: CGRect) -> CGRect {
+        guard let placement else { return box }
+        var rect = [Double](repeating: 0, count: 4)
+        rect.withUnsafeMutableBufferPointer { placement(context, natural.width, natural.height, box.width, box.height, $0.baseAddress) }
+        return CGRect(x: box.minX + rect[0], y: box.minY + rect[1], width: rect[2], height: rect[3])
     }
     func displayReadinessChanged() {
         guard Thread.isMainThread else { DispatchQueue.main.async { [weak self] in self?.displayReadinessChanged() }; return }
@@ -913,6 +919,9 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
     /// layer (LLP 1100 D11). Before iOS/macOS 26 AVKit has no range control.
     func applyDynamicRange() {
         let limit = props["dynamicRangeLimit"] ?? "no-limit"
+        if #available(iOS 26, tvOS 26, macOS 26, *), let positionedPicture {
+            positionedPicture.preferredDynamicRange = limit == "standard" ? .standard : limit == "constrained" ? .constrainedHigh : .high
+        }
         #if !os(macOS)
         let image: UIImage.DynamicRange = limit == "standard" ? .standard : limit == "constrained" ? .constrainedHigh : .high
         #else
@@ -983,6 +992,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         if controller == nil && needsController {
             let native = AVPlayerViewController()
             native.player = player
+            native.delegate = self
             // Its gravity before it is on screen: AVKit animates a later
             // change, and on iOS 17 that animation's mirrored
             // `sublayerTransform.scale.y` carries a CGSize, which
@@ -1032,9 +1042,43 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         controller.removeFromParent()
     }
     #endif
+    /// Forward authored `aria-label` / `aria-labelledby` onto the media view:
+    /// a named container for players with controls (keeping Play/scrubber reachable),
+    /// or the inline surface itself when there are no controls.
+    private func applyAccessibility() {
+        let label = props["accessibilityLabel"].flatMap { $0.isEmpty ? nil : $0 }
+        #if os(macOS)
+        presentation.setAccessibilityLabel(label)
+        #else
+        #if os(iOS)
+        if audioControls != nil {
+            container.isAccessibilityElement = false
+            container.accessibilityContainerType = label == nil ? .none : .semanticGroup
+            container.accessibilityLabel = label
+            return
+        }
+        #endif
+        if let controller {
+            container.isAccessibilityElement = false
+            container.accessibilityContainerType = label == nil ? .none : .semanticGroup
+            container.accessibilityLabel = label
+            controller.view.accessibilityLabel = label
+        } else if let inline {
+            container.isAccessibilityElement = false
+            container.accessibilityContainerType = .none
+            container.accessibilityLabel = nil
+            inline.isAccessibilityElement = label != nil
+            inline.accessibilityLabel = label
+        } else {
+            container.isAccessibilityElement = false
+            container.accessibilityContainerType = label == nil ? .none : .semanticGroup
+            container.accessibilityLabel = label
+        }
+        #endif
+    }
     /// CSS `object-fit` as AVFoundation's gravity.
     var gravity: AVLayerVideoGravity {
-        let fit = props["objectFit"] ?? "contain"
+        let fit = props["objectFit"] ?? "fill"
         return fit == "contain" || fit == "scale-down" ? .resizeAspect : fit == "cover" ? .resizeAspectFill : .resize
     }
     func layout() {
@@ -1042,7 +1086,8 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         #if os(iOS) || os(tvOS)
         attach()
         #endif
-        let fit = props["objectFit"] ?? "contain", gravity = self.gravity
+        let gravity = self.gravity
+        let fittedView = props["objectPositionAuthored"] == "true" || ["none", "scale-down"].contains(props["objectFit"] ?? "fill")
         #if os(macOS)
         presentation.videoGravity = gravity
         if let fullscreen, fullscreen.player.videoGravity != gravity { fullscreen.player.videoGravity = gravity }
@@ -1050,26 +1095,71 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         if let controller, controller.videoGravity != gravity {
             UIView.performWithoutAnimation { controller.videoGravity = gravity }
         }
-        if let layer = inline?.playerLayer, layer.videoGravity != gravity { layer.videoGravity = gravity }
-        // Full screen keeps the element's `object-fit`, as the web's does.
+        let inlineGravity: AVLayerVideoGravity = fittedView ? .resize : gravity
+        if let layer = inline?.playerLayer, layer.videoGravity != inlineGravity { layer.videoGravity = inlineGravity }
+        // Full screen is the platform player's presentation; inline object-position belongs to the element's box.
         if let fullscreen, fullscreen.videoGravity != gravity { fullscreen.videoGravity = gravity }
         guard let presentation else { poster.frame = posterFrame; return }
         #endif
-        var frame = container.bounds
-        if (fit == "none" || fit == "scale-down"), naturalSize.width > 0, naturalSize.height > 0 {
-            let scale = fit == "none" ? 1 : min(1, min(frame.width / naturalSize.width, frame.height / naturalSize.height))
-            frame = CGRect(x: (frame.width - naturalSize.width * scale) / 2, y: (frame.height - naturalSize.height * scale) / 2, width: naturalSize.width * scale, height: naturalSize.height * scale)
-        }
-        if presentation.superview === container { presentation.frame = frame }
+        let object = naturalSize.width > 0 && naturalSize.height > 0 ? placed(naturalSize, in: container.bounds) : container.bounds
+        #if os(macOS)
+        if presentation.superview === container { presentation.frame = container.bounds }
+        presentation.layoutSubtreeIfNeeded()
+        let overlay = presentation.contentOverlayView
+        #else
+        if presentation.superview === container { presentation.frame = controller == nil && inline != nil && fittedView ? object : container.bounds }
+        presentation.layoutIfNeeded()
+        let overlay = controller?.contentOverlayView
+        #endif
+        placePicture(fittedView && !nativeFullscreen ? object : nil, overlay: overlay)
         if let pending = sizedLoad, !container.bounds.isEmpty { sizedLoad = nil; boundedItem(pending.asset) }
         #if os(iOS)
         audioControls?.refresh()
         #endif
         poster.frame = posterFrame
     }
+    /// AVKit's public overlay sits below its controls. Cover its centered picture
+    /// and place a layer on the same player without moving the controls' container.
+    func placePicture(_ rect: CGRect?, overlay: PlatformView?) {
+        guard let rect, let overlay else {
+            positionedObservation = nil
+            positionedPicture?.player = nil
+            positionedPicture?.removeFromSuperlayer(); positionedPicture = nil
+            #if os(macOS)
+            pictureOverlay?.layer?.backgroundColor = nil
+            #else
+            pictureOverlay?.layer.backgroundColor = nil
+            #endif
+            pictureOverlay = nil
+            return
+        }
+        #if os(macOS)
+        overlay.wantsLayer = true
+        guard let layer = overlay.layer else { return }
+        #else
+        let layer = overlay.layer
+        #endif
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer.backgroundColor = CGColor(gray: 0, alpha: 1)
+        layer.masksToBounds = true
+        if positionedPicture == nil {
+            let picture = AVPlayerLayer(player: player)
+            picture.videoGravity = .resize
+            positionedPicture = picture
+            positionedObservation = picture.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, _ in self?.displayReadinessChanged() }
+            applyDynamicRange()
+        }
+        if let picture = positionedPicture {
+            if picture.superlayer !== layer { layer.addSublayer(picture) }
+            picture.frame = overlay.convert(rect, from: container)
+        }
+        pictureOverlay = overlay
+        CATransaction.commit()
+    }
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true; generation += 1; posterGeneration += 1
+        placePicture(nil, overlay: nil)
         variantRead?.cancel(); variantRead = nil
         clearPlaybackClock()
         hdrTask?.cancel(); hdrTask = nil
@@ -1092,6 +1182,33 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         container.removeFromSuperview()
     }
 }
+
+#if os(macOS)
+extension VideoArm: AVPlayerViewDelegate {
+    func playerViewWillEnterFullScreen(_ playerView: AVPlayerView) {
+        nativeFullscreen = true; layout()
+    }
+    func playerViewDidExitFullScreen(_ playerView: AVPlayerView) {
+        nativeFullscreen = false; layout()
+    }
+}
+#else
+extension VideoArm: AVPlayerViewControllerDelegate {
+    #if os(iOS)
+    func playerViewController(_ playerViewController: AVPlayerViewController, willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+        nativeFullscreen = true; layout()
+        coordinator.animate(alongsideTransition: nil) { [weak self] context in
+            if context.isCancelled { self?.nativeFullscreen = false; self?.layout() }
+        }
+    }
+    func playerViewController(_ playerViewController: AVPlayerViewController, willEndFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+        coordinator.animate(alongsideTransition: nil) { [weak self] context in
+            if !context.isCancelled { self?.nativeFullscreen = false; self?.layout() }
+        }
+    }
+    #endif
+}
+#endif
 
 #if os(iOS) || os(tvOS)
 /// The full-screen player: AVKit's own controller on the inline one's
@@ -1260,11 +1377,12 @@ extension VideoArm {
 #endif
 
 @_cdecl("exact_video_create")
-public func videoCreate(_ context: UnsafeMutableRawPointer?, _ callback: VideoCallback?, _ configuring: VideoConfiguring?,
+public func videoCreate(_ context: UnsafeMutableRawPointer?, _ callback: VideoCallback?, _ configuring: VideoConfiguring?, _ placement: VideoPlacement?,
                         _ player: UnsafeMutablePointer<UnsafeMutableRawPointer?>?) -> UnsafeMutableRawPointer? {
     guard let callback else { return nil }
     let object = VideoArm(context: context, callback: callback)
     object.configuringHook = configuring
+    object.placement = placement
     // Borrowed for the arm's lifetime, as exact_video_view's view is.
     player?.pointee = Unmanaged.passUnretained(object.player).toOpaque()
     return Unmanaged.passRetained(object).toOpaque()

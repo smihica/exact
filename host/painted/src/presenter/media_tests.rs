@@ -59,6 +59,46 @@ fn a_players_reports_reach_the_node_only_for_its_session_and_allocation() {
     assert!(!p.reader_media(id, key, session, "", "", state, 4.));
 }
 
+#[test]
+fn a_background_audio_loan_reads_committed_pause_and_removal_without_a_frame() {
+    let source = r#"component App
+  state paused = false
+  state removed = false
+  action ticked(t: number)
+    paused = t >= 1
+    removed = t >= 2
+  view
+    column
+      if not removed
+        audio src="a.mp3" paused=paused timeupdate=ticked testId="video"
+"#;
+    let (mut p, error) = Presenter::boot_with(
+        &crate::test_plan(source),
+        (),
+        (400., 400.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let id = video(&p);
+    let key = p.host.kernel().node(id).unwrap().key;
+    let session = p.brush.native_session;
+    let props = p.background_audio(id, key, session).unwrap();
+    assert_eq!(props["paused"], false);
+    assert_eq!(props["timeupdate"], true);
+    assert!(p.background_audio(id, key, session + 1).is_none());
+
+    assert!(p.reader_media(id, key, session, "timeupdate", "1", "", 1.));
+    assert_eq!(
+        p.background_audio(id, key, session).unwrap()["paused"],
+        true
+    );
+    assert!(p.reader_media(id, key, session, "timeupdate", "2", "", 2.));
+    assert!(p.background_audio(id, key, session).is_none());
+}
+
 /// Only a node that handles `timeupdate` has its player run the 4 Hz clock
 /// (LLP 1042.001 D3): the painter names which.
 #[test]

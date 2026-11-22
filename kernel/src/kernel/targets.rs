@@ -52,6 +52,12 @@ struct Reports {
 }
 
 impl Targets {
+    /// The highest generation the owner `slot`'s reports gave each target,
+    /// against which a new report is checked (`NativeTargets::refusal`).
+    pub(crate) fn seen(&self, slot: u32) -> Option<&crate::id::IdMap<u64, u64>> {
+        self.owners.get(&slot).map(|r| &r.seen)
+    }
+
     /// What `slot` reads raw insets from, where it reads any.
     pub(crate) fn scope(&self, arena: &NodeArena, slot: u32) -> Option<Scope> {
         if !arena.readers.targets.contains_key(&slot) {
@@ -88,10 +94,12 @@ impl Kernel {
     /// its identity, generation and raw insets, `None` while unavailable.
     /// Its readers of a target whose insets changed are derived again;
     /// returns whether any was (a layout is owed then). A report is refused
-    /// whole: nonfinite or negative insets, a target at a generation older
+    /// whole: nonfinite insets, a target at a generation older
     /// than an earlier report gave it, a chain entry of kind `owner` or
-    /// `parent` (entries 1 and 2 by position), a relation twice, or a chain
-    /// past 255.
+    /// `parent` (entries 1 and 2 by position) or of a kind bit past the
+    /// kinds, a relation twice, or a chain past 255.
+    /// A host reports this field with the owner's others through
+    /// [`Kernel::update_owner`], which applies them whole or not at all.
     pub fn set_owner_targets(
         &mut self,
         view: ViewId,
@@ -105,6 +113,7 @@ impl Kernel {
         let readers = self.report(&targets, reports, self.held_by(slot))?;
         let store = &mut self.arena.observations.targets;
         store.owners.entry(slot).or_default().take(targets);
+        let readers = self.with_captures(readers);
         self.restyle_readers(&readers);
         Ok(!readers.is_empty())
     }
@@ -120,8 +129,29 @@ impl Kernel {
         let reports = Some(&self.arena.observations.targets.session);
         let readers = self.report(&targets, reports, outside)?;
         self.arena.observations.targets.session.take(targets);
+        let readers = self.with_captures(readers);
         self.restyle_readers(&readers);
         Ok(!readers.is_empty())
+    }
+
+    /// Why [`Kernel::set_registered_target`] would refuse registering
+    /// `target` under `name`, or its removal (`None`), changing nothing.
+    pub fn check_registered_target(
+        &self,
+        name: &str,
+        target: Option<&NativeTarget>,
+    ) -> Result<(), KernelError> {
+        if !targets::valid_name(name) {
+            return Err(LayoutError::NativeTarget(
+                "a registered name must be ASCII lowercase letters, digits and inner hyphens, at most 64; rename the target",
+            )
+            .into());
+        }
+        let last = self.arena.observations.targets.registered.get(name);
+        match target.and_then(|t| targets::registration_refusal(t, last)) {
+            Some(why) => Err(LayoutError::NativeTarget(why).into()),
+            None => Ok(()),
+        }
     }
 
     /// Register a native target for the session under `name`, which
@@ -137,18 +167,14 @@ impl Kernel {
         name: &str,
         target: Option<NativeTarget>,
     ) -> Result<bool, KernelError> {
-        if !targets::valid_name(name) {
-            return Err(LayoutError::NativeTarget(
-                "a registered name must be ASCII lowercase letters, digits and inner hyphens, at most 64; rename the target",
-            )
-            .into());
-        }
-        let registered = &self.arena.observations.targets.registered;
-        let last = registered.get(name).copied();
-        let refusal = target.and_then(|t| targets::registration_refusal(&t, last.as_ref()));
-        if let Some(why) = refusal {
-            return Err(LayoutError::NativeTarget(why).into());
-        }
+        self.check_registered_target(name, target.as_ref())?;
+        let last = self
+            .arena
+            .observations
+            .targets
+            .registered
+            .get(name)
+            .copied();
         // Keep a removed registration, unavailable, for its generation
         let Some(next) = target.or(last.map(|l| NativeTarget { insets: None, ..l })) else {
             return Ok(false);
@@ -163,8 +189,22 @@ impl Kernel {
         let readers = self.reading(raw, |t, edges| *t == read && changes_read(old, new, edges));
         let registered = Arc::make_mut(&mut self.arena.observations.targets.registered);
         registered.insert(key, next);
+        let readers = self.with_captures(readers);
         self.restyle_readers(&readers);
         Ok(!readers.is_empty())
+    }
+
+    /// `readers`, whose read insets a report or a holder change moved, and
+    /// below each that captures a target, each node whose lengths take the
+    /// capture's value (LLP 1123 D5).
+    pub(super) fn with_captures(&mut self, mut readers: Vec<u32>) -> Vec<u32> {
+        readers.extend(super::readers::Readers::captured_targets(
+            &mut self.arena,
+            &readers,
+        ));
+        readers.sort_unstable();
+        readers.dedup();
+        readers
     }
 
     /// Of `held`, the raw readers a report holds, those whose read insets
@@ -215,33 +255,31 @@ impl Kernel {
     /// readers are found (`readers::walk_down`); else each reader's
     /// ancestors are checked.
     pub(super) fn held_through(&self, top: u32) -> Vec<u32> {
-        let arena = &self.arena;
-        let raw = &arena.readers.targets;
-        if raw.is_empty() {
-            return Vec::new();
-        }
-        let enter = |c: u32| holds(arena, c).is_none();
-        let mut out: Vec<u32> =
-            match super::readers::walk_down(arena, top, 2 * raw.len() + 1, enter) {
-                Some(nodes) => (nodes.into_iter())
-                    .filter(|s| raw.contains_key(s))
-                    .collect(),
-                None => (raw.keys().copied())
-                    .filter(|&s| through(arena, s, top))
-                    .collect(),
-            };
-        out.sort_unstable();
-        out
+        let raw = &self.arena.readers.targets;
+        let readers = raw.keys().copied();
+        held_among(
+            &self.arena,
+            top,
+            raw.len(),
+            |s| raw.contains_key(&s),
+            readers,
+        )
     }
 
-    /// Derive again the raw readers whose holder is `slot`'s or `slot`
-    /// ([`Kernel::held_through`]), after a block gained or given back, or a
-    /// top-layer change, that may give them another.
+    /// Derive again the raw readers and the owner segments' readers whose
+    /// holder is `slot`'s or `slot` ([`Kernel::held_through`]), after a block
+    /// gained or given back, or a top-layer change, that may give them another.
     pub(super) fn targets_moved(&mut self, slot: u32) {
-        if !self.arena.observations.targets.placed_any() {
-            return;
+        let mut readers = Vec::new();
+        if self.arena.observations.targets.placed_any() {
+            readers.extend(self.held_through(slot));
         }
-        let readers = self.held_through(slot);
+        // An owner segment's reader reads its holder's report as a raw
+        // reader does (D16)
+        if super::owner::segments_differ(&self.arena) {
+            readers.extend(self.segment_readers_through(slot));
+        }
+        let readers = self.with_captures(readers);
         self.restyle_readers(&readers);
     }
 }
@@ -255,6 +293,29 @@ impl Reports {
         }
         self.last = Some(Arc::new(report));
     }
+}
+
+/// The readers whose holder is `top`'s or `top` itself, of a set of `count`
+/// for which `is_reader` holds and which `readers` lists, found by a walk
+/// down from `top` where that is shorter than the set
+/// ([`Kernel::held_through`]).
+pub(super) fn held_among(
+    arena: &NodeArena,
+    top: u32,
+    count: usize,
+    is_reader: impl Fn(u32) -> bool,
+    readers: impl Iterator<Item = u32>,
+) -> Vec<u32> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let enter = |c: u32| holds(arena, c).is_none();
+    let mut out: Vec<u32> = match super::readers::walk_down(arena, top, 2 * count + 1, enter) {
+        Some(nodes) => nodes.into_iter().filter(|&s| is_reader(s)).collect(),
+        None => readers.filter(|&s| through(arena, s, top)).collect(),
+    };
+    out.sort_unstable();
+    out
 }
 
 /// Whether `reader` is `top` or below it short of a box that holds its own.

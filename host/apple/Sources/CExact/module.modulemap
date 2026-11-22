@@ -12,6 +12,10 @@ module CExact {
         header "../../include/exact_content_regions.h"
         export *
     }
+    explicit module Canvas {
+        header "../../include/exact_canvas.h"
+        export *
+    }
     module Traces {
         header "../../include/exact_traces.h"
         export *

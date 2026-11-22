@@ -6,6 +6,23 @@
 //! clips and stacks as the box does. Other backends draw nothing for them.
 use super::*;
 
+pub(super) fn is_audio(node: &NodeRef<'_>) -> bool {
+    node.node_type == NodeType::Video && node.props.str(PropId::SemanticTag) == Some("audio")
+}
+
+pub(super) struct PictureBackend(Box<dyn Backend>, Option<Vec<ViewId>>);
+
+pub(crate) fn object_fit_of(node: &NodeRef<'_>) -> ObjectFit {
+    if node.node_type == NodeType::Video {
+        exact_kernel::object::video_fit(
+            node.style.object_fit,
+            node.style.written.has(StyleId::ObjectFit),
+        )
+    } else {
+        node.style.object_fit
+    }
+}
+
 pub(super) fn new_session() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -113,61 +130,153 @@ impl Painter {
         }
     }
 
-    /// Name `node`'s platform element to the backend, shown in `edge`: its
-    /// content box on the content edge's curve.
-    pub(super) fn native(&mut self, node: &NodeRef<'_>, edge: &Shape, ts: Transform) {
+    // @ref LLP 1042.001 D3, D5 — null distinguishes an unbound prop from an assignment.
+    pub(crate) fn media_props(&self, node: &NodeRef<'_>) -> serde_json::Value {
         let p = node.props;
         let flag = |id| p.bool(id) == Some(true);
+        let number = |id| {
+            p.get(id)
+                .and_then(|v| v.as_float().or(v.as_int().map(|i| i as f64)))
+        };
+        let mut props = serde_json::json!({
+            "src": p.str(PropId::Src),
+            "autoplay": flag(PropId::Autoplay),
+            "loop": flag(PropId::Loop),
+            "muted": flag(PropId::Muted),
+            "paused": p.bool(PropId::Paused),
+            "controls": flag(PropId::Controls),
+            "poster": p.str(PropId::Poster).is_some_and(|s| !s.is_empty()),
+            "preload": p.str(PropId::Preload),
+            "controlslist": p.str(PropId::Controlslist),
+            "volume": number(PropId::Volume),
+            "playbackRate": number(PropId::PlaybackRate),
+            "currentTime": number(PropId::CurrentTime),
+            "preservesPitch": p.bool(PropId::PreservesPitch),
+            "preferredMaximumResolution": p.str(PropId::PreferredMaximumResolution),
+            "preferredPeakBitRate": number(PropId::PreferredPeakBitRate),
+            "preventsDisplaySleepDuringVideoPlayback": p.bool(PropId::PreventsDisplaySleepDuringVideoPlayback),
+            "audio": is_audio(node),
+            "label": p.str(PropId::AccessibilityLabel),
+            "timeupdate": self.media.timed.contains(&node.key),
+            "focused": self.media.focused == Some(node.key),
+            "fit": match object_fit_of(node) {
+                ObjectFit::Contain => "contain",
+                ObjectFit::Cover => "cover",
+                ObjectFit::None => "none",
+                ObjectFit::ScaleDown => "scale-down",
+                ObjectFit::Fill => "fill",
+            },
+            "generation": node.key.generation,
+            "slot": node.key.index,
+            "session": self.native_session,
+        });
+        if let Some(c) = self.media.commands.get(&node.key) {
+            if c.seeks > 0 {
+                props["seek"] = format!("{} {}", c.seeks, c.seconds).into();
+            }
+            if c.loads > 0 {
+                props["load"] = c.loads.into();
+            }
+            if c.fullscreens > 0 {
+                props["fullscreen"] = c.fullscreens.into();
+            }
+        }
+        props
+    }
+
+    pub(super) fn boxless_audio(&mut self, walk: &Walk<'_, '_>, node: &NodeRef<'_>) {
+        if !walk.scene.kernel.has_type(NodeType::Video)
+            || (walk.scene.hidden)(node.id)
+            || walk.skip == Some(node.key)
+            || walk.draws_alert_elsewhere(node)
+        {
+            return;
+        }
+        if is_audio(node) {
+            self.record_boxless_audio(node);
+        }
+        for child in node.child_nodes() {
+            self.boxless_audio(walk, &child);
+        }
+    }
+
+    pub(super) fn record_boxless_audio(&mut self, node: &NodeRef<'_>) {
+        if let Some(audio) = &mut self.boxless_audio {
+            audio.push(node.id);
+            return;
+        }
+        let props = self.media_props(node);
+        self.backend.boxless_audio(node.id, &props.to_string());
+    }
+
+    pub(super) fn capture_boxless_audio(&mut self, kernel: &Kernel) -> Option<Vec<ViewId>> {
+        let capture = kernel.has_type(NodeType::Video).then(Vec::new);
+        std::mem::replace(&mut self.boxless_audio, capture)
+    }
+
+    pub(super) fn emit_boxless_audio(&mut self, kernel: &Kernel, audio: Option<Vec<ViewId>>) {
+        for id in audio.into_iter().flatten() {
+            if let Some(node) = kernel.node(id) {
+                self.record_boxless_audio(&node);
+            }
+        }
+    }
+
+    // An island's backend draws its pixels. The enclosing stream still owns its audio players.
+    pub(super) fn replace_picture_backend(
+        &mut self,
+        kernel: &Kernel,
+        backend: Box<dyn Backend>,
+    ) -> PictureBackend {
+        PictureBackend(
+            std::mem::replace(&mut self.backend, backend),
+            self.capture_boxless_audio(kernel),
+        )
+    }
+
+    pub(super) fn restore_picture_backend(
+        &mut self,
+        kernel: &Kernel,
+        PictureBackend(backend, parent_audio): PictureBackend,
+    ) -> Box<dyn Backend> {
+        let picture = std::mem::replace(&mut self.backend, backend);
+        let audio = std::mem::replace(&mut self.boxless_audio, parent_audio);
+        self.emit_boxless_audio(kernel, audio);
+        picture
+    }
+
+    /// Name `node`'s platform element to the backend, shown in `edge`: its
+    /// content box on the content edge's curve.
+    pub(super) fn native(
+        &mut self,
+        walk: &Walk<'_, '_>,
+        node: &NodeRef<'_>,
+        edge: &Shape,
+        ts: Transform,
+    ) {
+        let p = node.props;
+        let flag = |id| p.bool(id) == Some(true);
+        if edge.rect.2 <= 0.0 || edge.rect.3 <= 0.0 {
+            return;
+        }
         let (kind, props) = match node.node_type {
-            // @ref LLP 1042.001 D3, D5 — every prop the player maps; an
-            // unset `paused` or `currentTime` is null, so the player knows
-            // whether the author binds it.
             NodeType::Video => {
-                let number = |id| {
-                    p.get(id)
-                        .and_then(|v| v.as_float().or(v.as_int().map(|i| i as f64)))
-                };
-                let mut props = serde_json::json!({
-                        "src": p.str(PropId::Src),
-                        "autoplay": flag(PropId::Autoplay),
-                        "loop": flag(PropId::Loop),
-                        "muted": flag(PropId::Muted),
-                        "paused": p.bool(PropId::Paused),
-                        "controls": flag(PropId::Controls),
-                        "poster": p.str(PropId::Poster).is_some_and(|s| !s.is_empty()),
-                        "preload": p.str(PropId::Preload),
-                        "controlslist": p.str(PropId::Controlslist),
-                        "volume": number(PropId::Volume),
-                        "playbackRate": number(PropId::PlaybackRate),
-                        "currentTime": number(PropId::CurrentTime),
-                        "preservesPitch": p.bool(PropId::PreservesPitch),
-                        "preferredMaximumResolution": p.str(PropId::PreferredMaximumResolution),
-                        "preferredPeakBitRate": number(PropId::PreferredPeakBitRate),
-                        "preventsDisplaySleepDuringVideoPlayback": p.bool(PropId::PreventsDisplaySleepDuringVideoPlayback),
-                        "audio": p.str(PropId::SemanticTag) == Some("audio"),
-                        "label": p.str(PropId::AccessibilityLabel),
-                        "timeupdate": self.media.timed.contains(&node.key),
-                        "focused": self.media.focused == Some(node.key),
-                        "fit": match node.style.object_fit {
-                            ObjectFit::Contain => "contain",
-                            ObjectFit::Cover => "cover",
-                            ObjectFit::None => "none",
-                            ObjectFit::ScaleDown => "scale-down",
-                            ObjectFit::Fill => "fill",
-                        },
-                        "generation": node.key.generation,
-                        "slot": node.key.index,
-                        "session": self.native_session,
-                });
-                if let Some(c) = self.media.commands.get(&node.key) {
-                    if c.seeks > 0 {
-                        props["seek"] = format!("{} {}", c.seeks, c.seconds).into();
-                    }
-                    if c.loads > 0 {
-                        props["load"] = c.loads.into();
-                    }
-                    if c.fullscreens > 0 {
-                        props["fullscreen"] = c.fullscreens.into();
+                let mut props = self.media_props(node);
+                let natural = walk.scene.kernel.arena().intrinsic(node.key.index);
+                if let Some(natural) = natural {
+                    if let Some(rect) = exact_kernel::object::placed(
+                        natural,
+                        object_fit_of(node),
+                        &node.style.object_position,
+                        (0., 0., edge.rect.2, edge.rect.3),
+                        &walk.scene.kernel.env_of(node.id),
+                    ) {
+                        props["objectRect"] = serde_json::json!([
+                            rect.0 / edge.rect.2,
+                            rect.1 / edge.rect.3,
+                            rect.2 / edge.rect.2,
+                            rect.3 / edge.rect.3
+                        ]);
                     }
                 }
                 (NativeKind::Video, props)
@@ -177,6 +286,9 @@ impl Painter {
                 serde_json::json!({
                     "src": p.str(PropId::Src),
                     "sandbox": p.str(PropId::Sandbox),
+                    "generation": node.key.generation,
+                    "slot": node.key.index,
+                    "session": self.native_session,
                 }),
             ),
             NodeType::NativeView => (
@@ -193,9 +305,6 @@ impl Painter {
             NodeType::Canvas => (NativeKind::Surface, serde_json::json!({})),
             _ => return,
         };
-        if edge.rect.2 <= 0.0 || edge.rect.3 <= 0.0 {
-            return;
-        }
         self.backend.native(
             node.id,
             kind,
@@ -223,3 +332,9 @@ impl PaintedBox {
 #[cfg(test)]
 #[path = "native_tests.rs"]
 mod tests;
+
+impl super::Walk<'_, '_> {
+    pub(super) fn draws_alert_elsewhere(&self, node: &NodeRef<'_>) -> bool {
+        self.alert == Some(node.key) && self.dialog != Some(node.id)
+    }
+}

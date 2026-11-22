@@ -178,11 +178,12 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// What the reader draws around the page, when that is not what it was
     /// last given: where the page is in the window (x, y, width, height, in
     /// pixels), the colour behind it and in the edges it keeps out of
-    /// (ARGB), and three bits: bit 0 is the dark scheme (light navigation
-    /// icons); bit 1 requests light status bar icons; bit 2 hides the
+    /// (ARGB), and three bits. Bit 0 requests light navigation icons.
+    /// Bit 1 requests light status bar icons. Bit 2 hides the
     /// system bars (LLP 1105 D7). `None` while nothing changed.
     pub fn chrome(&mut self) -> Option<[i32; 6]> {
-        let now = pack_chrome(self.p.chrome(), self.scale);
+        let mut now = pack_chrome(self.p.chrome(), self.scale);
+        now[5] |= self.p.development_status() << 3;
         if self.shell.chrome == Some(now) {
             return None;
         }
@@ -202,7 +203,7 @@ fn pack_chrome(c: Chrome, scale: f32) -> [i32; 6] {
         px(c.frame[2]),
         px(c.frame[3]),
         i32::from_be_bytes([a, r, g, b]),
-        i32::from(c.dark)
+        i32::from(c.navigation_light_icons)
             | (i32::from(c.status_light_icons) << 1)
             | (i32::from(c.bars_hidden) << 2),
     ]
@@ -214,7 +215,7 @@ mod tests {
 
     #[test]
     fn chrome_keeps_geometry_and_argb_and_packs_independent_bar_bits() {
-        for (dark, status_light_icons, bars_hidden, flags) in [
+        for (navigation_light_icons, status_light_icons, bars_hidden, flags) in [
             (false, false, false, 0),
             (true, false, false, 1),
             (false, true, false, 2),
@@ -225,7 +226,8 @@ mod tests {
             let chrome = Chrome {
                 frame: [1.25, 2.5, 100., 200.],
                 background: [0x12, 0x34, 0x56, 0xff],
-                dark,
+                dark: !navigation_light_icons,
+                navigation_light_icons,
                 status_light_icons,
                 bars_hidden,
             };

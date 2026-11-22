@@ -3,7 +3,10 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { appleCommand, crossSdk, spawn as appleSpawn, spawnSync as appleSpawnSync } from './toolchain.mjs';
+import { appleCommand, crossSdk, experimental, spawn as appleSpawn, spawnSync as appleSpawnSync, swiftOptimization, swiftOptimizationKey } from './toolchain.mjs';
+import { widgetReload } from './widgets.mjs';
+import { appleComposition } from './link.mjs';
+import { createHash } from 'node:crypto';
 import { decodeProfile, xcodeRefusal } from './devices.mjs';
 import { appleCrossReport, CROSS_IOS_ROWS, distributionToolchain, ensureWatchSDK, installWatchSDK } from './sdk.mjs';
 import { iosTestRuns } from './xctest.mjs';
@@ -384,6 +387,19 @@ test('Cargo links with the selected Apple SDK and minimum OS while preserving ta
   expect(appleCommand('cargo', args, { cwd: root, env: { ...env, IPHONEOS_DEPLOYMENT_TARGET: '18.2' } }, 'linux')[2].env.CARGO_TARGET_AARCH64_APPLE_IOS_SIM_LINKER).toBe(executable);
 }));
 
+test('Cargo keeps the linker in the build directory when one is set, so every unit there has one configuration', () => fixture(({ root, env }) => {
+  const linker = (args, extra = {}) => appleCommand('cargo', args, { cwd: root, env: { ...env, IPHONEOS_DEPLOYMENT_TARGET: '18.2', ...extra } }, 'linux')[2].env.CARGO_TARGET_AARCH64_APPLE_IOS_SIM_LINKER;
+  const app = linker(['build', '--target', 'aarch64-apple-ios-sim'], { CARGO_TARGET_DIR: resolve(root, 'target') });
+  expect(app.startsWith(resolve(root, 'target/exact-cross-tools') + '/')).toBe(true);
+  const modules = ['build', '--target', 'aarch64-apple-ios-sim', '--target-dir', resolve(root, 'target/apple-modules')];
+  // Without a build directory a --target-dir build keeps its own linker, as its units are its own.
+  expect(linker(modules, { CARGO_TARGET_DIR: resolve(root, 'target') }).startsWith(resolve(root, 'target/apple-modules/exact-cross-tools') + '/')).toBe(true);
+  // With one, a --target-dir build's linker is the one every other build in that directory uses.
+  expect(linker(modules, { CARGO_TARGET_DIR: resolve(root, 'target'), CARGO_BUILD_BUILD_DIR: resolve(root, 'target') })).toBe(app);
+  expect(linker(['build', '--target', 'aarch64-apple-ios-sim'], { CARGO_BUILD_BUILD_DIR: 'target' })).toBe(app);
+  expect(linker(modules, { CARGO_BUILD_BUILD_DIR: '{workspace-root}/build' }).startsWith(resolve(root, 'target/apple-modules/exact-cross-tools') + '/')).toBe(true);
+}));
+
 test('Linux plist tools preserve typed XML and binary bundle metadata and report missing keys', () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-plist-'));
   const file = resolve(dir, 'Info.plist');
@@ -472,7 +488,8 @@ async function iosRunsFixture(body) {
     for (const name of ['plutil', 'xcrun']) chmodSync(resolve(root, name), 0o755);
     process.env.PATH = `${root}:${savedPath}`;
     opening = spyOn(await import('./touches.mjs'), 'openTouches');
-    await body({ root, opening, options: { pkg, derived, destination: `id=${udid}`, udid, env: {}, canvasGpu: 'gpu', hostSource: 'host.swift', triple: 'arm64-apple-ios-simulator', run: () => {} } });
+    await body({ root, opening, options: { pkg, derived, destination: `id=${udid}`, udid, env: {}, canvasGpu: 'gpu', hostSource: 'host.swift', triple: 'arm64-apple-ios-simulator', run: () => {},
+      testingDevices: resolve(root, 'XCTestDevices') } });
   } finally {
     opening?.mockRestore();
     process.env.PATH = savedPath;
@@ -564,6 +581,54 @@ test('the iOS tests build without coverage into the derived data that every test
   expect(runs).toEqual(Array(4).fill(options.derived));
 }));
 
+for (const live of [null, 'udid', 'name', 'twin']) test(`the iOS tests delete their simulator's leftover clones ${live ? `only while no xcodebuild tests on ${live === 'twin' ? 'a simulator with its name, runtime and device type' : `it, named by its ${live}`}` : 'even when the tests fail'}`, () => iosRunsFixture(async ({ root, options }) => {
+  const devices = options.testingDevices, events = resolve(root, 'events'), runtime = 'com.apple.CoreSimulator.SimRuntime.iOS-27-1';
+  const device = (n, name, { state = 'Shutdown', runtime: on = runtime, type = 'iPhone-Duo' } = {}) =>
+    ({ udid: `00000000-0000-0000-0000-00000000000${n}`, name, state, runtime: on, deviceTypeIdentifier: `com.apple.CoreSimulator.SimDeviceType.${type}` });
+  // Deleted: two clones of the simulator, one of whose deletions fails, and one that another run's cleanup deletes
+  // first. Kept: a booted clone, and clones of another simulator and of same-named ones on another runtime or of another
+  // type
+  const left = device(1, 'Clone 2 of Fixture Duo'), stuck = device(2, 'Clone 2 of Fixture Duo'), raced = device(3, 'Clone 2 of Fixture Duo');
+  const booted = device(4, 'Clone 1 of Fixture Duo', { state: 'Booted' }), other = device(5, 'Clone 2 of Other Duo');
+  const elsewhere = device(6, 'Clone 2 of Fixture Duo', { runtime: 'com.apple.CoreSimulator.SimRuntime.iOS-27-0' });
+  const tablet = device(7, 'Clone 2 of Fixture Duo', { type: 'iPad-Pro-13-inch-M5' }), twin = device(8, 'Fixture Duo'), stranger = device(9, 'Other Duo');
+  for (const clone of [left, stuck, raced, booted, other, elsewhere, tablet]) mkdirSync(resolve(devices, clone.udid), { recursive: true });
+  const list = (listed) => JSON.stringify({ devices: Object.groupBy(listed, d => d.runtime) });
+  writeFileSync(resolve(root, 'simulators.json'), list([{ ...device(0, 'Fixture Duo', { state: 'Booted' }), udid: options.udid }, twin, stranger]));
+  writeFileSync(resolve(root, 'clones.json'), list([left, stuck, raced, booted, other, elsewhere, tablet]));
+  const xcodebuild = udid => `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test-without-building -destination platform=iOS Simulator,id=${udid}`;
+  // Another simulator's test, a build, a test without parallel testing and processes that are not xcodebuild leave the
+  // clones to be deleted
+  const quiet = [xcodebuild(stranger.udid), `xcodebuild build-for-testing -destination platform=iOS Simulator,id=${options.udid}`,
+    `${xcodebuild(options.udid)} -parallel-testing-enabled NO`, `xcrun simctl spawn ${options.udid} log stream`, `make test SIMULATOR=${options.udid}`];
+  const running = { udid: `${xcodebuild(options.udid)} -parallel-testing-enabled YES -parallel-testing-worker-count 2`, name: `timeout 2400 xcodebuild test -destination platform=iOS Simulator,name=Fixture Duo`, twin: xcodebuild(twin.udid) };
+  writeFileSync(resolve(root, 'processes'), [...quiet, ...(live ? [running[live]] : [])].join('\n'));
+  writeFileSync(events, '');
+  writeFileSync(resolve(root, 'ps'), '#!/bin/sh\ncat "${0%/*}/processes"\n');
+  chmodSync(resolve(root, 'ps'), 0o755);
+  writeFileSync(resolve(root, 'xcrun'), [
+    '#!/bin/sh',
+    'fixture=${0%/*}',
+    'if [ "$2" = "--set" ]; then',
+    '  case "$4" in',
+    '    list) cat "$fixture/clones.json" ;;',
+    '    delete) echo "$5" >> "$fixture/events"',
+    `      case "$5" in ${stuck.udid}) echo "Unable to delete" >&2; exit 1 ;; ${raced.udid}) rm -r "$3/$5"; echo "Invalid device" >&2; exit 1 ;; esac ;;`,
+    '  esac',
+    'elif [ "$2" = "list" ]; then cat "$fixture/simulators.json"; fi',
+  ].join('\n'));
+  const warned = spyOn(console, 'warn').mockImplementation(() => {}), failure = new Error('tests failed');
+  try {
+    await expect(iosTestRuns({ ...options, only: ['BareTests'], runApple: (command, args) => {
+      if (args[0] === 'test-without-building') throw failure;
+    } })).rejects.toBe(failure);
+    expect(readFileSync(events, 'utf8').trim().split('\n').filter(Boolean)).toEqual(live ? [] : [left, stuck, raced].map(clone => clone.udid));
+    expect(warned.mock.calls.flat()).toEqual(live ? [] : [`host/apple: leftover clones of the iOS tests' simulator may remain in ${devices}: \`xcrun simctl delete\` failed for ${stuck.udid} (Unable to delete). List them with \`xcrun simctl --set ${devices} list devices\` and delete one with \`xcrun simctl --set ${devices} delete <udid>\`, or the next iOS test run on this simulator tries again`]);
+  } finally {
+    warned.mockRestore();
+  }
+}));
+
 for (const [phase, kept] of [['setup', false], ['handoff', false], ['test and cleanup', false], ['test and cleanup', true]]) test(`the GPU tests still run after a ${kept ? 'reused' : 'new'} touch runner's ${phase} failure`, () => iosRunsFixture(async ({ opening, options }) => {
   const failure = new Error(`touch ${phase}`), cleanupFailure = new Error('touch cleanup'), ran = [];
   let cleaned = false;
@@ -593,3 +658,78 @@ for (const [phase, kept] of [['setup', false], ['handoff', false], ['test and cl
   if (phase === 'test and cleanup') expect(reported.errors).toEqual([failure, cleanupFailure]);
   else expect(reported).toBe(failure);
 }));
+
+test('EXACT_EXPERIMENTAL=1 alone turns on experimental features, and only a development archive compiles Swift unoptimized', () => {
+  const development = ['bun', 'host/apple/build.mjs', '--device', '--archive', 'a.ipa', '--unsigned', '--development'];
+  for (const value of [undefined, '', '0', 'true', 'yes', ' 1']) {
+    expect(experimental({ EXACT_EXPERIMENTAL: value })).toBe(false);
+    expect(swiftOptimization({ EXACT_EXPERIMENTAL: value }, development)).toBe('-O');
+    expect(swiftOptimizationKey({ EXACT_EXPERIMENTAL: value }, development)).toEqual([]);
+  }
+  const on = { EXACT_EXPERIMENTAL: '1' };
+  expect(experimental(on)).toBe(true);
+  expect(swiftOptimization(on, development)).toBe('-Onone');
+  expect(swiftOptimizationKey(on, development)).toEqual(['-Onone']);
+  for (const args of [['bun', 'host/apple/build.mjs', '--ios', '--run'], ['bun', 'host/apple/build.mjs', '--device', '--archive', 'a.ipa'], ['bun', 'host/apple/build.mjs', '--release']]) {
+    expect(swiftOptimization(on, args)).toBe('-O');
+    expect(swiftOptimizationKey(on, args)).toEqual([]);
+  }
+  // A distributed development archive bakes production trust, which build.mjs sets: it compiles optimized.
+  expect(swiftOptimization(on, [...development, '--distribution'])).toBe('-O');
+  expect(swiftOptimization({ ...on, EXACT_UPDATE_TRUST: 'production' }, development)).toBe('-O');
+  expect(swiftOptimizationKey({ ...on, EXACT_UPDATE_TRUST: 'production' }, development)).toEqual([]);
+});
+
+test('the widget reload dylib compiles and is kept as before without EXACT_EXPERIMENTAL, and unoptimized beside it with it in a development archive', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-experimental-'));
+  const was = { flag: process.env.EXACT_EXPERIMENTAL, argv: process.argv };
+  try {
+    const source = resolve(dir, 'WidgetContainer.swift');
+    writeFileSync(source, 'let reload = 1\n');
+    const reload = () => {
+      const compiles = [];
+      const runApple = (tool, args) => { compiles.push(args); const out = args[args.indexOf('-o') + 1]; writeFileSync(out, 'dylib'); };
+      const binary = widgetReload({ directory: dir, triple: 'arm64-apple-ios17.0', sdk: '/sdk', device: true, production: false, runApple, source });
+      return { binary, compiles };
+    };
+    process.argv = [...was.argv, '--development'];
+    delete process.env.EXACT_EXPERIMENTAL;
+    const plain = reload();
+    // The digest as it was computed before experimental features existed: its source and [triple, sdk, production].
+    const digest = createHash('sha256').update(readFileSync(source)).update(JSON.stringify(['arm64-apple-ios17.0', '/sdk', false])).digest('hex').slice(0, 16);
+    expect(plain.binary).toBe(resolve(dir, `widget-reload-${digest}`, 'libexact_widget_reload.dylib'));
+    expect(plain.compiles).toHaveLength(1);
+    expect(plain.compiles[0]).toContain('-O');
+    expect(plain.compiles[0]).not.toContain('-Onone');
+    process.env.EXACT_EXPERIMENTAL = '1';
+    const unoptimized = reload();
+    expect(unoptimized.binary).not.toBe(plain.binary);
+    expect(unoptimized.compiles).toHaveLength(1);
+    expect(unoptimized.compiles[0]).toContain('-Onone');
+    expect(unoptimized.compiles[0]).not.toContain('-O');
+    process.argv = was.argv;
+    expect(reload()).toEqual({ binary: plain.binary, compiles: [] });
+  } finally {
+    process.argv = was.argv;
+    if (was.flag === undefined) delete process.env.EXACT_EXPERIMENTAL; else process.env.EXACT_EXPERIMENTAL = was.flag;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('EXACT_EXPERIMENTAL=1 links every Swift capability into a development archive, and nothing else changes', () => {
+  const graph = { uses: ['markdown', 'picker'] }, baked = { inputs: { linked: ['markdown'] } };
+  const was = process.env.EXACT_EXPERIMENTAL;
+  try {
+    delete process.env.EXACT_EXPERIMENTAL;
+    const byUse = appleComposition(graph, false);
+    expect(byUse.products.includes('ExactTips')).toBe(false);
+    expect(appleComposition(graph, false, [], null, true)).toEqual(byUse);
+    process.env.EXACT_EXPERIMENTAL = '1';
+    expect(appleComposition(graph, false, [], null, true)).toEqual(appleComposition(undefined, false));
+    expect(appleComposition(graph, false, [], null, true).link).toBe('all');
+    expect(appleComposition(graph, false)).toEqual(byUse);
+    expect(appleComposition(graph, true, [], baked)).toEqual({ link: 'markdown', products: ['ExactMarkdown'] });
+  } finally {
+    if (was === undefined) delete process.env.EXACT_EXPERIMENTAL; else process.env.EXACT_EXPERIMENTAL = was;
+  }
+});

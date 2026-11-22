@@ -11,7 +11,7 @@ import XCTest
 @testable import ExactNavigation
 
 final class SplitMacTests: XCTestCase {
-    private var window: NSWindow?
+    var window: NSWindow?
     private var session: ExactSession?
     override func tearDown() {
         window?.close(); window = nil
@@ -21,7 +21,7 @@ final class SplitMacTests: XCTestCase {
     /// A library of books under a root tab bar: its rows link to a book,
     /// a book pushes its notes, and + opens a sheet. `tabs: false` is the
     /// same stack with no tab bar.
-    private func app(tabs: Bool) -> String {
+    func app(tabs: Bool) -> String {
         let routes = """
                       if e.name == "library"
                         column navigationKey=`${e.id}` position="absolute" inset=0 display="flex" flex-direction="column" testId="route-library"
@@ -108,7 +108,7 @@ final class SplitMacTests: XCTestCase {
         """
     }
 
-    private func boot(tabs: Bool, size: CGSize, source: String? = nil, location: String? = nil) throws -> ExactSession {
+    func boot(tabs: Bool, size: CGSize, source: String? = nil, location: String? = nil) throws -> ExactSession {
         _ = NSApplication.shared
         let dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("../../target/split-test-" + UUID().uuidString).standardizedFileURL
@@ -129,14 +129,14 @@ final class SplitMacTests: XCTestCase {
         return session
     }
 
-    private func node(_ testId: String) throws -> NodeView {
+    func node(_ testId: String) throws -> NodeView {
         try XCTUnwrap(session?.presenter.views.values.first { $0.props["testId"] == testId }, testId)
     }
     /// The node `testId` names, nil while there is none (`node`'s XCTUnwrap would record a failure)
     private func view(_ testId: String) -> NodeView? { session?.presenter.views.values.first { $0.props["testId"] == testId } }
-    private func has(_ testId: String) -> Bool { view(testId) != nil }
+    func has(_ testId: String) -> Bool { view(testId) != nil }
     /// Pumps the presenter's settle and the session's fill, a turn at a time, until `done`
-    private func settle(_ what: String, until done: () -> Bool) {
+    func settle(_ what: String, until done: () -> Bool) {
         guard let session else { return XCTFail("\(what): no session") }
         waitFor(what) { session.presenter.settlePump(); session.drainFill(); return done() }
     }
@@ -147,7 +147,7 @@ final class SplitMacTests: XCTestCase {
 
     /// The window's owner, as ExactMac composes it: a full-size-content
     /// window whose content is the split view, and the window's toolbar.
-    private func compose(_ view: ExactView, width: CGFloat, sidebar: Bool, minimum: CGFloat = 320, autosave: String? = nil,
+    func compose(_ view: ExactView, width: CGFloat, sidebar: Bool, minimum: CGFloat = 320, autosave: String? = nil,
                          window kind: NSWindow.Type = NSWindow.self) -> ExactSidebarController {
         let window = kind.init(contentRect: NSRect(x: 0, y: 0, width: width, height: 500),
                                styleMask: [.titled, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
@@ -683,6 +683,7 @@ final class SplitMacTests: XCTestCase {
             source = source.replacingOccurrences(of: "text `Book ${id}`", with: "text `Book ${id}` testId=`name-${id}`")
                 .replacingOccurrences(of: "testId=`row-${id}`", with: "testId=`row-${id}` display=(id == \"d\" and hidden ? \"none\" : \"flex\")")
             let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source, location: "/book/b")
+            session.presenter.tables.painted = painted
             let columns = compose(ExactView(session: session), width: 1000, sidebar: false, window: KeyedWindow.self)
             let p = session.presenter, split = p.navigationHost.split
             let feed = p.tables.feeds[try node("books").id]
@@ -849,7 +850,7 @@ final class SplitMacTests: XCTestCase {
         XCTAssertNil(title.enclosingScrollView)
         let shown = session.presenter.selection.shownParagraphs
         XCTAssertTrue(shown.contains { $0 === title })
-        XCTAssertTrue(TextViewportIndex(shown).candidates().contains { $0 === title })
+        XCTAssertTrue(TextViewportIndex(shown).candidates().contains { $0.node === title })
         XCTAssertEqual(shown.count, Set(shown.map(ObjectIdentifier.init)).count, "each paragraph once")
     }
 
@@ -1177,7 +1178,7 @@ final class SplitMacTests: XCTestCase {
 
     /// `source` with each line that contains `marker` replaced by `lines`,
     /// written at that line's indent.
-    private func replacing(_ marker: String, with lines: [String], in source: String) -> String {
+    func replacing(_ marker: String, with lines: [String], in source: String) -> String {
         source.components(separatedBy: "\n").flatMap { line -> [String] in
             guard line.contains(marker) else { return [line] }
             let indent = String(line.prefix { $0 == " " })
@@ -1232,9 +1233,7 @@ final class SplitMacTests: XCTestCase {
         XCTAssertEqual(own.style["display"]?.string, "none")
     }
 
-    /// The library with its books in the painted grouped form (D6), as
-    /// Excord's channels are: a section of rows whose press is an action
-    /// that pushes the book. A book's Next replaces it with the next.
+    /// Excord uses the grouped form (D6) with a button in each row. Next replaces the current book.
     private func paintedList() -> String {
         let swapping = app(tabs: false).replacingOccurrences(of: "  action count\n", with: "  action swap(url: string)\n    nav = replace(nav, url)\n  action count\n")
         let next = replacing("box testId=`half-${e.params.id}`", with: [
@@ -1258,12 +1257,55 @@ final class SplitMacTests: XCTestCase {
         ], in: bare)
     }
 
+    func testSectionHeadersAndRowsBelongToTheSplitsInsetTable() throws {
+        let grouped = replacing("section", with: [
+            "section", "  header", "    text \"Staff picks\"", "  row", "    text \"Paperbacks\"",
+            "  footer", "    text \"Updated weekly\"", "section",
+        ], in: paintedList())
+        let source = replacing("for id in (counted", with: [
+            "header testId=\"books-header\"",
+            "  text \"Books\"",
+            "for id in (counted > 0 ? [\"a\", \"b\"] : [\"a\", \"b\", \"c\"]) key=id",
+        ], in: grouped)
+        let session = try boot(tabs: false, size: CGSize(width: 1100, height: 700), source: source)
+        _ = compose(ExactView(session: session), width: 1100, sidebar: false, window: ExactAgentWindow.self)
+        window?.level = .agentBehind
+        window?.orderFront(nil)
+        XCTAssertTrue(session.presenter.navigationHost.split.active)
+        let list = try node("books")
+        let feed = try XCTUnwrap(session.presenter.tables.feeds[list.id])
+        XCTAssertEqual(feed.table.style, .inset)
+        XCTAssertEqual(feed.table.numberOfRows, 8)
+        XCTAssertTrue(try XCTUnwrap(feed.table.rowView(atRow: 0, makeIfNecessary: true)).isGroupRowStyle)
+        XCTAssertFalse(feed.tableView(feed.table, shouldSelectRow: 0))
+        XCTAssertFalse(try XCTUnwrap(feed.table.rowView(atRow: 1, makeIfNecessary: true)).isGroupRowStyle)
+        XCTAssertTrue(try XCTUnwrap(feed.table.rowView(atRow: 2, makeIfNecessary: true)).isGroupRowStyle)
+        XCTAssertTrue(feed.tableView(feed.table, shouldSelectRow: 3))
+        let row = try node("row-a"), parent = try XCTUnwrap(session.presenter.eventParent(of: row))
+        let cell = try XCTUnwrap(feed.table.view(atColumn: 0, row: 3, makeIfNecessary: true))
+        let title = try node("name-a"), ink = cell.convert(title.bounds, from: title)
+        XCTAssertGreaterThanOrEqual(ink.minY, cell.bounds.minY)
+        XCTAssertLessThanOrEqual(ink.maxY, cell.bounds.maxY)
+        XCTAssertEqual(Agent(session: session).tap(["id": Int(row.id)])["delivery"] as? String, "platform")
+        XCTAssertEqual(feed.table.selectedRow, 3)
+        XCTAssertNotNil(try node("route-book-a"))
+        try press("row-count")
+        XCTAssertEqual(feed.table.numberOfRows, 7)
+        XCTAssertEqual(feed.table.selectedRow, 3)
+        XCTAssertTrue(session.presenter.navigationHost.split.closeDetail())
+        session.presenter.navigationHost.split.painted = true
+        XCTAssertNil(session.presenter.tables.feeds[list.id])
+        XCTAssertTrue(row.superview === parent)
+        XCTAssertFalse(row.isHiddenOrHasHiddenAncestor)
+    }
+
     /// LLP 1115.002 D5: the list's column draws no disclosure chevron, as
     /// a hand-built Mac list beside its detail has none, also where the list
     /// is no table but the painted grouped form (D6), as Excord's channels
     /// are. Pushed, the rows draw them again.
     func testAPaintedListBesideItsDetailDrawsNoChevrons() throws {
         let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: paintedList())
+        session.presenter.tables.painted = true
         _ = compose(ExactView(session: session), width: 1000, sidebar: false)
         let p = session.presenter, split = p.navigationHost.split
         XCTAssertTrue(split.active)
@@ -1286,6 +1328,7 @@ final class SplitMacTests: XCTestCase {
     /// ink. The selection moves with the detail and goes with it.
     func testAPaintedListMarksTheRowWhoseDetailShows() throws {
         let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: paintedList())
+        session.presenter.tables.painted = true
         let columns = compose(ExactView(session: session), width: 1000, sidebar: false, window: KeyedWindow.self)
         let window = try XCTUnwrap(self.window)
         let p = session.presenter, split = p.navigationHost.split

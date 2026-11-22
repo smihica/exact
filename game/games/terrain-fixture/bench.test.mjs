@@ -8,11 +8,12 @@ const ring = (p95, count = 7, p50 = p95, mean = p95) => ({
 // Terrain smoke proof state at tick 36 after perf_reset.
 const recorded = {
   tick: 36, device: true, ready: true, readyReasons: [],
+  quality: { rung: 'high', samples: 1, scale: 1 },
   perf: {
     clock: 'agent', pixels: [1280, 720],
     tickMs: ring(0.19999999925494194, 1),
     encodeMs: ring(0.6000000014901161, 7, 0.19999999925494194, 0.2714285712156977),
-    frameMs: ring(null, 0),
+    frameMs: ring(16.7),
     catchUp: { overloadFrames: 0, clampFrames: 0, clampMs: 0, idleFrames: 0, idleMs: 0 },
   },
   renderHooks: {
@@ -45,12 +46,13 @@ const recordedGame = {
 
 const defaultArgs = {
   radius: 'smoke', move: 'stand', light: '0', edits: '0', inflight: 'discard',
-  compare: 'off', vertex: '12', blend: 'off', budget: 'deadline', draw: 'on', pool: 'off',
+  compare: 'off', vertex: '12', blend: 'off', budget: 'deadline', draw: 'on', pool: 'off', jobs: 'off',
+  quality: 'high', fps: '0',
 };
 
 function double({
   first = 1, full = 2, intervals, timestamps = true, thermal = false, extraUnits = 0,
-  extraUploads = 0, encodeMs = recorded.perf.encodeMs, ignoredSwitch, finishedCount = 1,
+  extraUploads = 0, encodeMs = recorded.perf.encodeMs, ignoredSwitch, finishedCount = 1, bindsPerMs,
 } = {}) {
   let elapsed = 0, window = 0;
   const calls = [];
@@ -75,6 +77,7 @@ function double({
             ...recordedGame,
             pending, drew: elapsed >= first, completed: recordedGame.completed + (7 + extraUnits) * elapsed,
             uploadBytes: (1024 + extraUploads) * elapsed,
+            bindsTotal: bindsPerMs == null ? null : bindsPerMs * elapsed,
             timestampQueries: timestamps,
             thermalState: 'nominal', thermalChanges: thermal && afterFirstWindow ? 2 : 0,
             refills: afterFirstWindow
@@ -130,7 +133,7 @@ test('records the state rings and refill observations across three windows', asy
   const row = await readBench(host, options('radius=40', 'move=fly', 'light=5', 'budget=deadline'), 'abc');
   expect(host.calls).toEqual([['radius', '40'], ['move', 'fly'], ['light', '5'], ['budget', 'deadline'], 'play']);
   expect(row).toMatchObject({
-    commit: 'abc', host: 'web', profile: 'web', resolution: [1280, 720], pixels: [1280, 720],
+    commit: 'abc', host: 'web', profile: 'web', resolution: [1280, 720], pixels: [1280, 720], quality: 'high',
     device: 'Mac Studio', os: 'macOS 27.2.1', refreshHz: 60, calibration: 'uncalibrated',
     switches: { radius: '40', move: 'fly', light: '5', budget: 'deadline', draw: 'on' },
     firstPicture: { ms: 1 }, fullWindow: { ms: 2 }, mountSampling: 'poll', pollMs: 1, paired: false,
@@ -166,6 +169,22 @@ test('mount timeouts carry their backlog and draw off has no first picture', asy
   const off = await readBench(double(), options('draw=off'), 'abc');
   expect(off.firstPicture).toBeNull();
   expect(off.fullWindow).toEqual({ ms: 2 });
+});
+
+test('arena and indirect rows wait for a first picture and report mean binds beside draws', async () => {
+  for (const [draw, bindsPerMs, mean] of [['arena', 14, 20], ['indirect', 63, 90]]) {
+    const host = double({ first: 3, bindsPerMs });
+    const row = await readBench(host, options('draw=' + draw), 'abc');
+    expect(host.calls).toEqual([['draw', draw], 'play']);
+    expect(row.observedSwitches.draw).toBe(draw);
+    expect(row.firstPicture).toEqual({ ms: 3 });
+    expect(row.inconclusive).toEqual([]);
+    expect(tableRow(row)).toContain('draw=' + draw);
+    for (const window of row.windows) {
+      expect(window.binds).toBe(mean);
+      expect(window.draws).toEqual(recorded.renderHooks.frame.draws);
+    }
+  }
 });
 
 test('reports browser cadence, long tasks and display periods for each web window', async () => {
@@ -293,18 +312,182 @@ test('draw pairing runs on then off and refuses mismatched units or bytes', asyn
   expect(order).toEqual(['on', 'off', 'on', 'off', 'on', 'off']);
 });
 
+test('a run that measured nothing fails instead of printing a row', async () => {
+  const idle = double();
+  const state = idle.state;
+  idle.state = async reset => ({ ...await state(reset), perf: { ...recorded.perf, frameMs: ring(null, 0) } });
+  await expect(readBench(idle, options('radius=40'), 'abc')).rejects.toThrow('Window 1 drew no frame');
+  const blind = double();
+  blind.state = async () => null;
+  await expect(readBench(blind, options('radius=40'), 'abc'))
+    .rejects.toThrow('Canvas argument radius at the start of window 1 is missing, expected 40');
+});
+
 test('validates hosts, metadata and switch values before opening a host', async () => {
   expect(() => options('radius=12')).toThrow('radius');
   expect(() => options('light=-1')).toThrow('light');
   expect(() => options('budget=count:0')).toThrow('budget');
-  expect(() => parseOptions(['linux'], true)).toThrow('web (Chrome WebGPU), macos (Metal) or ios');
+  expect(() => parseOptions(['linux'], true)).toThrow('or web-android (Chrome on it)');
   expect(() => parseOptions(['ios', '--device=d', '--os=o', '--refresh-hz=120'], false)).toThrow('--phone');
   expect(parseOptions(['ios', '--device=d', '--os=o', '--refresh-hz=120', '--phone=pad'], false).phone).toBe('pad');
+  for (const host of ['android', 'web-android'])
+    expect(parseOptions([host, '--device=d', '--os=o', '--refresh-hz=90'], false).host).toBe(host);
+  expect(() => parseOptions(['android'], true)).toThrow('web only');
   expect(() => parseOptions(['macos'], true)).toThrow('web only');
   expect(() => parseOptions(['web'], false)).toThrow('--refresh-hz');
   await expect(readBench(double({ ignoredSwitch: 'radius' }), options('radius=8'), 'abc'))
-    .rejects.toThrow('Canvas argument radius is smoke; expected 8');
+    .rejects.toThrow('Canvas argument radius at the start of window 1 is smoke, expected 8');
   const mac = parseOptions(['macos', '--device=Mac Studio', '--os=macOS', '--refresh-hz=59.94',
     '--warmup-ms=0', '--window-ms=10', '--poll-ms=1'], false);
   expect(await readBench(double(), mac, 'abc')).toMatchObject({ profile: 'host-dev', refreshHz: 59.94 });
+});
+
+test('records the jobs switch, counters and lane', async () => {
+  expect(options().switches.jobs).toBe('off');
+  expect(() => options('jobs=yes')).toThrow('jobs');
+  const host = double();
+  const read = host.state;
+  const jobs = { queued: 3, queuedBytes: 32, running: 1, done: 7, stale: 2, failed: 0, lane: 'pool' };
+  let resetAt = 0, window = 0;
+  host.state = async reset => {
+    const world = await read(reset);
+    if (reset) {
+      resetAt = host.now();
+      window++;
+    }
+    world.renderHooks.jobs = { ...jobs, done: (host.now() - resetAt) * window,
+      stale: Number(host.now() > resetAt) * window };
+    return world;
+  };
+  const row = await readBench(host, options('jobs=on'), 'abc');
+  expect(row.observedSwitches.jobs).toBe('on');
+  expect(row.windows.map(window => window.jobs)).toEqual([1, 2, 3].map(window => ({
+    ...jobs, done: window * 10, stale: window,
+  })));
+  expect(row).not.toHaveProperty('renderHooks');
+  expect(row.lane).toBe('pool');
+  expect(tableRow(row)).toContain('| pool |');
+  const off = await readBench(double(), options(), 'abc');
+  expect(off.windows.map(window => window.jobs)).toEqual([null, null, null]);
+  expect(off.lane).toBeNull();
+});
+
+test('parses quality rungs and benchmark frame caps', () => {
+  expect(options().switches).toMatchObject({ quality: 'high', fps: '0' });
+  for (const quality of ['low', 'medium', 'high']) {
+    const config = options(`quality=${quality}`);
+    expect(config.switches.quality).toBe(quality);
+    expect(config.set.get('quality')).toBe(quality);
+  }
+  for (const fps of ['0', '30', '45', '60']) {
+    const config = options(`fps=${fps}`);
+    expect(config.switches.fps).toBe(fps);
+    expect(config.set.get('fps')).toBe(fps);
+  }
+  expect(() => options('quality=mid')).toThrow('quality=mid');
+  expect(() => options('fps=5')).toThrow('fps=5');
+  expect(() => options('fps=junk')).toThrow('fps=junk');
+});
+
+test.each([['low', 'low', 0.5], ['medium', 'mid', 0.75]])('records the %s rung and the frame intervals', async (quality, rung, scale) => {
+  const host = double({ intervals: [22.2, 22.3, 22.2] });
+  const state = host.state;
+  host.state = async reset => ({ ...await state(reset), quality: { rung, samples: 1, scale } });
+  const row = await readBench(host, options(`quality=${quality}`, 'fps=45'), 'abc');
+  expect(host.calls).toEqual([['quality', quality], ['fps', '45'], 'play']);
+  expect(row).toMatchObject({
+    switches: { quality, fps: '45' },
+    observedSwitches: { quality, fps: '45' },
+    quality: rung,
+  });
+  expect(row.windows.map(window => window.frameMs.p50)).toEqual([22.2, 22.3, 22.2]);
+});
+
+test('rejects a quality argument the canvas ignored', async () => {
+  await expect(readBench(double({ ignoredSwitch: 'quality' }), options('quality=low'), 'abc'))
+    .rejects.toThrow('Canvas argument quality at the start of window 1 is high, expected low');
+});
+
+const boundaries = [
+  ['start of window 1', 2, true],
+  ['end of window 1', 12, false],
+  ['end of window 2', 22, false],
+  ['end of window 3', 32, false],
+];
+
+test.each(boundaries)('rejects a stale rung at the %s', async (boundary, at, resetAtBoundary) => {
+  const host = double();
+  const state = host.state;
+  host.state = async reset => {
+    const world = await state(reset);
+    if (host.now() !== at || reset !== resetAtBoundary) world.quality = { rung: 'mid', samples: 1, scale: 0.75 };
+    return world;
+  };
+  await expect(readBench(host, options('quality=medium'), 'abc'))
+    .rejects.toThrow(`Quality rung at the ${boundary} is high, expected mid`);
+});
+
+for (const [name, requested, changed] of [['fps', '45', '0'], ['move', 'fly', 'stand']]) {
+  test.each(boundaries)(`rejects a changed canvas argument ${name} at the %s`, async (boundary, at, resetAtBoundary) => {
+    const host = double();
+    const state = host.state;
+    host.state = async reset => {
+      const world = await state(reset);
+      if (host.now() === at && reset === resetAtBoundary) world.args[name] = changed;
+      return world;
+    };
+    await expect(readBench(host, options(`${name}=${requested}`), 'abc'))
+      .rejects.toThrow(`Canvas argument ${name} at the ${boundary} is ${changed}, expected ${requested}`);
+  });
+}
+
+test('rejects a missing canvas argument at the end of the last window', async () => {
+  const host = double();
+  const state = host.state;
+  host.state = async reset => {
+    const world = await state(reset);
+    if (host.now() === 32) delete world.args.fps;
+    return world;
+  };
+  await expect(readBench(host, options('fps=45'), 'abc'))
+    .rejects.toThrow('Canvas argument fps at the end of window 3 is missing, expected 45');
+});
+
+test('records the canvas arguments from the last boundary', async () => {
+  const host = double();
+  const state = host.state;
+  host.state = async reset => {
+    const world = await state(reset);
+    return { ...world, args: { ...world.args, marker: String(host.now()) } };
+  };
+  const row = await readBench(host, options(), 'abc');
+  expect(row.observedSwitches).toEqual({ ...defaultArgs, marker: '32' });
+});
+
+test('rejects a missing rung when the first window starts', async () => {
+  const host = double();
+  const state = host.state;
+  host.state = async reset => ({ ...await state(reset), quality: undefined });
+  await expect(readBench(host, options(), 'abc'))
+    .rejects.toThrow('Quality rung at the start of window 1 is missing, expected high');
+});
+
+test('reports worker startup and handler and idle totals for each window and per frame', async () => {
+  const host = double();
+  const state = host.state;
+  host.state = async reset => {
+    const world = await state(reset);
+    const at = host.now();
+    world.perf.frameMs = ring(16.7, world.renderHooks.cpuMs.prepare.count - 1);
+    world.renderHooks.jobs = { lane: 'worker', wire: {
+      readyMs: at >= 12 ? 7 : null, handlerMs: 100 + at * 2, idleWithWork: 40 + at,
+    } };
+    return world;
+  };
+  const row = await readBench(host, options('jobs=on'), 'abc');
+  for (const window of row.windows) {
+    expect(window.wire).toEqual({ readyMs: 7, handlerMs: 20, handlerMsPerFrame: 20 / window.prepareMs.count,
+      idleWithWork: 10, idleWithWorkPerFrame: 10 / window.prepareMs.count });
+    expect(window.jobs.wire).toEqual(window.wire);
+  }
 });

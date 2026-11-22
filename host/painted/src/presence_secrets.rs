@@ -204,7 +204,7 @@ pub fn backend(app_id: &str, grants: &str) -> Option<Installed> {
     // locked items in the Keystore, behind the prompt it binds: the
     // conformance suite's mode, as on Apple.
     let real = std::env::var("EXACT_STORE").as_deref() == Ok("real");
-    let agent = std::env::var("EXACT_AGENT").as_deref() == Ok("1") && !real;
+    let agent = exact_runner::agent::carried() && !real;
     let (backend, keystore, capable) = match crate::picker::secret_root(app_id) {
         Ok(Some(root)) => {
             let reader = !agent && KEYSTORE.get().is_some();

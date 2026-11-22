@@ -178,7 +178,7 @@ extension ExactSession {
     }
 
     /// The view that hears `navigate`: the navigation root (LLP 1038 D8).
-    var navigationRoot: NodeView? {
+    package var navigationRoot: NodeView? {
         presenter.views.values.first { $0.props["navigationBack"] != nil && $0.handlers.contains("navigate") }
     }
 

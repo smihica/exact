@@ -35,8 +35,8 @@ const DRIVE = [
   ['--size <w>x<h>', 'viewport; Linux: unrotated panel; 90/270 swap layout'],
   ['--scale <n>', 'screenshots at n pixels per point (exact.mjs agent on ios, macos: 1; an iPhone\'s own: 3)'],
   ['--chrome platform|agent', 'UIKit\'s bars (exact.mjs on iOS); agent paints the header'],
-  ['--live · --timing platform · --bind <extension>', 'macOS, iOS simulator: the wall clock and normal scheduling, input and reads only · Apple: native transitions · use a module implementation'],
-  ['--touch platform', 'iOS simulator: every tap a real touch, through the XCTest runner'],
+  ['--live · --timing platform · --bind <extension>', 'wall clock on macOS, iOS and Android reader · Apple native transitions · use a module implementation'],
+  ['--touch platform', 'iOS simulator or paired iPhone: send taps and drags through XCTest'],
   ['--epoch <ISO|ms|now> · --login [hidden]', 'the date at the clock\'s zero (default 2026-01-01) · a launch the login item made, hidden: with no window'],
   ['--locale <tag> · --format-locale <tag> · --time-zone <zone> · --seed <n>', 'default en-US, the locale (the Region\'s format, exactTime().formatLocale), UTC, 1'],
   ['--fail-fetch <prefix> · --permission <name>=<state> · --notification <entry> · --wake <entry> · --call \'<tool> <json>\'', 'each fetch whose URL starts with it fails, from the first data load · a module\'s permission at the start (geolocation=granted) · a relaunch handed a listed entry, as state.notifications printed it · a cold wake for a registration, as state.backgroundSync printed it · a cold call of a tool, as a system\'s call that started the app'],
@@ -110,14 +110,18 @@ export const HELP = {
          the app needs no dev server.`,
     bodyAll: `Ports    one HTTP port on 127.0.0.1 (--lan: every interface), printed with the URL. A native
          client opening <url>__dev/open starts the producers on a second, loopback-only port.
-         The server stops with its process however it ends.`,
+         The server stops with its process however it ends.
+Frames   To embed the app in a local canvas at http://127.0.0.1:7420, start the loop with
+         EXACT_TOOL_PORT=7420 bun exact.mjs web. This selects the canvas as the loop's
+         framing origin alongside the app's own origin. The default canvas port is 7740.`,
     example: 'bun exact.mjs web --port 9000      # then open http://127.0.0.1:9000/',
   },
   'web-build': {
     line: 'build the web app once',
-    usage: 'bun exact.mjs web-build [--out <dir>] [--render rust|js|none] [--json]',
+    usage: 'bun exact.mjs web-build [--out <dir>] [--render rust|js|none] [--sizes] [--json]',
     flags: [
       ['--out <dir>', 'a release build there (inside the app: dist), as deploy publishes, and how a static host serves it'],
+      ['--sizes', 'show the JS launch script’s minified bytes by source module, its gzip size, and Contract bytecode by component'],
       ['--render rust|js|none', 'pre-rendered pages: rust (the app\'s <app>-render entry; the default where it has one), js (Bun; the default otherwise), none'],
       jsonBuilt(),
     ],
@@ -171,7 +175,7 @@ Backend  start snapback4 dev on app.ts’s selected origin’s port first; check
 Lines    tap, type, expect text|tree|state|disabled|refusal, clock data|settle|+<ms>|until state …, reload, back, fail|pass
          fetch, answer fetch "<prefix>" with <status> [json], request: docs/recipes/tests.md;
          all: docs/contract-grammar.md "Authored tests".`,
-    bodyAll: `A phone's build is ios --device's.
+    bodyAll: `A phone's build is ios --device's; on macOS with multiple Apple teams, set EXACT_IDENTITY=- or DEVELOPMENT_TEAM=<team-id>.
 Ports    --port <n> or EXACT_PORT chooses the page’s port; otherwise web: headless Chrome over a pipe; the page on 127.0.0.1, each test at a
          port fixed by its own store's name (20000-47999).
          ${NATIVE_PORTS}`,
@@ -185,16 +189,16 @@ Ports    --port <n> or EXACT_PORT chooses the page’s port; otherwise web: head
     flags: DRIVE.filter(naming(DRIVE_FIRST, true)),
     more: DRIVE.filter(naming(DRIVE_FIRST, false)),
     internal: ['--test <file>', ...DRIVE_INTERNAL],
-    body: `Gallery: ios|macos widget|activity <entry> tree|state|screenshot|clock · drag: tap <target> drag dx dy [hold ms during "read"] [then dx dy …] (one iOS touch; into keyboard needs --touch platform and keyboard up).
-Ops      a target is a testId, else a view's exact text or label
+    body: `Gallery: ios|macos widget|activity <entry> tree|state|screenshot|clock
   tree [<target>|--ax] · logs · layout|perf [<target>] · resize <w>x<h> · close · back
   state [<name>] [--full]  a state, resource or field, dotted: groceries.0.done; >8 KB: sizes
-  tap <target> [contextmenu|hover|drag <dx> <dy>|down|…] · tap up
+  tap <target> [contextmenu|hover|drag <dx> <dy>|down|…] · tap up (testId, exact text or label)
   type <target> <text>|key <Name>   (a select, date or checkbox: its value)
   clock data|settle|held|+<ms> [real]    replies · transitions · push
-  check [dark|both]  what is wrong · screenshot <png> [over <ms> every <ms>] [window]  window: bars
+  check [dark|both]  what is wrong · screenshot <png> [over <ms> every <ms>] [window]  window: bars · --device captures display
+  Android reader drives refuse film and play layers only under --live. Record a live or normal run with adb shell screenrecord.
   screenshot <png> compare <ref> · prefer <feature> <value> · fail|pass fetch <prefix>`,
-    bodyAll: `Unnamed, the host is one app.json ships, as test's. Builds if stale, launches, runs each quoted op on the agent's clock and closes. A game's world: post [<surface>] <text> is a message its next tick reads (type <surface> message <text>). No --storage, no storage; --reset-storage empties a native store, --keep-storage keeps a web or compare's. A deep link is typed on the navigate= root: "type <root> euxy://p/1" (macOS, iOS: through protocol_handlers, no alert). Held contact: "tap <t> down" "screenshot <png>" "tap up". clock held [<target>…] [<n>s] waits for a held reply with the clock frozen, then runs clock data (default bound: 20 s). clock until state <path> == <JSON literal> within <ms> waits, the clock frozen, until state reads it (a stream's state after its first message); a miss names the last value. state media (Apple): each video's player (renderer, paused, currentTime, muted, volume); under the agent a video takes no audio session, and on iOS AVKit's own controls answer only --touch platform.
+    bodyAll: `Unnamed, the host is one app.json ships, as test's. Builds if stale, launches, runs each quoted op and closes. A game's world: post [<surface>] <text> is a message its next tick reads (type <surface> message <text>). No --storage, no storage; --reset-storage empties a native store, --keep-storage keeps a web or compare's. A deep link is typed on the navigate= root: "type <root> euxy://p/1" (macOS, iOS: through protocol_handlers, no alert). Held contact: "tap <t> down" "screenshot <png>" "tap up". A drag takes [hold ms during "read"] [then dx dy …] in one iOS touch. Dragging into the keyboard needs --touch platform and the keyboard open. clock held [<target>…] [<n>s] waits for a held reply with the clock frozen, then runs clock data (default bound: 20 s). clock until state <path> == <JSON literal> within <ms> waits, the clock frozen, until state reads it (a stream's state after its first message); a miss names the last value. state media (Apple): each video's player (renderer, paused, currentTime, muted, volume); under the agent a video takes no audio session, and on iOS AVKit's own controls answer only --touch platform.
 Ports    web: --port/EXACT_PORT, else a named store’s port (20000-47999), else free. ${NATIVE_PORTS}`,
     example: 'bun exact.mjs agent web --storage s1 tree "tap add" "screenshot .exact/a.png"',
   },
@@ -256,7 +260,7 @@ Ports    none to choose: test's and agent's (headless Chrome over a pipe; a simu
       ['--archive <out.ipa>', 'with --device: an .ipa to distribute (EXACT_IDENTITY, EXACT_PROFILE), no phone; production trust, so with an update store EXACT_UPDATE_RECEIPT or EXACT_UPDATE_GENESIS=1'],
       ['--unsigned', 'with --device: ad-hoc signed .app, no phone, profile, identity or install; no --run; --archive writes an .ipa for re-signing'],
       ['--development', 'with --archive --unsigned: the development build --run installs, as an .ipa (development trust, host-dev; no update store receipt)'],
-      ['--extensions <kinds>', 'which app extensions to package: all (the default), none, or a list of widgets,activities,intents,alarms,notifications,watch (the watch app a device build embeds); the bake still compiles every entry, and app code that reaches a missing one is refused, not crashed'],
+      ['--extensions <kinds>', 'which app extensions to package: all (the default), none, or a list of widgets,activities,intents,alarms,notifications,watch,share; the bake still compiles every entry, and app code that reaches a missing one is refused, not crashed'],
       ['--tvos', 'an Apple TV simulator instead (with --device, an Apple TV)'],
       ['--url <url>', 'connect the client to that dev server (web\'s URL) for live reload'],
       OPTIMIZE,
@@ -288,7 +292,8 @@ own Apple ID. The first share makes the link; later ones publish a new version t
 an installed copy offers the update. Each build is app.json's version, and the next build
 number past its buildNumber and the link's last build, which the share writes back to
 app.json to commit; AppDrop shows both. With the app's and exact2's trees clean and unchanged
-since the last share it rebuilds nothing and prints the same link. A share from another git
+since the last share but for that build number, committed or not, and the same version, it
+rebuilds nothing and prints the same link. A share from another git
 branch than the last stops with code link_branch_mismatch: pass --new-link or --force.
 The link is kept in .exact/appdrop.json; the iPhone build takes minutes the first time.
 Ports    none. Runs to completion.`,
@@ -427,7 +432,10 @@ artifacts under game/target only. Ports none. Runs to completion.`,
                                           tag, attribute, CSS property and function); each name's entry in
                                           turn, a recipe whole, a pattern's summary; exit 1 if one is unknown
   fmt [--check | --stdout | --stdin] <file.contract> · fmt --uses <file.contract>
-  symbols <file.contract> [--name <name>] · sources <file.contract>
+  symbols <file.contract> [--editor] [--name <name>]
+  symbols <file.contract> --editor [--component <name>] [--tag <tag>] [--has <attr> …] [--where 'attr=expression' …] [--match <text> …] [--or <filters> …]
+    bun exact.mjs contract symbols app.contract --editor --component Editor --tag button --match 'Save draft' --or --component Preview --tag button --match Cancel
+  sources <file.contract>
   build … --stdin · symbols … --stdin     the file's text is stdin's (an editor's unsaved buffer), read as
                                           if saved at <file.contract>; app.ts is not type-checked against it
   test <file.test.contract>               the compiled tests, as JSON (bun exact.mjs test runs them)
@@ -602,7 +610,7 @@ Ports    none; send makes one HTTPS request. Runs to completion.`,
   windows: {
     line: 'build for Windows into dist-windows/ (--run opens it)',
     usage: 'bun exact.mjs windows [--run] [--release] [--out <dir>] [--json]',
-    flags: [['--run', 'open it when built: here, until it quits; from SSH, on the signed-in desktop, returning once its window is up'], ['--release', 'the release profile (default gpu-dev)'], ['--out <dir>', 'package into <dir> instead of dist-windows/, e.g. beside a copy still running'], jsonBuilt('', '; not with --run')],
+    flags: [['--run', 'open it when built: here, until it quits; from SSH, on the signed-in desktop, returning once its window is up'], ['--release', 'build for distribution. Set EXACT_UPDATE_TRUST=development for an optimized build you can drive'], ['--out <dir>', 'package into <dir> instead of dist-windows/, e.g. beside a copy still running'], jsonBuilt('', '; not with --run')],
     body: 'Needs Windows and the MSVC Rust target; test windows and agent windows build first when the build is stale, and\ndrive it headless. A build closes the copy the last --run opened from the same directory.\nPorts    none. Runs to completion; with --run here, until the app quits.',
     example: 'bun exact.mjs windows --run',
   },
@@ -704,8 +712,12 @@ const VARIANT_VERBS = new Set(['web', 'web-build', 'serve', 'test', 'agent', 've
  * every one it starts, as `--sim` sets EXACT_SIM, so the flag wins over an exported value; the app the verb resolves
  * then claims the selection (scripts/variants.mjs `claimVariant`). Returns `args`. Here, beside `guardFlags`, because
  * copied SDKs carry this module alone. */
-export function takeVariant(args, env = process.env) {
-  for (let i = args.indexOf('--variant'); i !== -1; i = args.indexOf('--variant')) {
+export function takeVariant(args, env = process.env, takesValue = () => false) {
+  for (let i = 0; i < args.length;) {
+    if (args[i] !== '--variant') {
+      i += takesValue(args[i]) ? 2 : 1;
+      continue;
+    }
     const name = args[i + 1];
     if (name === undefined || name.startsWith('-')) throw new Error('--variant needs a name: one of app.json\'s "variants"');
     env.EXACT_VARIANT = name;

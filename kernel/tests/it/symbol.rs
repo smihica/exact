@@ -488,3 +488,131 @@ fn a_nonfinite_report_for_a_measured_symbol_is_refused() {
         .set_intrinsic_size(2, Some((f32::NAN, 20.0)))
         .is_err());
 }
+
+#[test]
+fn a_template_has_its_viewbox_aspect_before_a_host_reports() {
+    for (w, h) in [(799.1, 184.0), (184.0, 799.1), (24.0, 24.0)] {
+        let source = format!("symbol:icon||0 0 {w} {h}|M0 0H{w}V{h}H0Z|");
+        let mut kernel = tree(Box::<MonospaceMeasurer>::default(), &source, 20.0);
+        let expected = (20.0 * w / f32::max(w, h), 20.0 * h / f32::max(w, h));
+        let actual = size(&mut kernel);
+        assert!((actual.0 - expected.0).abs() < 0.001 && (actual.1 - expected.1).abs() < 0.001);
+        kernel.set_intrinsic_size(2, Some((20.0, 20.0))).unwrap();
+        assert_eq!(
+            size(&mut kernel),
+            actual,
+            "a square host report cannot replace the template's aspect"
+        );
+    }
+}
+
+#[test]
+fn changing_a_template_replaces_its_layout_ratio() {
+    let mut kernel = tree(
+        Box::<MonospaceMeasurer>::default(),
+        "symbol:icon||0 0 400 100|M0 0H400V100H0Z|",
+        20.0,
+    );
+    let mut style = StyleProps::default();
+    style.width = exact_kernel::Dimension::Points(160.0);
+    style.mask.set(StyleId::Width);
+    kernel
+        .apply(
+            1,
+            2,
+            &[Op::SetStyle {
+                id: 2,
+                patch: Box::new(style),
+            }],
+        )
+        .unwrap();
+    assert_eq!(size(&mut kernel), (160.0, 40.0));
+    for (i, report) in [false, true].into_iter().enumerate() {
+        for (j, (w, h)) in [(100.0, 400.0), (799.1, 184.0)].into_iter().enumerate() {
+            let revision = 3 + (i * 2 + j) as u64;
+            kernel
+                .apply(
+                    0,
+                    revision,
+                    &[Op::SetProp {
+                        id: 2,
+                        prop: PropId::ImageSource,
+                        value: format!("symbol:icon||0 0 {w} {h}|M0 0H{w}V{h}H0Z|").into(),
+                    }],
+                )
+                .unwrap();
+            if report {
+                kernel
+                    .set_intrinsic_size(
+                        2,
+                        Some((20.0 * w / f32::max(w, h), 20.0 * h / f32::max(w, h))),
+                    )
+                    .unwrap();
+            }
+            let actual = size(&mut kernel);
+            assert!(
+                (actual.1 - 160.0 * h / w).abs() < 0.001,
+                "{actual:?}, {w}×{h}, report={report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn object_position_reads_custom_properties_and_tracks_their_changes() {
+    use exact_kernel::{object, StyleValue};
+    let mut kernel = tree(
+        Box::<MonospaceMeasurer>::default(),
+        "symbol:icon||0 0 799.1 184|M0 0H799.1V184H0Z|",
+        20.0,
+    );
+    let patch = |id, row, css: &str| {
+        let mut style = StyleProps::default();
+        style
+            .set_dynamic(row, &StyleValue::Text(css.into()))
+            .unwrap();
+        Op::SetStyle {
+            id,
+            patch: Box::new(style),
+        }
+    };
+    let rect = |kernel: &Kernel| {
+        let node = kernel.node(2).unwrap();
+        object::placed(
+            object::symbol_size("0 0 799.1 184", 20.0),
+            exact_kernel::ObjectFit::None,
+            &node.style.object_position,
+            (0.0, 0.0, 160.0, 80.0),
+            &kernel.env_of(2),
+        )
+        .unwrap()
+    };
+    kernel
+        .apply(
+            0,
+            2,
+            &[
+                patch(
+                    1,
+                    StyleId::SafeAreaProperties,
+                    "--offset: 7px; --vertical: 11px",
+                ),
+                patch(2, StyleId::ObjectPosition, "var(--offset) var(--vertical)"),
+            ],
+        )
+        .unwrap();
+    assert_eq!((rect(&kernel).0, rect(&kernel).1), (7.0, 11.0));
+    let changed = kernel
+        .apply(
+            0,
+            3,
+            &[patch(
+                1,
+                StyleId::SafeAreaProperties,
+                "--offset: 13px; --vertical: 17px",
+            )],
+        )
+        .unwrap();
+    assert!(changed.touched.contains(&kernel.node(2).unwrap().key));
+    assert_eq!((rect(&kernel).0, rect(&kernel).1), (13.0, 17.0));
+}

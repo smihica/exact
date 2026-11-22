@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactDialogs
 
 final class CustomInvokerIOSTests: XCTestCase {
     private final class Controller: UIViewController {

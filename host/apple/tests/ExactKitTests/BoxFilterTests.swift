@@ -417,7 +417,7 @@ final class BoxFilterTests: XCTestCase {
         ExactSurfaces.install()
         try card(inner: "canvas")
         let parent: CALayer = try XCTUnwrap(p.views[2]?.layer), host = Canvas2DHost()
-        host.place(2, in: CGRect(x: 0, y: 0, width: 40, height: 40), radii: [])
+        host.place(2, in: CGRect(x: 0, y: 0, width: 40, height: 40), radii: []) { _ in CGRect(x: 0, y: 0, width: 40, height: 40) }
         func list(_ rgb: [Double]) -> Data {
             var d = Data()
             func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }

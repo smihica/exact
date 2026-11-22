@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import { glueDeclarations } from './glue-fixture.mjs';
 
 const source = readFileSync(new URL('../glue.js', import.meta.url), 'utf8');
-const declarations = glueDeclarations(source, ['bootNow', 'reportColors', 'resizeRunner', 'mediaChanged', 'pageChanged']);
+const declarations = glueDeclarations(source, ['bootNow', 'reportColors', 'resizeRunner', 'mediaChanged', 'pageChanged', 'toldScreenReader']);
 
 // Run the host through its ABI call. The stand-in accepts only a positive
 // viewport, then stops before DOM adoption, which the built-app test covers.
@@ -23,11 +23,12 @@ function host(width, height) {
     addEventListener: (kind, fn) => { if (kind === 'resize') listeners.push(fn); },
     requestAnimationFrame: () => {}, positionContexts: () => {},
     readOut: value => value, prepareFonts: async () => [],
-    launchLocation: () => '/', preferences: () => 0, foldBits: () => 0, now: () => 0,
+    launchLocation: () => '/', launchVisits: () => [], preferences: () => 0, foldBits: () => 0, now: () => 0,
     loadStage: async () => {}, focus: { keep: () => null }, ask: () => ({}),
-    pageFacts: { bits: () => 0 }, applyBatch: () => {}, presence: { resize: x => x },
+    pageFacts: { bits: () => 0, read: () => ({ 'screen-reader': 'unknown' }), screenReaderCode: () => 0 }, applyBatch: () => {}, presence: { resize: x => x },
     wasm: {
       exact_plan: () => 1, exact_out: () => 0, exact_in: () => 0, exact_plan_fonts: () => '[]',
+      exact_set_screen_reader: () => {},
       exact_boot: (w, h) => accept('boot', w, h),
       exact_boot_plan: (_, w, h) => accept('plan', w, h),
       exact_boot_module: () => accept('module', 400, 300),

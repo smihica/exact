@@ -434,6 +434,46 @@ fn the_agents_hold_state_holds_and_lets_go() {
 }
 
 #[test]
+fn a_live_held_press_eases_in_and_out() {
+    let source = r#"component App
+  state presses = 0
+  action go
+    presses = presses + 1
+  view
+    box press=go width=80 height=40 testId="pad" -exact-press-scale=0.6
+"#;
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan(source),
+        (),
+        (80., 40.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.frame();
+    let wall = std::rc::Rc::new(std::cell::Cell::new(5000.));
+    let read = wall.clone();
+    p.set_live_clock(Some(std::rc::Rc::new(move || read.get())));
+    let pad = view(&p, "pad");
+    for (now, state, landed) in [(5000., Some("active"), 0.6), (5500., None, 1.)] {
+        wall.set(now);
+        let request = json!({"op": "tap", "id": pad, "holdState": state});
+        let reply = crate::agent::handle_for_window(&mut p, &request.to_string());
+        assert!(!reply.contains("\"error\""), "{reply}");
+        p.tick(now + 10.);
+        let scale = p.host().presented(pad).press;
+        assert!(
+            scale > 0.6 && scale < 1.,
+            "{state:?} scale at 10 ms: {scale}"
+        );
+        p.tick(now + 400.);
+        assert_eq!(p.host().presented(pad).press, landed);
+    }
+}
+
+#[test]
 fn a_hold_of_another_plan_or_of_a_revision_ended_here_is_nothing() {
     let mut p = boot();
     let card = target(&p, "card", "hover");

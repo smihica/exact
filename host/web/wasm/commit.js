@@ -1,6 +1,6 @@
 import { AGENT_ADMITTED, views, retiredViews, presence, host, followedScrolls, motion, loadAfterPaint, root, agentMode, log, t0, readOut, writeIn, loadLiveTime, lists, arrange, pieces, loadGpuIfNeeded, afterNativePaint, deferFulfill, holds, agentKeepsStore, pendingStore, moduleReady, safelyFulfill, encoder, track, byTicket, forgettable, surfaceGranted, HOST_WORK_BASE64, loadPageNative, localAssetURL, controllers, pageFile, heldAsks, httpHelpers, now, postSurface, ask, picker, inflight, documentsGlue, frameNav, followScroll, messageFrames, messageViews, dropSurface, register, seek, settleFollow, pendingScrolls, rememberScroll, ownFollowed, releaseFollowed, collections, focusAutofocus, markScrollDocument, letGo, holdWake, holdOrientation, clocks } from "../glue.js";
 import { prepareContexts, positionContexts } from "./context.js";
-import { pageTitle, navigation, noteFit, syncListItemRoles, listItem, settleValue, afterPaint, createGrantSet, rawGrantText, grantError, grantWords, scopedGrantSet, refusal, appRootFontSize, liveById, navigableURL, sheetLeaves, popoverCommand, runFocusCommands, inertAncestor, refitTexts } from "../navigation.js";
+import { pageTitle, navigation, noteFit, syncListItemRoles, listItem, settleValue, afterPaint, createGrantSet, rawGrantText, grantError, grantWords, scopedGrantSet, refusal, appRootFontSize, liveById, navigableURL, sheetLeaves, modalCommand, popoverCommand, runFocusCommands, inertAncestor, refitTexts } from "../navigation.js";
 import { applyProps, nativeCreate, listView, appSource, syncMedia, forgetList, syncViewportFit, refreshSymbols, syncLists } from "./views.js";
 import { attach } from "./input.js";
 import { flowBatch } from "./flow.js";
@@ -408,7 +408,7 @@ function apply(batch) {
           // A safe read the runner lets go of is aborted after the commit that
           // forgot it (`letGo`), as the native executor does: a write that
           // was sent was sent, and runs on, uncounted (LLP 1016 D5).
-          const requestIncarnation = host.incarnation, controller = new AbortController(), started = performance.now();
+          const requestIncarnation = host.incarnation, controller = new AbortController(), started = performance.now(), askedAt = now();
           let p, first, messages = 0, batch = [];
           const opened = new Promise((r) => {
             first = r;
@@ -468,7 +468,7 @@ function apply(batch) {
           if (op.url !== "exact-native:") {
             byTicket.set(op.ticket, controller);
           }
-          p = httpHelpers().then(({ request }) => request(op, requestHost)).then((r) => safelyFulfill(requestIncarnation, op.ticket, r.kind, r.status, r.headers, r.body, performance.now() - started)).catch((error) => safelyFulfill(requestIncarnation, op.ticket, 1, 0, "", encoder.encode(String(error)), performance.now() - started));
+          p = httpHelpers().then(({ request }) => request(op, requestHost)).then((r) => safelyFulfill(requestIncarnation, op.ticket, r.kind, r.status, r.headers, r.body, performance.now() - started, askedAt, r.afterMs, op.timeoutMs)).catch((error) => safelyFulfill(requestIncarnation, op.ticket, 1, 0, "", encoder.encode(String(error)), performance.now() - started));
           if (op.held) {
             const entry = {
               target: op.target,
@@ -557,27 +557,9 @@ function apply(batch) {
           } else if (op.name === "close" && op.args?.[0] == null) {
             window.close();
           } else if (op.name === "showModal" || op.name === "close") {
-            /* studio diary R17 */
-            const id = op.args?.[0], el = [...views.values()].find((el) => el.id === id), close = op.name === "close";
-            if (el instanceof HTMLDialogElement) {
-              if (close) {
-                el.close();
-              } else if (!el.open) {
-                el.showModal();
-              } else {
-                log(`showModal "${id}" ignored: dialog is already open`);
-              }
-            } else if (el?.popover != null && el.getAttribute("role") === "alertdialog") {
-              if (close) {
-                el.hidePopover();
-              } else if (!el.matches(":popover-open")) {
-                el.showPopover();
-              }
-            } else if (!close) {
-              log(`showModal "${id}" refused: no dialog or alertdialog popover has that id`);
-            }
+            const id = op.args?.[0];
+            modalCommand([...views.values()].find(el => el.id === id), id, op.name, log);
           } else if (op.name === "stopPropagation") {
-            // `showModal(id)`, `close(id)` from an action: the dialog's own, or an alertdialog popover's (LLP 1101.001 P5, LLP 1115 D6), as host/web-js/commands.js `modal`
             const e = host.keyEvent ?? (host.sending === host.pointerDepth ? host.pointerEvent : null);
             if (e) {
               e.exactStopped = true;
@@ -802,6 +784,8 @@ function apply(batch) {
             log("setWindowOpacity refused: a page cannot change its window's opacity");
           } else if (op.name === "hideWindow") {
             log("hideWindow refused: a page cannot hide its window");
+          } else if (op.name === "startViewTransition") {
+            log("startViewTransition: cut: this host plays no view transition (exact-web-js does)");
           } else if (!/^(playSound|playSounds|stopSounds|setSounds|sendMIDI|requestMIDIAccess)$/.test(op.name)) {
             console.warn(`exact: unknown command ${op.name}`);
           }

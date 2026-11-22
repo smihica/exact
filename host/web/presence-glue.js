@@ -260,7 +260,8 @@ function createPresence(root) {
   function sync(placed = false) {
     for (const el of surfaces) {
       const f = flips.get(el), sf = f.surface;
-      if (!el.isConnected || ['idle', 'finished'].includes(f.animation.playState)) { stop(el); continue; }
+      // A paused move can leave the effect stack without resolving `finished`.
+      if (!el.isConnected || !el.getAnimations().includes(f.animation)) { stop(el); continue; }
       reveal(f);
       f.animation.effect.target = null;
       const cs = getComputedStyle(el);
@@ -357,8 +358,7 @@ function createPresence(root) {
     const animation = el.animate(moved, { ...timing, composite: 'add' });
     if (sf) {
       const size = ([, , dw, dh]) => [Math.max(0, w + dw), Math.max(0, h + dh)];
-      const hold = { ...timing, fill: 'both' };
-      sf.hide = el.animate([CLEAR, CLEAR], hold);
+      sf.hide = el.animate([CLEAR, CLEAR], timing);
       parts.push(
         sf.stand.animate(moved, timing),
         sf.box.animate(frames(s => { const [bw, bh] = size(s); return { width: `${bw}px`, height: `${bh}px` }; }), timing),
@@ -368,11 +368,11 @@ function createPresence(root) {
         sf.box.style.clipPath = clipPath;
         if (sf.clips) sf.contentClip = contentClip(sf);
         const content = sf.contentClip ? sf.contentClip(clipPath, getComputedStyle(el), bw, bh) : clipPath;
-        sf.shape = el.animate([{ clipPath: content }, { clipPath: content }], hold);
+        sf.shape = el.animate([{ clipPath: content }, { clipPath: content }], timing);
         parts.push(sf.shape);
       }
       // A box that clips its children clips them to the shown box.
-      if (sf.clips) parts.push(el.animate([{ overflow: 'visible' }, { overflow: 'visible' }], hold));
+      if (sf.clips) parts.push(el.animate([{ overflow: 'visible' }, { overflow: 'visible' }], timing));
       surfaces.add(el);
     }
     const f = { animation, parts, surface: sf, d, v, config };

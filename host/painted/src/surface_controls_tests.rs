@@ -117,6 +117,24 @@ fn done(p: Presenter<()>, path: Probe) {
     drop(p);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
+
+#[test]
+fn a_live_canvas_control_hold_waits_in_the_carrier() {
+    let (mut p, path) = fixture();
+    p.set_live_clock(Some(std::rc::Rc::new(|| 100.)));
+    let button = find(&p, "a-jump");
+    let down = p.control_tap(&json!({"phase":"down","id":button})).unwrap();
+    assert_eq!(down["delivery"], "recognized", "{down}");
+    let invalid = p.control_tap(&json!({"phase":"hold","ms":-1})).unwrap();
+    assert_eq!(invalid["malformed"], true);
+    let hold = p.control_tap(&json!({"phase":"hold","ms":500})).unwrap();
+    assert_eq!(hold["waitMs"].as_f64(), Some(500.));
+    let up = p.control_tap(&json!({"phase":"up"})).unwrap();
+    assert_eq!(up["delivery"], "recognized");
+    assert!(p.control_bindings.is_empty());
+    done(p, path);
+}
+
 #[test]
 fn surface_qualified_contacts_and_repeated_restore() {
     let (mut p, path) = fixture();

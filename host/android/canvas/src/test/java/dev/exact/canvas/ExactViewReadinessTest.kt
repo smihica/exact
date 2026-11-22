@@ -31,14 +31,14 @@ class ExactViewReadinessTest {
             var page: ByteBuffer? = null
             var barStatement: IntArray? = null
             @JvmStatic @Implementation fun __staticInitializer__() {}
-            @JvmStatic @Implementation fun frame(): ByteBuffer? = page.also { page = null }
+            @JvmStatic @Implementation fun frame(vsync: Boolean): ByteBuffer? = page.also { page = null }
             @JvmStatic @Implementation fun bars(): IntArray? = barStatement.also { barStatement = null }
             @JvmStatic @Implementation fun fields(): IntArray? = null
             @JvmStatic @Implementation fun chrome(): IntArray? = null
             @JvmStatic @Implementation fun scrollers(): IntArray? = null
             @JvmStatic @Implementation fun requests(): IntArray? = null
             @JvmStatic @Implementation fun timerHeld() = 0
-            @JvmStatic @Implementation fun animating() = false
+            @JvmStatic @Implementation fun animating(vsyncOnly: Boolean) = false
             @JvmStatic @Implementation fun owed() = false
             @JvmStatic @Implementation fun nextDue() = -1.0
         }

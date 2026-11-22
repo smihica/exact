@@ -86,7 +86,8 @@ final class Canvas2DHost: Canvas2DEnv {
     private var layers: [UInt32: CALayer] = [:]
     /// Where each bitmap shows (`place`). A bitmap drawn at a new size before
     /// its view lays out is stretched into the old box.
-    private var placements: [UInt32: (box: CGRect, radii: [CGSize])] = [:]
+    private var placements: [UInt32: (box: CGRect, radii: [CGSize], object: (CGSize) -> CGRect)] = [:]
+    private var naturalSizes: [UInt32: CGSize] = [:]
     /// Replay runs off the main thread, in order (LLP 1056 §8 stage 4, as
     /// built): a list row's canvas cost 130 ms/s of an iPhone's main thread
     /// in a fling. The row's box, mask and scale apply with its batch; its
@@ -290,7 +291,8 @@ final class Canvas2DHost: Canvas2DEnv {
             parent.insertSublayer(layer, at: 0)
             #endif
         }
-        if let placed = placements[id] { Self.place(layer, placed.box, placed.radii) }
+        naturalSizes[id] = CGSize(width: w, height: h)
+        if let placed = placements[id] { Self.place(layer, placed.box, placed.radii, object: placed.object(naturalSizes[id]!)) }
         layer.contentsScale = max(1, scale)
         let actual = parent.contentsScale
         if (payload["stretch"] as? NSNumber)?.boolValue != true, actual >= 1, abs(actual - scale) > 0.01, actual != reported {
@@ -542,22 +544,21 @@ final class Canvas2DHost: Canvas2DEnv {
         while pending > 0 && Date() < end { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.002)) }
     }
 
-    func place(_ id: UInt32, in box: CGRect, radii: [CGSize]) {
-        if let placed = placements[id], placed.box == box, placed.radii == radii { return }
-        placements[id] = (box, radii)
+    func place(_ id: UInt32, in box: CGRect, radii: [CGSize], placement: @escaping (CGSize) -> CGRect) {
+        placements[id] = (box, radii, placement)
         guard let layer = layers[id] else { return }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        Self.place(layer, box, radii)
-        recorders[id]?.bounds = CGRect(origin: .zero, size: box.size)
+        Self.place(layer, box, radii, object: placement(naturalSizes[id] ?? box.size))
+        recorders[id]?.bounds = layer.bounds
         CATransaction.commit()
     }
 
-    /// Frames the bitmap's layer at the content box and clips it to the
-    /// content edge's curve, as the web clips replaced content.
-    private static func place(_ layer: CALayer, _ box: CGRect, _ radii: [CGSize]) {
-        layer.frame = box
-        let bounds = CGRect(origin: .zero, size: box.size)
-        if radii.contains(where: { $0.width > 0 && $0.height > 0 }) {
+    /// The bitmap occupies its object viewport; the content edge clips it
+    /// even when cover, none or a position puts it outside the box.
+    private static func place(_ layer: CALayer, _ box: CGRect, _ radii: [CGSize], object: CGRect) {
+        layer.frame = object
+        let bounds = box.offsetBy(dx: -object.minX, dy: -object.minY)
+        if object != box || radii.contains(where: { $0.width > 0 && $0.height > 0 }) {
             let mask = (layer.mask as? CAShapeLayer) ?? CAShapeLayer()
             mask.path = BorderPaint.roundedRect(bounds, BorderPaint.reduced(radii, in: bounds))
             layer.mask = mask
@@ -569,6 +570,7 @@ final class Canvas2DHost: Canvas2DEnv {
     func forget(_ id: UInt32) {
         // Every retired view is forgotten here; only a canvas has a replayer.
         placements.removeValue(forKey: id)
+        naturalSizes.removeValue(forKey: id)
         guard sequence.removeValue(forKey: id) != nil else { return }
         shown.removeValue(forKey: id)
         born.removeValue(forKey: id)

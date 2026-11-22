@@ -75,8 +75,8 @@ extension NodeView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         let pixels = AnimatedRasters.shared.frame(for: self) ?? bitmap.image
-        let content = contentBox()
-        let rect = flightLook?.image ?? RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: style["object_fit"]?.string ?? "fill")
+        let content = flightLook?.contentClip ?? contentBox()
+        let rect = flightLook?.image ?? RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: style["object_fit"]?.string ?? "fill", position: style["object_position"]?.array)
         var root = host
         while let parent = root.superlayer { root = parent }
         let origin = host.convert(CGPoint.zero, to: root)

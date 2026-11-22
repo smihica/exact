@@ -317,6 +317,19 @@ fn the_pointer_is_in_the_holding_monitors_laid_out_space() {
     assert!(pointer(&monitors, None, 2, [0, 0], None).is_none());
 }
 
+/// expo/exact#506: three physical pixels each side of the seam between a
+/// left display at 125 % and the primary, read as the browser reads them.
+#[test]
+fn a_point_beside_a_laid_out_origin_is_divided_once() {
+    let monitors = [
+        whole([-2560, 0, 2560, 1440], 1.25),
+        whole([0, 0, 3440, 1440], 1.25),
+    ];
+    let at = |on, x| pointer(&monitors, None, on, [x, 400], None).unwrap().at;
+    assert_eq!(at(0, -3), [-3. / 1.25, 320.]);
+    assert_eq!(at(1, 3), [3. / 1.25, 320.]);
+}
+
 /// expo/exact#726's displays: 2560 × 1440 and 3440 × 1440 at 125 %, under a
 /// window whose client area covers both.
 #[test]

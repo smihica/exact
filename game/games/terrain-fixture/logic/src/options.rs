@@ -14,6 +14,9 @@ pub struct Options {
     budget: String,
     draw: String,
     pool: String,
+    jobs: String,
+    quality: String,
+    fps: String,
 }
 
 impl Default for Options {
@@ -30,11 +33,30 @@ impl Default for Options {
             budget: "deadline".into(),
             draw: "on".into(),
             pool: "off".into(),
+            jobs: "off".into(),
+            quality: "high".into(),
+            fps: "0".into(),
         }
     }
 }
 
 impl Options {
+    pub(crate) fn quality(&self) -> Quality {
+        match self.quality.as_str() {
+            "low" => Quality::Low,
+            "medium" => Quality::Mid,
+            _ => Quality::High,
+        }
+    }
+
+    pub(crate) fn max_fps(&self) -> u32 {
+        self.fps
+            .parse()
+            .ok()
+            .filter(|fps| (5..=240).contains(fps))
+            .unwrap_or(0)
+    }
+
     pub(crate) fn motion(&self) -> Motion {
         match self.r#move.as_str() {
             "walk" => Motion::Walk,
@@ -92,6 +114,21 @@ pub enum Budget {
     Deadline,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Data)]
+pub enum Draw {
+    #[default]
+    On,
+    Off,
+    Arena,
+    Indirect,
+}
+
+impl Draw {
+    pub fn shared(self) -> bool {
+        matches!(self, Self::Arena | Self::Indirect)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Presentation)]
 pub struct WorkloadSettings {
     pub radius: i32,
@@ -103,8 +140,9 @@ pub struct WorkloadSettings {
     pub vertex: u32,
     pub blend: Blend,
     pub budget: Budget,
-    pub draw: bool,
+    pub draw: Draw,
     pub pool: bool,
+    pub jobs: bool,
 }
 
 impl Default for WorkloadSettings {
@@ -119,8 +157,9 @@ impl Default for WorkloadSettings {
             vertex: 12,
             blend: Blend::Off,
             budget: Budget::default(),
-            draw: true,
+            draw: Draw::On,
             pool: false,
+            jobs: false,
         }
     }
 }
@@ -154,8 +193,14 @@ impl From<&Options> for WorkloadSettings {
                 .and_then(|count| count.parse::<u32>().ok())
                 .filter(|&count| count > 0)
                 .map_or(Budget::Deadline, Budget::Count),
-            draw: args.draw != "off",
+            draw: match args.draw.as_str() {
+                "off" => Draw::Off,
+                "arena" => Draw::Arena,
+                "indirect" => Draw::Indirect,
+                _ => Draw::On,
+            },
             pool: args.pool == "on",
+            jobs: args.jobs == "on",
         }
     }
 }
@@ -248,6 +293,55 @@ impl Options {
         Self {
             r#move: "fly".into(),
             ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TerrainFixture;
+
+    #[test]
+    fn decision_display_quality() {
+        assert_eq!(TerrainFixture::quality(&Options::default()), Quality::High);
+        for (quality, expected) in [
+            ("low", Quality::Low),
+            ("medium", Quality::Mid),
+            ("high", Quality::High),
+            ("junk", Quality::High),
+        ] {
+            let args = Options {
+                quality: quality.into(),
+                ..Options::default()
+            };
+            assert_eq!(
+                TerrainFixture::quality(&args),
+                expected,
+                "quality={quality}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_display_fps() {
+        let mut sim = Sim::<TerrainFixture>::new(Options::default()).unwrap();
+        let world = sim.world_mut();
+        assert_eq!(TerrainFixture::max_fps(world, &Options::default()), 0);
+        for (fps, expected) in [
+            ("45", 45),
+            ("0", 0),
+            ("5", 5),
+            ("240", 240),
+            ("4", 0),
+            ("241", 0),
+            ("junk", 0),
+        ] {
+            let args = Options {
+                fps: fps.into(),
+                ..Options::default()
+            };
+            assert_eq!(TerrainFixture::max_fps(world, &args), expected, "fps={fps}");
         }
     }
 }

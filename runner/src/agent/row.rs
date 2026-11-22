@@ -155,6 +155,7 @@ pub fn row_json(row: StyleId, v: RowValue<'_>, out: &mut String) {
         RowValue::DashArray(d) => quote(&d.css(), out),
         RowValue::Transform(t) => quote(&t.css(), out),
         RowValue::TransformOrigin(t) => quote(&t.css(), out),
+        RowValue::ObjectPosition(t) => quote(&t.css(), out),
         RowValue::PaintOrder(p) => quote(&p.css(), out),
         RowValue::Marker(m) => quote(&m.css(), out),
         RowValue::Filter(f) => quote(&f.css(), out),

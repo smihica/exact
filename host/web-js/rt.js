@@ -247,6 +247,30 @@ export function sig(v, t, name) {
   g.n = n;
   return g;
 }
+// Each late slot's node and initializer, in the order the app's body made them
+const Late = [];
+/** A child's state used outside every region (LLP 1017 P4c): its signal now, for what is declared after it, and its
+ * value from `init` when the boot's commit starts (`startLate`). */
+export function late(init, t, name) {
+  const n = node(null, undefined);
+  n.t = t;
+  n.name = name;
+  const g = () => read(n);
+  g.n = n;
+  Late.push([n, init]);
+  return g;
+}
+/** Each late slot's first value, in order, as the boot's commit starts (mount). The runner starts them after the boot's
+ * settlement (`init_late_slots`); here the root's derives and resources settle as an initializer reads them, so it
+ * reads what that settlement gives, and what it asks lands with the commit's asks. A boot that builds afresh in a
+ * second commit starts them again, and a reader the first commit made sees the new value. */
+export function startLate() {
+  for (const [n, init] of Late) {
+    const v = init();
+    if (n.t && !conforms(v, n.t)) throw new Error(`a slot's initial value does not conform to its type: ${v}`);
+    write(n, v);
+  }
+}
 /** A string past MAX_STRING's UTF-8 bytes (runner `too_long`): one test, TextEncoder's U+FFFD for a lone surrogate
  * (LLP 1090 D6). */
 const long = s =>
@@ -626,7 +650,7 @@ export function commit(f, what = 'commit', finished) {
   // a Back or Forward is mirrored to the history first, and one the browser animated cuts (router.js `traversal`)
   const deferred = Sh && ok && !Traversal?.();
   if (deferred && hasOutput(cmds)) HeldOutput.add(cmds);
-  return deferred ? Sh.commit(tail, Queue, inflight, After) : tail();
+  return deferred ? Sh.commit(tail, Queue, inflight, After, cmds.some(c => c[0] === 'startViewTransition')) : tail();
 }
 /** A commit made again after a write ended or the source became ready (the runner's `commit_again`). Refused while
  * reads are owed (a reconciling ask), they fail, keeping what they show, before a commit publishes it; a refusal of
@@ -844,6 +868,7 @@ export const DEVELOPMENT_STORE = null;
  * state's kind is "state" (persist.js); the durable store's (LLP 1018, `Store`: name → text, kept after a commit
  * stands) is "secret". */
 export const Kept = kind => `exact.${kind}.${DEVELOPMENT_STORE ? `@${DEVELOPMENT_STORE}/` : ''}`;
+if (DEVELOPMENT_STORE) globalThis.__exactSeedStored?.(Kept('state'), Kept('secret'));
 export const Store = {
   map: new Map(),
   writes: [],
@@ -954,8 +979,9 @@ export const Store = {
 // A release build's DEVELOPMENT_STORE is null: it inspects nothing, and its bundle drops the inspection's code.
 export const Inspections = DEVELOPMENT_STORE
   ? resourceInspection(true, () => clock.now)
-  : { track() {}, begin() {}, placeholder() {}, take() {}, fail() {} };
-// Requests in flight, for the agent's `clock settle`.
+  : { track() {}, begin() {}, placeholder() {}, stoodIn() {}, take() {}, fail() {} };
+// Each new request can interrupt an agent clock jump so its reply lands before the next timer.
+// A queued style refresh runs at the browser's microtask checkpoint without interrupting the jump.
 export const inflight = { n: 0 };
 // A development build's only: the dev page's hold asks for it so, as a bundled page serves no rt.js; not on `exact`,
 // which says the runtime is up.

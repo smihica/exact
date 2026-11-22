@@ -33,6 +33,8 @@ impl DataSource for Books {
                 "https://books.test/{name}/{id}"
             )))),
             "quick" => Ok(Answer::Now(lines(args, "quick "))),
+            "bad" if id == "reject" => Err(DataError::BadArguments("seats full".into())),
+            "bad" if id == "closed" => Err(DataError::Unavailable("closed".into())),
             "bad" => Ok(Answer::Now(Value::Number(1.0))),
             _ => Err(DataError::UnknownSource(name.into())),
         }
@@ -349,6 +351,29 @@ fn a_refused_send_leaves_the_instance_as_it_was() {
     );
     r.fulfill(sent[1].ticket, ok()).unwrap();
     assert_eq!(text(&r, "state-1").as_deref(), Some("detect 1"));
+}
+
+#[test]
+fn a_source_refusal_fails_only_its_owning_screens_receipt() {
+    let source = BOOKS.replace("send detected = bad(id)", "show([id])\n    send detected = bad(id)")
+        .replace("text notes.lines.join", r#"text (match failure(detected) { case some(e) => e.code + " " + e.message, case none => "ready" }) testId=`failure-${id}`
+      text notes.lines.join"#);
+    let mut r = Runner::boot(
+        contract::compile(&source).unwrap(),
+        Books::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    for (id, failure) in [("reject", "error seats full"), ("closed", "error closed")] {
+        open(&mut r, id);
+        press(&mut r, &format!("bad-{id}"));
+        assert_eq!(text(&r, "shown").as_deref(), Some(id));
+        assert_eq!(text(&r, &format!("failure-{id}")).as_deref(), Some(failure));
+        press(&mut r, &format!("now-{id}"));
+        assert_eq!(text(&r, &format!("failure-{id}")).as_deref(), Some("ready"));
+    }
 }
 
 fn id_of<D: DataSource>(r: &Runner<D>, test_id: &str) -> u32 {

@@ -21,7 +21,7 @@
 //! - `EXACT_SCALE=n` — device pixels per point (1 otherwise): what the frame is
 //!   drawn at and what the kernel is told the display's scale is, so a
 //!   hairline is one of those pixels (LLP 1115.000 D10.3).
-//! - `EXACT_PAINTER=auto|gpu|ink|cpu` — overrides the app's baked painter choice.
+//! - `EXACT_PAINTER=auto|gpu|ink|cpu` selects the painter. Windows accepts this override with development trust.
 //!   Windows defaults to ink for apps, CPU for declared games; Linux uses auto (LLP 1149 D12).
 //! - `EXACT_CACHE=<dir>` — where the GPU's pipeline cache lives (`~/.cache/exact`).
 //! - `EXACT_DRM=<card>` — the KMS device (`/dev/dri/card0` otherwise).
@@ -164,8 +164,41 @@ fn has_explicit_locator(plan: Option<&str>, dev_plan: Option<&str>) -> bool {
     plan.is_some() || dev_plan.is_some()
 }
 
+/// Native services the shell links for its data modules and pictures.
+#[derive(Clone, Copy)]
+pub struct Services {
+    pub(crate) start_executor: crate::executor::Start,
+    pub(crate) open_images: fn(crate::image::Assets) -> crate::image::Images,
+}
+
+impl Services {
+    /// Share the process's downloader for remote images and video posters.
+    pub const fn with_image_downloads(start_executor: crate::executor::Start) -> Self {
+        Self {
+            start_executor,
+            open_images: crate::image::Images::with_assets,
+        }
+    }
+
+    /// Decode local pictures for a fixed plan that cannot name a remote source.
+    pub const fn with_local_images(start_executor: crate::executor::Start) -> Self {
+        Self {
+            start_executor,
+            open_images: crate::image::Images::local,
+        }
+    }
+}
+
+impl Default for Services {
+    fn default() -> Self {
+        Self::with_image_downloads(crate::executor::Executor::start)
+    }
+}
+
 /// What the environment asked for.
 pub struct Config {
+    /// Constructors selected by the shell before it starts the presenter.
+    pub services: Services,
     /// Viewport preferences the carrier read before boot (LLP 1039 D10).
     pub preferences: Option<exact_runner::Preferences>,
     /// Explicit consumer registration before the first layout; ordinary default
@@ -318,22 +351,62 @@ impl Config {
     /// Read the environment; `baked` is the plan compiled into the binary
     /// and `compat` its `compat.json` (LLP 1030 D3a).
     pub fn from_env(baked: &[u8], compat: &str) -> Config {
-        Self::from_env_lent(baked, None, compat)
+        Self::from_bake::<true>(baked, compat)
+    }
+
+    /// A shell that knows its baked trust can omit the unsigned plan loaders
+    /// from a production executable. Development shells also check the receipt.
+    pub fn from_bake<const DEVELOPMENT: bool>(baked: &[u8], compat: &str) -> Config {
+        Self::from_bake_with_executor::<DEVELOPMENT>(
+            baked,
+            compat,
+            crate::executor::Executor::start,
+        )
+    }
+
+    /// Load a baked shell with the data executor selected by its build.
+    pub fn from_bake_with_executor<const DEVELOPMENT: bool>(
+        baked: &[u8],
+        compat: &str,
+        start: crate::executor::Start,
+    ) -> Config {
+        Self::from_bake_with_services::<DEVELOPMENT>(
+            baked,
+            compat,
+            Services::with_image_downloads(start),
+        )
+    }
+
+    /// Boot with the data executor and image loader selected by the bake.
+    pub fn from_bake_with_services<const DEVELOPMENT: bool>(
+        baked: &[u8],
+        compat: &str,
+        services: Services,
+    ) -> Config {
+        Self::from_env_lent::<DEVELOPMENT>(baked, None, compat, services)
     }
 
     /// [`Config::from_env`] of a plan linked into the binary: booting it
     /// copies none of it (its data pool, a baked app's largest part, is
     /// read in place).
     pub fn from_env_static(baked: &'static [u8], compat: &str) -> Config {
-        Self::from_env_lent(baked, Some(baked), compat)
+        Self::from_env_lent::<true>(baked, Some(baked), compat, Services::default())
     }
 
-    fn from_env_lent(baked: &[u8], lent: Option<&'static [u8]>, compat: &str) -> Config {
+    fn from_env_lent<const DEVELOPMENT: bool>(
+        baked: &[u8],
+        lent: Option<&'static [u8]>,
+        compat: &str,
+        services: Services,
+    ) -> Config {
         // Drop development overrides before reading plans, storage or launch mode (LLP 1069.007 D2).
         prepare_environment(compat);
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let exact_plan = env("EXACT_PLAN");
-        let exact_dev_plan = env("EXACT_DEV_PLAN");
+        let (exact_plan, exact_dev_plan) = if DEVELOPMENT {
+            (env("EXACT_PLAN"), env("EXACT_DEV_PLAN"))
+        } else {
+            (None, None)
+        };
         let mut dev_said = None;
         let from_url = [exact_plan.as_deref(), exact_dev_plan.as_deref()]
             .into_iter()
@@ -404,6 +477,7 @@ impl Config {
             })
             .unwrap_or((420.0, 860.0));
         Config {
+            services,
             preferences: None,
             content_region: None,
             // An argument, else `EXACT_LAUNCH_URL`: the Android reader's launching intent's data has no
@@ -501,6 +575,45 @@ pub fn boot_presenter<D: DataSource + Default>(
     Ok(result)
 }
 
+/// Boot with the Ink device that owns the selected Linux display.
+#[cfg(target_os = "linux")]
+pub fn boot_scanout_presenter<D: DataSource + Default>(
+    config: &mut Config,
+    viewport: (f32, f32),
+    device: exact_ink::Wgpu,
+) -> Result<(Presenter<D>, Option<String>), String> {
+    let (mut p, warning) = boot_presenter_with_painter(config, viewport, PainterBoot::cpu())?;
+    p.install_scanout_painter(device);
+    p.set_output_rotation(config.output_rotation);
+    Ok((p, warning))
+}
+
+#[cfg(any(windows, test))]
+/// Decide whether the window starts hidden and start early preparation for a visible launch.
+/// A measured frame run always shows its window. @ref LLP 1133.025 D6.
+pub fn prepare_window_painter<P, E>(
+    login: Option<bool>,
+    measured: bool,
+    prepare: impl FnOnce() -> Result<Option<P>, E>,
+) -> Result<(bool, Option<P>), E> {
+    let hidden = !measured && login == Some(true);
+    Ok((hidden, if hidden { None } else { prepare()? }))
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn boot_window_with_painter<D: DataSource + Default>(
+    config: &mut Config,
+    viewport: (f32, f32),
+    hidden: bool,
+    painter: PainterBoot,
+) -> Result<(Presenter<D>, Option<String>), String> {
+    let boot = if hidden { PainterBoot::cpu() } else { painter };
+    let (mut presenter, warning) = boot_presenter_with_painter(config, viewport, boot)?;
+    presenter.set_output_rotation(config.output_rotation);
+    presenter.deferred_painter = hidden.then_some(painter);
+    Ok((presenter, warning))
+}
+
 thread_local! {
     /// Whether the agent drives the presenter this thread boots: the presenter
     /// is the agent's from its first commit, so a request its boot makes (a
@@ -526,39 +639,32 @@ pub(crate) fn boot_phase(name: &'static core::ffi::CStr) {
     }
 }
 
-/// Load fonts and lay out while the carrier's device opens. Readiness is bounded
-/// by the boot budget; a late device takes over after first pixel. @ref LLP 1149 D6.3.
+/// Boot the window while its device prepares, or defer opening the painter for
+/// a hidden launch. The startup measurement can move preparation after layout.
+/// @ref LLP 1149 D6.3.
 #[cfg(windows)]
-pub fn boot_presenter_with_device<D: DataSource + Default>(
+pub fn boot_window_presenter<D: DataSource + Default>(
     config: &mut Config,
     viewport: (f32, f32),
-    preparing: exact_ink::device::d3d11::Startup,
+    hidden: bool,
+    painter: PainterBoot,
+    preparing: Option<exact_ink::device::d3d11::Startup>,
+    prepare_after_layout: bool,
 ) -> Result<(Presenter<D>, Option<String>), String> {
-    let (mut presenter, warning) = boot_presenter_with_painter(
-        config,
-        viewport,
-        PainterBoot::selected(crate::presenter::PainterChoice::Cpu),
-    )?;
-    presenter.install_prepared_painter(preparing)?;
-    Ok((presenter, warning))
-}
-
-#[cfg(windows)]
-/// Measurement arm: prepare the device only after the ordinary first layout.
-pub fn boot_presenter_after_layout_device<D: DataSource + Default>(
-    config: &mut Config,
-    viewport: (f32, f32),
-) -> Result<(Presenter<D>, Option<String>), String> {
-    let (mut presenter, warning) = boot_presenter_with_painter(
-        config,
-        viewport,
-        PainterBoot::selected(crate::presenter::PainterChoice::Cpu),
-    )?;
-    let device = std::env::var("EXACT_INK_DEVICE").ok();
-    let preparing = exact_ink::device::d3d11::Startup::start(
-        exact_ink::device::direct_d3d11(device.as_deref()).unwrap_or(false),
-    )
-    .map_err(|error| error.to_string())?;
+    if hidden || (preparing.is_none() && !prepare_after_layout) {
+        return boot_window_with_painter(config, viewport, hidden, painter);
+    }
+    let (mut presenter, warning) =
+        boot_presenter_with_painter(config, viewport, PainterBoot::cpu())?;
+    let preparing = match preparing {
+        Some(preparing) => preparing,
+        None => exact_ink::device::d3d11::Startup::start(
+            painter
+                .direct_d3d11()
+                .ok_or("only the Direct3D painter can prepare after layout")?,
+        )
+        .map_err(|error| error.to_string())?,
+    };
     presenter.install_prepared_painter(preparing)?;
     Ok((presenter, warning))
 }
@@ -570,11 +676,8 @@ pub fn boot_presenter_with_metal<D: DataSource + Default>(
     viewport: (f32, f32),
     preparing: exact_ink::device::apple::Startup,
 ) -> Result<(Presenter<D>, Option<String>), String> {
-    let (mut presenter, warning) = boot_presenter_with_painter(
-        config,
-        viewport,
-        PainterBoot::selected(crate::presenter::PainterChoice::Cpu),
-    )?;
+    let (mut presenter, warning) =
+        boot_presenter_with_painter(config, viewport, PainterBoot::cpu())?;
     presenter.install_apple_painter(preparing)?;
     Ok((presenter, warning))
 }
@@ -729,6 +832,7 @@ pub(crate) fn boot_presenter_with_painter<D: DataSource + Default>(
                     &config.launch,
                     config.content_region,
                     painter,
+                    config.services,
                 )
             })
         });
@@ -781,6 +885,7 @@ pub(crate) fn boot_presenter_with_painter<D: DataSource + Default>(
                     &config.launch,
                     config.content_region,
                     painter,
+                    config.services,
                 )
             })
             .map(|v| delivered(v, updates, None))
@@ -1070,6 +1175,20 @@ mod scale_tests {
         ] {
             assert!(std::env::var_os(name).is_none(), "{name}");
         }
+
+        let path =
+            std::env::temp_dir().join(format!("exact-baked-plan-{}.plan", std::process::id()));
+        std::fs::write(&path, b"local").unwrap();
+        std::env::set_var("EXACT_PLAN", &path);
+        let development = r#"{"embedded":{"trust":"development"}}"#;
+        let baked = super::Config::from_bake::<false>(b"baked", development);
+        let editable = super::Config::from_bake::<true>(b"baked", development);
+        let production =
+            super::Config::from_bake::<true>(b"baked", r#"{"embedded":{"trust":"production"}}"#);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(baked.plan.as_ref(), b"baked");
+        assert_eq!(editable.plan.as_ref(), b"local");
+        assert_eq!(production.plan.as_ref(), b"baked");
     }
 
     #[test]

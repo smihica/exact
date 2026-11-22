@@ -33,7 +33,7 @@ extension Presenter {
 
     /// The innermost surface containing a view; the document's scrolling
     /// port is still `viewport`, even when its root is the session's view.
-    func surface(containing view: UIView, includingRetiring: Bool = true) -> SessionSurface? {
+    package func surface(containing view: UIView, includingRetiring: Bool = true) -> SessionSurface? {
         surfaces(includingRetiring: includingRetiring).last { view === $0.view || view.isDescendant(of: $0.view) }
     }
 
@@ -55,7 +55,7 @@ extension Presenter {
 /// A lifted popover belongs to its sheet even though UIKit places its layer
 /// beside the sheet's controller view, outside that controller's responders.
 package enum ViewPresentation {
-    static func isPresented(_ controller: UIViewController, above ancestor: UIViewController) -> Bool {
+    package static func isPresented(_ controller: UIViewController, above ancestor: UIViewController) -> Bool {
         sequence(first: controller.presentingViewController, next: { $0?.presentingViewController })
             .contains { $0 === ancestor }
     }

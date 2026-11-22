@@ -1,7 +1,7 @@
 //! CPU-only conservative ink selection. Full shaping and GPU paint stay intact.
 use super::catalog::{subpixel, Catalog, FaceKey, GlyphKey};
 use super::lines::{LayoutGlyph, Lines};
-use super::Paragraph;
+use super::{GlyphRun, Paragraph, RunPaint, TextEngine};
 use std::mem::size_of;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use tiny_skia::Transform;
 
 pub(super) const MAX_BYTES: usize = 8 * 1024 * 1024;
 const ENVELOPES: usize = 256;
+pub(super) const GLYPHS_PER_CHUNK: usize = 128;
 // Beyond this range float/integer conversion and inversion use the full path.
 const COORD_LIMIT: f64 = 16_777_216.0;
 
@@ -108,6 +109,7 @@ pub(super) struct Cache {
     catalog: Weak<()>,
     scale: u32,
     pub index: Option<IndexOwner>,
+    previous: Weak<Paragraph>,
 }
 impl Cache {
     /// Attach numeric worker output; the UI catalog Weak stays local.
@@ -116,6 +118,7 @@ impl Cache {
             catalog: Rc::downgrade(catalog),
             scale: scale.to_bits(),
             index: Some(IndexOwner::Prepared(layout)),
+            previous: Weak::new(),
         }
     }
 
@@ -126,6 +129,25 @@ impl Cache {
         self.index = None; // Release this owner before allocation; siblings may pin it.
         self.catalog = Rc::downgrade(catalog);
         self.scale = scale.to_bits();
+    }
+    pub fn prepare(&mut self, catalog: &mut Catalog, paragraph: &Paragraph, scale: f32) -> bool {
+        if self.matches(&catalog.ink_catalog, scale) {
+            return false;
+        }
+        let previous = std::mem::take(&mut self.previous).upgrade();
+        self.reset(&catalog.ink_catalog, scale);
+        let cache = previous.as_ref().map(|old| old.ink.borrow());
+        let prior = previous
+            .as_deref()
+            .zip(cache.as_deref())
+            .and_then(|(old, ink)| {
+                ink.index
+                    .as_deref()
+                    .filter(|_| ink.matches(&catalog.ink_catalog, scale))
+                    .map(|index| (old, index))
+            });
+        self.index = Index::replacing(catalog, paragraph, scale, MAX_BYTES, prior).map(Into::into);
+        true
     }
     pub fn bytes(&self) -> usize {
         self.index.as_ref().map_or(0, |index| index.bytes())
@@ -154,15 +176,54 @@ impl std::ops::Deref for IndexOwner {
     }
 }
 
+impl TextEngine {
+    pub(crate) fn physical_glyph_runs(
+        &mut self,
+        paragraph: &Paragraph,
+        palette: &[RunPaint],
+        origin: (f32, f32),
+        scale: f32,
+        clip: Option<(Transform, [f32; 4])>,
+    ) -> Vec<GlyphRun> {
+        let mut cache = paragraph.ink.borrow_mut();
+        let visible = clip
+            .filter(|_| paragraph.layouts().glyphs.len() > GLYPHS_PER_CHUNK)
+            .and_then(|(transform, [x, y, w, h])| {
+                cache.prepare(&mut paragraph.source.catalog.borrow_mut(), paragraph, scale);
+                let index = cache.index.as_deref()?;
+                Some((
+                    index,
+                    index.viewport(origin, scale, transform, (x, y, w, h))?,
+                ))
+            });
+        Self::glyph_runs_mapped(paragraph, palette, visible, |g, baseline| {
+            exact_ink::glyph::position(g.x, g.y, baseline, origin, scale)
+        })
+    }
+}
+
 impl Paragraph {
+    /// The previous frame owns the old field while this one paints. A
+    /// deferred or GPU paint need not keep its paragraph or build an index.
+    pub(crate) fn reuse_field_ink(&self, old: &Rc<Self>) {
+        let spec = &self.source.spec;
+        if !std::ptr::eq(self, old.as_ref())
+            && old.ink.borrow().index.is_some()
+            && self.ink.borrow().index.is_none()
+            && self.remake.is_some()
+            && self.remake == old.remake
+            && matches!(spec.runs.as_slice(), [run] if run.edges.is_empty() && run.inline.is_none())
+            && super::cache::same_style(spec, &old.source.spec)
+        {
+            self.ink.borrow_mut().previous = Rc::downgrade(old);
+        }
+    }
+
     /// Shaped glyph ink in paragraph points, including raster placement rounding.
     pub(crate) fn paint_bounds(&self, scale: f32) -> Option<(f32, f32, f32, f32)> {
         let mut catalog = self.source.catalog.borrow_mut();
         let mut cache = self.ink.borrow_mut();
-        if !cache.matches(&catalog.ink_catalog, scale) {
-            cache.reset(&catalog.ink_catalog, scale);
-            cache.index = Index::build(&mut catalog, self, scale).map(Into::into);
-        }
+        cache.prepare(&mut catalog, self, scale);
         let index = cache.index.as_ref()?;
         let bounds = index.spans[1];
         if bounds.empty() {
@@ -201,8 +262,8 @@ pub(super) fn slots(catalog: &mut Catalog, lines: &Lines) -> Vec<u32> {
 }
 
 /// A glyph's raster key and whole-pixel origin at `scale`, the pen at
-/// `offset` (device pixels): x in quarter-pixel phases, y truncated to the
-/// pixel row, as cosmic-text's `LayoutGlyph::physical` placed them.
+/// `offset` (device pixels): x in quarter-pixel phases, y rounded down to
+/// its pixel row.
 pub(super) fn physical(
     g: &LayoutGlyph,
     slot: u32,
@@ -210,7 +271,7 @@ pub(super) fn physical(
     scale: f32,
 ) -> (GlyphKey, i32, i32) {
     let (x, x_bin) = subpixel(g.x.mul_add(scale, offset.0));
-    let (y, y_bin) = subpixel(g.y.mul_add(scale, offset.1).trunc());
+    let (y, y_bin) = subpixel(g.y.mul_add(scale, offset.1).floor());
     (
         GlyphKey {
             slot,
@@ -228,10 +289,14 @@ pub(super) struct Index {
     #[cfg(test)]
     pub(super) lifetime: std::sync::Arc<()>,
     spans: Vec<Bounds>,
-    lines: usize,
+    // Only long lines need a map from leaves to (visual line, first glyph).
+    chunks: Vec<(usize, usize)>,
+    leaf_count: usize,
     leaves: usize,
     // Bounds on inputs to the CPU's f32 baseline arithmetic, not CSS line boxes.
     max_input: f64,
+    // Keep each leaf's contribution so an edit can remove the old maximum.
+    leaf_inputs: Vec<f32>,
 }
 
 fn storage(count: usize, limit: usize) -> Option<(usize, usize)> {
@@ -255,11 +320,21 @@ impl Index {
         scale: f32,
         limit: usize,
     ) -> Option<Self> {
+        Self::replacing(engine, p, scale, limit, None)
+    }
+
+    fn replacing(
+        engine: &mut Catalog,
+        p: &Paragraph,
+        scale: f32,
+        limit: usize,
+        previous: Option<(&Paragraph, &Index)>,
+    ) -> Option<Self> {
         #[cfg(test)]
         count(|n| n.attempts += 1);
         engine.envelopes.prepare(&engine.ink_catalog)?;
         let mut envelopes = std::mem::take(&mut engine.envelopes.entries);
-        let result = Self::build_with(engine, p, scale, limit, &mut envelopes, envelope);
+        let result = Self::build_with(engine, p, scale, limit, &mut envelopes, envelope, previous);
         engine.envelopes.entries = envelopes;
         result
     }
@@ -271,86 +346,158 @@ impl Index {
         limit: usize,
         envelopes: &mut Vec<(GlyphKey, Bounds)>,
         envelope_of: EnvelopeOf,
+        previous: Option<(&Paragraph, &Index)>,
     ) -> Option<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return None;
         }
-        let (leaves, nodes) = storage(p.baselines.len(), limit)?;
+        let lines = p.layouts();
+        if p.baselines.len() != lines.lines.len() {
+            return None;
+        }
+        let chunked = lines
+            .lines
+            .iter()
+            .any(|line| lines.glyphs_of(line).len() > GLYPHS_PER_CHUNK);
+        let chunk_count = if chunked {
+            lines.lines.iter().try_fold(0usize, |n, line| {
+                n.checked_add(lines.glyphs_of(line).len().div_ceil(GLYPHS_PER_CHUNK))
+            })?
+        } else {
+            0
+        };
+        let leaf_count = if chunked {
+            chunk_count
+        } else {
+            lines.lines.len()
+        };
+        let metadata = chunk_count
+            .checked_mul(size_of::<(usize, usize)>())?
+            .checked_add(leaf_count.checked_mul(size_of::<f32>())?)?;
+        let (leaves, nodes) = storage(leaf_count, limit.checked_sub(metadata)?)?;
         let mut result = Self {
             #[cfg(test)]
             lifetime: std::sync::Arc::new(()),
             spans: Vec::new(),
-            lines: 0,
+            chunks: Vec::new(),
+            leaf_count,
             leaves,
             max_input: 0.0,
+            leaf_inputs: Vec::new(),
         };
         result.spans.try_reserve_exact(nodes).ok()?;
+        result.chunks.try_reserve_exact(chunk_count).ok()?;
+        result.leaf_inputs.try_reserve_exact(leaf_count).ok()?;
         if result.bytes() > limit {
             return None;
         }
         result.spans.resize(nodes, Bounds::EMPTY);
-        let lines = p.layouts();
+        result.leaf_inputs.resize(leaf_count, 0.);
         let slots = slots(engine, lines);
-        for line in &lines.lines {
-            let n = result.lines;
-            let baseline = *p.baselines.get(n)?;
-            result.lines += 1;
-            let mut span = Bounds::EMPTY;
-            for glyph in lines.glyphs_of(line) {
-                #[cfg(test)]
-                count(|n| n.glyphs += 1);
-                let (x, y) = (glyph.x, glyph.y);
-                if !x.is_finite() || !y.is_finite() || !baseline.is_finite() {
-                    span = Bounds::ALL;
+        let mut same_hard = None;
+        for (line_no, line) in lines.lines.iter().enumerate() {
+            let baseline = p.baselines[line_no];
+            let reusable = previous.and_then(|(old, index)| {
+                let old_lines = old.layouts();
+                let other = old_lines.lines.get(line_no)?;
+                if line_no == 0 || lines.lines[line_no - 1].hard != line.hard {
+                    // For a single styled run, shaping and wrapping start
+                    // afresh at each hard break. Compare its source once
+                    // for all its visual lines, regardless of glyph count.
+                    same_hard = ((line_no == 0 || old_lines.lines[line_no - 1].hard != other.hard)
+                        && (line.hard == 0) == (other.hard == 0)
+                        && !(line.hard == 0
+                            && p.source.spec.text_wrap_style
+                                == exact_kernel::TextWrapStyle::Balance)
+                        && p.source.data.lines[line.hard as usize].text
+                            == old.source.data.lines[other.hard as usize].text)
+                        .then_some(other.hard);
+                }
+                (same_hard == Some(other.hard)
+                    && baseline.to_bits() == old.baselines[line_no].to_bits()
+                    && lines.glyphs_of(line).len() == old_lines.glyphs_of(other).len())
+                .then_some(index)
+            });
+            for (chunk, glyphs) in lines.glyphs_of(line).chunks(GLYPHS_PER_CHUNK).enumerate() {
+                let first = chunk * GLYPHS_PER_CHUNK;
+                let leaf = if chunked {
+                    result.chunks.push((line_no, first));
+                    result.chunks.len() - 1
+                } else {
+                    line_no
+                };
+                if let Some((old, i)) =
+                    reusable.and_then(|old| Some((old, old.leaf(line_no, first)?)))
+                {
+                    result.spans[leaves + leaf] = old.spans[old.leaves + i];
+                    result.leaf_inputs[leaf] = old.leaf_inputs[i];
                     continue;
                 }
-                result.max_input = result
-                    .max_input
-                    .max(f64::from(x).abs())
-                    .max(f64::from(y).abs())
-                    .max(f64::from(baseline).abs());
-                let (mut key, _, _) =
-                    physical(glyph, slots[glyph.face as usize], (0.0, 0.0), scale);
-                key.x_bin = 0;
-                key.y_bin = 0;
-                let bound = match envelopes.binary_search_by_key(&key, |(k, _)| *k) {
-                    Ok(i) => envelopes[i].1,
-                    Err(_) => {
-                        let bound = envelope_of(engine, key);
-                        if envelopes.len() == ENVELOPES {
-                            envelopes.clear();
-                        }
-                        let i = envelopes
-                            .binary_search_by_key(&key, |(k, _)| *k)
-                            .unwrap_err();
-                        envelopes.insert(i, (key, bound));
-                        bound
+                let mut span = Bounds::EMPTY;
+                let mut max_input = 0.0f32;
+                for glyph in glyphs {
+                    #[cfg(test)]
+                    count(|n| n.glyphs += 1);
+                    let (x, y) = (glyph.x, glyph.y);
+                    if !x.is_finite() || !y.is_finite() || !baseline.is_finite() {
+                        span = Bounds::ALL;
+                        continue;
                     }
-                };
-                span = span.union(bound.translated(
-                    f64::from(x) * f64::from(scale),
-                    (f64::from(baseline) + f64::from(y)) * f64::from(scale),
-                ));
+                    max_input = max_input.max(x.abs()).max(y.abs()).max(baseline.abs());
+                    let (mut key, _, _) =
+                        physical(glyph, slots[glyph.face as usize], (0.0, 0.0), scale);
+                    key.x_bin = 0;
+                    key.y_bin = 0;
+                    let bound = match envelopes.binary_search_by_key(&key, |(k, _)| *k) {
+                        Ok(i) => envelopes[i].1,
+                        Err(_) => {
+                            let bound = envelope_of(engine, key);
+                            if envelopes.len() == ENVELOPES {
+                                envelopes.clear();
+                            }
+                            let i = envelopes
+                                .binary_search_by_key(&key, |(k, _)| *k)
+                                .unwrap_err();
+                            envelopes.insert(i, (key, bound));
+                            bound
+                        }
+                    };
+                    span = span.union(bound.translated(
+                        f64::from(x) * f64::from(scale),
+                        (f64::from(baseline) + f64::from(y)) * f64::from(scale),
+                    ));
+                }
+                result.spans[leaves + leaf] = span;
+                result.leaf_inputs[leaf] = max_input;
             }
-            result.spans[leaves + n] = span;
-        }
-        if result.lines != p.baselines.len() {
-            return None;
         }
         for i in (1..leaves).rev() {
             result.spans[i] = result.spans[2 * i].union(result.spans[2 * i + 1]);
         }
+        result.max_input = f64::from(result.leaf_inputs.iter().copied().fold(0., f32::max));
         Some(result)
+    }
+
+    fn leaf(&self, line: usize, first: usize) -> Option<usize> {
+        if self.chunks.is_empty() {
+            return (first == 0 && line < self.leaf_count).then_some(line);
+        }
+        self.chunks.binary_search(&(line, first)).ok()
     }
 
     pub(super) fn bytes(&self) -> usize {
         self.spans.capacity() * size_of::<Bounds>()
+            + self.chunks.capacity() * size_of::<(usize, usize)>()
+            + self.leaf_inputs.capacity() * size_of::<f32>()
     }
 
-    pub fn glyphs<'a>(&self, p: &'a Paragraph, line: usize) -> (&'a [LayoutGlyph], f32) {
+    pub fn glyphs<'a>(&self, p: &'a Paragraph, chunk: usize) -> (&'a [LayoutGlyph], f32, u32) {
+        let (line, first) = self.chunks.get(chunk).copied().unwrap_or((chunk, 0));
+        let glyphs = p.layouts().glyphs_of(&p.layouts().lines[line]);
         (
-            p.layouts().glyphs_of(&p.layouts().lines[line]),
+            &glyphs[first..(first + GLYPHS_PER_CHUNK).min(glyphs.len())],
             p.baselines[line],
+            p.layouts().lines[line].run_base,
         )
     }
 
@@ -441,9 +588,9 @@ impl Index {
                 return 1;
             }
             if node >= index.leaves {
-                let line = node - index.leaves;
-                if line < index.lines {
-                    draw(line);
+                let chunk = node - index.leaves;
+                if chunk < index.leaf_count {
+                    draw(chunk);
                 }
                 1
             } else {
@@ -455,8 +602,8 @@ impl Index {
 }
 
 /// The union of a glyph's ink over the four x phases. The CPU places every
-/// finite glyph on a whole-pixel row (y truncated): the y phase is always
-/// zero. Tiny-skia applies transforms after this raster choice.
+/// finite glyph on a whole-pixel row (y rounded down): the y phase is
+/// always zero. Tiny-skia applies transforms after this raster choice.
 fn envelope(engine: &mut Catalog, mut key: GlyphKey) -> Bounds {
     if !f32::from_bits(key.size_bits).is_finite() {
         return Bounds::ALL;
@@ -536,6 +683,7 @@ impl Index {
             limit,
             &mut envelopes,
             uncached_envelope_oracle,
+            None,
         )
     }
 
@@ -548,7 +696,8 @@ impl Index {
             self.spans.iter().map(bits).collect::<Vec<_>>(),
             other.spans.iter().map(bits).collect::<Vec<_>>()
         );
-        assert_eq!(self.lines, other.lines);
+        assert_eq!(self.chunks, other.chunks);
+        assert_eq!(self.leaf_inputs, other.leaf_inputs);
     }
 }
 #[cfg(test)]
@@ -588,9 +737,11 @@ mod tests {
         let index = Index {
             lifetime: std::sync::Arc::new(()),
             spans: vec![Bounds::EMPTY, Bounds::ALL, Bounds::ALL, Bounds::ALL],
-            lines: 2,
+            chunks: Vec::new(),
+            leaf_count: 2,
             leaves: 2,
             max_input: 0.0,
+            leaf_inputs: vec![0.; 2],
         };
         let mut order = Vec::new();
         index.visit(

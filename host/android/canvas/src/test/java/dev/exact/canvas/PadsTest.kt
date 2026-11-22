@@ -22,6 +22,42 @@ import org.robolectric.shadows.ShadowInputDevice
 import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
+@Config(sdk = [31], manifest = Config.NONE, shadows = [PadsTest.Host::class, LivePadsTest.Environment::class])
+class LivePadsTest {
+    @Implements(android.system.Os::class)
+    class Environment {
+        companion object {
+            @JvmStatic @Implementation fun getenv(name: String): String? = when (name) {
+                "EXACT_AGENT" -> "live"
+                "EXACT_AGENT_PADS" -> """[{"index":0,"id":"Fixture pad","pressed":[0]}]"""
+                else -> null
+            }
+        }
+    }
+
+    @Test fun aLiveDriveDeliversTheFixturePadsPress() {
+        PadsTest.Host.reports.clear()
+        val context = RuntimeEnvironment.getApplication()
+        val previous = ReflectionHelpers.getField<InputManager?>(Pads, "input")
+        ReflectionHelpers.setField(Pads, "input", null)
+        try {
+            val pads = Pads.attach(context)
+            val (slot, pad) = pads.list().single()
+            assertTrue(pad.test)
+            assertEquals(0, slot)
+            assertEquals(slot, pads.current)
+            assertEquals(PadsTest.Host.Report(slot, true, List(21) { if (it == 0) 1f else 0f }),
+                PadsTest.Host.reports.single())
+        } finally {
+            Pads.onInputDeviceRemoved(-1000)
+            val manager = context.getSystemService(Context.INPUT_SERVICE) as InputManager
+            if (manager !== previous) manager.unregisterInputDeviceListener(Pads)
+            ReflectionHelpers.setField(Pads, "input", previous)
+        }
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
 @Config(sdk = [31], manifest = Config.NONE, shadows = [PadsTest.Host::class])
 class PadsTest {
     @Implements(Exact::class, isInAndroidSdk = false)

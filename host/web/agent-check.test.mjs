@@ -70,7 +70,10 @@ const BROKEN = `component CheckFixture
       column testId="swatch" press=toggle width=100 height=100 background-color=(on ? "#ff0000" : "#0000ff") transition="background-color 400ms linear"
 `;
 // The same kinds of views, as the platform would have them: nothing to find in either scheme.
-const CLEAN = `component CleanFixture
+// Exact's own Badge reads in either scheme: the accent and the system blue as a tint under the label's ink (white on the
+// solid system blue is 3.5:1, short of a caption's 4.5:1), red under white ink and green under dark.
+const CLEAN = `use Badge from "exact:content"
+component CleanFixture
   state n = 0
   action bump
     n = n + 1
@@ -89,6 +92,12 @@ const CLEAN = `component CleanFixture
           text "One"
         button testId="two" press=bump
           text "Two"
+      row gap=8 flex-wrap="wrap"
+        Badge(label="Accent", tint=some("AccentColor"))
+        Badge(label="Swap", tint=some("-exact-system-blue"))
+        Badge(label="Cancelled", tint=some("-exact-system-red"))
+        Badge(label="Open", tint=some("-exact-system-green"))
+        Badge(label="Locked", tint=none)
 `;
 // LLP 1116.009 D5 (focus-timer, recipe-finder, round 11): a written percentage width and the padding it does not include,
 // past what the parent gives it, inside the `scroll` that holds the overflow so nothing else sees it. `card` is the finding;
@@ -878,3 +887,54 @@ test('check on the wasm web target names the target and where check runs', async
   const failed = { host: 'web', op: async () => { throw new Error('display failed'); } };
   await expect(checkOp(failed)).rejects.toThrow('display failed');
 });
+
+// On the web a sheet's header is a dialog's (docs/recipes/web-look.md): one grid over the whole sheet, its title on top and its
+// buttons at its foot. A row resting under the buttons scrolls up clear of them, so it is not covered; the header's own box, which
+// spans the sheet, is not what covers it.
+const SHEET_FOOT = `routes nav
+  home "/"
+  edit "/edit"
+component SheetFootFixture
+  action open
+    nav = go(nav, "/edit")
+  action back
+    nav = back(nav)
+  action follow(url: string)
+    nav = go(nav, url)
+  view
+    main navigationKey=\`\${top(nav).id}\` navigate=follow width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        if e.name == "edit"
+          column navigationKey=\`\${e.id}\` navigationPresentation="modal" navigationScroll="form" position="absolute" inset=0
+            header
+              button press=back testId="cancel"
+                text "Cancel"
+              text "Edit Item" role="heading" aria-level=2
+              button press=back testId="save"
+                text "Save"
+            list id="form" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
+              section
+                for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] key=i
+                  row
+                    text \`Row \${i}\` testId=\`row-\${i}\`
+        else
+          column navigationKey=\`\${e.id}\` position="absolute" inset=0
+            header
+              text "Home" role="heading" aria-level=1
+            button press=open testId="open"
+              text "Edit"
+`;
+
+test("a row resting under a web sheet's foot buttons scrolls clear of them, so it is not covered", async () => {
+  const session = await open({ host: 'web', url: await built('sheet-foot', SHEET_FOOT), size: [402, 874] });
+  try {
+    await session.tap('open');
+    await session.clock('settle');
+    const run = (await checkOp(session, ['light'])).check[0];
+    expect(kinds(run)).toEqual({});
+    // Under the buttons at rest: the row is drawn there, so the check had something to judge.
+    const obs = await session.op({ op: 'check' }), ids = new Map(((await session.op({ op: 'tree' })).nodes ?? []).map((n) => [n.props?.testId, n.id]));
+    const under = obs.items.find((it) => it.beneath && it.id === ids.get('row-15'));
+    expect(under).toBeDefined();
+  } finally { await session.close(); }
+}, 900000);

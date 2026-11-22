@@ -12,6 +12,10 @@ use exact_kernel::style::sides as box_sides;
 use exact_kernel::{PropId, StyleId, StyleProps, StyleValue, StyleValueError};
 pub(crate) use length_tokens::{call_tokens, fallback_tokens, grid_tokens};
 use std::{cell::Cell, rc::Rc};
+
+/// The host's names a value reads (LLP 1123 D9, D16), as a refusal lists them.
+pub(crate) const HOST_NAMES: &str = "the observations `var(--exact-<family>-inset-<edge>)`, the edge `top`, `right`, `bottom` or `left`, or `start` or `end` for any family but `safe-area`, the family `safe-area`, `keyboard`, `keyboard-undocked`, `safe-area-corners`, `layout-margins`, `layout-margins-corners`, `readable-content`, `readable-content-corners`, `readable-content-guide` or `system-minimum-layout-margins`, and a native target's raw safe area `var(--exact-<target>-safe-area-inset-<edge>)`, any of the six edges, the target `native-<n>` for the nth chain entry, from 1 to 255, `owner`, `parent`, `navigation`, `tab`, `split`, `column`, `presenter`, `session`, `root`, `window`, `tab-content`, `window-content`, `screen` or `target-<name>` for one native code registered, a name of lowercase letters, digits and inner hyphens, and a field of the owner's segment `var(--exact-viewport-segment-<field>-<x>-<y>)`, the field `width`, `height`, `top`, `left`, `bottom` or `right`, each index 0 to 15";
+
 /// A literal, as an author wrote it, for a message.
 fn literal_text(e: &Expr) -> String {
     match e {
@@ -155,6 +159,7 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::WrongKind { expected, .. } => format!("expected {expected}"),
         StyleValueError::BadEnv { refusal, .. } => refusal.reason().into(),
         StyleValueError::BadComparison { reason, .. } => (*reason).into(),
+        StyleValueError::UnknownEnumValue { style: StyleId::ScrollEdgeEffectHidden | StyleId::ScrollEdgeEffectSoft | StyleId::ScrollEdgeEffectHard | StyleId::SafeAreaReachEdges } => "expected `none`, or edges, each named once, separated by spaces: `top`, `right`, `bottom`, `left`, `start`, `end`".into(),
         StyleValueError::UnknownEnumValue { style: StyleId::FontVariantLigatures } => "expected `normal`, `none`, or a space-separated list taking at most one of each pair: `common-ligatures` or `no-common-ligatures`, `discretionary-ligatures` or `no-discretionary-ligatures`, `historical-ligatures` or `no-historical-ligatures`, `contextual` or `no-contextual`".into(),
         StyleValueError::UnknownEnumValue { style } => format!(
             "expected one of {}",
@@ -189,6 +194,7 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::BadMarker { .. } => "a marker or a mask is `none` or `url(#id)`, naming a `marker` or a `mask`".into(),
         StyleValueError::BadFilter { .. } => "`filter` is `none`, or `url(#id)` naming a `filter` and the filter functions (blur, brightness, contrast, drop-shadow, grayscale, hue-rotate, invert, opacity, saturate, sepia), in order".into(),
         StyleValueError::BadPaintOrder { .. } => "`paint-order` is `normal`, or `fill`, `stroke` and `markers` in the order they paint".into(),
+        StyleValueError::BadObjectPosition { .. } => "`object-position` is a CSS position: coordinates or edge offsets".into(),
         StyleValueError::BadTransformOrigin { .. } => "`transform-origin` is one or two of left, center, right, top, bottom, a length or a percentage".into(),
         StyleValueError::BadAnimation { .. } => "not a CSS `animation` shorthand: `<name> <duration> [<easing>] [<delay>] [<count>|infinite] [<direction>] [<fill-mode>] [<play-state>]`".into(),
         StyleValueError::Unsupported { .. } => "this row has no dynamic form".into(),
@@ -484,19 +490,19 @@ fn style_value(
             }
             // @ref LLP 1081 D5 — `--exact-*` names are the web host's own,
             // but for the observations an author reads (LLP 1123 D7, D9),
-            // which `Family::named` matches as written
+            // and the owner's segments (D16), which `calc::host_name` matches as written
             let lower = v.to_ascii_lowercase();
             let host = lower.match_indices("--exact-").any(|(at, _)| {
                 let name = &v[at..];
                 let end = (name
                     .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')))
                 .unwrap_or(name.len());
-                exact_kernel::style::calc::Family::named(&name[..end]).is_none()
+                !exact_kernel::style::calc::host_name(&name[..end])
             });
             if host {
                 return err(
                     "lower-attr-value",
-                    format!("`--exact-*` names are the host's own: a value reads only the observations `var(--exact-safe-area-inset-<edge>)`, `var(--exact-keyboard-inset-<edge>)` and `var(--exact-keyboard-undocked-inset-<edge>)`, and a style is the author's `-exact-` name: `{}=\"{v}\"`", a.name),
+                    format!("`--exact-*` names are the host's own: a value reads only {}; a style is the author's `-exact-` name: `{}=\"{v}\"`", HOST_NAMES, a.name),
                     span,
                 );
             }
@@ -1019,12 +1025,17 @@ pub(crate) fn check_prop_value(
             );
         }
     }
-    if prop == PropId::StatusBarStyle
+    if matches!(prop, PropId::StatusBarStyle | PropId::NavigationBarStyle)
         && matches!(value, Expr::Str(s, _) if !matches!(s.as_str(), "light-content" | "dark-content" | "auto"))
     {
+        let attr = if prop == PropId::StatusBarStyle {
+            "status-bar-style"
+        } else {
+            "navigation-bar-style"
+        };
         return err(
             "lower-attr-value",
-            "`status-bar-style` takes \"light-content\" (light text, for a dark surface), \"dark-content\" or \"auto\"",
+            format!("`{attr}` takes \"light-content\" (light icons on a dark surface), \"dark-content\" or \"auto\""),
             span,
         );
     }

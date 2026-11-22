@@ -92,6 +92,17 @@ pub(crate) fn symbol_size(node: &exact_kernel::NodeRef<'_>) -> f32 {
     node.computed_row(exact_kernel::StyleId::FontSize, |s| s.font_size) * symbol_scale(role, false)
 }
 
+/// A symbol's intrinsic box on this painted host.
+pub(crate) fn symbol_natural(node: &exact_kernel::NodeRef<'_>) -> (f32, f32) {
+    let size = symbol_size(node);
+    node.props
+        .str(exact_kernel::PropId::ImageSource)
+        .and_then(|s| s.strip_prefix("symbol:"))
+        .and_then(exact_kernel::Icon::parse)
+        .and_then(|icon| icon.template_size(size))
+        .unwrap_or((size, size))
+}
+
 /// A colour role as this process shows it under a scheme.
 pub(crate) fn role(name: &str, dark: bool) -> [u8; 4] {
     roles::role(name).map_or([0, 0, 0, 255], |id| {

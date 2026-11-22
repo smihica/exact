@@ -15,16 +15,17 @@ export const HOST_WEB_GLUE = [
   // Virtualized lists' browser half; animated images on the agent's clock (agent.js only); Canvas 2D's replayer.
   'collection-glue.js', 'list-selection.js', 'image-glue.js', 'canvas2d-glue.js',
   // An iframe's navigation records and commands (commands.js, rt.js `onFrameNavigation`; LLP 1020.002).
-  'frame-navigation.js', 'frame-messages.js',
+  'frame-navigation.js', 'frame-messages.js', 'symbol-geometry.js',
   // Sign-in, storage, request bodies, injected faults and the local network's spaces (ts-data.js, auth.js, admission.js, agent.js, modules.js).
   'auth-glue.js', 'storage-environment.js', 'http-body.js', 'faults.js', 'address-space.js',
   // The scroll to a location's fragment, at its first (router.js; LLP 1153 D5).
   'fragment.js',
+  'drag-out.js', 'drag-input.js',
 ];
 
 /** `code`, the source of `file`, with each constant in `names` that it declares true written false, so the bundler
  * drops what the constant gates; one it no longer declares fails the build by name. */
-function writeFalse(code, file, names) {
+export function writeFalse(code, file, names) {
   for (const name of names) {
     const said = new RegExp(`(?<=\\bconst |, )${name} = true\\b`);
     if (!said.test(code)) throw new Error(`${file}: glue.mjs replaces a line it no longer has: ${name} = true`);
@@ -55,8 +56,10 @@ export function driverRuntime(root) {
 
 /** A runtime module's `../web/…` imports, pointed at the copies beside it. */
 export const localImports = text => text
+  .replaceAll('"../web/symbol-geometry.js"', '"./symbol-geometry.js"')
   .replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'")
   .replaceAll("'../web/faults.js'", "'./faults.js'")
+  .replaceAll("'../web/drag-out.js'", "'./drag-out.js'")
   .replaceAll("'../web/address-space.js'", "'./address-space.js'")
   .replaceAll('"../web/address-space.js"', '"./address-space.js"');
 
@@ -66,7 +69,7 @@ export const localImports = text => text
 // reads storage-environment.js, so it ships in base, not only with storage.
 const WEB_HOST_GROUPS = {
   base: ['glue.js', 'navigation.js', 'audio-session.js', 'frame-messages.js', 'frame-navigation.js', 'textflow-glue.js', 'timer-glue.js', 'timer-waits-glue.js', 'timer-observations.js', 'input-glue.js', 'agent-input.js',
-    'http-body.js', 'grant-admission.js', 'faults.js', 'address-space.js', 'media-glue.js', 'list-selection.js', 'markup-editor.js', 'atoms.js', 'decorations.js', 'live-time-glue.js', 'document-glue.js',
+    'http-body.js', 'grant-admission.js', 'faults.js', 'address-space.js', 'media-glue.js', 'drag-out.js', 'list-selection.js', 'markup-editor.js', 'atoms.js', 'decorations.js', 'live-time-glue.js', 'document-glue.js',
     'motion-glue.js', 'group-glue.js', 'collection-glue.js', 'canvas2d-glue.js', 'presence-glue.js', 'picker-glue.js',
     'documents-glue.js', 'storage-environment.js', 'auth-glue.js', 'image-glue.js', 'geometry-glue.js', 'resize-glue.js', 'intersect-glue.js', 'sound-glue.js', 'midi-glue.js', 'prompt-glue.js', 'alert-message.js', 'wakelock-glue.js', 'orientationlock-glue.js', 'menu-rows.js', 'fragment.js'],
   module: ['module-glue.js', 'module-worker.js', 'module-binary.js', 'module-prelude.js'],
@@ -75,10 +78,16 @@ const WEB_HOST_GROUPS = {
   rust: ['rust-glue.js'],
   gpu: ['gpu-glue.js', 'pace.js', 'gpu-assets.js', 'gpu-pads.js', 'gpu-tier.js', 'gpu-refusal.js'],
   gpuModules: ['gpu-modules.js'],
+  gpuJobs: ['gpu-jobs.js', 'gpu-jobs-worker.js'],
   native: ['native-glue.js'],
   // A development page's frame sampler (LLP 1079 D3); a production build ships none.
   development: ['frames.js'],
 };
+
+// Each built as one module. drag-out.js carries the input helper it imports, so the wasm target's retry of it from a
+// fresh URL (views.js) fetches the helper again too.
+const HOST_ENTRIES = ['glue.js', 'navigation.js', 'drag-out.js'];
+const BUILT_HOST_FILES = [...HOST_ENTRIES, 'grant-admission.js', 'module-prelude.js'];
 
 /** Public filename -> repo-relative source; omit groups to inventory every host file. */
 export function webHostFiles(...groups) {
@@ -86,7 +95,7 @@ export function webHostFiles(...groups) {
     .flatMap(group => WEB_HOST_GROUPS[group]).map(name => [name,
       name === 'module-binary.js' ? 'js/src/binary.js'
         : name.startsWith('sqlite3.') ? 'node_modules/@sqlite.org/sqlite-wasm/dist/' + (name === 'sqlite3.mjs' ? 'index.mjs' : name)
-          : ['glue.js', 'navigation.js', 'grant-admission.js', 'module-prelude.js'].includes(name) ? 'target/web-host/' + name : 'host/web/' + name]));
+          : BUILT_HOST_FILES.includes(name) ? 'target/web-host/' + name : 'host/web/' + name]));
 }
 
 /** The data module realm's prelude (LLP 1027 D1a): these scripts, in this order, after module-binary.js, as
@@ -97,8 +106,8 @@ export const MODULE_PRELUDE = ['time.js', 'crypto.js', 'module-work.js', 'fetch.
 export const modulePrelude = root => MODULE_PRELUDE.map(f => readFileSync(resolve(root, f), 'utf8')).join('\n');
 
 
-/** The two entry modules' static sources, for build invalidation. */
-export function hostModuleSources(root, entries = ['host/web/glue.js', 'host/web/navigation.js']) {
+/** The entry modules' static sources, for build invalidation. */
+export function hostModuleSources(root, entries = HOST_ENTRIES.map(name => 'host/web/' + name)) {
   const pending = [...entries];
   const seen = new Set();
   const parser = new Bun.Transpiler({ loader: 'js' });
@@ -163,14 +172,14 @@ export async function buildHostGlue(root, { production = false, out = resolve(ro
   mkdirSync(out, { recursive: true });
   const stage = mkdtempSync(resolve(out, '.build-'));
   try {
-    for (const name of ['glue.js', 'navigation.js']) {
+    for (const name of HOST_ENTRIES) {
       writeFileSync(resolve(stage, name), await bundleHostModule(root, name, { production }));
     }
     const admission = await import(resolve(root, 'host/web/grant-admission.js'));
     writeFileSync(resolve(stage, 'grant-admission.js'), `export { ${Object.keys(admission).join(', ')} } from './navigation.js';\n`);
     writeFileSync(resolve(stage, 'module-prelude.js'), modulePrelude(root));
     // Readers may already have a published module open while another build finishes.
-    for (const name of ['glue.js', 'navigation.js', 'grant-admission.js', 'module-prelude.js']) {
+    for (const name of BUILT_HOST_FILES) {
       renameSync(resolve(stage, name), resolve(out, name));
     }
   } finally {

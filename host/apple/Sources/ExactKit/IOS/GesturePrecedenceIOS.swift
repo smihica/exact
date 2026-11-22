@@ -14,7 +14,7 @@ extension NodeView {
     /// Whether `gesture` is one of this node's drags, the photo's pinch or the
     /// reorder lift: the recognizers a nested press or editor keeps its touch from.
     func stopsAtPress(_ gesture: UIGestureRecognizer) -> Bool {
-        dragRecognizers.contains { $0 === gesture } || gesture === transformContact?.pinch || gesture === reorderPress
+        dragRecognizers.contains { $0 === gesture } || gesture === transformContact?.pinchRecognizer || gesture === reorderPress
     }
     /// A press handler or text input strictly between the touch and this node.
     /// A `pan` passes a press (`presses: false`): it takes the touch once it

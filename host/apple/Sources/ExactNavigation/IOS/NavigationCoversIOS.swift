@@ -19,45 +19,97 @@ extension NavigationHost {
 
     /// @ref LLP 1075.003 §3.7, LLP 1083.000 D4 — the native container stands
     /// for the routes in the navigation root's paint order. Its box can extend
-    /// past the routes' authored boxes: a column the author
-    /// placed beside routes offset past it shows on the web and would be
-    /// covered here. A child of the root that no shown route's box
-    /// meets, which the routes therefore paint nothing over, paints over the
-    /// container; one a route's box meets keeps CSS's order under it. The
-    /// tab panels and a tablist replaced by the native bar are the container's
-    /// own. Such a child that reaches the container's top edge and one side
-    /// (a column) grows the container's safe area on that side
-    /// by its width, so UIKit lays the bars' contents out clear of it, as a
-    /// hand-built screen insets its bars from a view beside them; the routes
-    /// clear only the part of that inset their own boxes reach (`reportCovers`).
-    /// With the tab bar hidden, an in-flow row below the panels bounds the
-    /// bottom too, whether the root's child or nested beside them (`rowsBelowTabs`).
-    func clearBesideRoutes(tabBarHidden: Bool? = nil) {
+    /// past the routes' authored boxes: a column the author placed beside
+    /// routes offset past it shows on the web and would be covered here. A
+    /// child of the root beside the routes, which they therefore paint nothing
+    /// over (`PanelSiblings.beside`: no shown route's box meets it, and no
+    /// route's view covers it except to its side), paints over the container;
+    /// one a route's box meets keeps CSS's order under it. A child with no area
+    /// is decided by the box its children paint over, within what clips them,
+    /// and one with a `clip-path` by its own (`paintedBox`). The tab panels and
+    /// a tablist replaced by the native bar are the container's own. Such a
+    /// child wholly to one side of the routes grows the container's safe area
+    /// on that side up to where CSS lays the routes out (`sideReach`), so UIKit
+    /// lays the bars' contents out clear of it, as a hand-built screen insets
+    /// its bars from a view beside them, and a tab's route, which UIKit draws
+    /// over the page from the container's origin, is covered only for the part
+    /// of that inset its own box does not clear (`reportCovers`). With the tab
+    /// bar hidden, an in-flow row below the panels bounds the bottom too,
+    /// whether the root's child or nested beside them. A node nested beside the
+    /// panels that paints over the container is lifted into a layer just after
+    /// it (`panelSiblings`, LLP 1083.000 D4), and grows the safe area as a root
+    /// child does.
+    @discardableResult func clearBesideRoutes(tabBarHidden: Bool? = nil) -> [NodeView] {
         guard let owner = primaryOwner, let root = container, let holder = owner.viewIfLoaded,
-              holder.superview === ownerMount(root) else { return }
-        let routes = primaryRoutes.filter { $0.viewIfLoaded?.window != nil && presenter.views[$0.node.id] === $0.node }
-            .map { $0.node.convert($0.node.bounds, to: root) }.filter { !$0.isEmpty }
-        let owned = Set(tabPanels + (tablistAppearanceNone ? [] : [adoptedTablist].compactMap { $0 }))
+              holder.superview === ownerMount(root) else { return [] }
+        // Each shown route's box where CSS lays it out, within its logical parent (UIKit holds a tab's route at its
+        // container's origin, sized to the page, which leaves out the panel's place; a parent with no box of its
+        // own leaves the frame as it is), and where its view is drawn
+        let shown = primaryRoutes.filter { $0.viewIfLoaded?.window != nil && presenter.views[$0.node.id] === $0.node }
+        let routes = shown.map { c in
+            let parent = logicalParent(of: c.node) ?? root
+            let frame = parent.container.convert(c.node.frame, to: root), within = frame.intersection(parent.convert(parent.bounds, to: root))
+            return within.isEmpty ? frame : within
+        }.filter { !$0.isEmpty }
+        let drawn = shown.map { $0.node.convert($0.node.bounds, to: root) }.filter { !$0.isEmpty }
+        var owned = Set(tabPanels + (tablistAppearanceNone ? [] : [adoptedTablist].compactMap { $0 }))
+        if let footer = sidebarFooter() { owned.insert(footer.id) }
+        #if os(iOS)
+        if let accessory = tabAccessory, let node = accessory.node, accessory.holds { owned.insert(node.id) }
+        #endif
         let area = holder.convert(holder.bounds, to: root)
         let before = besideOwner === owner ? besideInsets : .zero
-        var changed = false, reach = UIEdgeInsets.zero
-        let (bottom, rows) = rowsBelowTabs(in: area, routes: routes, skipping: owned, hidden: tabBarHidden)
+        var changed = false, reach = UIEdgeInsets.zero, above: [NodeView] = []
+        siblings.place(in: ownerMount(root))
+        var walk = panelSiblings(in: area, routes: routes, drawn: drawn, skipping: owned, hidden: tabBarHidden)
+        if !walk.promote.isEmpty {
+            // A flat leaf that paints over the container gets a view, mounted now, and lifts with the rest
+            for id in walk.promote { presenter.flats.promote(id) }
+            presenter.flats.flush()
+            walk = panelSiblings(in: area, routes: routes, drawn: drawn, skipping: owned, hidden: tabBarHidden)
+        }
+        let (bottom, rows, lifts) = (walk.bottom, walk.rows, walk.lifts)
+        #if os(iOS)
+        // The adopted More on screen at its list, as its stack names it from the start of a pop to it (reading
+        // `moreNavigationController` makes a More where UIKit has none); not the tab controller's selection, which
+        // names More only after More's `didShow` for its pop to the list
+        let moreList = more.map { $0.viewIfLoaded?.window != nil && $0.topViewController === $0.viewControllers.first } ?? false
+        #else
+        let moreList = false
+        #endif
+        // With no route in the window, under a full-screen cover, the last decision stands, as the covers do;
+        // More's list, inside the container, shows no route for a node to be beside, so it lifts nothing
+        if !routes.isEmpty || moreList { siblings.apply(lifts, in: ownerMount(root), after: holder) }
+        // A lifted node beside the routes; one over them, an overlay, insets nothing, as CSS moves nothing for it
+        for lift in lifts {
+            let box = paintedBox(lift.node, in: root)
+            guard PanelSiblings.beside(box, routes, drawn: drawn) else { continue }
+            let asked = Self.reach(box, beside: routes, in: area)
+            reach = UIEdgeInsets(top: max(reach.top, asked.top), left: max(reach.left, asked.left), bottom: 0, right: max(reach.right, asked.right))
+            if asked.top > 0 { above.append(lift.node) }
+        }
         for case let child as NodeView in ownerMount(root).subviews {
-            let box = child.convert(child.bounds, to: root)
+            let box = child.isHidden ? .null : paintedBox(child, in: root)
             let below = rows.contains { $0 === child }
             let clears = !ExactEnv.authoredChrome && !routes.isEmpty && !owned.contains(child.id) && !box.isEmpty
-                && box.intersects(area) && (below || !routes.contains { $0.intersects(box) })
-            if child.clearsNavigation != clears {
-                child.clearsNavigation = clears
+                && box.intersects(area) && (below || PanelSiblings.beside(box, routes, drawn: drawn))
+            let paint: NavigationPaintRole = owned.contains(child.id) ? .represented : (clears ? .besideRoutes : .sibling)
+            if child.navigationPaint != paint {
+                child.navigationPaint = paint
                 changed = true
             }
-            guard clears, box.minY <= area.minY + 0.5 else { continue }
-            let left = box.minX <= area.minX + 0.5, right = box.maxX >= area.maxX - 0.5
-            if left, !right { reach.left = max(reach.left, box.maxX - area.minX) }
-            if right, !left { reach.right = max(reach.right, area.maxX - box.minX) }
+            guard clears else { continue }
+            let asked = Self.reach(box, beside: routes, in: area)
+            reach = UIEdgeInsets(top: max(reach.top, asked.top), left: max(reach.left, asked.left), bottom: 0, right: max(reach.right, asked.right))
+            if asked.top > 0 { above.append(child) }
         }
-        // UIKit already supplies the indicator and any inset inherited from an outer container.
-        reach.bottom = max(0, bottom - max(0, holder.safeAreaInsets.bottom - before.bottom))
+        // Add only what the container's own safe area leaves: UIKit's (the indicator, a landscape notch, an outer
+        // container's inset) and what an app's hatch added count toward the reach
+        let own = holder.safeAreaInsets
+        reach.top = max(0, reach.top - max(0, own.top - before.top))
+        reach.left = max(0, reach.left - max(0, own.left - before.left))
+        reach.right = max(0, reach.right - max(0, own.right - before.right))
+        reach.bottom = max(0, bottom - max(0, own.bottom - before.bottom))
         if changed { PaintOrder.changed(ownerMount(root)) }
         // Exact's part only: what an app's hatch set on its container stays
         let now = owner.additionalSafeAreaInsets
@@ -66,6 +118,34 @@ extension NavigationHost {
         besideInsets = reach
         besideOwner = owner
         if now != wanted { owner.additionalSafeAreaInsets = wanted }
+        return above
+    }
+
+    /// The edges of the session's view that `node`, page content outside the routes, reaches where the page did not ask
+    /// to cover them: on each edge, the part of its box past the view's safe area, within the view, so its content
+    /// clears the status bar, a notch and the indicator while its background stays full-size. A sheet leaves it where
+    /// it is (LLP 1123 D1).
+    func unsafeEdges(of node: NodeView) -> HostCover.Edges? {
+        guard wantsWholeView, presenter.viewportFit != "cover", let view = presenter.session?.view, view.window != nil else { return nil }
+        let rect = node.convert(node.bounds, to: view).intersection(view.bounds)
+        guard !rect.isNull, !rect.isEmpty else { return nil }
+        let safe = view.bounds.inset(by: view.safeAreaInsets)
+        let edges = HostCover.Edges(top: max(0, min(rect.height, safe.minY - rect.minY)), right: max(0, min(rect.width, rect.maxX - safe.maxX)),
+                                    bottom: max(0, min(rect.height, rect.maxY - safe.maxY)), left: max(0, min(rect.width, safe.minX - rect.minX)))
+        return edges == .init(top: 0, right: 0, bottom: 0, left: 0) ? nil : edges
+    }
+
+    /// How far a box beside the routes asks the container's top, left and right safe area to reach: on a side of
+    /// the routes it lies wholly to, or above them all, up to where CSS lays the routes out, as the web starts their
+    /// content and headers there. A route offset from the container's edge with nothing beside it asks nothing:
+    /// UIKit's bars span the page with their items at its edges, as a hand-built screen's do around a readable-width
+    /// column. Below the routes, a row bounds them only while the tab bar is hidden (`panelSiblings`).
+    static func reach(_ box: CGRect, beside routes: [CGRect], in area: CGRect) -> UIEdgeInsets {
+        guard let start = routes.map(\.minX).min(), let end = routes.map(\.maxX).max(), let top = routes.map(\.minY).min() else { return .zero }
+        return UIEdgeInsets(top: box.maxY <= top + 0.5 ? max(0, top - area.minY) : 0,
+                            left: box.maxX <= start + 0.5 ? max(0, start - area.minX) : 0,
+                            bottom: 0,
+                            right: box.minX >= end - 0.5 ? max(0, area.maxX - end) : 0)
     }
 
     /// What a route's padding clears of its controller's safe area (`safe`),
@@ -76,6 +156,14 @@ extension NavigationHost {
     /// and the bottom only while the containers take the whole view
     /// (`whole`) or the page covers it (`covered`, `viewport-fit="cover"`),
     /// and the bottom only as far as the route reaches it.
+    /// What of its controller's safe area (`safe`) a route's box (`box`, within its view's `bounds`) leaves to cover:
+    /// a route offset in its block, past a box beside or above it (`clearBesideRoutes`), already clears the part of
+    /// each of those edges' insets its box reaches
+    static func routeSafe(_ safe: UIEdgeInsets, box: CGRect, in bounds: CGRect) -> UIEdgeInsets {
+        UIEdgeInsets(top: max(0, safe.top - max(0, box.minY - bounds.minY)), left: max(0, safe.left - max(0, box.minX - bounds.minX)),
+                     bottom: safe.bottom, right: max(0, safe.right - max(0, bounds.maxX - box.maxX)))
+    }
+
     static func routeEdges(safe: UIEdgeInsets, whole: Bool, covered: Bool = false, collapses: Bool, reached: CGFloat) -> HostCover.Edges {
         let edges = whole || covered
         return .init(top: collapses ? 0 : max(0, safe.top),
@@ -110,9 +198,14 @@ extension NavigationHost {
     /// page that did not ask to cover it — and the header a bar replaces,
     /// reported when they change, after the batch being applied.
     func reportCovers() {
-        clearBesideRoutes()
+        projectSidebarFooter(sidebarFooter())
+        #if os(iOS)
+        projectTabAccessory()
+        #endif
+        let above = clearBesideRoutes()
         var changes: [(UInt32, HostCover?)] = []
         var wanted: [UInt32: HostCover] = [:]
+        if let hiddenSidebarFooter { wanted[hiddenSidebarFooter.id] = .whole }
         var extras: [ObjectIdentifier: (UIScrollView, top: CGFloat, bottom: CGFloat)] = [:]
         for c in controllers.values where presenter.views[c.node.id] === c.node {
             // A lifted header takes no room, on a stack yet or not (`coverLifted`).
@@ -142,7 +235,9 @@ extension NavigationHost {
             // under More, and none on the tab bar.
             let search = searching(c)
             let barAbove = nav.map { c.parent is PlainTab ? !$0.isNavigationBarHidden : routeShowsBar(c, in: $0) } ?? false
-            let settled = c.surface.window != nil && (search || (nav?.isNavigationBarHidden ?? true) != barAbove)
+            // Nested in a split's list column, the detail's routes are under that column's bar (LLP 1127 §1, item 2)
+            let barNav = split.flatMap { $0.nested && nav === $0.detail ? $0.list : nil } ?? nav
+            let settled = c.surface.window != nil && (search || (barNav?.isNavigationBarHidden ?? true) != barAbove)
             // A route showing no bar has no title: its inset is the status bar's, none in landscape (LLP 1130 D3).
             let barless = !barAbove
             let topPeers = arrangementScrollers(in: c, top: true), bottomPeers = arrangementScrollers(in: c, top: false)
@@ -167,12 +262,7 @@ extension NavigationHost {
                 }
             }
             if settled {
-                // A route offset in its block, past a box beside it (`clearBesideRoutes`), clears only the part of
-                // each side's inset its box reaches
-                let box = c.node.convert(c.node.bounds, to: c.surface)
-                var safe = c.surface.safeAreaInsets
-                safe.left = max(0, safe.left - max(0, box.minX))
-                safe.right = max(0, safe.right - max(0, c.surface.bounds.maxX - box.maxX))
+                let safe = Self.routeSafe(c.surface.safeAreaInsets, box: c.node.convert(c.node.bounds, to: c.surface), in: c.surface.bounds)
                 // The route's end with its page unscrolled: scrolling moves the route, not the bars.
                 // A route the keyboard shortens can end above the bars, with no bottom cover.
                 let end = c.node.convert(c.node.bounds, to: c.contentMount).maxY + (c.contentViewport?.frame.minY ?? 0)
@@ -249,26 +339,13 @@ extension NavigationHost {
             if adopts(tablist: list) {
                 for node in Self.covered(list, keeping: tabPanels.compactMap { presenter.views[$0] }) { wanted[node.id] = .whole }
             }
-            else if tablistAppearanceNone, list.style["display"]?.string != "none",
-                    wantsWholeView, presenter.viewportFit != "cover",
-                    let view = presenter.session?.view, view.window != nil {
-                // Authored tabs are page content outside the routes. Protect
-                // only the edges they reach; leave the viewport and bar
-                // backgrounds full-size. A sheet leaves them where they are
-                // (LLP 1123 D1).
-                // Authored overflow outside the viewport is no additional unsafe area.
-                let rect = list.convert(list.bounds, to: view).intersection(view.bounds)
-                if !rect.isNull && !rect.isEmpty {
-                    let safe = view.bounds.inset(by: view.safeAreaInsets)
-                    let edges = HostCover.Edges(
-                        top: max(0, min(rect.height, safe.minY - rect.minY)),
-                        right: max(0, min(rect.width, rect.maxX - safe.maxX)),
-                        bottom: max(0, min(rect.height, rect.maxY - safe.maxY)),
-                        left: max(0, min(rect.width, safe.minX - rect.minX)))
-                    if edges != .init(top: 0, right: 0, bottom: 0, left: 0) { wanted[list.id] = .edges(edges) }
-                }
+            // Clear authored tabs, page content outside the routes, of the unsafe edges they reach
+            else if tablistAppearanceNone, list.style["display"]?.string != "none", let edges = unsafeEdges(of: list) {
+                wanted[list.id] = .edges(edges)
             }
         }
+        // Clear a row above the routes, over the container, of them too: its content would show under the status bar
+        for node in above { if let edges = unsafeEdges(of: node) { wanted[node.id] = .edges(edges) } }
         applyClearance(extras)
         // A pane a native arrangement hides is the arrangement's to cover whole (`ArrangementHost.reportHiddenPanes`):
         // nothing is told of it here, and once shown again it is told afresh.
@@ -428,31 +505,35 @@ extension NavigationHost {
         return (max(0, safe.left - minX), max(0, safe.right - (container.bounds.maxX - maxX)))
     }
 
-    /// @ref LLP 1123 D9 — each route's own safe area, which its content reads
-    /// as `var(--exact-safe-area-inset-*)`: its controller's view's, the bars,
-    /// the status bar and the home indicator in it, on the sides only as far
-    /// as the route's box reaches them, as its covers are. A route out of a
-    /// window keeps the last it had, UIKit's zero there being no measurement,
-    /// and so does one while its stack's transition runs, as its cover does;
-    /// one that has none yet takes what it has from its first frame, its sides
-    /// from where a sheet being presented lands (`landingSides`). And the
-    /// session root's while the containers take the whole view, where `env()`
-    /// is 0 but the screen's insets are not. Whether any changed.
+    /// @ref LLP 1123 D9 — each route's own safe area, which its content reads as
+    /// `var(--exact-safe-area-inset-*)`: its controller's view's, the bars, the
+    /// status bar and the home indicator in it, on the sides only as far as the
+    /// route's box reaches them, as its covers are. A route out of a window keeps
+    /// the last it had, UIKit's zero there being no measurement, and so does one
+    /// while its stack's transition runs, as its cover does, but for its sides
+    /// while it appears (`RouteController.appearing`), since UIKit can give a route
+    /// coming back in a pop its new sides during the transition, after
+    /// `viewIsAppearing`. One that has none yet takes what it has, and an appearing
+    /// one its sides, from where a sheet being presented lands (`landingSides`).
+    /// And the session root's while the containers take the whole view, where
+    /// `env()` is 0 but the screen's insets are not. Whether any changed.
     func reportLocalInsets() -> Bool {
         var wanted: [UInt32?: [CGFloat]] = [:]
         for c in controllers.values where presenter.views[c.node.id] === c.node {
-            let last = localInsets.wanted[c.node.id]
+            let last = localInsets.wanted[c.node.id], moving = c.navigationController?.transitionCoordinator != nil
             let view = c.surface
-            guard view.window != nil, c.node.window != nil,
-                  last == nil || c.navigationController?.transitionCoordinator == nil else {
+            guard view.window != nil, c.node.window != nil, last == nil || !moving || c.appearing else {
                 wanted[c.node.id] = last
                 continue
             }
             let box = c.node.convert(c.node.bounds, to: view)
             let safe = view.safeAreaInsets
             var sides = (left: max(0, safe.left - max(0, box.minX)), right: max(0, safe.right - max(0, view.bounds.maxX - box.maxX)))
-            if last == nil, let landing = Self.landingSides(c) { sides = landing }
-            wanted[c.node.id] = [safe.top, sides.right, safe.bottom, sides.left]
+            if last == nil || c.appearing, let landing = Self.landingSides(c) { sides = landing }
+            // An appearing route takes its sides afresh while the transition runs and keeps its top and bottom, which the
+            // bars' own transition moves, until it ends
+            if let last, moving { wanted[c.node.id] = [last[0], sides.right, last[2], sides.left] }
+            else { wanted[c.node.id] = [safe.top, sides.right, safe.bottom, sides.left] }
         }
         if wantsWholeView, let view = presenter.session?.view, view.window != nil {
             let safe = view.safeAreaInsets
@@ -512,7 +593,8 @@ extension NavigationHost {
         // no hatch, so the `hatched` guard skips it
         for nav in allNavigations {
             guard let stack = stacks[ObjectIdentifier(nav)], stack.hatched else { continue }
-            if nav.transitionCoordinator == nil, !searching(nav.topViewController as? RouteController), nav.isNavigationBarHidden == topShowsBar(nav) { say("navigation \(stack.label)", "navigation bar visibility") }
+            // Nested, a split's detail column's bar is UIKit's to hide
+            if nav.transitionCoordinator == nil, split.map({ !$0.nested || nav !== $0.detail }) ?? true, !searching(nav.topViewController as? RouteController), nav.isNavigationBarHidden == topShowsBar(nav) { say("navigation \(stack.label)", "navigation bar visibility") }
             #if !os(tvOS)
             if let pop = nav.interactivePopGestureRecognizer, pop.delegate !== self { say("navigation \(stack.label)", "the pop gesture's delegate") }
             if #available(iOS 26.0, tvOS 26.0, *), let pop = nav.interactiveContentPopGestureRecognizer, pop.delegate !== self {

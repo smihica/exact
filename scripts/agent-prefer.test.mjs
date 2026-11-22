@@ -37,6 +37,9 @@ test('the midi group names what a request finds and the ports by name (LLP 1125 
 });
 
 test('an unknown fact or a value it does not take is refused naming what is expected', () => {
+  expect(preferGroups({ safeArea: '47 0 34 0' }).page).toEqual({ 'safe-area': '47 0 34 0' });
+  for (const bad of ['34', '1 2 3 -1', '1 2 3 4.5', '0 0 2147483648 0'])
+    expect(() => preferGroups({ 'safe-area': bad })).toThrow('four nonnegative integers');
   for (const facts of [{ 'prefers-color-scheme': 'banana' }, { theme: 'dark' }, { 'has-focus': undefined }]) expect(() => preferGroups(facts)).toThrow(MalformedOperation);
   expect(() => preferGroups({ 'color-scheme': 'blue' })).toThrow(/^prefer: prefers-color-scheme blue: expected .*prefers-color-scheme dark\|light/);
   expect(() => preferGroups({ banana: 'split' })).toThrow(/^prefer: banana split: expected display-mode /);

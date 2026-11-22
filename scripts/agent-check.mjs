@@ -9,7 +9,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decodePng, encodePng, shrink } from './png.mjs';
+import { encodePng, readSrgbPng, shrink } from './png.mjs';
 
 const SHOWN = 12;
 const OFFSCREEN = 'a column taller than the screen runs past it: let it scroll (`overflow-y: auto`), or give it `flex: 1` and `min-height: 0` under a header instead of `height: 100%`';
@@ -30,20 +30,23 @@ const over = (fg, bg) => { const a = fg[3] ?? 1; return [0, 1, 2].map((i) => fg[
 const near = (a, b, d) => a && b && [0, 1, 2].every((i) => Math.abs(a[i] - b[i]) <= d);
 const r0 = (n) => Math.round(n);
 
-/** A pixel of the capture at a viewport point, or null off it. */
-function pixel(png, scale, x, y) {
-  const px = Math.floor(x * scale), py = Math.floor(y * scale);
-  if (px < 0 || py < 0 || px >= png.width || py >= png.height) return null;
-  const i = (py * png.width + px) * 4;
-  return [png.data[i], png.data[i + 1], png.data[i + 2]];
+/** Samples a capture in the observer's coordinates. */
+function sampler(png, { x = 0, y = 0, w, h }) {
+  const sx = png.width / w, sy = h > 0 ? png.height / h : sx;
+  return (px, py) => {
+    const col = Math.floor((px + x) * sx), row = Math.floor((py + y) * sy);
+    if (col < 0 || row < 0 || col >= png.width || row >= png.height) return null;
+    const i = (row * png.width + col) * 4;
+    return [png.data[i], png.data[i + 1], png.data[i + 2]];
+  };
 }
 
 /** What a text stands on: the commonest of its box's four corners (a glyph rarely reaches one), or null where they disagree (an image).
  *  A corner the host says another view is drawn over (`drawnOver`) is not read. */
-function backdrop(png, scale, it) {
+function backdrop(pixel, it) {
   const inset = Math.min(1.5, it.w / 4, it.h / 4);
   const corners = [[it.x + inset, it.y + inset], [it.x + it.w - inset, it.y + inset], [it.x + inset, it.y + it.h - inset], [it.x + it.w - inset, it.y + it.h - inset]]
-    .map(([x, y], k) => (it.drawnOver?.includes(k) ? null : pixel(png, scale, x, y))).filter(Boolean);
+    .map(([x, y], k) => (it.drawnOver?.includes(k) ? null : pixel(x, y))).filter(Boolean);
   let best = null, count = 0;
   for (const c of corners) { const n = corners.filter((d) => near(c, d, 12)).length; if (n > count || (n === count && best && ratio(c, it.fg) > ratio(best, it.fg))) { best = c; count = n; } }
   return count >= 2 ? best : null;
@@ -86,8 +89,9 @@ const holds = (a, b) => a.x <= b.x + 0.5 && a.y <= b.y + 0.5 && a.x + a.w >= b.x
 
 /** The findings for one observation (`obs`, the host's reply) and its capture (`png`, decoded; null skips what needs pixels),
  *  with node types from the tree shown in the same scheme (`nodes`, by id). */
-export function judge(obs, png, { host = 'web', nodes = new Map() } = {}) {
-  const vp = obs.viewport, scale = png ? png.width / (obs.capture?.w ?? vp.w) : 1, items = obs.items ?? [], found = [], palette = paletteOf(obs);
+export function judge(obs, png, { host = 'web', nodes = new Map(), capture = obs.capture ?? obs.viewport } = {}) {
+  const vp = obs.viewport, items = obs.items ?? [], found = [], palette = paletteOf(obs);
+  const pixel = png && capture ? sampler(png, capture) : null;
   const add = (kind, it, detail, hint) => found.push({ kind, id: it.id ?? null, ...(it.of != null ? { of: it.of } : {}), name: it.name, text: it.text, box: [r0(it.x), r0(it.y), r0(it.w), r0(it.h)], detail, ...(hint ? { hint } : {}) });
   const unit = host === 'web' ? 'px' : 'pt';
   for (const it of items) {
@@ -120,8 +124,8 @@ export function judge(obs, png, { host = 'web', nodes = new Map() } = {}) {
     }
     // Contrast against what it stands on: the fill the host found painted under it (LLP 1116.006 D5), else what the
     // pixels show behind it, read where it is presented (a bar's glass over it is not what it stands on, LLP 1116.007 D3.8).
-    if (it.text && it.fg && (it.bg || png) && !covers(it, obs.keyboard)) {
-      const need = floor(it, obs.scheme, palette), bg = need && (it.bg ?? backdrop(png, scale, shown(it, obs.keyboard)));
+    if (it.text && it.fg && (it.bg || pixel) && !covers(it, obs.keyboard)) {
+      const need = floor(it, obs.scheme, palette), bg = need && (it.bg ?? backdrop(pixel, shown(it, obs.keyboard)));
       if (bg) {
         const ink = over(it.fg, bg), got = ratio(ink, bg);
         if (got < need - 0.005) add('contrast', it, { got: Math.floor(got * 10) / 10, need, fg: hex(ink), bg: hex(bg), ...(it.bg ? { on: it.on ?? 'page' } : {}) },
@@ -138,12 +142,12 @@ export function judge(obs, png, { host = 'web', nodes = new Map() } = {}) {
     // `faded` is not judged: an ancestor's opacity mixes it with what lies behind that ancestor, so no colour can be
     // expected at its edge.
     // Only where it is presented: under the keyboard the capture shows the keyboard, not the card's edge (unit-converter, round 9).
-    if (it.fill && !it.edge && !it.faded && png && !covers(it, obs.keyboard)) {
+    if (it.fill && !it.edge && !it.faded && pixel && !covers(it, obs.keyboard)) {
       const v = shown(it, obs.keyboard), on = (x, y) => x >= v.x - 2.5 && x <= v.x + v.w + 2.5 && y >= v.y - 2.5 && y <= v.y + v.h + 2.5;
       const sides = [[it.x + 2, it.y + it.h / 2, it.x - 2, it.y + it.h / 2], [it.x + it.w - 2, it.y + it.h / 2, it.x + it.w + 2, it.y + it.h / 2],
         [it.x + it.w / 2, it.y + 2, it.x + it.w / 2, it.y - 2], [it.x + it.w / 2, it.y + it.h - 2, it.x + it.w / 2, it.y + it.h + 2]]
         .filter(([ix, iy, ox, oy]) => on(ix, iy) && on(ox, oy))
-        .map(([ix, iy, ox, oy]) => [pixel(png, scale, ix, iy), pixel(png, scale, ox, oy)]).filter(([a, b]) => a && b);
+        .map(([ix, iy, ox, oy]) => [pixel(ix, iy), pixel(ox, oy)]).filter(([a, b]) => a && b);
       const filled = sides.filter(([a, b]) => near(a, over(it.fill, b), 4));
       if (filled.length >= 2 && sides.every(([a, b]) => near(a, b, 4))) {
         const fill = role(it.fillRole), behind = filled[0][1], scheme = obs.scheme ?? 'light';
@@ -262,7 +266,8 @@ export function report(runs, trees, host) {
   for (const [i, run] of runs.entries()) {
     const nodes = trees[i];
     const head = `check ${host} · ${run.scheme}${run.asked && run.asked !== run.scheme ? ` (asked ${run.asked}: the app keeps its own scheme)` : ''}${run.accepted?.length ? ` (${run.accepted.length} accepted)` : ''}`;
-    if (!run.findings.length) out.push(`${head}: no findings (text fits, nothing covered or overlapping, targets ≥ ${run.target}, no horizontal overflow, contrast ≥ 4.5:1 or 3:1 large, cards show)`);
+    if (run.incomplete) out.push(`${head}: incomplete (${run.incomplete})`);
+    else if (!run.findings.length) out.push(`${head}: no findings (text fits, nothing covered or overlapping, targets ≥ ${run.target}, no horizontal overflow, contrast ≥ 4.5:1 or 3:1 large, cards show)`);
     else {
       out.push(`${head}: ${run.findings.length} finding${run.findings.length === 1 ? '' : 's'}`);
       for (const f of run.findings.slice(0, SHOWN)) out.push(line(f, nodes));
@@ -293,29 +298,60 @@ export async function checkOp(s, args = [], { shots, accept = [] } = {}) {
     for (const scheme of asked) {
       let obs = first;
       if (scheme !== first.scheme || preferred) { await s.prefer({ 'prefers-color-scheme': scheme }); preferred = scheme; obs = await s.op({ op: 'check' }); }
-      const path = shots?.(obs.viewport, scheme) ?? resolve(dir, `${scheme}.png`);
-      // Keep UIKit's menu substitutes hidden through the carrier's display composition.
-      const held = s.host !== 'web';
-      let taken;
-      try {
-        if (held) obs = await s.op({ op: 'check', capture: true });
-        taken = await s.carrier.screenshot(path, obs.capture?.window === true);
-      } finally {
-        if (held) await s.op({ op: 'check', release: true });
+      const pathFor = viewport => shots?.(viewport, scheme) ?? resolve(dir, `${scheme}.png`);
+      let picture = await checkPicture(s, obs, pathFor);
+      if (picture.incomplete) {
+        const { incomplete, obs: previous } = picture;
+        picture = await checkPicture(s, previous, pathFor).catch(() => ({ obs: previous, incomplete }));
       }
-      const png = decodePng(readFileSync(path));
+      const { path, taken, display, capture, incomplete } = picture;
+      obs = picture.obs;
+      const run = { scheme: obs.scheme, asked: scheme, target: obs.target, viewport: obs.viewport };
+      if (incomplete) {
+        trees.push(new Map());
+        runs.push({ ...run, findings: [], incomplete });
+        break;
+      }
+      const png = readSrgbPng(path);
       // The tree as this scheme shows it: a view only one scheme shows is named, and accepted, by its own testId.
       const nodes = new Map(((await s.op({ op: 'tree' })).nodes ?? []).map((n) => [n.id, n]));
       trees.push(nodes);
-      runs.push({ scheme: obs.scheme, asked: scheme, target: obs.target, viewport: obs.viewport, findings: judge(obs, png, { host: s.host === 'web' ? 'web' : 'ios', nodes }), ...(obs.advice ? { advice: obs.advice } : {}) });
+      runs.push({ ...run, findings: judge(obs, png, { host: s.host === 'web' ? 'web' : 'ios', nodes, capture }), ...(obs.advice ? { advice: obs.advice } : {}) });
       // A capture kept for a person or an agent to look at is a pixel a point once judged, as `agent`'s are: a third of an iPhone's pixels each way.
-      if (shots && taken?.scale > 1) writeFileSync(path, encodePng(shrink(png, Math.round(png.width / taken.scale), Math.round(png.height / taken.scale))));
+      if (shots && taken?.scale > 1) {
+        const w = display ? taken.w : png.width / taken.scale, h = display ? taken.h : png.height / taken.scale;
+        writeFileSync(path, encodePng(shrink(png, Math.round(w), Math.round(h))));
+      }
     }
   } finally {
     if (preferred && preferred !== first.scheme) await s.prefer({ 'prefers-color-scheme': first.scheme }).catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   }
-  return s.tagged(settle(runs, trees, accept, s.host));
+  const result = settle(runs, trees, accept, s.host);
+  return runs.some(run => run.incomplete) ? result : s.tagged(result);
+}
+
+async function checkPicture(s, obs, pathFor) {
+  // Keep UIKit's menu substitutes hidden through capture and release them before a retry.
+  const held = s.host !== 'web';
+  let path, taken, releaseFailed = false;
+  try {
+    if (held) obs = await s.op({ op: 'check', capture: true });
+    path = pathFor(obs.viewport);
+    taken = await s.carrier.screenshot(path, obs.capture?.window === true);
+  } finally {
+    if (held) await s.op({ op: 'check', release: true }).catch(error => {
+      if (taken?.captureSpace !== 'screen') throw error;
+      releaseFailed = true;
+    });
+  }
+  const display = taken?.captureSpace === 'screen';
+  if (!display) return { obs, path, taken, display, capture: obs.capture };
+  if (taken.front !== true || releaseFailed) return { obs, incomplete: 'app focus could not be confirmed during display capture' };
+  const screen = obs.capture?.screen;
+  if (!screen || screen.w !== taken.w || screen.h !== taken.h)
+    return { obs, incomplete: 'screen geometry changed between observation and capture' };
+  return { obs, path, taken, display, capture: screen };
 }
 
 /** The runs judged, each against the tree its own scheme showed (`trees[i]`): what `accept` takes is the run's `accepted`, each

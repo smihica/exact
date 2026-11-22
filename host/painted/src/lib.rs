@@ -105,6 +105,7 @@ pub mod transfer;
 #[path = "canvas/travel.rs"]
 mod travel;
 mod wake;
+pub mod window_title;
 mod zone;
 
 /// Install the window event-loop wake for native work, images and text results.
@@ -130,6 +131,15 @@ pub(crate) fn traced<T>(_name: &'static core::ffi::CStr, f: impl FnOnce() -> T) 
     #[cfg(not(target_os = "android"))]
     f()
 }
+
+pub(crate) const PLATFORM: exact_runner::page::Platform = if cfg!(target_os = "android") {
+    exact_runner::page::Platform::Android
+} else if cfg!(target_os = "windows") {
+    exact_runner::page::Platform::Windows
+} else {
+    // The headless Linux host can also run on macOS.
+    exact_runner::page::Platform::Linux
+};
 
 /// A Contract source compiled and encoded once per test binary: the tests boot fresh presenters
 /// from a few constant sources many times, and a compile depends on nothing but its source.

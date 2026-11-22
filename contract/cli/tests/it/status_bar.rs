@@ -76,6 +76,7 @@ fn a_literal_outside_the_set_is_refused() {
     for (attr, value) in [
         ("status-bar-style", "dark"),
         ("status-bar-style", "light"),
+        ("navigation-bar-style", "light"),
         ("status-bar-animation", "slide"),
     ] {
         let src = format!("component App\n  view\n    column {attr}=\"{value}\"\n");

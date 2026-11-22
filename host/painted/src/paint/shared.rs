@@ -12,6 +12,8 @@ pub struct SharedState {
     /// Destinations this paint found not rendering; the host retires them.
     pub(crate) unrendered: Vec<exact_kernel::NodeKey>,
     epoch: Option<u64>,
+    /// Source dimensions survive teardown until the reader releases its borrowed raster.
+    naturals: std::collections::HashMap<u64, (u32, u32)>,
 }
 
 impl SharedState {
@@ -30,9 +32,10 @@ pub struct SharedElement<'a> {
     pub(crate) radius: f32,
     pub(crate) opacity: f32,
     pub(crate) transform: Transform,
-    pub(crate) image: Option<(&'a Arc<Bitmap>, Rect4)>,
+    pub(crate) image: Option<&'a Arc<Bitmap>>,
     pub(crate) fit: u32,
     pub(crate) content: Rect4,
+    pub(crate) crop: Option<Rect4>,
 }
 
 impl Painter {
@@ -42,6 +45,7 @@ impl Painter {
         self.shared.alive.clear();
         if !scene.kernel.has_prop(PropId::SharedElement) {
             self.shared.recorded.clear();
+            self.shared.naturals.clear();
             return;
         }
         let mut stack: Vec<_> = scene.roots.iter().copied().rev().collect();
@@ -77,6 +81,14 @@ impl Painter {
         }
         let alive: std::collections::HashSet<_> = self.shared.alive.iter().copied().collect();
         self.shared.recorded.retain(|key| alive.contains(key));
+        self.shared.naturals.retain(|key, _| {
+            alive.contains(key)
+                || self
+                    .shared
+                    .frames
+                    .iter()
+                    .any(|f| motion_node(f.from) == *key)
+        });
     }
 
     /// A flight whose destination stopped rendering ends: the reader would
@@ -153,13 +165,26 @@ impl Painter {
         // `visibility: hidden` paints no pixels of this node, so a flight must
         // not draw its raster either; visible descendants stay live content.
         let painted = paints(walk.scene.kernel, id, walk.reveal);
-        let image = (painted && node.node_type == NodeType::Image)
+        let bitmap = (painted && node.node_type == NodeType::Image)
             .then(|| walk.scene.images.get(&id))
-            .flatten()
-            .and_then(|image| {
-                object_fit(image.natural(), node.style.object_fit, geometry.content)
-                    .map(|rect| (image, rect))
-            });
+            .flatten();
+        let natural = bitmap.map(|image| image.natural()).or_else(|| {
+            let source = self.shared.frames.iter().find(|f| f.to == node.key)?.from;
+            self.shared.naturals.get(&motion_node(source)).copied()
+        });
+        if let Some(natural) = natural {
+            self.shared.naturals.insert(motion_node(node.key), natural);
+        }
+        let crop = natural.and_then(|natural| {
+            object_fit(
+                natural,
+                node.style.object_fit,
+                &node.style.object_position,
+                geometry.content,
+                &walk.scene.kernel.env_of(node.id),
+            )
+        });
+        let image = bitmap.filter(|_| crop.is_some());
         // Symbols, animated pictures and decorated images keep their live drawing.
         // A plain raster can independently interpolate its fitted image rectangle.
         // The reader draws that rectangle upright, so an image rotated, skewed or
@@ -192,7 +217,7 @@ impl Painter {
                 .str(PropId::ImageSource)
                 .is_some_and(|s| s.starts_with("symbol:"))
             && image_tint(&node, &shown, self.dark).is_none()
-            && image.is_none_or(|(i, _)| i.animation_file().is_none())
+            && image.is_none_or(|i| i.animation_file().is_none())
             && node.style.filter.is_none()
             && node.computed_row(StyleId::ImageRendering, |s| s.image_rendering)
                 == exact_kernel::ImageRendering::Auto
@@ -227,6 +252,7 @@ impl Painter {
                 }
             },
             content: geometry.content,
+            crop,
         });
         self.node_content(walk, id, ts, offset, clip);
         if opened {

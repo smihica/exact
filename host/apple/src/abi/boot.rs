@@ -3,6 +3,12 @@
 use super::*;
 use exact_runner::DataSource;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeBase {
+    Empty,
+    Live,
+}
+
 pub(super) struct PreparedHost<D: DataSource> {
     pub(super) host: crate::host::Host<D>,
     pub(super) batch: String,
@@ -14,9 +20,42 @@ pub(super) struct PreparedHost<D: DataSource> {
 }
 
 impl<D: DataSource> Bridge<D> {
-    /// Prepare and commit a single session's plan replacement.
+    /// Prepare with candidate delivery facts, without publishing them globally.
+    pub fn prepare_plan_with_delivery(
+        &mut self,
+        len: usize,
+        data: D,
+        hooks: Hooks,
+        width: f32,
+        height: f32,
+        delivery: Option<exact_runner::Delivery>,
+    ) -> u32 {
+        self.prepare_plan_carried(
+            len,
+            data,
+            hooks,
+            width,
+            height,
+            delivery,
+            None,
+            None,
+            TreeBase::Live,
+        )
+    }
+
+    /// A boot returns a complete first frame, including when its runner carries state.
     pub fn boot_plan(&mut self, len: usize, data: D, hooks: Hooks, width: f32, height: f32) -> u32 {
-        let len = self.prepare_plan(len, data, hooks, width, height);
+        let len = self.prepare_plan_carried(
+            len,
+            data,
+            hooks,
+            width,
+            height,
+            None,
+            None,
+            None,
+            TreeBase::Empty,
+        );
         if self.prepared.is_some() {
             self.commit_plan()
         } else {
@@ -127,6 +166,8 @@ impl<D: DataSource> Bridge<D> {
             Some(io) => (io.endow)(data.grants(), data.app_id(), true),
             None => crate::store::Endowed::none(),
         };
+        let mut snapshot = snapshot;
+        self.seed_window_state(&mut snapshot);
         let fonts = self.fonts;
         let fonts_ctx = self.fonts_ctx;
         let control_text = self.control_text;
@@ -198,6 +239,7 @@ impl<D: DataSource> Bridge<D> {
                 self.presenter_hooks(&mut host, &hooks);
                 self.wake = hooks.wake.map(|w| (w, hooks.wake_ctx));
                 self.executor = executor;
+                self.restore_window.clear();
                 let batch = Host::ending(self.host.replace(host), batch);
                 self.launch_layout.insets = None;
                 self.parked.clear();

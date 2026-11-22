@@ -280,8 +280,7 @@ fn prepared(
 }
 
 impl Read {
-    /// What `file`'s styles, `root`'s view and the `fn`s, states, derives and
-    /// actions they read say about token uses.
+    /// What the styles, decorations, view and its bindings say about token uses.
     /// `declared`: the app's fonts, which a font row is judged with;
     /// `typing`: the root's scope and the file's shapes, which type and
     /// judge a computed row as lowering does; a `for` or `match` arm's
@@ -321,7 +320,7 @@ impl Read {
                     .for_each(|e| strings(e, false, &mut literals));
             }
         };
-        for s in &file.styles {
+        for s in file.styles.iter().chain(&file.decorations) {
             attrs(&s.attrs);
         }
         // Each node, with whether an `svg` encloses it and its parent's tag,
@@ -721,6 +720,9 @@ impl Read {
                 leave(&mut uses_left, r);
             }
         }
+        for r in file.decorations.iter().flat_map(|d| &d.attrs) {
+            leave(&mut uses_left, r);
+        }
         // A judged row naming a role by another of its names (`label` for
         // `-exact-label`) reads the token overriding it, which the check's
         // reach does not follow.
@@ -995,8 +997,8 @@ fn expressions<'t>(text: &'t str, is_token: &dyn Fn(&str) -> bool) -> Vec<&'t st
     let mut from = 0;
     while let Some(open) = text[from..].find('(').map(|k| from + k) {
         let start = text[..open]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .map_or(0, |k| k + 1);
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .len();
         let mut depth = 0;
         let mut end = None;
         for (k, c) in text[open..].char_indices() {

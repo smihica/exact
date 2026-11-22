@@ -349,13 +349,17 @@ pub fn project(
                 .props
                 .insert("data-exact-router-press".into(), writes.to_string());
         }
-        // A sampled prop decided the tag; its value is the effect's.
+        // A sampled prop decided the tag; its value is the effect's. A drag's
+        // `url` and `files` are bound, whatever their value.
         for b in node.bindings.iter() {
             let row = plan.binding(b);
-            if row.kind == BindingKind::Prop && literal(plan, plan.code(row.expr)).is_none() {
-                if let Some(prop) =
-                    PropId::from_wire(row.id).filter(|p| decides_tag(plan, &node, *p))
-                {
+            if row.kind == BindingKind::Prop
+                && (literal(plan, plan.code(row.expr)).is_none()
+                    || crate::emit::admitted_on_the_page(row.id))
+            {
+                if let Some(prop) = PropId::from_wire(row.id).filter(|p| {
+                    decides_tag(plan, &node, *p) || crate::emit::admitted_on_the_page(row.id)
+                }) {
                     if let Ok(name) = prop_name(NodeType::from_wire(node.node_type).unwrap(), prop)
                     {
                         parts.props.remove(&name);
@@ -704,8 +708,8 @@ fn ramp_rem(text: &str) -> Option<String> {
 /// non-physics properties become `linear()`; an entry naming the host's
 /// `--exact-*` or an old spelling is dropped, as the native parser refuses it.
 /// `-exact-tint-color` becomes the property the browser animates,
-/// `--exact-tint`. `p` is the list of kept entries.
-pub static TRANSITION_ENTRIES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+/// `--exact-tint`.
+pub(super) fn transition_entries() -> String {
     use exact_motion::Property;
     let mut properties: std::collections::BTreeMap<_, Vec<&str>> = Property::ALL
         .into_iter()
@@ -740,16 +744,8 @@ pub static TRANSITION_ENTRIES: std::sync::LazyLock<String> = std::sync::LazyLock
     let spring = include_str!("../transition-spring.js")
         .replace("ALL_PROPERTIES", &serde_json::to_string(&all).unwrap())
         .replace("PROPERTIES", &serde_json::to_string(&properties).unwrap());
-    format!("const spring={spring};const p=v.replace(/\\/\\*[\\s\\S]*?\\*\\//g,\" \").split(/,(?![^(]*\\))/).map(t=>t.trim().replace(/[A-Z]+/g,c=>c.toLowerCase())).filter(t=>t&&!/(^|\\s)(--exact-\\S*|tint-color|exit-animation|layout-transition|press-scale|drag-timeline|symbol-rendering|symbol-palette|symbol-value|symbol-effect|press-haptic|content-transition|scroll-edge-effect|hover-effect|smart-invert|animation-trigger)(?=\\s|$)/i.test(t)).flatMap(t=>/spring\\(/i.test(t)?spring(t):[t]).map(t=>t.replace(/(^|\\s)-exact-tint-color(?=\\s|$)/i,\"$1--exact-tint\"));")
-});
-
-/// A computed `transition`, as the browser takes it: [`TRANSITION_ENTRIES`].
-pub static TRANSITION_MAP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!(
-        "v=>{{if(v==null)return v;{}return p.join(\",\")||\"none\"}}",
-        TRANSITION_ENTRIES.as_str()
-    )
-});
+    format!("v=>{{const spring={spring};return v.replace(/\\/\\*[\\s\\S]*?\\*\\//g,\" \").split(/,(?![^(]*\\))/).map(t=>t.trim().replace(/[A-Z]+/g,c=>c.toLowerCase())).filter(t=>t&&!/(^|\\s)(--exact-\\S*|tint-color|exit-animation|layout-transition|press-scale|drag-timeline|symbol-rendering|symbol-palette|symbol-value|symbol-effect|press-haptic|content-transition|scroll-edge-effect|hover-effect|smart-invert|animation-trigger)(?=\\s|$)/i.test(t)).flatMap(t=>/spring\\(/i.test(t)?spring(t):[t]).map(t=>t.replace(/(^|\\s)-exact-tint-color(?=\\s|$)/i,\"$1--exact-tint\"))}}")
+}
 
 /// `text` with each `-exact-platform-color()` in it as its CSS (its `web` colour or
 /// its fallback), as the kernel writes a literal's.
@@ -896,6 +892,14 @@ static CONTROL_SIZE_MAPS: std::sync::LazyLock<[String; 2]> = std::sync::LazyLock
     ]
 });
 
+static OBJECT_POSITION_MAP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let regions = exact_kernel::style::env::Region::ALL.map(|region| region.prefix());
+    format!(
+        r#"v=>typeof v!=='string'?v:/^\s*(unset|initial)?\s*$/i.test(v)?'50% 50%':v.replace(/(env\(\s*)(?:{})(top|right|bottom|left)(?=\s*[,\)])/g,'$1safe-area-inset-$2')"#,
+        regions.join("|")
+    )
+});
+
 static TINT_MAP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let mut initial = String::new();
     exact_kernel::gradient::color_css(
@@ -973,6 +977,21 @@ pub fn style_writes(id: u16, timeline: bool, written: bool) -> Result<Vec<Write>
             with("--exact-touch-floor", &CONTROL_SIZE_MAPS[1]),
         ],
         StyleId::TintColor => vec![with("--exact-tint", &TINT_MAP)],
+        StyleId::ObjectPosition => vec![
+            with("--exact-object-position", &OBJECT_POSITION_MAP),
+            with("object-position", "v=>v==null?v:'var(--exact-tint-offset,var(--exact-object-position,50% 50%))'"),
+        ],
+        // The rendered page has this fallback before the browser reads the computed fit.
+        StyleId::ObjectFit => vec![
+            with("object-fit", "v=>v"),
+            with(
+                "--exact-tint-size",
+                concat!(
+                    "v=>v==null?v:({fill:'100% 100%',contain:'contain',cover:'cover',none:'auto',",
+                    "'scale-down':'var(--exact-tint-fit,contain)'})[String(v).trim().toLowerCase()]??'100% 100%'",
+                ),
+            ),
+        ],
         StyleId::PlaceholderColor => vec![with("--exact-placeholder-color", "v=>v==null?v:/^\\s*(unset)?\\s*$/i.test(v)?'initial':v")],
         StyleId::BackdropColor => vec![with("--exact-backdrop-color", "v=>v==null?v:/^\\s*(unset)?\\s*$/i.test(v)?'initial':v")],
         // A capsule's ends are half-circles, so it takes no curve (index.html).
@@ -1030,6 +1049,56 @@ pub fn style_writes(id: u16, timeline: bool, written: bool) -> Result<Vec<Write>
         | StyleId::ScrollEdgeEffect
         | StyleId::HoverEffect
         | StyleId::SmartInvert => vec![],
+        // @ref LLP 1123 §"What it replaces" — main's route clearance opt-out, not CSS, as
+        // css.rs has it: the web host executes no route clearance for it to turn off.
+        StyleId::SafeArea => vec![],
+        // @ref LLP 1123 D4, D8, D11 to D14 — not CSS, and not written yet, as on the web
+        // host: a page's ignored regions, insets, margins, reach and scroll insets
+        // wait for the web's owners (D17).
+        StyleId::ScrollContentInsetTop
+        | StyleId::ScrollContentInsetRight
+        | StyleId::ScrollContentInsetBottom
+        | StyleId::ScrollContentInsetLeft
+        | StyleId::ScrollVerticalIndicatorInsetsTop
+        | StyleId::ScrollVerticalIndicatorInsetsRight
+        | StyleId::ScrollVerticalIndicatorInsetsBottom
+        | StyleId::ScrollVerticalIndicatorInsetsLeft
+        | StyleId::ScrollHorizontalIndicatorInsetsTop
+        | StyleId::ScrollHorizontalIndicatorInsetsRight
+        | StyleId::ScrollHorizontalIndicatorInsetsBottom
+        | StyleId::ScrollHorizontalIndicatorInsetsLeft
+        | StyleId::SafeAreaExtendBoundsTop
+        | StyleId::SafeAreaExtendBoundsRight
+        | StyleId::SafeAreaExtendBoundsBottom
+        | StyleId::SafeAreaExtendBoundsLeft
+        | StyleId::ScrollInsetAdjustment
+        | StyleId::ScrollIndicatorAdjustment
+        | StyleId::ScrollEdgeEffectSoft
+        | StyleId::ScrollEdgeEffectHard
+        | StyleId::ScrollEdgeEffectHidden
+        | StyleId::SafeAreaReach
+        | StyleId::SafeAreaReachEdges
+        | StyleId::SafeAreaExtend
+        | StyleId::SafeAreaIgnore
+        | StyleId::SafeAreaIgnoreAlign
+        | StyleId::SafeAreaBar
+        | StyleId::LayoutMarginTop
+        | StyleId::LayoutMarginRight
+        | StyleId::LayoutMarginBottom
+        | StyleId::LayoutMarginLeft
+        | StyleId::LayoutMarginLeading
+        | StyleId::LayoutMarginTrailing
+        | StyleId::LayoutMarginsPreserved
+        | StyleId::LayoutMarginsFromSafeArea
+        | StyleId::LayoutMarginsMinimum
+        | StyleId::AdditionalSafeAreaTop
+        | StyleId::AdditionalSafeAreaRight
+        | StyleId::AdditionalSafeAreaBottom
+        | StyleId::AdditionalSafeAreaLeft
+        | StyleId::SafeAreaPaddingTop
+        | StyleId::SafeAreaPaddingRight
+        | StyleId::SafeAreaPaddingBottom
+        | StyleId::SafeAreaPaddingLeft => vec![],
         // @ref LLP 1055 D13 — tree.js `css` gives the list's hold rule this value as an attribute.
         StyleId::AnimationTrigger => vec![with(
             "--exact-animation-trigger",
@@ -1107,12 +1176,6 @@ pub fn style_writes(id: u16, timeline: bool, written: bool) -> Result<Vec<Write>
         StyleId::JustifyItems => vec![with(
             "justify-items",
             "v=>gridValue(\"justify\",v)",
-        )],
-        // A spring on a physics property is the engine's (motion.js); on
-        // any other it is its `linear()`, as css.rs `transition_css` writes.
-        StyleId::Transition => vec![with(
-            "transition",
-            TRANSITION_MAP.as_str(),
         )],
         // CSS shapes and paths are drawn by the browser.
         StyleId::ClipPath => vec![with(
@@ -1209,6 +1272,7 @@ pub fn style_row(id: u16, written: bool) -> Result<(String, String), String> {
             | StyleCodec::Paint
             | StyleCodec::DashArray
             | StyleCodec::TransformOrigin
+            | StyleCodec::ObjectPosition
             | StyleCodec::PaintOrder
             | StyleCodec::Filter
             | StyleCodec::BackgroundImage
@@ -1385,15 +1449,17 @@ pub(crate) fn unset_mirrors(
 #[cfg(test)]
 pub(crate) mod tests;
 
-/// Transition authored bases independently of host press feedback.
-pub(crate) fn composed_transition_map(press: bool, shift: bool) -> String {
+/// Map a bound transition to CSS, including the base properties of a composed scale or translation.
+pub(super) fn transition_map(entries: &str, press: bool, shift: bool) -> String {
+    if !press && !shift {
+        return format!(r#"v=>v==null?v:({entries})(v).join(",")||"none""#);
+    }
     let names: Vec<_> = [(press, "scale"), (shift, "translate")]
         .into_iter()
         .filter_map(|(yes, name)| yes.then_some(name))
         .collect();
     format!(
-        r#"v=>{{if(v==null)return v;{}let o=[...p];for(const n of {}){{const bases=n==='scale'?['--exact-scale']:['--exact-translate-x','--exact-translate-y','--exact-translate-z'],m=p.filter(t=>new RegExp('^('+n+'|all)(\\s|$)').test(t)).pop();o=o.map(t=>t.replace(new RegExp('^'+n+'(?=\\s)'),bases[0]));if(m)o.push(n+' 0s',...bases.map(base=>m.replace(new RegExp('^('+n+'|all)'),base)));}}return o.join(',')||'none'}}"#,
-        crate::style::TRANSITION_ENTRIES.as_str(),
+        r#"v=>{{if(v==null)return v;const p=({entries})(v);let o=[...p];for(const n of {}){{const bases=n==='scale'?['--exact-scale']:['--exact-translate-x','--exact-translate-y','--exact-translate-z'],m=p.filter(t=>new RegExp('^('+n+'|all)(\\s|$)').test(t)).pop();o=o.map(t=>t.replace(new RegExp('^'+n+'(?=\\s)'),bases[0]));if(m)o.push(n+' 0s',...bases.map(base=>m.replace(new RegExp('^('+n+'|all)'),base)));}}return o.join(',')||'none'}}"#,
         serde_json::to_string(&names).unwrap()
     )
 }

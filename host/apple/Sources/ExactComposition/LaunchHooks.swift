@@ -7,6 +7,9 @@
 // installs once.
 import ExactKit
 import Foundation
+#if EXACT_LINK_CONTENT_INDEX
+import ExactIndexMirror
+#endif
 #if !os(tvOS)
 import UserNotifications
 #endif
@@ -64,6 +67,33 @@ extension ExactComposition {
     public static func installWakes(on app: ExactApp, boot: (() -> Void)? = nil) {
         #if EXACT_LINK_WAKES
         app.installWakes(boot: boot)
+        #endif
+    }
+
+    /// The system's ways in a package's code does not keep: the icon's menu
+    /// in every app, the content index when the plan uses
+    /// `@exact/search-index`, and the tool door when it has a tool; `boot`
+    /// takes a tool call that launched the app with no scene (LLP 1133.023
+    /// D7, D15).
+    public static func installReach(on app: ExactApp, boot: (() -> Void)? = nil) {
+        app.installReach()
+        #if EXACT_LINK_CONTENT_INDEX
+        app.installContentIndex()
+        #endif
+        #if EXACT_LINK_TOOLS
+        app.installToolDoor(boot: boot)
+        #endif
+    }
+
+    /// The location of a search result the system opened
+    /// (`CSSearchableItemActionType`); nil for another activity, and for
+    /// every activity without the content index: an item an earlier build
+    /// indexed then opens the app where it starts.
+    public static func location(of activity: NSUserActivity) -> String? {
+        #if EXACT_LINK_CONTENT_INDEX
+        ExactContentIndex.location(of: activity)
+        #else
+        nil
         #endif
     }
 

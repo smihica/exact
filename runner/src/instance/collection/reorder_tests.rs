@@ -6,7 +6,7 @@ struct Rows(Vec<String>);
 impl DataSource for Rows {
     fn query(&mut self, name: &str, args: &[Value]) -> Result<Value, DataError> {
         if name == "refuse" || (name == "refuse_second" && args[0].as_str() == Some("11")) {
-            return Err(DataError::BadArguments("refused drop".into()));
+            return Ok(Value::Bool(false));
         }
         if name == "trim" {
             self.0.drain(..10);

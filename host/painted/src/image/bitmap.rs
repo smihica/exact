@@ -211,7 +211,14 @@ mod tests {
                 };
                 let actual =
                     crop::part(natural, full, (box_rect.2, box_rect.3), ObjectFit::Cover).unwrap();
-                let dst = object_fit(natural, ObjectFit::Cover, box_rect).unwrap();
+                let dst = object_fit(
+                    natural,
+                    ObjectFit::Cover,
+                    &exact_kernel::object::Position::default(),
+                    box_rect,
+                    &exact_kernel::Env::default(),
+                )
+                .unwrap();
                 let mut drawn = Vec::new();
                 for (x, y, (w, h)) in [actual, expected] {
                     let pixels = source
@@ -305,7 +312,14 @@ mod tests {
                     .unwrap();
                     let part = plan.part(x, y, size).unwrap();
                     let cropped = decode_rows(Cursor::new(&bytes), &part, || false).unwrap();
-                    let dst = object_fit(natural, ObjectFit::Cover, box_rect).unwrap();
+                    let dst = object_fit(
+                        natural,
+                        ObjectFit::Cover,
+                        &exact_kernel::object::Position::default(),
+                        box_rect,
+                        &exact_kernel::Env::default(),
+                    )
+                    .unwrap();
                     let mut drawn = Vec::new();
                     for (pixels, crop) in [(cropped, part.crop), (whole.clone(), plan.crop)] {
                         let bytes = u64::from(pixels.width()) * u64::from(pixels.height()) * 4;

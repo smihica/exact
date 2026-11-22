@@ -222,3 +222,114 @@ fn shown_target(p: &Presenter<()>, node: ViewId) -> &look::Target {
         .find(|t| t.node == node)
         .unwrap()
 }
+
+/// LLP 1035.001 D11 on a shell that makes windows, as Android's does: a
+/// dialog whose author painted its surface is no window of the platform's
+/// but the author's box in the page's top layer, as on the desktop hosts
+/// (alert.rs); the page under it is inert, Back and its own button close it.
+/// A dialog laid out on the platform's surface is still refused.
+#[test]
+fn a_dialog_whose_author_painted_its_surface_is_the_authors_box_in_the_page() {
+    let source = r#"component App
+  state said = "nothing"
+  state name = ""
+  action askMine
+    showModal("mine")
+  action askPlain
+    showModal("plain")
+  action keep
+    said = "kept"
+  action edit(v: string)
+    name = v
+  view
+    column width=360 height=640
+      text said testId="said"
+      button press=askMine testId="ask-mine" width=100 height=40
+        text "Mine"
+      button press=askPlain testId="ask-plain" width=100 height=40
+        text "Plain"
+      button press=keep testId="poke" width=100 height=40
+        text "Poke"
+      dialog id="mine" closedby="any" background-color="rgb(255, 244, 244)" border-radius=24 padding=24 width=280
+        text "Your own box"
+        input value=name input=edit testId="mine-field" width=200 height=30
+        button press=keep commandfor="mine" command="close" testId="mine-ok" background-color="rgb(181, 0, 0)" border-radius=999
+          text "Got it"
+      dialog id="plain"
+        text "Laid out on the platform's surface"
+        button commandfor="plain" command="close"
+          text "OK"
+"#;
+    let (mut p, error) = Presenter::boot_with(
+        &crate::test_plan(source),
+        (),
+        (360., 640.),
+        1.,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    struct NoopPainter;
+    impl SurfacePainter for NoopPainter {
+        fn record(
+            &mut self,
+            _size: (f32, f32),
+            _scale: f32,
+            _paint: &mut dyn FnMut(&mut dyn crate::paint::Backend),
+        ) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+    p.serve_windows(Box::new(NoopPainter));
+    p.frame();
+
+    let id_of = |p: &Presenter<()>, test_id: &str| {
+        let k = p.host().kernel();
+        k.node_by_key(k.find_by_test_id(test_id)[0]).unwrap().id
+    };
+    let named = |p: &Presenter<()>, name: &str| {
+        let k = p.host().kernel();
+        k.node_by_key(k.find_by_id(name)[0]).unwrap().id
+    };
+    let tap_id = |p: &mut Presenter<()>, test_id: &str| {
+        let view = id_of(p, test_id);
+        p.tap(view).unwrap();
+        p.run_commands(|| ());
+        p.frame();
+    };
+    let says = |p: &Presenter<()>, needle: &str| {
+        p.host()
+            .runner()
+            .journal()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+
+    tap_id(&mut p, "ask-plain");
+    assert!(p.alert_root().is_none() && p.surface().is_none());
+    assert_eq!(says(&p, "showModal \"plain\" refused"), 1);
+
+    tap_id(&mut p, "ask-mine");
+    assert!(p.surface().is_none(), "no window of the platform's");
+    assert_eq!(p.alert_root(), Some(named(&p, "mine")));
+    assert_eq!(says(&p, "showModal \"mine\" refused"), 0);
+    assert!(
+        !p.alert_allows(id_of(&p, "poke")),
+        "the page under it is inert"
+    );
+    assert!(p.alert_allows(id_of(&p, "mine-field")), "its field is live");
+    assert!(p.back_goes());
+    assert!(p.system_back(1.0));
+    p.run_commands(|| ());
+    assert!(p.alert_root().is_none());
+
+    tap_id(&mut p, "ask-mine");
+    assert_eq!(p.alert_root(), Some(named(&p, "mine")));
+    tap_id(&mut p, "mine-ok");
+    assert!(p.alert_root().is_none());
+    assert_eq!(
+        p.host().runner().slot("said"),
+        Some(&exact_runner::Value::str("kept"))
+    );
+}

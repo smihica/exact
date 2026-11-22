@@ -8,6 +8,53 @@
 use crate::compat::{compatibility_digest, Compat};
 use exact_runner::{Capability, Uses};
 
+impl Compat {
+    /// The data executor linked into a Windows shell. Development can add source origins on reload.
+    pub fn windows_data_executor(&self) -> &'static str {
+        windows_data_executor(self.admits_agent(), self.inputs["grantCeiling"].as_str())
+    }
+
+    /// Development and signed updates can replace the plan with one that downloads pictures.
+    pub fn windows_image_services(&self, plan: &exact_plan::Plan) -> &'static str {
+        windows_image_services(
+            plan,
+            self.embedded["trust"].as_str(),
+            self.inputs["store"]["L"].as_str(),
+        )
+    }
+}
+
+fn windows_image_services(
+    plan: &exact_plan::Plan,
+    trust: Option<&str>,
+    store: Option<&str>,
+) -> &'static str {
+    if trust == Some("production")
+        && store == Some("0")
+        && !exact_runner::uses::sources_can_be_remote(plan)
+    {
+        "exact_windows::Services::with_local_images"
+    } else {
+        "exact_windows::Services::with_image_downloads"
+    }
+}
+
+fn windows_data_executor(development: bool, ceiling: Option<&str>) -> &'static str {
+    let network = ceiling.is_none_or(|grants| {
+        grants.lines().any(|line| {
+            matches!(
+                line.split_whitespace().next(),
+                Some("net.fetch" | "net.websocket")
+            )
+        })
+    });
+    if development || network {
+        "exact_windows::Executor::start"
+    } else {
+        "exact_windows::Executor::local"
+    }
+}
+
 /// Name what a native artifact links into `compat`'s inputs (`linked`), from
 /// the plan its build script baked into `out`, before the id is taken and
 /// everything that binds it (the GPU module's card, the receipts) is written.
@@ -51,8 +98,11 @@ pub(crate) fn name_into(
         Capability::ALL.into_iter().fold(Uses::NONE, Uses::with)
     };
     // The native roster is Apple's: another platform's set, and so its id,
-    // never names it, whatever a manifest links ahead.
-    let uses = if apple(&compat.inputs) {
+    // never names it, whatever a manifest links ahead; a macOS set never
+    // names what the Mac's core presents itself.
+    let uses = if compat.inputs["platform"] == "macos" {
+        uses.beyond(Uses::MAC_CORE)
+    } else if apple(&compat.inputs) {
         uses
     } else {
         uses.beyond(Uses::NATIVE)
@@ -88,12 +138,14 @@ pub(crate) fn composed<'a>(
 }
 
 /// `uses` with what the manifest links `ahead`. On Apple, an SVG linked
-/// ahead links box effects' engine too, which SVG's filters run on; and
-/// `documents` or `media_picker` linked ahead links the pickers' family
-/// (`picker`), since a later plan's document pickers or photo picker present
-/// through it. A plan's own uses need no such rule: its document-picker
+/// ahead links box effects' engine too, which SVG's filters run on;
+/// `activities` linked ahead links the widgets family, whose generation a
+/// later plan's activity sends name; and `documents` or `media_picker`
+/// linked ahead links the pickers' family (`picker`), since a later plan's
+/// document pickers or photo picker present through it. A plan's own uses need no such rule: its document-picker
 /// commands and file inputs select `picker` themselves, and its drops,
-/// pastes and `requestPermission` need only the core's `doc:` table.
+/// pastes and `requestPermission` need only the core's `doc:` table. On the
+/// Mac, what its core presents itself ([`Uses::MAC_CORE`]) is never linked.
 fn linked_ahead(uses: Uses, ahead: Vec<Capability>, inputs: &serde_json::Value) -> Uses {
     let presents = ahead
         .iter()
@@ -102,8 +154,14 @@ fn linked_ahead(uses: Uses, ahead: Vec<Capability>, inputs: &serde_json::Value) 
     if apple(inputs) && uses.has(Capability::Svg) {
         uses = uses.with(Capability::Effects);
     }
+    if apple(inputs) && uses.has(Capability::Activities) {
+        uses = uses.with(Capability::Widgets);
+    }
     if apple(inputs) && presents {
         uses = uses.with(Capability::Picker);
+    }
+    if inputs["platform"] == "macos" {
+        uses = uses.beyond(Uses::MAC_CORE);
     }
     uses
 }
@@ -159,6 +217,10 @@ pub(crate) fn production_uses<'a>(
     if plans.iter().any(|plan| bundles_svg(app, plan)) {
         uses = uses.with(Capability::Svg).with(Capability::Effects);
     }
+    // A share target's received shares are the sharing product's to claim.
+    if inputs["shareTarget"] == true {
+        uses = uses.with(Capability::Share);
+    }
     // The app's own module artifact is loaded by the native module family.
     if ships_module(app, inputs["platform"].as_str().unwrap_or("")) {
         uses = uses.with(Capability::NativeViews);
@@ -173,7 +235,10 @@ pub(crate) fn production_uses<'a>(
 ///   (`host_work`, LLP 1047.001 D12), one placed on a worker, which answers
 ///   through continuations (LLP 1027.002 D1), or a native module's calls;
 /// - the native module family, which loads a module's Swift implementation,
-///   with the runner's module seam (`modules`).
+///   with the runner's module seam (`modules`);
+/// - on the Mac, text selection, whatever the plan: AppKit's document text
+///   is selectable when its author says nothing (LLP 1115 D8), so the Mac's
+///   selection is in its core and the family's product is iOS's alone.
 fn dependents(uses: Uses, inputs: &serde_json::Value, host_work: bool) -> Uses {
     if !apple(inputs) {
         return uses;
@@ -182,6 +247,9 @@ fn dependents(uses: Uses, inputs: &serde_json::Value, host_work: bool) -> Uses {
         .iter()
         .any(|key| inputs[key] == "worker");
     let mut uses = uses;
+    if inputs["platform"] == "macos" {
+        uses = uses.with(Capability::TextSelection);
+    }
     if host_work || placed || uses.has(Capability::Modules) {
         uses = uses.with(Capability::Io);
     }
@@ -229,9 +297,11 @@ fn ships_module(app: &std::path::Path, platform: &str) -> bool {
 
 /// What `plan` uses on the platform `inputs` name: on Apple, which links
 /// grid layout by use and the native roster, [`exact_runner::uses::apple_uses`]
-/// (LLP 1047.001 D10).
+/// (LLP 1047.001 D10), less on the Mac what its core presents itself.
 pub(crate) fn plan_uses(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> Uses {
-    if apple(inputs) {
+    if inputs["platform"] == "macos" {
+        exact_runner::uses::apple_uses(plan).beyond(Uses::MAC_CORE)
+    } else if apple(inputs) {
         exact_runner::uses::apple_uses(plan)
     } else {
         exact_runner::uses(plan)
@@ -277,7 +347,39 @@ pub fn ahead(manifest: &contract::Manifest) -> Result<Vec<Capability>, String> {
         .collect()
 }
 
-/// Take the Rust sources of an Apple bake made before Cargo. The build
+/// The file system's time now, in milliseconds since the epoch: a stamp's,
+/// written in `dir`. File change times come from a coarser clock than the
+/// system's and can trail it by a tick, so a bake dated by the system clock
+/// could take an input it changed for one older than its read.
+fn file_clock(dir: &std::path::Path) -> Result<u128, String> {
+    let stamp = dir.join(".started");
+    std::fs::write(&stamp, b"").map_err(|e| e.to_string())?;
+    let modified = std::fs::metadata(&stamp).and_then(|info| info.modified());
+    std::fs::remove_file(&stamp).map_err(|e| e.to_string())?;
+    let since = modified
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH);
+    Ok(since.map_err(|e| e.to_string())?.as_millis())
+}
+
+/// Whether Cargo's bootstrap bakes again: `registration` differs from the one
+/// in `baked` apart from when that ran (`started`, `since`), or the bake it
+/// left there is incomplete.
+fn bootstraps(baked: &std::path::Path, registration: &serde_json::Value, files: &[&str]) -> bool {
+    let mut previous: serde_json::Value = std::fs::read(baked.join("rust-baker.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if let Some(object) = previous.as_object_mut() {
+        object.remove("started");
+        object.remove("since");
+    }
+    previous != *registration
+        || !baked.join("compat.json").exists()
+        || files.iter().any(|file| !baked.join(file).exists())
+}
+
+/// Take the Rust sources of a linked Apple or Android bake. The build
 /// script calls this before baking and returns when it answers true.
 /// `files` names generated Rust inputs; a bake must preserve their times
 /// when their bytes do not change. Without EXACT_BAKED, bake normally.
@@ -289,7 +391,7 @@ pub fn take_linked(files: &[&str]) -> Result<bool, String> {
     use sha2::{Digest, Sha256};
     use std::{env, fs, path::PathBuf, process::Command};
     println!("cargo:rerun-if-env-changed=EXACT_BAKED");
-    let Some(baked) = env::var_os("EXACT_BAKED").map(PathBuf::from) else {
+    let Some(mut baked) = env::var_os("EXACT_BAKED").map(PathBuf::from) else {
         return Ok(false);
     };
     if env::var_os("EXACT_RUST_BAKE").is_some() {
@@ -297,10 +399,43 @@ pub fn take_linked(files: &[&str]) -> Result<bool, String> {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("build requires OUT_DIR")?);
     let executable = env::current_exe().map_err(|e| e.to_string())?;
+    let android = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android");
+    if android {
+        println!(
+            "cargo:rerun-if-changed={}",
+            baked.join(".cargo-watch").display()
+        );
+        let out_path = out.to_str().ok_or("Cargo OUT_DIR is not UTF-8")?;
+        baked = baked.join(format!("{:x}", Sha256::digest(out_path.as_bytes())));
+    }
+    let loader_path = if cfg!(windows) {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_FALLBACK_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
     let variables: std::collections::BTreeMap<_, _> = env::vars()
         .filter(|(key, _)| {
             key.starts_with("CARGO_CFG_")
                 || key.starts_with("CARGO_FEATURE_")
+                || (android
+                    && (key == loader_path
+                        || key.starts_with("CARGO_PKG_")
+                        || key.starts_with("DEP_")
+                        || matches!(
+                            key.as_str(),
+                            "CARGO"
+                                | "CARGO_MANIFEST_PATH"
+                                | "CARGO_MANIFEST_LINKS"
+                                | "CARGO_ENCODED_RUSTFLAGS"
+                                | "NUM_JOBS"
+                                | "RUSTC"
+                                | "RUSTDOC"
+                                | "RUSTC_WRAPPER"
+                                | "RUSTC_WORKSPACE_WRAPPER"
+                                | "RUSTC_LINKER"
+                        )))
                 || matches!(
                     key.as_str(),
                     "TARGET" | "HOST" | "PROFILE" | "OPT_LEVEL" | "DEBUG" | "CARGO_MANIFEST_DIR"
@@ -311,25 +446,24 @@ pub fn take_linked(files: &[&str]) -> Result<bool, String> {
         "executable": executable, "cwd": env::current_dir().map_err(|e| e.to_string())?,
         "env": variables, "sha256": format!("{:x}", Sha256::digest(fs::read(&executable).map_err(|e| e.to_string())?)),
     });
+    if android {
+        registration["out"] = serde_json::json!(out);
+        registration["files"] = serde_json::json!(files);
+    }
     fs::create_dir_all(&baked).map_err(|e| e.to_string())?;
     let registry = baked.join("rust-baker.json");
-    let mut previous: serde_json::Value = fs::read(&registry)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    if let Some(object) = previous.as_object_mut() {
-        object.remove("started");
-    }
-    if previous != registration
-        || !baked.join("compat.json").exists()
-        || files.iter().any(|file| !baked.join(file).exists())
-    {
+    if bootstraps(&baked, &registration, files) {
+        // `started` orders this bootstrap against the driver's records, whose
+        // `at` is the system clock's; `since` is the file clock's, for the
+        // change times of the inputs it read.
+        registration["since"] = serde_json::json!(file_clock(&baked)?);
         registration["started"] = serde_json::json!(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis());
         let result = Command::new(&executable)
             .env("EXACT_RUST_BAKE", "1")
+            .env("EXACT_BAKED", &baked)
             .env("OUT_DIR", &baked)
             .output()
             .map_err(|e| e.to_string())?;
@@ -344,13 +478,26 @@ pub fn take_linked(files: &[&str]) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
         .lines()
     {
-        if line.starts_with("cargo:warning=") || line.starts_with("cargo::warning=") {
+        let Some((name, _)) = line
+            .strip_prefix("cargo::")
+            .or_else(|| line.strip_prefix("cargo:"))
+            .and_then(|line| line.split_once('='))
+        else {
+            continue;
+        };
+        // The separate Android bake owns its input watches. Cargo still owns
+        // the compiler and linker directives emitted by the build script.
+        if name == "warning"
+            || (android && !matches!(name, "rerun-if-changed" | "rerun-if-env-changed"))
+        {
             println!("{line}");
         }
     }
     for file in files {
         let from = baked.join(file);
-        println!("cargo:rerun-if-changed={}", from.display());
+        if !android {
+            println!("cargo:rerun-if-changed={}", from.display());
+        }
         let bytes = fs::read(from).map_err(|e| e.to_string())?;
         let to = out.join(file);
         if fs::read(&to).ok().as_deref() != Some(&bytes) {
@@ -385,6 +532,68 @@ mod tests {
             id: "com.example.link".into(),
             name: "Link".into(),
             declared: true,
+        }
+    }
+
+    #[test]
+    fn windows_data_transports_follow_the_baked_grant_ceiling() {
+        use super::windows_data_executor as executor;
+        let full = "exact_windows::Executor::start";
+        let local = "exact_windows::Executor::local";
+        assert_eq!(executor(true, Some("")), full);
+        assert_eq!(executor(false, None), full);
+        assert_eq!(executor(false, Some("")), local);
+        assert_eq!(
+            executor(
+                false,
+                Some("fs.read app:/data/notes\n# net.fetch https://example.test")
+            ),
+            local
+        );
+        assert_eq!(
+            executor(
+                false,
+                Some("fs.read app:/data/notes\nnet.fetch https://example.test")
+            ),
+            full
+        );
+        assert_eq!(
+            executor(false, Some("net.websocket wss://socket.test")),
+            full
+        );
+    }
+
+    #[test]
+    fn windows_omits_image_downloads_only_for_a_fixed_plan_with_local_sources() {
+        let compile = |view: &str| {
+            contract::compile(&format!(
+                "component A\n  state src = \"assets/a.png\"\n  view\n    {view}\n"
+            ))
+            .unwrap()
+        };
+        let local = compile(r#"image "app:/tmp/freeze/screen.png""#);
+        let images = super::windows_image_services;
+        let download = "exact_windows::Services::with_image_downloads";
+        assert_eq!(
+            images(&local, Some("production"), Some("0")),
+            "exact_windows::Services::with_local_images"
+        );
+        for (trust, store) in [
+            (Some("development"), Some("0")),
+            (Some("production"), Some("A")),
+            (None, None),
+        ] {
+            assert_eq!(images(&local, trust, store), download);
+        }
+        for view in [
+            r#"image "https://example.test/image""#,
+            "image src",
+            r#"video poster="https://example.test/poster""#,
+        ] {
+            assert_eq!(
+                images(&compile(view), Some("production"), Some("0")),
+                download
+            );
         }
     }
 
@@ -440,7 +649,8 @@ mod tests {
     }
 
     /// Production hello, the size row's app, links nothing beyond the core
-    /// (LLP 1047.001 D10): every roster entry is absent from its binary.
+    /// (LLP 1047.001 D10): every roster entry is absent from its binary but,
+    /// on the Mac, text selection, which is the Mac's core.
     #[test]
     fn production_hello_links_no_capability() {
         let hello = contract::compile(include_str!("../../apps/hello/app.contract")).unwrap();
@@ -449,7 +659,11 @@ mod tests {
             let inputs = serde_json::json!({ "platform": platform, "grantCeiling": "" });
             let uses =
                 super::production_uses(&hello_dir, &hello, std::iter::empty(), &inputs, false);
-            assert_eq!(uses, exact_runner::Uses::NONE, "{platform}: {uses}");
+            let core = match platform {
+                "macos" => exact_runner::Uses::NONE.with(Capability::TextSelection),
+                _ => exact_runner::Uses::NONE,
+            };
+            assert_eq!(uses, core, "{platform}: {uses}");
         }
     }
 
@@ -479,7 +693,7 @@ mod tests {
         assert_eq!(required("ios", false), Some(serde_json::json!(["grid"])));
         assert_eq!(
             required("macos", true),
-            Some(serde_json::json!(["grid", "io"]))
+            Some(serde_json::json!(["grid", "io", "text_selection"]))
         );
         assert_eq!(required("linux", true), None);
         let mut linking = manifest.clone();
@@ -493,6 +707,14 @@ mod tests {
             ahead.unwrap(),
             Some(serde_json::json!(["effects", "grid", "svg"]))
         );
+        // Activities linked ahead bring the publication their sends name.
+        linking.json["link"] = serde_json::json!(["activities"]);
+        let ahead =
+            super::apple_requirement(&hello, &table, std::iter::empty(), &inputs, &linking, false);
+        assert_eq!(
+            ahead.unwrap(),
+            Some(serde_json::json!(["grid", "activities", "widgets"]))
+        );
         let svg = contract::compile(
             "component S\n  view\n    svg viewBox=\"0 0 10 10\"\n      circle cx=5 cy=5 r=4\n",
         )
@@ -500,6 +722,65 @@ mod tests {
         let drawn =
             super::apple_requirement(&hello, &svg, std::iter::empty(), &inputs, &manifest, false);
         assert_eq!(drawn.unwrap(), Some(serde_json::json!(["effects", "svg"])));
+        // An entry's plan, as the publisher asks it of each pushed entry,
+        // needs the binary that publishes entries.
+        let widget = contract::Widget {
+            kind: "card".into(),
+            title: None,
+            description: None,
+            families: vec!["systemSmall".into()],
+            watch_families: vec![],
+            component: "Card".into(),
+            props: "Props".into(),
+            refresh: "refresh".into(),
+            requires_secrets: false,
+            preview: serde_json::json!({"title": "preview"}),
+            configuration: None,
+        };
+        let entry = contract::snapshot::compile(
+            "shape Props\n  title: string\ncomponent Card\n  props\n    title: string\n  view\n    text title\n",
+            &widget,
+        )
+        .unwrap();
+        let entry = super::apple_requirement(
+            &hello,
+            &entry,
+            std::iter::empty(),
+            &inputs,
+            &manifest,
+            false,
+        );
+        assert_eq!(entry.unwrap(), Some(serde_json::json!(["widgets"])));
+    }
+
+    /// A `dialog` needs the dialogs family on iOS and tvOS (an `ios` bake);
+    /// on the Mac the core presents it, even when the manifest links it ahead.
+    #[test]
+    fn a_dialog_requires_its_family_except_on_the_mac() {
+        let hello = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps/hello");
+        let mut manifest = contract::Manifest::read(&hello).unwrap();
+        let dialog =
+            contract::compile("component D\n  view\n    dialog id=\"d\"\n      text \"a\"\n")
+                .unwrap();
+        for (platform, ahead, required) in [
+            ("ios", false, serde_json::json!(["dialogs"])),
+            ("macos", false, serde_json::json!(["text_selection"])),
+            ("macos", true, serde_json::json!(["text_selection"])),
+        ] {
+            if ahead {
+                manifest.json["link"] = serde_json::json!(["dialogs"]);
+            }
+            let inputs = serde_json::json!({ "platform": platform, "grantCeiling": "" });
+            let got = super::apple_requirement(
+                &hello,
+                &dialog,
+                std::iter::empty(),
+                &inputs,
+                &manifest,
+                false,
+            );
+            assert_eq!(got.unwrap(), Some(required), "{platform} {ahead}");
+        }
     }
 
     /// A source that declares host work (LLP 1047.001 D12) and one placed on
@@ -602,6 +883,53 @@ mod tests {
         std::fs::create_dir_all(dir.join("modules/apple")).unwrap();
         std::fs::write(dir.join("modules/apple/Hatches.swift"), "").unwrap();
         assert!(linked("assets/a.png").has(Capability::NativeViews));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Rust bake is dated on the clock its inputs' change times read, so an
+    /// input changed after its start never reads as older than it. The
+    /// system clock does not promise that: file times can trail it by a tick.
+    #[test]
+    fn a_rust_bake_is_dated_on_the_clock_change_times_read() {
+        let dir = std::env::temp_dir().join(format!("exact-file-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input");
+        for _ in 0..50 {
+            let started = super::file_clock(&dir).unwrap();
+            std::fs::write(&input, b"edited").unwrap();
+            let changed = std::fs::metadata(&input).unwrap().modified().unwrap();
+            let changed = changed
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            assert!(
+                changed >= started,
+                "an input changed at {changed} reads as older than a bake started at {started}"
+            );
+        }
+        assert!(!dir.join(".started").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A registration that differs only in when its bootstrap ran, both its
+    /// system-clock `started` and its file-clock `since`, does not bake again.
+    #[test]
+    fn a_registration_bootstraps_again_only_when_more_than_its_times_change() {
+        let dir = std::env::temp_dir().join(format!("exact-bootstraps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registration =
+            serde_json::json!({ "executable": "/b", "cwd": "/a", "env": {}, "sha256": "x" });
+        let mut registered = registration.clone();
+        registered["started"] = serde_json::json!(1);
+        registered["since"] = serde_json::json!(2);
+        std::fs::write(dir.join("rust-baker.json"), registered.to_string()).unwrap();
+        std::fs::write(dir.join("compat.json"), "{}").unwrap();
+        assert!(!super::bootstraps(&dir, &registration, &[]));
+        let mut rebuilt = registration.clone();
+        rebuilt["sha256"] = serde_json::json!("y");
+        assert!(super::bootstraps(&dir, &rebuilt, &[]));
+        std::fs::remove_file(dir.join("compat.json")).unwrap();
+        assert!(super::bootstraps(&dir, &registration, &[]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

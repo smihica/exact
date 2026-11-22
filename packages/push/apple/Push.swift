@@ -29,9 +29,9 @@ import UIKit
 private typealias App = UIApplication
 #elseif os(macOS)
 import AppKit
-import Security
 private typealias App = NSApplication
 #endif
+import Security
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
@@ -75,7 +75,7 @@ public final class PushModule: NSObject, ExactPackage {
                     }
                     register()
                     said = context.push.current["token"] as? String
-                    reply(["exact:answer": subscription(said)])
+                    reply(["exact:answer": said.map { subscription($0) as Any } ?? NSNull()])
                 }
             case "subscribePush": subscribe(reply)
             default: reply(["error": "NotSupportedError"])
@@ -94,9 +94,55 @@ public final class PushModule: NSObject, ExactPackage {
         }
     }
 
-    /// The value app code reads: the credential under the platform's key.
-    private func subscription(_ token: String?) -> Any {
-        token.map { ["apple": ["deviceToken": $0]] as Any } ?? NSNull()
+    /// The value app code reads: the credential under the platform's key,
+    /// with the bundle id APNs issued it to, a server's `apns-topic`, and the
+    /// installation it was issued to, which outlives the token.
+    private func subscription(_ token: String) -> [String: Any] {
+        Self.installationId = Self.installationId ?? Self.installation()
+        return ["apple": ["deviceToken": token, "appId": Bundle.main.bundleIdentifier ?? "", "installationId": Self.installationId ?? ""]]
+    }
+
+    /// The installation's ID, once read.
+    private static var installationId: String?
+
+    /// A random UUID for this installation, so a server can tell a rotated
+    /// token from another device. APNs replaces the token after a restore, a
+    /// reinstall and some system updates; the ID stays while its Keychain
+    /// item does. The item is this device's only
+    /// (`AfterFirstUnlockThisDeviceOnly`), as Expo's own client keeps its
+    /// installation ID (expo-notifications' `ServerRegistrationModule.swift`), so a backup restored to a second device gives that
+    /// device its own. Before the first unlock, or under a signature with no
+    /// data-protection Keychain, it is nil and nothing is written.
+    static func installation(
+        copy: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching,
+        add: (CFDictionary) -> OSStatus = { SecItemAdd($0, nil) }
+    ) -> String? {
+        let item: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: (Bundle.main.bundleIdentifier ?? "exact") + ".exact.push",
+            kSecAttrAccount: "installation",
+            kSecUseDataProtectionKeychain: true,
+        ]
+        var query = item
+        query[kSecReturnData] = true
+        query[kSecMatchLimit] = kSecMatchLimitOne
+        func read() -> (OSStatus, String?) {
+            var found: CFTypeRef?
+            let status = copy(query as CFDictionary, &found)
+            return (status, (found as? Data).flatMap { String(data: $0, encoding: .utf8) })
+        }
+        let (status, kept) = read()
+        if status == errSecSuccess { return kept }
+        guard status == errSecItemNotFound else { return nil }
+        let id = UUID().uuidString.lowercased()
+        var new = item
+        new[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        new[kSecValueData] = Data(id.utf8)
+        switch add(new as CFDictionary) {
+        case errSecSuccess: return id
+        case errSecDuplicateItem: return read().1
+        default: return nil
+        }
     }
 
     #if os(iOS) || os(macOS)
@@ -121,6 +167,14 @@ public final class PushModule: NSObject, ExactPackage {
         observers.append(NotificationCenter.default.addObserver(forName: App.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.state { _ in }
         })
+        #if os(iOS)
+        // A token read before the first unlock carried no installation ID:
+        // its readers read again once the Keychain can give one.
+        observers.append(NotificationCenter.default.addObserver(forName: App.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, Self.installationId == nil, said != nil else { return }
+            context.changed("push.pushSubscription")
+        })
+        #endif
     }
 
     /// Once a launch (Apple: register in every launch, never cache the token).
@@ -155,7 +209,7 @@ public final class PushModule: NSObject, ExactPackage {
         // The process holds the system's answer already (another session's, or an embedder's forwarded one).
         if let token = context.push.current["token"] as? String {
             Self.registered = true
-            return reply(["apple": ["deviceToken": token]])
+            return reply(subscription(token))
         }
         // Apple promises no answer within any time; a call that had none
         // in 60 s fails alone, and a later answer still reaches the source.
@@ -178,7 +232,7 @@ public final class PushModule: NSObject, ExactPackage {
         waiting = [:]
         for call in calls {
             call.bound.cancel()
-            if let token { call.reply(["apple": ["deviceToken": token]]) }
+            if let token { call.reply(subscription(token)) }
             else { call.reply(["error": "AbortError", "message": answer["error"] as? String ?? "registration failed"]) }
         }
         if token != said, saidState == "granted" {

@@ -250,6 +250,24 @@ final class ProgressIOSTests: XCTestCase {
         XCTAssertNil(p.controls.spinners[2], "removed with its node")
         XCTAssertNil(spinner.superview)
     }
+
+    func testBackgroundColorSetsProgressTrackTintWithoutPaintingOuterBox() throws {
+        let p = presenter(box(1) + bar(2, ["value": "0.5"]) + [["op": "children", "id": 1, "ids": [2]], ["op": "roots", "ids": [1]]])
+        let water = try XCTUnwrap(p.controls.bars[2])
+        let owner = try XCTUnwrap(p.views[2])
+        XCTAssertNil(water.trackTintColor, "unsaid background leaves UIKit's default track")
+        p.apply(wireBatch([["op": "style", "id": 2, "style": ["background_color": [255, 255, 255, 76]]]]))
+        let track = try XCTUnwrap(water.trackTintColor)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        track.resolvedColor(with: water.traitCollection).getRed(&r, green: &g, blue: &b, alpha: &a)
+        XCTAssertEqual(r, 1, accuracy: 0.01)
+        XCTAssertEqual(g, 1, accuracy: 0.01)
+        XCTAssertEqual(b, 1, accuracy: 0.01)
+        XCTAssertEqual(a, 76.0 / 255.0, accuracy: 0.01)
+        XCTAssertNil(owner.layer.backgroundColor, "track tint does not paint a full-height box behind the bar")
+        p.apply(wireBatch([["op": "style", "id": 2, "style": [:]]]))
+        XCTAssertNil(water.trackTintColor, "clearing background-color restores UIKit's default track")
+    }
 }
 
 private extension UIActivityIndicatorView {

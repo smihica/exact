@@ -7,25 +7,36 @@ fn sampled_raster_does_not_change_object_fit_natural_geometry() {
     // A 100x50 sampled bitmap is still a 4000x2000 natural image.
     let natural = (4000, 2000);
     let content = (10., 20., 200., 200.);
+    let position = exact_kernel::object::Position::default();
+    let env = exact_kernel::Env::default();
     assert_eq!(
-        object_fit(natural, ObjectFit::None, content),
+        object_fit(natural, ObjectFit::None, &position, content, &env),
         Some((-1890., -880., 4000., 2000.))
     );
     assert_eq!(
-        object_fit(natural, ObjectFit::ScaleDown, content),
+        object_fit(natural, ObjectFit::ScaleDown, &position, content, &env),
         Some((10., 70., 200., 100.))
     );
     assert_eq!(
-        object_fit(natural, ObjectFit::Contain, content),
+        object_fit(natural, ObjectFit::Contain, &position, content, &env),
         Some((10., 70., 200., 100.))
     );
     assert_eq!(
-        object_fit(natural, ObjectFit::Cover, content),
+        object_fit(natural, ObjectFit::Cover, &position, content, &env),
         Some((-90., 20., 400., 200.))
     );
-    assert_eq!(object_fit(natural, ObjectFit::Fill, content), Some(content));
     assert_eq!(
-        object_fit(natural, ObjectFit::ScaleDown, (0., 0., 8000., 8000.)),
+        object_fit(natural, ObjectFit::Fill, &position, content, &env),
+        Some(content)
+    );
+    assert_eq!(
+        object_fit(
+            natural,
+            ObjectFit::ScaleDown,
+            &position,
+            (0., 0., 8000., 8000.),
+            &env
+        ),
         Some((2000., 3000., 4000., 2000.))
     );
 }

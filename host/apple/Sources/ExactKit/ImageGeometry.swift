@@ -82,20 +82,22 @@ package enum RasterTiles {
 }
 
 package enum RasterGeometry {
-    package static func rect(natural: CGSize, content: CGRect, fit: String) -> CGRect {
-        guard natural.width > 0, natural.height > 0 else { return .zero }
-        if fit == "fill" { return content }
-        let x = content.width / natural.width, y = content.height / natural.height
-        let scale: CGFloat
-        switch fit {
-        case "contain": scale = min(x, y)
-        case "cover": scale = max(x, y)
-        case "scale-down": scale = min(1, min(x, y))
-        case "none": scale = 1
-        default: return content
-        }
-        let size = CGSize(width: natural.width * scale, height: natural.height * scale)
-        return CGRect(x: content.midX - size.width / 2, y: content.midY - size.height / 2, width: size.width, height: size.height)
+    package static func rect(natural: CGSize, content: CGRect, fit: String, position: [BatchValue]? = nil) -> CGRect {
+        IconPath.placed(natural: natural, fit: fit, position: position, in: content)
+    }
+
+    static func unitRect(_ rect: CGRect, in box: CGRect) -> CGRect {
+        CGRect(x: (rect.minX - box.minX) / box.width, y: (rect.minY - box.minY) / box.height,
+               width: rect.width / box.width, height: rect.height / box.height)
+    }
+
+    /// The visible rect and the sample window in the layer's image coordinates.
+    package static func crop(_ rect: CGRect, to clip: CGRect, flipped: Bool) -> (shown: CGRect, unit: CGRect)? {
+        let shown = rect.intersection(clip)
+        guard !shown.isEmpty, !shown.isNull else { return nil }
+        var unit = unitRect(shown, in: rect)
+        if !flipped { unit.origin.y = 1 - unit.maxY }
+        return (shown, unit)
     }
 
     /// The bitmap into `rect`, or with a `-exact-tint-color` as a template: its

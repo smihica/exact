@@ -4,6 +4,8 @@
 // by the rules `host/web/src/document.rs` writes (escaping, void elements,
 // boolean attributes). Region anchors (comments) are not written: adoption
 // inserts its own.
+import { symbolPlaceholder, symbolSize } from '../web/symbol-geometry.js';
+
 const VOID = new Set(['img', 'input', 'br', 'hr', 'meta', 'link', 'source', 'area', 'col', 'embed', 'wbr']);
 // Text, or a quoted attribute value, as document.rs `escape` writes it: an attribute value's `<` and `>` are references
 // too, as in HTML's serializer. A NUL has no spelling the parser keeps, so a render with one is refused.
@@ -160,8 +162,12 @@ class Element extends Node {
     for (const cls of (this.getAttribute('class') ?? '').split(/\s+/)) if (this.fonts?.has(cls)) font = fontPx(this.fonts.get(cls), inheritedFont);
     const ownFont = this.style.getPropertyValue('font-size');
     if (ownFont !== '') font = fontPx(ownFont, inheritedFont);
-    // (An icon's file, `data-symbol-file`, is shown as written: LLP 1121 D10.)
-    if (this.localName === 'img' && this.hasAttribute('data-symbol-source') && !this.hasAttribute('data-symbol-file')) this.setAttribute('src', `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='${font}' height='${font}'/%3E`);
+    const source = this.getAttribute('data-symbol-source');
+    // An icon's file keeps its own source (LLP 1121 D10).
+    if (this.localName === 'img' && source !== null && !this.hasAttribute('data-symbol-file')) {
+      const box = this.getAttribute('data-symbol-viewbox') || '0 0 24 24';
+      this.setAttribute('src', symbolPlaceholder(...symbolSize(box, font, source)));
+    }
     // A head is the page's <head>, never an element in the root (as document.rs).
     if (this.localName === 'template') return '';
     let out = `<${this.localName}`;

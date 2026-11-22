@@ -112,6 +112,14 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
   the `dialog` itself to fill the sheet between its side insets. Verified on an
   iPhone 17 Pro simulator, iOS 27.0 (#845).
 
+- **An `alertdialog` button with `press=action` and `commandfor`/`command="close"` stays open when `action` disables it.**
+  Symptom: tapping Save clears the prompt input (`draft = ""`), `disabled=(draft == "")` turns
+  true, and the alert never closes. Cause: HTML runs the button's click handler before its
+  invoker command and skips `command="close"` when the button is now disabled, and Exact's
+  native hosts follow HTML (LLP 1115). Fix: call `close("id")` inside the action (without
+  `commandfor`/`command="close"`), or clear `draft` in the mutation's `then` or the dialog's
+  `close` handler. (Feedback `b39da82a`, web and native hosts, 2026-11-19.)
+
 - **A root with `min-height="100%"` and `overflow-y="auto"` does not scroll itself.**
   `min-height` lets the box grow with its in-flow content (CSS), so it has nothing to
   scroll and the document scrolls instead: on the web a screenshot shows only the first
@@ -194,7 +202,11 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
   (`lower-width-padding`) when the width and the padding are literal; a computed width or
   padding, and `height="100%"` with padding, it does not. Fix: `box-sizing="border-box"`
   on the box, or drop `width`: a box in a block or a `column` already fills the width.
-  Look at a screenshot on each host. (Fresh-agent README trial, 2026-10-04.)
+  On iOS the host pads a route's root clear of the iPhone Duo's side strip and of a
+  split's list beside its detail (LLP 1123 D3, LLP 1127 D9), so a route's root with
+  `width="100%"` runs past the screen by that much: place it with `position="absolute"
+  inset=0`, as the patterns' routes are. Look at a screenshot on each host.
+  (Fresh-agent README trial, 2026-10-04.)
 
 - **A list of buttons is ragged: each is only as wide as its text.** A `button`
   directly in a `scroll` or another block container shrinks to fit, so a row's
@@ -438,11 +450,13 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
   round 30's grader named it. Fix: rows under a screen's own content are a
   `listStyle="plain"` list on the page's white, as the Clock's laps are; keep
   inset-grouped for a list that is the whole screen.
-- **A native sidebar separator needs another touch to redraw.** UI Gallery reloaded
-  its static table during row selection and selected the same row again. Keep the
-  cells and update selection only when it changes; reload when the row data changes.
-  The Gallery's native tests check row reuse during selection and compare the sidebar
-  before and after an extra background touch (`apps/ui-gallery/tests/GalleryUITests.swift`).
+- **A native sidebar separator needs another touch to redraw.** Cause: a native
+  module's own sidebar table reloads its rows during a row's selection and selects
+  the same row again. Keep the cells and update selection only when it changes;
+  reload when the row data changes. A list whose rows push needs no table of its own:
+  beside its detail a grouped list is UIKit's sidebar list (LLP 1127), which UI
+  Gallery's tests compare before and after an extra touch
+  (`apps/ui-gallery/tests/GalleryUITests.swift`).
 - **A sideways swipe on a row opens it.** Cause: the row has no swipe actions. A
   `UITableView` or SwiftUI `List` row with none is selected by a horizontal drag of any
   length or speed, and one with trailing actions only is selected by a rightward drag;
@@ -479,11 +493,18 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
   record the simulator (`xcrun simctl io booted recordVideo`) and read its frames.
 
 - **A cold launch flashes the wrong colour, and no screenshot shows it.** The launch
-  screen is `host.ios.launchImage` centred on `background_color` (`color_scheme_dark`'s
-  `background_color` in dark mode); unset, the platform's background (the grouped grey
-  under a first route that scrolls a grouped list). Android's launch window takes the same
-  two colours, with the launcher icon on them from Android 12 unless
-  `host.android.launchImage` names a picture or `false`. It is gone before a screenshot
+  screen is `host.ios.launchImage` centred on the launch colour, which a top-level
+  `background_color` names in every scheme, so a lone `"#ffffff"` launches white in dark
+  mode too; `color_scheme_light` or `color_scheme_dark` names one scheme's alone. Unnamed,
+  it is on iOS the app's own background where the build can read it, every route agrees (a
+  colour or a theme's colour on each route, else the root) and nothing may paint over it to
+  the screen's edges, else the platform's (the grouped grey where every route scrolls a
+  grouped list or writes `-exact-grouped-background`), and on Android and the web their own
+  page, as a native app's: name none unless the launch must differ, as it may on Android and
+  the web for an app with a background of its own, or on iOS where a launch recording shows
+  another colour.
+  Android's launch window takes the same colours, with the launcher icon on them from
+  Android 12 unless `host.android.launchImage` names a picture or `false`. It is gone before a screenshot
   can be taken: record one (`xcrun simctl io <udid> recordVideo launch.mp4`, then `simctl
   launch`; `adb shell screenrecord` on Android) and read its frames (the euxy port's white
   launch, 2026-10-21).
@@ -1611,6 +1632,12 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   `rotate="-45deg x"` and a sampled axis keyframe can look unrotated in the
   default capture. Use `screenshot out.png window` to read the composited
   window; `layout` also reports the transformed bounds. (#609, 2026-11-14.)
+
+- **Use `screenshot out.png window` to check how an `iframe` appears on macOS.**
+  The default viewport capture paints a fresh guest snapshot into the frame's
+  box. It can show page content while the window is still blank, or miss a
+  hatch's magnification or added layers. The window capture shows what the
+  window server composited. (#1282.)
 
 - **A macOS `screenshot` shows no focus ring on a native field or button.** AppKit
   draws its focus ring only in the key window of the active app, and the driver's

@@ -70,6 +70,9 @@ export const streamPath = ({ channel, compatibilityId }) => `.exact/${channel}/$
 /** The blob's path on the origin: content-addressed, immutable. */
 export const blobPath = (digest) => `.exact/blobs/${digest}`;
 
+// The readback limit also applies to payload files on native update hosts.
+export const MAX_FILE_BYTES = 64 * 1024 * 1024;
+
 // The web release has one complete public inventory and one guarded pointer.
 // It uses the same OS lock and conditional write as native stream heads.
 export const webRootStream = { channel: 'root', compatibilityId: 'web' };
@@ -302,7 +305,12 @@ export class HttpsOrigin {
    * which lists every file of the root, is not a head. */
   async get(rel) {
     const url = `${this.url}/${safeRelative(rel)}`;
-    const { response, bytes } = await publisherFetch(url, { headers: { 'cache-control': 'no-cache' } }, /(?:^|\/)exact\.json$/i.test(rel) && rel !== webRootPath ? 64 << 10 : 64 << 20);
+    return this.getURL(url, /(?:^|\/)exact\.json$/i.test(rel) && rel !== webRootPath ? 64 << 10 : MAX_FILE_BYTES);
+  }
+
+  /** Read a resolved file card, including its query. */
+  async getURL(url, cap = MAX_FILE_BYTES) {
+    const { response, bytes } = await publisherFetch(url, { headers: { 'cache-control': 'no-cache' } }, cap);
     if (response.status === 404) return null;
     if (!response.ok) throw new OriginUnavailable(`${url}: HTTP ${response.status}`);
     return bytes;

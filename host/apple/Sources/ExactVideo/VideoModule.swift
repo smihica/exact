@@ -9,9 +9,12 @@ import UIKit
 #endif
 private typealias MediaCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
 private typealias MediaConfiguring = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
+// The arm asks for placement when its video or poster dimensions arrive.
+private typealias MediaPlacement = @convention(c) (UnsafeMutableRawPointer?, Double, Double, Double, Double, UnsafeMutablePointer<Double>?) -> Void
+
 private final class VideoModule {
     typealias Create = @convention(c) (
-        UnsafeMutableRawPointer?, MediaCallback?, MediaConfiguring?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+        UnsafeMutableRawPointer?, MediaCallback?, MediaConfiguring?, MediaPlacement?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?
     ) -> UnsafeMutableRawPointer?
     typealias View = @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
     typealias Update = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
@@ -185,6 +188,13 @@ final class VideoView: VideoPlaying, VisibilityRefreshing {
             let video = Unmanaged<VideoView>.fromOpaque(context).takeUnretainedValue()
             guard let owner = video.owner else { return }
             owner.presenter?.elements.configuring(owner, Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue())
+        }, { context, nw, nh, width, height, output in
+            guard let context, let output else { return }
+            let video = Unmanaged<VideoView>.fromOpaque(context).takeUnretainedValue()
+            guard let owner = video.owner else { return }
+            let rect = IconPath.placed(natural: CGSize(width: nw, height: nh), fit: owner.style["object_fit"]?.string ?? "fill",
+                                       position: owner.style["object_position"]?.array, in: CGRect(x: 0, y: 0, width: width, height: height))
+            for (i, value) in [rect.minX, rect.minY, rect.width, rect.height].enumerated() { output[i] = Double(value) }
         }, &player)
         if let player { platform = Unmanaged<AnyObject>.fromOpaque(player).takeUnretainedValue() }
         #if os(iOS) || os(tvOS)
@@ -234,6 +244,11 @@ final class VideoView: VideoPlaying, VisibilityRefreshing {
         let radii = BorderPaint.contentRadii(owner.cornerSizes(in: owner.bounds), outer: owner.bounds, inner: content)
         BorderPaint.clip(layer, in: CGRect(origin: .zero, size: content.size), radii: radii)
     }
+    func reloadAssets(_ properties: Set<String>) {
+        for key in properties { resolved[key] = nil }
+        update()
+    }
+
     func update() {
         #if os(iOS) || os(tvOS)
         let started = CACurrentMediaTime()
@@ -244,6 +259,7 @@ final class VideoView: VideoPlaying, VisibilityRefreshing {
         guard let owner, let module = VideoModule.shared, let handle,
               owner.presenter?.elements.waits(owner) != true else { return }
         var props = owner.props
+        if let label = owner.authoredLabel { props["accessibilityLabel"] = label } else { props.removeValue(forKey: "accessibilityLabel") }
         if props["src"] != autoplaySource {
             autoplaySource = props["src"]
             autoplay.load(autoplay: props["autoplay"] == "true")
@@ -269,7 +285,12 @@ final class VideoView: VideoPlaying, VisibilityRefreshing {
             visibilityBlocked = false
             owner.presenter?.videoVisibility?.remove(self)
         }
-        props["objectFit"] = owner.style["object_fit"]?.string ?? "contain"
+        props["objectFit"] = owner.style["object_fit"]?.string ?? "fill"
+        props["objectPositionAuthored"] = owner.style["object_position"] == nil ? "false" : "true"
+        if let position = owner.style["object_position"]?.array,
+           let data = try? JSONSerialization.data(withJSONObject: position.map(\.any), options: .sortedKeys) {
+            props["objectPosition"] = String(decoding: data, as: UTF8.self)
+        }
         // @ref LLP 1100 D11
         props["dynamicRangeLimit"] = owner.style["dynamic_range_limit"]?.string ?? "no-limit"
         for name in ["src", "poster", "mediaArtwork"] {

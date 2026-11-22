@@ -100,6 +100,161 @@ they ended in total (`overMs`). That total includes time lost before
 `prepare` began. `perf_reset`, a restore and a restart clear both counters.
 The budget report is `null` when the hook leaves `ALLOWANCE` at zero.
 
+### Jobs
+
+Use `exact_game_render::Jobs<J>` for bounded presentation work (LLP 1182.000 D9).
+A `Job` is a function of the data moved into it by `submit`. Keep GPU handles
+out of jobs and install results in `Hooks::prepare`. `take` requires the
+`HookGpu` from that `prepare` and borrows it and the `FrameView` for the
+lifetime of the iterator. Drop the take before using the queue again. On the
+worker lane a take can post work when it drops.
+
+- Declare `Hooks::ALLOWANCE > 0`. The allowance belongs to the hook for that
+  `prepare`. Takes from one `Jobs` share it. A hook with two queues divides
+  the allowance between them itself.
+- `take_per_frame` and the deadline bound delivered results. The pool and
+  inline lanes can deliver the first current result of a late frame.
+  Results invalidated since they completed are dropped without using a unit.
+  After the first delivery, the deadline is checked between results and
+  stale drops (LLP 1182.000 D6). The worker lane shares its late unit with
+  job encoding and hook work.
+- Each step of `take` yields the ready `Done { key, generation, result }`
+  with the highest priority, breaking ties by submission order.
+- `submit(key, generation, priority, job)` supersedes earlier work for the
+  key. `Full(job)` returns the job for retry. The byte limits are thresholds.
+  An empty input queue admits one oversized job. A result's size is known
+  when it completes, so running jobs can finish above the completed threshold.
+  `Job::bytes` measures queued input and `Job::output_bytes` measures completed
+  output. A value of zero for `running` or `take_per_frame` means one.
+- `cancel(key)` invalidates that key. `clear()` invalidates every key and
+  drops waiting results. A running job can poll `Cancel::is_set()` to stop
+  early. Its output is discarded when it returns after `cancel` or `clear`.
+  Clear and advance the hook's generation when a restore or restart
+  invalidates job inputs. The default device-loss reset drops the queue. A
+  native pool cancels and joins its workers, so jobs should poll
+  `Cancel::is_set()` or finish quickly. A remote queue retires immediately.
+  Its transport owns the workers.
+- A job returns `JobError` by value. A native worker that unwinds reports
+  `job panicked` for that job. A hook waiting for work should clear
+  `PENDING` or expose the failure through `error()`. `pending()` counts
+  queued, running and completed work still held by the lane.
+
+Each `Jobs` owns its pool. A hook with two queues has two pools. A live
+`take` starts the native pool if work is queued. With an empty queue, the first
+later `submit` starts the pool. Take before submitting in `prepare` so the queue
+knows the current clock mode. Submit only on an advancing frame. A pool uses
+up to four threads at the platform's default priority, leaving two logical
+CPUs when possible. If no worker can start, the queue runs inline.
+
+WebAssembly runs jobs inline without a transport or until a take sees a ready
+worker. The agent's clock runs jobs inline as the iterator advances.
+A held frame takes no result and runs no job inline. A pool that was working
+when the agent took the clock keeps working until the first advance. That
+advance's `take` waits for running jobs and delivers results in the same
+order with the queued work regardless of the pool's progress. The reported
+lane stays the one selected by the last advancing frame. A hook
+waiting on jobs under the agent's clock reports `PENDING | STARVED`. Advance
+the clock until the hook is ready.
+
+A hook that is `PENDING` for jobs keeps its canvas drawing and ticking where a
+canvas with nothing pending would rest, as any pending hook does. In a game
+that rests, input sent after that lands on a different tick.
+
+Return `Some(jobs.report())` from `Hooks::jobs` to populate
+`state.world.renderHooks.jobs`. The report holds `queued`, `queuedBytes`,
+`running`, `done`, `stale`, `failed` and `lane` (`"pool"`, `"inline"` or
+`"worker"`). On the worker lane, `running` counts jobs out that the hook can
+still receive. A worker can still occupy a posting slot after those jobs are
+cancelled. `done` counts successful results taken, `stale` counts results discarded
+after replacement, cancellation or clear, and `failed` counts error results
+taken. On the worker lane, `stale` counts only answers the queue saw in a
+snapshot. An answer discarded by the transport before that snapshot is
+excluded. `perf_reset` clears those three counters. Use `+` to report several
+queues from one hook. Hooks without a report return `null`.
+
+#### Worker transport
+
+Set `game.render.workers: true` for browser workers (LLP 1182.000 D9).
+Implement `WireJob` with a unique `NAME`, register
+`RemoteJob::of::<YourJob>()` in `Hooks::REMOTE`, and build the queue with
+`Jobs::remote(limits)`. Entries match by type. A value can decline the wire
+with `wire() == false` at submission. Debug pools and inline lanes round-trip
+eligible jobs and outputs, including after the worker lane ends.
+
+The generated adapter owns buffer access and installs its transport on the
+owner thread before creating hooks. The ES module loader imports `gpu-jobs.js` on the first
+eligible live take, for that instance. The web lane is inline for unregistered
+types, versioned dev loads, unavailable workers, and the agent's clock. Each
+queue runs inline until its first take sees a ready worker. If an established
+queue loses its only ready worker, wire jobs wait up to five seconds for the
+replacement. Jobs that decline the wire still run on the page. If the
+replacement fails to start, the lane ends and the wire jobs run on the page.
+Unload, a committed swap and quarantine close the transport. A rolled-back
+swap leaves the original instance's lane running. A page restored from the
+back/forward cache keeps its workers. A lost device clears the hook's queue
+while the transport stays available.
+
+Workers import the same build's glue URL and instantiate the page's compiled
+module without a device. Ship build-specific URLs to keep glue and wasm paired.
+A job must depend only on its inputs. Workers share no memory, keep their own
+statics, and always see `Cancel::is_set()` as false. `run_remote_job` tags
+result bytes or a `JobError`. A trap inside `Job::run` fails that job. Codec
+or glue traps in a worker, unknown names, failed input decoding and invalid
+output are transport failures. A page decoder that returns `Err` triggers
+recovery. A panic in `decode_output` traps the page's module. A job can also
+run inline, so return errors by value.
+
+Rust retains jobs, priorities, generations and limits. A live advancing take
+snapshots readiness and events once. It yields arrivals and declining jobs
+in priority and submission order, copying each buffer only at delivery. A
+missing buffer runs the retained job inline without recording a loss.
+Established queues can drain during replacement startup. At exit, posting
+counts announced bytes still held in 64 bits and stops at the completed
+threshold while an answer is pending. On the worker lane, one late unit per
+`prepare` covers delivery, encoding even if the post is refused, or the hook's
+`mark_late_unit_spent()`. It stays spent across takes even if the lane ends.
+A queue that begins and stays inline or in the pool can deliver its first
+result late. Held takes do nothing. The first advancing agent take forgets
+attempts and requeues out and arrived jobs in original order, including traps.
+Submission, cancellation and clear can discard buffers or withdraw asks.
+
+Protocol version 1 clones the compiled module and transfers input and output
+buffers. Send each attempt as two 32-bit words. Each worker holds one batch
+of 1–16 jobs. A refused post accepts none. At take exit, queues ask while they
+have wire work, room under both limits, and time or a late unit. An ask lasts
+250 ms unless withdrawn for a limit, deadline or refusal. Posting renews the
+queue's own ask. The idle worker goes
+to the least recently served active queue, with never-served queues first.
+Successful posts update that order.
+
+The script stores replies without calling the module. A start must match the
+version and names within five seconds. The first start includes the script
+import. Report `Starting` while none are ready
+and one can still start, and `Ready` with a positive count including busy
+workers. Each wanted attempt ends in an arrival, loss or end. Worker errors,
+throwing posts, rejected answers and ten seconds without a batch answer count
+as losses. Rejection stops posts immediately, reports unanswered attempts at
+the next live snapshot and keeps other received answers. A trap replaces its
+worker without counting a loss and retries the unanswered batch. Ignore replies
+from replaced workers or forgotten attempts.
+
+Only accepted answers reset the loss count, including `JobError` and
+`Trapped`. Three consecutive losses, a failed replacement, or no worker able
+to start ends the lane immediately. The transport terminates all workers,
+drops every buffer and returns `Gone` on subsequent reads. Each queue's next
+snapshot keeps traps and losses in order and omits byte arrivals. The queue
+requeues its remaining work and delivers known traps on live takes.
+
+A remote queue reports copy, decode, encode and post timings and bytes in
+`renderHooks.jobs.wire`, reset by `perf_reset`. Its `idleWithWork` counts
+live, advancing prepares whose first take finds a wire job queued and a ready
+worker with no batch, before posting. The transport reports instance-wide ready
+workers, milliseconds from the first start request to the first worker whose
+names matched, largest worker linear memory, time in message and error
+handlers, and peak buffered answer bytes.
+
+### Render stages
+
 Stages are compute before shadows, opaque, `background` after sky for blended
 geometry that draws without sampling the scene, `surface` for geometry that
 samples the scene copy, and optional HDR post before bloom/tone. Geometry uses

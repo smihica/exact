@@ -44,6 +44,26 @@ const NIN_SELECT: u16 = 0x400;
 const NIN_KEYSELECT: u16 = 0x401;
 const WM_CONTEXTMENU: u16 = 0x7B;
 
+/// Handle a pending Exit. The popup disappears before the app asks to close.
+pub(super) fn exit_status_menu<D: exact_runner::DataSource>(
+    presenter: &mut exact_painted::Presenter<D>,
+    elapsed_ms: f64,
+    hide: impl FnOnce(),
+) -> Option<bool> {
+    if !presenter.take_status_exit() {
+        return None;
+    }
+    hide();
+    presenter.advance(elapsed_ms);
+    let now = presenter.host().now();
+    let quit = presenter.before_unload(now);
+    if quit {
+        presenter.end_hatches();
+        presenter.end_packages();
+    }
+    Some(quit)
+}
+
 /// What a notification icon's callback says.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(not(windows), allow(dead_code))]

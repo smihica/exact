@@ -100,10 +100,14 @@ fn material_surfaces_refresh_when_bold_text_changes_in_both_directions() {
                 shot.clone_rect(tiny_skia::IntRect::from_xywh(12, 20, 24, 24).unwrap())
                     .unwrap()
             };
+            // Material's filled `edit` is a vector, as Compose's icon is, and
+            // Bold Text weights only text.
+            let symbol = crop(&shots[0]);
             assert!(
-                crop(&shots[0]).data() != crop(&shots[1]).data(),
-                "the symbol"
+                symbol.pixels().iter().any(|p| *p != symbol.pixels()[0]),
+                "the symbol is drawn"
             );
+            assert!(symbol.data() == crop(&shots[1]).data(), "the symbol");
         }
     }
 }
@@ -343,8 +347,12 @@ fn short_rtl_alert_texts_have_accessibility_bounds_at_the_right() {
     tap(&mut p, "ask").unwrap();
     let width = p.surface().unwrap().size.0;
     let (nodes, _, _) = p.access_tree();
-    for name in ["عنوان", "نعم\nلا"] {
-        let text = nodes.iter().find(|n| n.name == name).unwrap();
+    use crate::presenter::access::role;
+    for (name, role) in [("عنوان", role::HEADING), ("نعم\nلا", role::TEXT)] {
+        let text = nodes
+            .iter()
+            .find(|n| n.role == role && n.name == name)
+            .unwrap();
         assert!(text.rect[0] > width / 2., "{name}: {:?}", text.rect);
         assert!(
             (text.rect[0] + text.rect[2] - (width - 24.)).abs() < 1.,

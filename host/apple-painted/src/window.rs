@@ -28,7 +28,7 @@ use winit::{
 pub enum Event {
     Tick,
     Wake,
-    Request(String, SyncSender<String>),
+    Request(String, SyncSender<serde_json::Value>),
     Closed,
 }
 
@@ -623,7 +623,7 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<Event> for App<D> {
                         self.first_frame = None;
                     }
                     if request["op"] == "state" && request["counters"] == true {
-                        let _ = reply.send(exact_painted::ink::counter_state().to_string());
+                        let _ = reply.send(exact_painted::ink::counter_state());
                         return;
                     }
                     if matches!(
@@ -636,17 +636,17 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<Event> for App<D> {
                         }
                     }
                     if request["platform"] == true && request.get("wheel").is_some() {
-                        let _ = reply.send(serde_json::json!({"error":"platform wheel placement is not available in the benchmark agent; use ordinary wheel operations or the G1 process-targeted driver"}).to_string());
+                        let _ = reply.send(serde_json::json!({"error":"platform wheel placement is not available in the benchmark agent; use ordinary wheel operations or the G1 process-targeted driver"}));
                         return;
                     }
                     if self.live && request["op"] == "tap" && request.get("wheel").is_some() {
                         let answer = live_wheel(p, &request, &mut self.scrolling)
                             .unwrap_or_else(|e| serde_json::json!({"error":e}));
-                        let _ = reply.send(answer.to_string());
+                        let _ = reply.send(answer);
                         return;
                     }
                     if request["op"] == "quit" {
-                        let _ = reply.send("{\"quit\":true}".into());
+                        let _ = reply.send(serde_json::json!({"quit": true}));
                         events.exit();
                         return;
                     }
@@ -656,7 +656,7 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<Event> for App<D> {
                     if request["op"] == "state" {
                         answer["carrier"] = serde_json::json!({"name":"exact-apple-painted","benchmark":true,"shipping":false,"scale":self.scale,"frames":self.frames,"paintMs":self.paint_ms,"wheelPhase":self.wheel_phases[0],"momentumPhase":self.wheel_phases[1],"ime":false,"accessibility":false});
                     }
-                    let _ = reply.send(answer.to_string());
+                    let _ = reply.send(answer);
                 }
             }
         }

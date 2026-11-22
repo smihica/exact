@@ -124,6 +124,48 @@ fn the_next_launch_reads_back_what_the_last_kept() {
 }
 
 #[test]
+fn window_state_is_restored_only_from_its_window_and_survives_a_peer_refresh() {
+    let source = SRC.replace("18 persist", "18 persist window");
+    let new_window = |snapshot| {
+        Runner::boot_stored(
+            contract::compile(&source).unwrap().redecode().unwrap(),
+            (),
+            Kernel::with_monospace(),
+            snapshot,
+            Default::default(),
+            "/",
+        )
+        .unwrap()
+    };
+    let shared = pair("tipPercent", "40");
+    let window = pair("#window.tipPercent", "25");
+    let mut first = new_window(vec![shared.clone(), window.clone()]);
+    let mut second = new_window(vec![shared]);
+    assert_eq!(first.slot("tipPercent"), Some(&Value::Number(25.0)));
+    assert_eq!(second.slot("tipPercent"), Some(&Value::Number(18.0)));
+
+    second.act("tip", vec![Value::Number(30.0)]).unwrap();
+    second.act("convert", vec![]).unwrap();
+    first.take_store_writes();
+    first.adopt_store(second.store().snapshot()).unwrap();
+    assert_eq!(first.slot("units"), Some(&Value::str("imperial")));
+    assert_eq!(first.slot("tipPercent"), Some(&Value::Number(25.0)));
+    assert!(first.store().snapshot().contains(&window));
+    assert!(first.take_store_writes().is_empty());
+    first.adopt_store(Vec::new()).unwrap();
+    assert_eq!(first.slot("units"), Some(&Value::str("metric")));
+    assert_eq!(first.persisted("tipPercent"), Some(Value::Number(25.0)));
+    assert_eq!(
+        kept(first.take_store_writes()),
+        [
+            pair("units", r#""metric""#),
+            pair("seen", "null"),
+            pair("recent", "[1,2]")
+        ]
+    );
+}
+
+#[test]
 fn a_stored_value_of_another_shape_keeps_the_initial_value_and_says_so() {
     let mut r = boot(vec![
         ("exact.state.tipPercent", "\"eighteen\""),
@@ -336,4 +378,33 @@ component App
         );
     }
     assert!(r.take_store_writes().is_empty());
+}
+
+#[test]
+fn stored_launch_lines_override_by_name_and_keep_json_text() {
+    let src = r#"stored units "F"
+stored retired [-0, null, false]
+test "upgrade"
+  stored units "°C"
+  expect state tipPercent == 18
+"#;
+    let tests = contract::tests(src).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&contract::tests_json(&tests)).unwrap();
+    let steps = json[0]["steps"].as_array().unwrap();
+    let stored: std::collections::BTreeMap<_, _> = steps
+        .iter()
+        .filter(|s| s["op"] == "stored")
+        .map(|s| (s["name"].as_str().unwrap(), s["json"].as_str().unwrap()))
+        .collect();
+    assert_eq!(steps.len(), 3);
+    assert_eq!(stored["units"], r#""°C""#);
+    assert_eq!(stored["retired"], "[-0,null,false]");
+    for src in [
+        "stored a 1\nstored a 2\n",
+        "test \"late\"\n  tap \"next\"\n  stored a 1\n",
+        "stored exact.secret.token 1\n",
+        "stored a missing\n",
+    ] {
+        assert!(contract::tests(src).is_err(), "{src}");
+    }
 }

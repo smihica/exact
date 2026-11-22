@@ -38,7 +38,8 @@ final class PointerRecognizer: UIGestureRecognizer {
     /// A sheet mount's observer for the presented route's logical
     /// ancestors: its node is the listener each touch resolves to.
     weak var relay: MountRelay?
-    weak var selection: SelectionDocument?
+    /// The shared selection surface this recognizer is on.
+    weak var selection: (any SharedSelectionSurface)?
     private var touch: UITouch?
     /// The held touch's id, DOM's `pointerId`: the mouse is 1, so a touch
     /// counts on from 2, a new one for each contact.
@@ -92,7 +93,7 @@ final class PointerRecognizer: UIGestureRecognizer {
             source.flatMap { LayoutHits.touched($0, at: touch.location(in: nil)) }
         }
         if touch == nil, let selection, let first = touches.first {
-            node = selection.paragraph(at: first.location(in: selection.surface)).flatMap { paragraph in
+            node = selection.paragraph(under: first).flatMap { paragraph in
                 guard let owner = selection.owner else { return nil }
                 // The owner and its ancestors already observe the physical surface.
                 return sequence(first: paragraph as UIView, next: { paragraph.presenter?.pointerParent(of: $0) ?? $0.superview })
@@ -140,8 +141,8 @@ final class PointerRecognizer: UIGestureRecognizer {
         } else if !lifetimes.allSatisfy({ $0() }) { presenter?.cancelledPressTouches.add(first) }
     }
     private static func source(_ touch: UITouch) -> UIView? {
-        guard let surface = touch.view as? SelectionSurface else { return touch.view }
-        return surface.input?.document?.paragraph(at: touch.location(in: surface)) ?? surface
+        guard let surface = touch.view as? any SharedSelectionSurface else { return touch.view }
+        return surface.paragraph(under: touch) ?? surface
     }
     /// One bubbling dispatch to `nodes`, innermost first, each still the
     /// tree's when its turn comes, until a handler calls `stopPropagation()`.
@@ -193,7 +194,8 @@ final class PointerRecognizer: UIGestureRecognizer {
         var view = touched
         while let v = view, v !== node {
             if let n = v as? NodeView, n.wantsPointer, !n.disabled { return true }
-            view = v.superview
+            // A node lifted over the tab container is nearer through its parent (LLP 1083.000 D4)
+            view = node?.presenter?.navigation.lifted?.parent(of: v) ?? v.superview
         }
         return false
     }
@@ -293,11 +295,11 @@ import UIKit
 
 /// The responder hop taken on down, not a gesture recognizer. Weak view and
 /// touch references leave UIKit's original hit and contact lifetime intact.
-final class PressContact {
+package final class PressContact {
     weak var touch: UITouch?
     package let incarnation: UInt64
     weak var responder: UIResponder?
-    weak var responderContact: PressContact?
+    package weak var responderContact: PressContact?
     var responderIncarnation: UInt64?
     var responderUsesCanvas = false
     /// Whether this contact’s down was taken here rather than forwarded.
@@ -336,7 +338,7 @@ final class PressContact {
         return downstream.routeActive
     }
     var routesToCanvas: Bool { responderUsesCanvas || responderContact?.routesToCanvas == true }
-    var routesBubbledPress: Bool { bubbled || responderContact?.routesBubbledPress == true }
+    package var routesBubbledPress: Bool { bubbled || responderContact?.routesBubbledPress == true }
 }
 
 extension NodeView {
@@ -385,7 +387,7 @@ extension NodeView {
     /// Retirement, reparenting and disable cancel the old chain while its
     /// identities are still available. A late terminal callback cannot clear
     /// a new contact or a new incarnation's feedback.
-    func cancelPressContact(reparenting: Bool = false) {
+    package func cancelPressContact(reparenting: Bool = false) {
         let hit = promotedLayoutHit
         promotedLayoutHit = nil
         hit?.cancel()
@@ -707,12 +709,14 @@ extension NodeView {
                 if node === target { break }
             }
             // Focus stays in the content the touch hit. In particular, a
-            // press bubbling out of a dialog cannot blur the page's field.
-            if bubbled, presenter.listenerParent(of: view) !== view.superview {
+            // press bubbling out of a dialog cannot blur the page's field. A
+            // node lifted over the tab container stays in its parent's
+            // content (LLP 1083.000 D4).
+            if bubbled, presenter.listenerParent(of: view) !== presenter.layoutParent(of: view) {
                 view.endEditing(true)
                 return handoff
             }
-            at = view.superview
+            at = presenter.layoutParent(of: view)
         }
         guard presenter.hasKeyboardEditor else { return handoff }
         // A button keeps the keyboard and its field, as a `UIButton` leaves
@@ -755,7 +759,7 @@ extension NodeView {
     /// action prevented (`Presenter.preventedTouches`): the view it went down
     /// on, and those it is in, until a turn after its lift (LLP 1005 §3).
     /// An action's own `focus()` (`Presenter.authoredFocus`) still reaches it.
-    func keepsFocus(from view: UIView) -> Bool {
+    package func keepsFocus(from view: UIView) -> Bool {
         guard presenter?.authoredFocus != true else { return false }
         return presenter?.preventedTouches.allObjects.contains { touch in touch.view.map { $0 === view || $0.isDescendant(of: view) } ?? false } ?? false
     }

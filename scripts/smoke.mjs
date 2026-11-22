@@ -6,7 +6,7 @@
 // -p <app>-linux. The web builds here. --app-only skips bare-plan host fixtures and their
 // all-capabilities web build (LLP 1047 D7), keeping the app drive and its Contract tests.
 import { spawnSync } from 'node:child_process';
-import { createHash, randomUUID, verify } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -17,7 +17,8 @@ import { HOST_DEV, authoredTests, resolveApp, withAppFixture } from './app.mjs';
 import { agree, explainNode, hostSections, httpFrameSmoke, formControlsSmoke, poolingDrive, messageKeys, rebooted, replacementGenerations, isDeckURL, webSmokeBuild, webSmokeSweep } from './smoke-inspect.mjs';
 import { DirectoryOrigin, parseWebRoot, webReleasePath, webRootPath } from './origin.mjs';
 import { jsTargetBuild, readStaticFile, serveStatic } from '../host/web/serve.mjs';
-import { canonicalBytes, publicKeyFromRaw, readAssetIndex, webRelease } from './deploy.mjs';
+import { canonicalBytes, readAssetIndex, webRelease } from './deploy.mjs';
+import { admitHead } from './deploy-heads.mjs';
 import { channelOf } from './origin.mjs';
 import { crop, decodePng, diff, encodePng } from './png.mjs';
 import { requireNativeBuilds } from './parity.mjs';
@@ -246,12 +247,14 @@ if (host === 'deploy') {
     const blobs1 = readdirSync(resolve(origin, '.exact/blobs')).length;
     check(blobs1 >= 1, 'blobs were written');
     for (const id of ids) {
-      const head = JSON.parse(headOf(id).toString('utf8'));
-      const ok = verify(null, canonicalBytes(head), publicKeyFromRaw(Buffer.from(publicKey, 'base64')), Buffer.from(head.signature.ed25519, 'base64'));
-      check(ok && head.stream.seq === 1 && head.stream.compatibilityId === id && head.stream.channel === channel && head.signature.keyId === keyId, `the head of ${id.slice(0, 8)} verifies and names its stream`);
+      const stream = { channel, compatibilityId: id }, adapter = new DirectoryOrigin(origin);
+      const found = await adapter.head(stream), head = found.json;
+      const admitted = await admitHead(adapter, found, { ...app, manifest }, stream);
+      check(admitted.usable && admitted.authenticated && admitted.seq === 1 && head.signature.keyId === keyId
+        && admitted.cohort?.compat.id === id, `the head of ${id.slice(0, 8)} verifies and names its cohort receipt`);
       const blob = (card) => resolve(origin, '.exact', 'blobs', card.sha256), listed = head.assets ? readAssetIndex(head.assets, readFileSync(blob(head.assets))) : [];
       check(!existsSync(resolve(origin, '.exact', channel, id, 'app.plan'))
-        && [head.plan, ...(head.assets ? [head.assets] : []), ...listed].every((card) => card.url === (listed.includes(card) ? `./${card.sha256}` : `../../blobs/${card.sha256}`) && existsSync(blob(card)))
+        && [head.plan, head.cohortReceipt, ...(head.assets ? [head.assets] : []), ...listed].every((card) => card.url === (listed.includes(card) ? `./${card.sha256}` : `../../blobs/${card.sha256}`) && existsSync(blob(card)))
         && readdirSync(resolve(origin, '.exact', channel, id, 'releases')).length === 1,
       `the stream ${id.slice(0, 8)} points at immutable blobs and has one release record`);
     }

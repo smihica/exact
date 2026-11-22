@@ -18,9 +18,9 @@ pub(crate) fn take_bound() -> Option<String> {
     PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
-/// Whether this process runs under the agent (`EXACT_AGENT=1`).
+/// Whether this process runs under the agent.
 pub fn agent() -> bool {
-    std::env::var("EXACT_AGENT").is_ok_and(|v| v == "1")
+    exact_runner::agent::carried()
 }
 
 /// The frame and input clock, ms, without waiting for the owner's thread
@@ -151,6 +151,41 @@ macro_rules! canvas_jni_extensions {
                 Some(file) => $crate::canvas::field::java(env, &file.to_string_lossy()),
                 None => std::ptr::null_mut(),
             }
+        }
+
+        /// The regular file an `app:/data|cache|tmp/…` path names, opened for
+        /// reading through no symbolic link (`picker::open_known`): its
+        /// descriptor, which the reader adopts (`Native.openApp`), or -1.
+        #[no_mangle]
+        pub unsafe extern "system" fn Java_dev_exact_canvas_Native_appDescriptor(
+            env: *mut JNIEnv,
+            _class: jclass,
+            path: jstring,
+        ) -> jint {
+            use std::os::fd::IntoRawFd;
+            let path = $crate::canvas::field::text(env, path);
+            match $crate::picker::open_known(&path) {
+                Some(file) => file.into_raw_fd(),
+                None => -1,
+            }
+        }
+
+        /// The reader's file `source` renamed to the `app:/` path `path`,
+        /// reached through no symbolic link (`picker::publish`): whether it
+        /// was.
+        #[no_mangle]
+        pub unsafe extern "system" fn Java_dev_exact_canvas_Native_publishApp(
+            env: *mut JNIEnv,
+            _class: jclass,
+            path: jstring,
+            source: jstring,
+        ) -> jboolean {
+            let path = $crate::canvas::field::text(env, path);
+            let source = $crate::canvas::field::text(env, source);
+            flag($crate::picker::publish(
+                &path,
+                std::path::Path::new(&source),
+            ))
         }
 
         /// The app's directory `index` names (0 `data`, 1 `cache`, 2

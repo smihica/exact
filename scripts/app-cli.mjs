@@ -10,6 +10,22 @@ import { noteBunLoaded } from '../js/bake/src/__exact_env.mjs';
 
 /** The hosts a `test`, `agent` or `verify` may name first. */
 const APP_HOSTS = ['web', 'ios', 'macos', 'mac', 'linux', 'windows', 'android'];
+
+const symbolTakesValue = (arg) => ['--name', '--component', '--tag', '--match', '--has', '--where'].includes(arg);
+
+function* symbolArguments(args) {
+  for (let i = 1; i < args.length; i++) {
+    yield i;
+    if (symbolTakesValue(args[i])) i++;
+  }
+}
+
+export function contractHelpRequested(args) {
+  const indices = args[0] === 'symbols' ? symbolArguments(args) : args.keys();
+  for (const i of indices) if (args[i] === '--help' || args[i] === '-h') return true;
+  return false;
+}
+
 /** app.json's text as JSON, a leading byte-order mark named with its fix (scripts/app.mjs `parseManifest`; this
  * module keeps its own copy, since copied SDKs carry it alone). */
 export function parseManifest(text) {
@@ -79,7 +95,7 @@ export const checkoutLine = (exact2) => {
 /** What a failed JS-target web build (`host/web-js/build.mjs`) said that is the app's to act on, from its stderr: the
  * types app.ts imports when rewritten, warnings, the diagnostics, then the compiler's warnings. Every compiler error is
  * kept with its quoted line and caret, as `contract build` prints them. Cargo's progress, a rustc warning's excerpt and
- * Bun's trace (a frame and its version line) are left out; with no diagnostic, the last three lines stand for one. */
+ * Bun's trace are omitted. Without a recognized diagnostic, keep the last three lines of raw stderr. */
 export function webBuildFailure(stderr) {
   const ambientDiagnostic = (l) => /^.+:\d+:\d+: .+ is unavailable in data sources[;:]/.test(l);
   const all = (stderr ?? '').trim().split('\n').filter((l) => ambientDiagnostic(l) || !/^\s*(Compiling|Finished|Running)/.test(l) && !compilerWarnings(l).length);
@@ -115,9 +131,17 @@ export function webBuildFailure(stderr) {
     i = last = end - 1;
   }
   // The bundler's refusal, in the words the type check uses (`Error: ` is its wrapper).
-  const reason = (message.length ? message : lines.slice(-3)).map((l) => l.replace(/^Error: (?=module outside captured app: )/, '')).join('\n');
   const types = all.filter((l) => /^app\.contract\.d\.ts: /.test(l));
-  return [...types, ...warnings, reason, ...compilerWarnings(stderr)];
+  const compiler = compilerWarnings(stderr);
+  if (!message.length) {
+    const raw = (stderr ?? '').trimEnd();
+    if (!raw) return [];
+    const tail = raw.split(/\r?\n/).slice(-3);
+    const earlier = [...types, ...warnings, ...compiler].filter((l) => !tail.includes(l));
+    return [...earlier, ...tail];
+  }
+  const reason = message.map((l) => l.replace(/^Error: (?=module outside captured app: )/, '')).join('\n');
+  return [...types, ...warnings, reason, ...compiler];
 }
 
 /** A drive's lines for the compiler's `warnings` (`compilerWarnings`) of the app in `dir` built for `host`: the
@@ -282,7 +306,8 @@ async function verbRun({ dir, name, game = false, exact2, args }, reply) {
   // the one place every verb passes, so no child sees the flag.
   if (rest.includes('--variant')) {
     const { takeVariant } = await import(resolve(exact2, 'scripts/help.mjs'));
-    try { takeVariant(rest); } catch (error) { console.error(`exact ${verb}: ${error.message}`); return 2; }
+    const takesValue = verb === 'contract' ? (arg) => rest[0] === 'symbols' && symbolTakesValue(arg) : undefined;
+    try { takeVariant(rest, process.env, takesValue); } catch (error) { console.error(`exact ${verb}: ${error.message}`); return 2; }
   }
   if (process.env.EXACT_VARIANT) process.env.EXACT_VARIANT_APP ??= realpathSync(dir); // variants.mjs `claimVariant`
   // The app's own verbs (paint, minesweeper, ledger: a regenerated file dropped the ones added to it): app.json's
@@ -314,7 +339,8 @@ async function verbRun({ dir, name, game = false, exact2, args }, reply) {
   // among them asks for a verb's whole text (`web --help all`, `help web all`, `help all web`); with no verb it is
   // the index (`--help all`, `help all`), never a verb (LLP 1116.010 D2).
   const known = (a) => verbs[a] || own[a];
-  const asked = !verb || ['help', '--help', '-h'].includes(verb) ? rest.find(known) ?? rest.find((a) => !a.startsWith('-') && a !== 'all') ?? '' : verbs[verb] && (rest.includes('--help') || rest.includes('-h')) ? verb : null;
+  const helpFlag = verb === 'contract' ? contractHelpRequested(rest) : rest.includes('--help') || rest.includes('-h');
+  const asked = !verb || ['help', '--help', '-h'].includes(verb) ? rest.find(known) ?? rest.find((a) => !a.startsWith('-') && a !== 'all') ?? '' : verbs[verb] && helpFlag ? verb : null;
   if (asked !== null) {
     const help = await import(resolve(exact2, 'scripts/help.mjs')).catch(() => null);
     if (!help) { console.error(`no Exact checkout at ${exact2}: EXACT names the checkout`); return 1; }
@@ -411,7 +437,7 @@ async function verbRun({ dir, name, game = false, exact2, args }, reply) {
   // A native verb names its platform in app.json the first time, after that platform's setup rows, and keeps the
   // generated workspace current unless the app authored one (LLP 1153 D1.2; scripts/app-shells.mjs). A drive's
   // host counts (`test ios`). Absent from a checkout that lacks the module (the scaffold's test SDK), it is skipped.
-  const platform = game || rest.includes('--help') || rest.includes('-h') ? null : (await import(resolve(exact2, 'scripts/app-shells.mjs')).catch(() => null))?.platformOf(verb, host);
+  const platform = game || helpFlag ? null : (await import(resolve(exact2, 'scripts/app-shells.mjs')).catch(() => null))?.platformOf(verb, host);
   if (verb === 'ios' && process.platform === 'linux' && rest.includes('--run') && !rest.includes('--help')) {
     console.error('ios --run needs an iOS simulator or connected iPhone; bun exact.mjs ios builds the bundle on Linux/WSL'); return log(2);
   }
@@ -422,7 +448,7 @@ async function verbRun({ dir, name, game = false, exact2, args }, reply) {
     // The Xcode row holds a build to the SDK it compiles with, and only a build that compiles the Swift host to its floor.
     const destination = { only: platform, device, tv: rest.includes('--tvos'), swift: named || await import(resolve(exact2, 'host/apple/devices.mjs')).then(({ compilesSwiftHost }) => compilesSwiftHost(rest), () => true) };
     const report = named ? null : await import(resolve(exact2, 'scripts/exact.mjs')).then(({ sdkReport, platformReport }) => platformReport(platform, sdkReport(process.env, destination), { device })).catch((error) => ({ error: String(error?.message ?? error) }));
-    const brought = await shells.bringPlatform(dir, platform, { report, name });
+    const brought = await shells.bringPlatform(dir, platform, { report, name, verb });
     if (brought.refused) { console.error(brought.refused); reply?.({ code: 'platform_refused', error: brought.refused }); return log(1); }
     for (const line of brought.lines) console.error(line);
   }
@@ -507,14 +533,15 @@ const inApp = (arg) => {
   return found ?? null;
 };
 if (verb === 'contract') {
+  const symbols = rest[0] === 'symbols';
   let moved = false;
-  for (const [i, arg] of rest.entries()) {
-    if (rest[i - 1] === '-o') continue;
-    const found = inApp(arg);
+  for (const i of symbols ? symbolArguments(rest) : rest.keys()) {
+    if (!symbols && rest[i - 1] === '-o') continue;
+    const found = inApp(rest[i]);
     if (found) { rest[i] = found; moved = true; }
   }
   // What a moved source writes goes beside it, as it would have from the app (`types app.contract -o app.contract.d.ts`).
-  const o = rest.indexOf('-o'), out = rest[o + 1];
+  const o = symbols ? -1 : rest.indexOf('-o'), out = rest[o + 1];
   if (moved && o >= 0 && out && !isAbsolute(out)) rest[o + 1] = resolve(appDir, out.startsWith(`${basename(appDir)}/`) ? out.slice(basename(appDir).length + 1) : out);
 }
   // The web build is about a second when nothing changed, so a web drive builds

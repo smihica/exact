@@ -1,13 +1,15 @@
 // A tool set is taken by its inputs' bytes, and a fetched one only where it may run (LLP 1174 D3, D5).
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash, generateKeyPairSync } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { digest, lockClosure, workspaceManifest } from './kept.mjs';
 import { cargoOnPath } from './cargo-check.mjs';
-import { ROOT, RustMissing, fromSet, fromSets, hostTriple, rustMissing } from './tools.mjs';
+import { ROOT, RustMissing, fetchToolSet, fromSet, fromSets, hostTriple, publishToolSet, publishWatchedTip, readToolManifest, rustMissing } from './tools.mjs';
+import { DirectoryOrigin, HttpsOrigin, blobPath } from './origin.mjs';
 import { offlineMiss } from './filesystem.mjs';
 
 const pin = Bun.TOML.parse(readFileSync(resolve(ROOT, 'rust-toolchain.toml'), 'utf8')).toolchain.channel;
@@ -35,6 +37,164 @@ function machine(sets, { rust }) {
 
 const ours = ['rust-toolchain.toml', 'contract/syntax/src'].map(file => [file, digest(resolve(ROOT, file))]);
 
+test('publish exposes a verified manifest and complete blobs before updating either lookup', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-tools-publish-'));
+  try {
+    const publication = resolve(dir, 'origin');
+    mkdirSync(publication);
+    const origin = new DirectoryOrigin(publication);
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const triple = hostTriple(), base = `.exact/tools/${triple}`, commit = 'b'.repeat(40);
+    const body = Buffer.from('a compiled tool'), digest = sha(body);
+    writeFileSync(resolve(dir, 'contract'), body);
+    const set = { dir, manifest: { version: 1, source: 'built', commit, triple, products: {
+      contract: { file: 'contract', size: body.length, sha256: digest },
+    } } };
+    const publish = (revision, newer = []) => publishToolSet(origin, { dir, manifest: { ...set.manifest, commit: revision } }, privateKey, newer);
+    const id = await publish(commit);
+    assert.deepEqual(await origin.get(blobPath(digest)), body);
+    const bytes = await origin.get(`${base}/manifests/${id}.json`);
+    const manifest = readToolManifest(bytes, id, triple, publicKey);
+    assert.deepEqual(manifest.products, set.manifest.products);
+    assert.equal(manifest.source, 'fetched');
+    assert.throws(() => readToolManifest(bytes, id, triple, generateKeyPairSync('ed25519').publicKey), /signature/);
+    const altered = Buffer.from(JSON.stringify({ ...manifest, commit: 'a'.repeat(40) }));
+    assert.throws(() => readToolManifest(altered, id, triple, publicKey), /digest/);
+    assert.throws(() => readToolManifest(altered, sha(altered), triple, publicKey), /signature/);
+    if (triple === 'aarch64-apple-darwin') {
+      const linux = 'x86_64-unknown-linux-gnu';
+      const linuxSet = { dir, manifest: { ...set.manifest, triple: linux } };
+      const linuxId = await publishToolSet(origin, linuxSet, privateKey);
+      const linuxBase = `.exact/tools/${linux}`;
+      assert.equal(JSON.parse(await origin.get(`${linuxBase}/commits/${commit}.json`)), linuxId);
+      assert.deepEqual(JSON.parse(await origin.get(`${linuxBase}/recent.json`)), [linuxId]);
+      const bytes = await origin.get(`${linuxBase}/manifests/${linuxId}.json`);
+      assert.equal(readToolManifest(bytes, linuxId, linux, publicKey).triple, linux);
+      assert.throws(() => readToolManifest(bytes, linuxId, triple, publicKey), /not a version 1 set/);
+    }
+    assert.equal(await publish(commit), id);
+    assert.equal(JSON.parse(await origin.get(`${base}/commits/${commit}.json`)), id);
+    assert.deepEqual(JSON.parse(await origin.get(`${base}/recent.json`)), [id]);
+    writeFileSync(resolve(dir, 'contract'), 'changed');
+    const next = 'c'.repeat(40);
+    await assert.rejects(publish(next), /contract differs/);
+    assert.equal(await origin.get(`${base}/commits/${next}.json`), null);
+    assert.deepEqual(JSON.parse(await origin.get(`${base}/recent.json`)), [id]);
+
+    writeFileSync(resolve(dir, 'contract'), body);
+    const commits = Array.from({ length: 10 }, (_, i) => i.toString(16).padStart(40, '0'));
+    const ids = [];
+    for (const i of [0, 4, 6, 9, 8, 7, 5, 3, 2, 1]) {
+      ids[i] = await publish(commits[i], commits.slice(i + 1).reverse());
+    }
+    assert.deepEqual(JSON.parse(await origin.get(`${base}/recent.json`)), ids.slice(-8).reverse());
+    assert.equal(JSON.parse(await origin.get(`${base}/commits/${commits[1]}.json`)), ids[1]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60000);
+
+test('fetch authenticates the whole set before the cache can run it and falls back from HEAD to matching recent inputs', async () => {
+  const m = machine([], { rust: false }), { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const triple = hostTriple(), base = `.exact/tools/${triple}`, dir = resolve(m.env.HOME, 'origin');
+  const cache = resolve(m.env.HOME, '.cache/exact/tools', triple);
+  mkdirSync(dir);
+  const origin = new DirectoryOrigin(dir), requests = [];
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    const path = new URL(request.url).pathname.slice(1);
+    requests.push(path);
+    const bytes = await origin.get(path);
+    return bytes === null ? new Response(null, { status: 404 }) : new Response(bytes);
+  } });
+  try {
+    const head = execFileSync('git', ['-C', ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const env = { ...m.env, PATH: process.env.PATH, EXACT_TOOLS_ORIGIN: server.url.href };
+    const mirror = new HttpsOrigin(server.url.href);
+    const tool = Buffer.from('contract executable'), wasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
+    const product = { file: 'contract', inputs: ours, crate: 'contract', closure: lockClosure(ROOT, 'contract'),
+      workspace: sha(JSON.stringify(workspaceManifest(ROOT))), size: tool.length, sha256: sha(tool) };
+    const products = { contract: product, 'motion.wasm': { ...product, file: 'motion.wasm', size: wasm.length, sha256: sha(wasm) } };
+    writeFileSync(resolve(dir, 'contract'), tool);
+    writeFileSync(resolve(dir, 'motion.wasm'), wasm);
+    const publish = (commit, rows) => publishToolSet(origin, { dir, manifest: { version: 1, triple, source: 'built', commit, products: rows } }, privateKey);
+    const good = await publish(head, products);
+    const fetchSet = (keys = [publicKey]) => fetchToolSet(mirror, 'contract', keys, env);
+    await assert.rejects(fetchSet([generateKeyPairSync('ed25519').publicKey]), /signature/);
+    assert.equal(requests.some(path => path.includes('/blobs/')), false);
+    writeFileSync(origin.path(blobPath(sha(wasm))), Buffer.alloc(wasm.length));
+    await assert.rejects(fetchSet(), /motion.wasm differs/);
+    assert.deepEqual(readdirSync(cache), []);
+    assert.equal(requests.includes(`${base}/recent.json`), false);
+    writeFileSync(origin.path(blobPath(sha(wasm))), wasm);
+    const stale = await publish(head, { ...products, contract: { ...product, inputs: [[ours[0][0], '0'.repeat(64)]] } });
+    await origin.put(`${base}/recent.json`, Buffer.from(JSON.stringify([stale])));
+    await assert.rejects(fetchSet(), new RegExp(`rust-toolchain.toml differs from the tool set built at ${head.slice(0, 12)}`));
+    await origin.put(`${base}/recent.json`, Buffer.from(JSON.stringify([stale, good])));
+    requests.length = 0;
+    assert.deepEqual(await Promise.all([fetchSet(), fetchSet()]), [true, true]);
+    assert.deepEqual(readdirSync(cache), [good]);
+    const distinct = [...new Set(requests)];
+    assert.deepEqual(distinct.slice(0, 4), [`${base}/commits/${head}.json`, `${base}/manifests/${stale}.json`, `${base}/recent.json`, `${base}/manifests/${good}.json`]);
+    assert.deepEqual(readFileSync(fromSets('contract', env).path), tool);
+    assert.deepEqual(readFileSync(fromSets('motion.wasm', env).path), wasm);
+    rmSync(resolve(cache, good, 'contract'));
+    assert.equal(await fetchSet(), true);
+    server.stop(true);
+    assert.deepEqual(readFileSync(fromSets('contract', env).path), tool);
+  } finally { server.stop(true); m.done(); }
+}, 60000);
+
+test('the publisher prefers each new tip and resumes skipped commits after failure, restart or branch replacement', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-tools-watch-'));
+  const repo = resolve(dir, 'repo'), tree = resolve(dir, 'worker'), state = resolve(dir, 'state.json');
+  mkdirSync(repo);
+  const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const commit = message => {
+    git(repo, '-c', 'user.name=Exact', '-c', 'user.email=exact@example.invalid', '-c', 'commit.gpgSign=false', 'commit', '--allow-empty', '-qm', message);
+    return git(repo, 'rev-parse', 'HEAD');
+  };
+  let retry = new Map(), fail;
+  const seen = [];
+  const poll = tip => publishWatchedTip(tree, state, tip, (revision, newer) => {
+    assert.equal(git(tree, 'rev-parse', 'HEAD'), revision);
+    if (revision === fail) throw new Error('build failed');
+    seen.push([revision, newer]);
+  }, retry, () => 1000);
+  try {
+    git(repo, 'init', '-q', '-b', 'main');
+    const a = commit('a');
+    git(repo, 'worktree', 'add', '--detach', tree, a);
+    await poll(a);
+    assert.equal(await poll(a), null);
+    const b = commit('b'), c = commit('c'), d = commit('d');
+    await poll(d);
+    const e = commit('e');
+    await poll(e);
+    fail = c;
+    assert.match((await poll(e)).error.message, /build failed/);
+    await poll(e);
+    assert.equal(await poll(e), null);
+    retry = new Map();
+    fail = null;
+    await poll(e);
+    assert.deepEqual(seen, [[a, []], [d, []], [e, []], [b, [e, d, c]], [c, [e, d]]]);
+    assert.equal(await poll(e), null);
+
+    commit('discarded');
+    await poll(commit('old tip'));
+    git(repo, 'switch', '-qc', 'replacement', e);
+    const replacement = commit('replacement');
+    writeFileSync(resolve(tree, 'unfinished'), 'keep');
+    await assert.rejects(poll(replacement), /clean producer checkout/);
+    assert.equal(readFileSync(resolve(tree, 'unfinished'), 'utf8'), 'keep');
+    rmSync(resolve(tree, 'unfinished'));
+    git(tree, 'switch', '-qc', 'work-in-progress');
+    await assert.rejects(poll(replacement), /detached worktree/);
+    git(tree, 'switch', '--detach', 'HEAD');
+    assert.deepEqual(await poll(replacement), { commit: replacement });
+    assert.equal(await poll(replacement), null);
+    assert.equal(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD'), 'replacement');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 60000);
+
 test('a set is taken while its inputs are these bytes, and a miss names the first that differs', () => {
   const changed = [ours[0], ['contract/syntax/src', 'f'.repeat(64)]];
   const m = machine([{ source: 'built', inputs: changed, commit: 'a'.repeat(40) }, { source: 'built', inputs: ours, commit: 'b'.repeat(40) }], { rust: false });
@@ -48,6 +208,61 @@ test('a set is taken while its inputs are these bytes, and a miss names the firs
   } finally { miss.done(); }
 }, 60000);
 
+test('when a cached compiler disappears, the next matching set supplies it', () => {
+  const m = machine(['a', 'b'].map(c => ({ source: 'built', inputs: ours, commit: c.repeat(40) })), { rust: false });
+  try {
+    const bin = i => resolve(m.env.HOME, '.cache/exact/tools', hostTriple(), `set${i}`, 'contract');
+    assert.equal(fromSets('contract', m.env)?.path, bin(1));
+    rmSync(bin(1));
+    assert.equal(fromSets('contract', m.env)?.path, bin(0));
+    rmSync(bin(0));
+    assert.equal(fromSets('contract', m.env), null);
+    assert.match(new RustMissing('contract', m.env).message, /tool set built at bbbbbbbbbbbb is missing contract/);
+  } finally { m.done(); }
+});
+
+test('web setup accepts a complete matching tool set for a Contract app and keeps the source requirements for a Rust app', () => {
+  const m = machine([{ source: 'built', inputs: ours, commit: 'a'.repeat(40) }], { rust: false });
+  try {
+    const dir = resolve(m.env.HOME, '.cache/exact/tools', hostTriple(), 'set0'), receipt = resolve(dir, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(receipt, 'utf8'));
+    for (const file of ['exact-web-js', 'exact-filesystem', 'markdown.wasm', 'motion.wasm', 'markup-editor.wasm', 'textflow.wasm']) {
+      writeFileSync(resolve(dir, file), '');
+      manifest.products[file] = { ...manifest.products.contract, file };
+    }
+    manifest.metadata = { record: { packages: [], resolve: { nodes: [] } }, inputs: ours };
+    writeFileSync(receipt, JSON.stringify(manifest));
+    const app = resolve(m.env.HOME, 'starter'), script = resolve(app, 'web/build.rs');
+    mkdirSync(resolve(app, 'web'), { recursive: true });
+    writeFileSync(resolve(app, 'app.contract'), '');
+    const check = (chrome = process.execPath) => spawnSync(process.execPath, [resolve(ROOT, 'scripts/exact.mjs'), 'setup', '--check', '--platform', 'web'],
+      { cwd: app, encoding: 'utf8', env: { ...m.env, CHROME: chrome, EXACT_TOOLS_ORIGIN: 'none' } });
+    const needsRust = () => {
+      const result = check();
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stdout, /MISSING rustup/);
+      assert.doesNotMatch(result.stdout, /Prebuilt web tools/);
+    };
+    writeFileSync(script, 'fn main() { exact_js_bake::build(); }');
+    const ready = check();
+    assert.equal(ready.status, 0, ready.stderr);
+    assert.match(ready.stdout, /Prebuilt web tools/);
+    assert.doesNotMatch(ready.stdout, /rustup|Cargo crates/);
+    const noBrowser = check(resolve(app, 'absent-chrome'));
+    assert.equal(noBrowser.status, 1);
+    assert.match(noBrowser.stdout, /MISSING Chrome/);
+    writeFileSync(script, 'fn main() { println!("cargo:rerun-if-changed=data.json"); }');
+    needsRust();
+    rmSync(script);
+    rmSync(resolve(dir, 'motion.wasm'));
+    needsRust();
+    writeFileSync(resolve(dir, 'motion.wasm'), '');
+    manifest.metadata.inputs = [[ours[0][0], '0'.repeat(64)]];
+    writeFileSync(receipt, JSON.stringify(manifest));
+    needsRust();
+  } finally { m.done(); }
+}, 60000);
+
 test('a fetched set runs only without Rust or when an origin is named, and never under EXACT_TOOLS_ORIGIN=none', () => {
   for (const [rust, origin, taken] of [[true, undefined, false], [true, 'https://tools.example', true], [false, undefined, true], [false, 'none', false]]) {
     const m = machine([{ source: 'fetched', inputs: ours, commit: 'd'.repeat(40) }], { rust });
@@ -57,6 +272,15 @@ test('a fetched set runs only without Rust or when an origin is named, and never
     } finally { m.done(); }
   }
 }, 60000);
+
+test('the rust-missing diagnostic includes the configured origin failure', () => {
+  const m = machine([], { rust: false });
+  try {
+    const env = { ...m.env, EXACT_TOOLS_ORIGIN: 'invalid:' };
+    assert.equal(fromSets('contract', env), null);
+    assert.match(new RustMissing('contract', env).message, /rust-missing.*tools origin needs an HTTP or HTTPS URL/);
+  } finally { m.done(); }
+});
 
 function onWindows(arch, run) {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform');

@@ -32,7 +32,7 @@ pub(crate) const KEPT: &str = "exact.kept";
 
 /// The kv scope persisted states live in where they are not the app's
 /// `UserDefaults` (LLP 1116 D5, [`Prefs`]).
-const STATE: &str = "exact.state";
+use exact_data::storage::PERSISTED_SCOPE as STATE;
 
 /// Where persisted states live (LLP 1116 D5): the app's `UserDefaults`
 /// domain, or — in agent mode (a nameless drive's memory, a named drive's
@@ -410,7 +410,8 @@ pub fn endowed<const PRESENCE: bool>(grants: &str, app_id: &str, fresh: bool) ->
     };
     let (mut snapshot, unread_kept) = match bindings.as_ref().filter(|_| fresh) {
         Some(b) => {
-            let read = snapshot_parts(&b.secrets, &b.kv, &prefs, Vec::new());
+            let mut read = snapshot_parts(&b.secrets, &b.kv, &prefs, Vec::new());
+            crate::picker::seed_first_window(app_id, &mut read.values);
             (read.values, read.omitted)
         }
         None => Default::default(),

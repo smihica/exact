@@ -6,14 +6,38 @@ import QuartzCore
 
 final class ColorReference: ExactModule {
     override func call(_ request: [String: Any]) throws -> [String: Any] {
-        guard request["op"] as? String == "colorReference" else { throw ExactNativeRefusal("unknown color reference operation") }
-        #if os(iOS)
-        if #available(iOS 26, *) { return ["available": true] }
-        #endif
-        return ["available": false]
+        switch request["op"] as? String {
+        case "colorReference":
+            #if os(iOS)
+            if #available(iOS 26, *) { return ["available": true] }
+            #endif
+            return ["available": false]
+        case "sidebarBarHeight":
+            #if os(iOS)
+            sidebarBar.update()
+            return ["height": Double(sidebarBar.height)]
+            #else
+            return ["height": 0]
+            #endif
+        case let op:
+            throw ExactNativeRefusal("The gallery's module was asked for \(op.map { "\"\($0)\"" } ?? "no operation"), which it does not answer. Pass \"colorReference\" or \"sidebarBarHeight\" as native.call's op.")
+        }
     }
 
     #if os(iOS)
+    private lazy var sidebarBar: SidebarBarHeight = {
+        let height = SidebarBarHeight()
+        height.changed = { [context] in context.changed(SidebarBarHeight.topic) }
+        return height
+    }()
+
+    /// Measures the list's bar again, and says so when its height changed.
+    private func updateSidebarBar() {
+        if sidebarBar.update() { context.changed(SidebarBarHeight.topic) }
+    }
+
+    override func window(_ window: ExactWindow) { updateSidebarBar() }
+
     private let sharedBackgrounds = NSMapTable<UIViewController, NSNumber>.weakToStrongObjects()
 
     /// Whether the gallery draws the header's material itself, before iOS 26, where the bar draws one of
@@ -25,9 +49,9 @@ final class ColorReference: ExactModule {
         return true
     }
 
-    override func tabContainer(_ contents: ExactTabContents) -> UIViewController? { GallerySplit(contents) }
-
     override func route(_ route: ExactRoute) {
+        sidebarBar.follow(route.controller)
+        updateSidebarBar()
         let shared = route.element("range-bar") != nil
         if Self.sharesMaterial, route.isNew || sharedBackgrounds.object(forKey: route.controller)?.boolValue != shared {
             let appearance = UINavigationBarAppearance()
@@ -45,12 +69,6 @@ final class ColorReference: ExactModule {
             route.controller.navigationItem.compactAppearance = appearance
             route.controller.navigationItem.compactScrollEdgeAppearance = appearance
             sharedBackgrounds.setObject(NSNumber(value: shared), forKey: route.controller)
-        }
-        if #available(iOS 27.0, *) {
-            let item = route.controller.navigationItem
-            if item.navigationBarMinimization.minimizationBehavior != .onScrollDown {
-                item.navigationBarMinimization.minimizationBehavior = .onScrollDown
-            }
         }
     }
 

@@ -7,7 +7,7 @@ import { Refusal } from './shape.js';
 import { regions } from './regions.js';
 import { declare } from './declarations.js';
 import { backdropValue as backdropCss } from './backdrop.js';
-import { onEnd, effect, say, inflight, After, Paint, Probes, Media, Links, Scrolls, Selects } from './rt.js';
+import { onEnd, effect, untracked, say, inflight, After, Paint, Probes, Media, Links, Scrolls, Selects } from './rt.js';
 import { Adopt, adopting, PrepareTasks } from './mount.js';
 import { autofocusProp } from './focus.js';
 const SVG = 'http://www.w3.org/2000/svg';
@@ -15,6 +15,8 @@ const SVG = 'http://www.w3.org/2000/svg';
 export function h(p, tag, cls, attrs, text, ns) {
   if (Adopt) {
     const e = adopt(p, tag, cls, attrs);
+    // A literal `draggable` is the app's too (drag.js `writeDraggable`)
+    if (attrs?.draggable !== undefined) PropHooks.draggable?.(e, attrs.draggable);
     if (tag === 'video' || tag === 'audio') Media.media(e, attrs);
     if (tag === 'iframe') Hooks.frame(e, attrs?.['data-app-src']);
     if (tag === 'button') oneActivation(e);
@@ -32,13 +34,14 @@ export function h(p, tag, cls, attrs, text, ns) {
     for (const k in attrs)
       if (NOT_DOM.test(k)) e['$' + k] = attrs[k];
       else if (k === 'autofocus') autofocusProp(e, attrs[k] !== 'false');
+      else if (k === 'draggable' && PropHooks.draggable) PropHooks.draggable(e, attrs[k]);
       else {
         e.setAttribute(k, rel(k, attrs[k]));
         if (k === 'data-exact-f' || k.startsWith('data-exact-f-')) bits |= Number(attrs[k]);
       }
     if (tag === 'a') Links?.made(e, attrs);
     if ('data-scrolldocument' in attrs) Docs.add(e);
-    if (tag === 'img' && ('data-symbol-source' in attrs || 'data-app-src' in attrs)) Hooks.image?.(e);
+    if (tag === 'img') Hooks.image?.(e);
   }
   if (Paint) e.$paintFacts = bits;
   if (text !== 0) e.textContent = text;
@@ -49,6 +52,13 @@ export function h(p, tag, cls, attrs, text, ns) {
   if (tag === 'video' || tag === 'audio') Media.media(e, attrs);
   Paint?.list(e);
   return e;
+}
+/** A block text takes its HTML tag from its initial role and level. Later changes update the ARIA attributes on that element. */
+export function headingText(p, cls, attrs, text, role, level) {
+  const heading = (role ? untracked(role) : attrs.role) === 'heading';
+  const value = level ? untracked(level) : Number(attrs['aria-level']);
+  const n = Number.isInteger(value) && value >= 1 ? value : 2;
+  return h(p, heading && n <= 6 ? 'h' + n : 'div', cls, attrs, text);
 }
 /** An SVG element (the compiler knows the node's type; element.rs's tag). */
 export const hs = (p, tag, cls, attrs, text) => h(p, tag, cls, attrs, text, SVG);
@@ -108,7 +118,7 @@ function adopt(p, tag, cls, attrs) {
     }
     if (tag === 'a') Links?.made(e, attrs, rendered);
     if ('data-scrolldocument' in attrs) Docs.add(e);
-    if (tag === 'img' && ('data-symbol-source' in attrs || 'data-app-src' in attrs)) Hooks.image?.(e);
+    if (tag === 'img') Hooks.image?.(e);
   }
   Paint?.list(e);
   return e;
@@ -318,6 +328,7 @@ export const cssText = (prop, unit, v) => {
             : regions(String(v));
   return t === 'auto' && (prop === 'max-width' || prop === 'max-height') ? 'none' : t;
 };
+export const GPU_PLACEMENT = true; // The build clears this for apps without a GPU module.
 export function css(e, prop, unit, v, rendered) {
   // The value this binding last wrote: the same again writes nothing (a write restyles and repaints the node, for every
   // dynamic row a list update touched).
@@ -341,13 +352,19 @@ export function css(e, prop, unit, v, rendered) {
     if (t == null ? !now : same(now) === (normal(prop, t) || 'unset')) return;
   }
   if (prop in MOVES) moved(e, MOVES[prop]);
-  if (t == null) return e.style.removeProperty(prop);
-  // A value not yet seen is probed on the detached style `normal` keeps, so the live node gets only the final write
-  // (LLP 1071.001 A8). Every property takes `unset`: one that reads back empty is a property this browser does not
-  // have (Chrome's `-moz-osx-font-smoothing`), not a refusal.
-  const valid = prop.startsWith('--') || t === 'unset' || normal(prop, t);
-  e.style.setProperty(prop, valid ? t : 'unset');
-  if (!valid) say(`unset ${prop}: ${JSON.stringify(v)} is not a value it takes`);
+  const placement = GPU_PLACEMENT && e.exactPlaced && /^(position|transform|transform-origin|z-index|visibility|clip-path)$/.test(prop)
+    ? globalThis.exact?.gpu : null;
+  placement?.beforeStyle(e);
+  if (t == null) e.style.removeProperty(prop);
+  else {
+    // A value not yet seen is probed on the detached style `normal` keeps, so the live node gets only the final
+    // write (LLP 1071.001 A8). Every property takes `unset`: one that reads back empty is a property this browser
+    // does not have (Chrome's `-moz-osx-font-smoothing`), not a refusal.
+    const valid = prop.startsWith('--') || t === 'unset' || normal(prop, t);
+    e.style.setProperty(prop, valid ? t : 'unset');
+    if (!valid) say(`unset ${prop}: ${JSON.stringify(v)} is not a value it takes`);
+  }
+  placement?.afterStyle(e);
 }
 // A box whose transform changes frame after frame is promoted to a compositor layer of its own while it changes, as
 // `will-change` asks (CSS Will Change 1 §2): the browser then moves and scales the layer's pixels instead of
@@ -415,7 +432,7 @@ export function Sr(e, prop, unit, f) {
 export const backdropValue = (v, report = true) =>
   backdropCss(v, report ? why => say(`unset backdrop-filter: ${why}`) : undefined);
 /** Loaded pieces' hooks: `style(e, prop, value)` takes a dynamic row's write on a node the motion piece holds
- * (motion.js); `image(e)` an image built or adopted with a symbol or `app:/` source (symbols.js); `frame(e, v)` an
+ * (motion.js); `image(e)` an image built or adopted (symbols.js); `frame(e, v)` an
  * iframe's app file (iframes.js); `listItem(e, owner)` and `listRoles(e)` a List's row and its role (list-items.js). */
 export const Hooks = {};
 /** `S` on a node the motion engine follows (`mo`): while a hold owns it, a

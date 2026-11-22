@@ -1,5 +1,53 @@
 use super::*;
 
+/// A table's, list's, or description list's element as its role (HTML-AAM): a
+/// node that holds what it heads or holds, named by its author, if at all.
+fn structure_role(node: &NodeRef<'_>) -> Option<i32> {
+    if node.node_type != exact_kernel::NodeType::View {
+        return None;
+    }
+    Some(match node.props.str(PropId::SemanticTag)? {
+        "table" => role::TABLE,
+        "caption" => role::CAPTION,
+        "tr" => role::ROW,
+        "td" => role::CELL,
+        "th" if node.props.str(PropId::Scope) == Some("row") => role::ROW_HEADER,
+        "th" => role::COLUMN_HEADER,
+        "dl" => role::DESCRIPTION_LIST,
+        "dt" => role::TERM,
+        "dd" => role::DEFINITION,
+        "ul" | "ol" => role::LIST,
+        "li" => role::LIST_ITEM,
+        _ => return None,
+    })
+}
+
+/// A labelled empty item still belongs to the list. Keep its real bounds so
+/// keyboard and screen-reader navigation can find it without adding a hit area.
+pub(super) fn empty_item_bounds(
+    rect: Rect4,
+    clip: Rect4,
+    node: &NodeRef<'_>,
+    role: i32,
+) -> Option<Rect4> {
+    if role != role::LIST_ITEM
+        || (rect.2 != 0. && rect.3 != 0.)
+        || !node
+            .props
+            .str(PropId::AccessibilityLabel)
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        return None;
+    }
+    let axis = |a: f32, length: f32, start: f32, extent: f32| {
+        let (lo, hi) = (a.max(start), (a + length).min(start + extent));
+        (hi > lo || (length == 0. && a >= start && a < start + extent)).then_some((lo, hi - lo))
+    };
+    let (x, w) = axis(rect.0, rect.2, clip.0, clip.2)?;
+    let (y, h) = axis(rect.1, rect.3, clip.1, clip.3)?;
+    Some((x, y, w, h))
+}
+
 impl<D: DataSource> Presenter<D> {
     /// Walk `id` and what is under it into the tree.
     pub(super) fn access_walk(&self, b: &mut Build, id: ViewId, scope: Scope) {
@@ -79,7 +127,7 @@ impl<D: DataSource> Presenter<D> {
         {
             let (role, mut flags, range, value) = self.access_control(&target, kind);
             if target.props.bool(PropId::Disabled) == Some(true) {
-                flags = (flags | flag::DISABLED) & !(flag::CLICK | flag::LONG_CLICK);
+                flags = (flags | flag::DISABLED) & !(flag::CLICK | flag::LONG_CLICK | flag::DRAG);
             }
             if let Some(said) = target.props.bool(PropId::AccessibilityDisabled) {
                 scope.disabled = said;
@@ -139,6 +187,26 @@ impl<D: DataSource> Presenter<D> {
             };
             scope.parent = own;
             scope.inside = true;
+        } else if Self::drags(&node)
+            && self.lifts()
+            && !matches!(
+                node.node_type,
+                NodeType::Text | NodeType::Image | NodeType::Svg
+            )
+            && !self.access_name(&node).trim().is_empty()
+        {
+            // @ref LLP 1094.000 D9 — a box a held press drags, on a host that
+            // lifts it, is one element named by its words, as a pressable
+            // is, so a service can start its drag; a text or an image is an
+            // element already.
+            let name = || Some((self.access_name(&node), String::new()));
+            let flags = self.access_menu_flag(&node);
+            let Some(own) = self.access_emit(b, &scope, &node, role::GROUP, flags, [0.0; 3], name)
+            else {
+                return;
+            };
+            scope.parent = own;
+            scope.inside = true;
         } else if matches!(
             node.node_type,
             NodeType::Text | NodeType::Image | NodeType::Svg
@@ -158,9 +226,10 @@ impl<D: DataSource> Presenter<D> {
             // @ref LLP 1115.000 D12.5 — a heading by its role, never by an
             // `aria-level` alone (the kernel's `Props::heading`).
             let heading = node.props.heading().is_some();
-            let role = match (text, heading) {
-                (true, true) => role::HEADING,
-                (true, false) => role::TEXT,
+            let role = match (text, heading, aria) {
+                (true, true, _) => role::HEADING,
+                (true, false, Some("listitem")) => role::LIST_ITEM,
+                (true, false, _) => role::TEXT,
                 _ => role::IMAGE,
             };
             if let Some(own) = self.access_emit(b, &scope, &node, role, 0, [0.0; 3], name) {
@@ -231,9 +300,33 @@ impl<D: DataSource> Presenter<D> {
             let scroller = (may.then(|| self.scroller(id, &b.limits)).flatten())
                 .filter(|s| s.axes.0 || s.axes.1);
             let label = self.access_label(&node);
+            let dialog = match aria {
+                Some("dialog") => Some(role::DIALOG),
+                Some("alertdialog") => Some(role::ALERT_DIALOG),
+                None if node.props.str(PropId::SemanticTag) == Some("dialog") => Some(role::DIALOG),
+                _ => None,
+            };
+            if let Some(role) = dialog {
+                let modal = self.alert_inert() && self.alert_root() == Some(id);
+                let flags = if modal { flag::MODAL } else { 0 };
+                let name = label
+                    .clone()
+                    .or_else(|| node.props.str(PropId::Title).map(str::to_owned))
+                    .unwrap_or_default();
+                if let Some(parent) =
+                    self.access_emit(b, &scope, &node, role, flags, [0.; 3], || {
+                        Some((name, String::new()))
+                    })
+                {
+                    scope.parent = parent;
+                }
+            }
             if let Some(s) = scroller {
                 let (flags, range) = Self::access_scroll(&s);
-                let words = (label.unwrap_or_default(), String::new());
+                let words = (
+                    label.filter(|_| dialog.is_none()).unwrap_or_default(),
+                    String::new(),
+                );
                 let painted = b.boxes.get(&id).cloned();
                 let Some(own) =
                     self.access_emit(b, &scope, &node, role::SCROLLER, flags, range, || {
@@ -256,29 +349,29 @@ impl<D: DataSource> Presenter<D> {
                     scope.shift.1 += was.1 - s.offset.1;
                 }
                 scope.parent = own;
-            } else if let Some(role) = structure_role(&node).filter(|_| aria.is_none()) {
+            } else if let Some(role) = match aria {
+                // A virtual row lends its place to the first accessible child.
+                // The native list already publishes its own scroll container.
+                Some("list") if node.node_type != NodeType::List => Some(role::LIST),
+                Some("listitem") if node.props.str(PropId::ListItemKey).is_none() => {
+                    Some(role::LIST_ITEM)
+                }
+                Some("tablist") => Some(role::TABLIST),
+                None => structure_role(&node),
+                _ => None,
+            } {
                 let words = (label.unwrap_or_default(), String::new());
                 if let Some(own) =
                     self.access_emit(b, &scope, &node, role, 0, [0.0; 3], || Some(words))
                 {
                     scope.parent = own;
                 }
-            } else if aria == Some("tablist")
-                || Self::access_live(&node) != 0
-                || (label.is_some()
-                    && matches!(
-                        aria,
-                        Some("group" | "radiogroup" | "region" | "dialog" | "alertdialog")
-                    ))
+            } else if (dialog.is_none() && Self::access_live(&node) != 0)
+                || (label.is_some() && matches!(aria, Some("group" | "radiogroup" | "region")))
             {
-                let role = if aria == Some("tablist") {
-                    role::TABLIST
-                } else {
-                    role::GROUP
-                };
                 let words = (label.unwrap_or_default(), String::new());
                 if let Some(own) =
-                    self.access_emit(b, &scope, &node, role, 0, [0.0; 3], || Some(words))
+                    self.access_emit(b, &scope, &node, role::GROUP, 0, [0.0; 3], || Some(words))
                 {
                     scope.parent = own;
                 }

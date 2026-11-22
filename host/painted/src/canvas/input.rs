@@ -16,7 +16,7 @@ impl<D: DataSource + Default> CanvasHost<D> {
         let (x, y) = (self.viewport.0 / 2.0, self.viewport.1 / 2.0);
         let _s = Section::begin(c"exact scroll");
         self.driven();
-        self.scrolled = self.prefetching;
+        self.scroll_hold.note_scroll(self.prefetching);
         self.scrolled_at = self.now();
         self.travel.scrolled(dy / self.scale, self.scrolled_at);
         self.p.hold_collections(self.prefetching);
@@ -32,6 +32,19 @@ impl<D: DataSource + Default> CanvasHost<D> {
         self.p.hold_collections(false);
     }
 
+    /// Selection commands use the reader's pixel coordinates and return visible handle
+    /// geometry, or the selected text for a clipboard or share action.
+    #[cfg(target_os = "android")]
+    pub fn reader_selection(&mut self, action: i32, x: f32, y: f32) -> Option<String> {
+        let reply = self
+            .p
+            .reader_select(action, x / self.scale, y / self.scale, self.scale)?;
+        Some(match reply {
+            serde_json::Value::String(text) => text,
+            geometry => geometry.to_string(),
+        })
+    }
+
     /// A touch (0 down, 1 up, 2 move, 3 cancel) at pixels, by Android's
     /// tool type `tool`: a mouse (3) is a mouse, a stylus or its eraser (2,
     /// 4) a pen, and anything else a finger. Action 4 is no new touch: the
@@ -41,6 +54,7 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// touch then presses nothing when it lifts.
     pub fn touch(&mut self, action: i32, x: f32, y: f32, tool: i32) {
         let _s = Section::begin(c"exact touch");
+        self.scroll_hold.touch(action);
         self.p.set_pointer_kind(match tool {
             3 => PointerKind::Mouse,
             2 | 4 => PointerKind::Pen,

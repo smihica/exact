@@ -121,7 +121,7 @@ impl<D: DataSource> Presenter<D> {
                 // or a wheel's, which take theirs), nothing to prevent or stop.
                 "preventDefault" | "stopPropagation" => {}
                 // Recorded in the journal for launch parts such as Observe.
-                n @ ("observe" | "observeAttributes" | "observeError") => {
+                n @ ("observe" | "observeAttributes" | "observeError" | "observeFeedback") => {
                     crate::journal::host_command(n, &c.args)
                 }
                 // The shell's share sheet; with no shell, refused into the
@@ -194,10 +194,14 @@ impl<D: DataSource> Presenter<D> {
                 name @ ("fastSeek" | "load" | "requestFullscreen") if cfg!(target_os = "android") => {
                     self.media_command(name, &c.args)
                 }
+                "format" => {
+                    let field = c.args.first().and_then(exact_plan::Value::as_str).unwrap_or("");
+                    self.host.log(format!("format \"{field}\" refused: this host edits Markdown as plain source"));
+                }
                 // With no shell there is no clipboard or browser; and no
-                // editor, dev menu or window to close on any Linux host, and
+                // dev menu or window to close on any Linux host, and
                 // no media player (LLP 1042 §8) or floating window (§9): known, and named so.
-                name @ ("copyText" | "openURL" | "format" | "reload" | "close" | "fastSeek"
+                name @ ("copyText" | "openURL" | "reload" | "close" | "fastSeek"
                 | "load" | "exitPictureInPicture") => {
                     eprintln!("exact: {name} unsupported on the headless/DRM host");
                     if name == "openURL" {
@@ -218,6 +222,10 @@ impl<D: DataSource> Presenter<D> {
                 "hideWindow" => self.host.log(
                     "hideWindow refused: a window that hides while the app keeps running is on the Mac and Windows hosts only",
                 ),
+                // The commit is already drawn: it cuts, as a browser without view transitions runs the update.
+                "startViewTransition" => self
+                    .host
+                    .log("startViewTransition: cut: this host plays no view transition"),
                 // A page zoom is the Mac's so far (LLP 1021 §5.3.1).
                 "setPageZoom" => self
                     .host

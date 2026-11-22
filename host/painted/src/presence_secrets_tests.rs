@@ -47,6 +47,50 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)] // The child redirects storage through XDG.
+#[test]
+fn a_live_drive_forgets_only_its_own_locked_item() {
+    const CHILD: &str = "EXACT_TEST_LIVE_PRESENCE";
+    const APP: &str = "dev.exact.presence";
+    let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let root = scratch("live");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("a_live_drive_forgets_only_its_own_locked_item")
+            .env(CHILD, &root)
+            .env("HOME", &root)
+            .env("XDG_DATA_HOME", root.join("share"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("EXACT_AGENT", "live")
+            .env("EXACT_AGENT_STORAGE", "review")
+            .env_remove("EXACT_AGENT_STORAGE_FRESH")
+            .env_remove("EXACT_STORE")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    on_keystore(keystore);
+    let dir = root.join("exact-presence").join(APP);
+    std::fs::create_dir_all(&dir).unwrap();
+    let installed = dir.join("key#1");
+    std::fs::write(&installed, "installed secret").unwrap();
+
+    let mut drive = backend(APP, GRANTS).unwrap();
+    drive.backend.enqueue("key", Op::Write(None), None);
+    pump(&mut drive.backend, true);
+    assert_eq!(
+        std::fs::read_to_string(installed).unwrap(),
+        "installed secret"
+    );
+    assert!(drive.keystore.is_none());
+}
+
 #[test]
 fn the_reader_s_items_are_files_by_name_and_generation_never_plain() {
     on_keystore(keystore);

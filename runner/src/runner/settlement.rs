@@ -77,33 +77,6 @@ impl<D: DataSource> Runner<D> {
         }
     }
 
-    /// The journal's word when an answer lands on a build-time one shown
-    /// until its source was ready (LLP 1048.003 D6), or on a kept answer
-    /// (LLP 1027 D4) that it contradicts: the first frame showed the last
-    /// session's value, which a reader of only the final frame never sees
-    /// (LLP 1102 §3.17).
-    pub(super) fn revalidated(&mut self, i: usize, shown: Option<&ResourceState>, answer: &Value) {
-        let Some(shown) = shown.filter(|_| self.resources[i].stale) else {
-            return;
-        };
-        // A stale value that is neither build-time nor a placeholder is one the
-        // last session left (a kept answer; its `kept_seed` mark is consumed
-        // at activation, before the answer lands).
-        let compiled = shown.value.is_compiled();
-        if !compiled && shown.placeholder {
-            return;
-        }
-        let same = crate::compare::equivalent(shown.value.get(&self.plan), answer);
-        let name = self.plan.str(self.resource_row(i).name);
-        if compiled {
-            let line = super::lines::revalidated(name, same);
-            self.log(line);
-        } else if !same {
-            let line = super::lines::kept_contradicted(name);
-            self.log(line);
-        }
-    }
-
     /// A store reader whose build-time answer, the bake's empty store's,
     /// is passed over for its declared placeholder: before its source is
     /// ready, at a launch whose store held granted secrets the bake never
@@ -462,6 +435,7 @@ impl<D: DataSource> Runner<D> {
                                 store_revision: self.store.revision(),
                                 placeholder: false,
                                 kept_seed: false,
+                                from_page: false,
                                 origin: 0,
                                 answered_for: None,
                                 asleep: false,
@@ -619,23 +593,36 @@ impl<D: DataSource> Runner<D> {
                         force.retain(|f| *f != i);
                         self.reconciling.retain(|r| *r != i);
                         let upload = self.uploading(i);
-                        if !upload {
-                            // An earlier pass's `Later` was never handed out.
-                            if let RequestEffect::Later { requests, .. } =
-                                std::mem::replace(&mut effects[i], RequestEffect::Answered)
-                            {
-                                for request in &requests {
-                                    self.discard_request(request);
-                                }
+                        // Replace an earlier pass's effect: `Answered` has the
+                        // commit let a request in flight go, and none leaves an
+                        // upload's ticket. A `Later` was never handed out.
+                        let idle = if upload {
+                            RequestEffect::None
+                        } else {
+                            RequestEffect::Answered
+                        };
+                        if let RequestEffect::Later { requests, .. } =
+                            std::mem::replace(&mut effects[i], idle)
+                        {
+                            for request in &requests {
+                                self.discard_request(request);
                             }
-                            pending_res[i] = false;
-                            self.resources[i].failed_args = None;
                         }
+                        pending_res[i] = upload;
+                        self.resources[i].failed_args = None;
                         awaiting[i] = false;
                         if let Some(waiting) = &mut self.resources[i].waiting {
                             waiting.slept = true;
                         }
-                        let state = match states[i].take() {
+                        // A new instance sleeps on the page's answer at the
+                        // arguments it wants, while the boot holds the page's
+                        // answers, as a declared resource does (LLP
+                        // 1035.005.004 D8). Its ask is dropped: a closed gate
+                        // asks nothing.
+                        let paged = (want.as_ref())
+                            .filter(|_| states[i].is_none())
+                            .and_then(|w| self.seed_member(i, &w.args, &mut Vec::new()));
+                        let state = match states[i].take().or(paged) {
                             Some(s) => s.sleeping(),
                             None => {
                                 let Some(v) = self.placeholder(i, &row, &resources) else {
@@ -649,6 +636,7 @@ impl<D: DataSource> Runner<D> {
                                     store_revision: self.store.revision(),
                                     placeholder: true,
                                     kept_seed: false,
+                                    from_page: false,
                                     origin: 0,
                                     answered_for: None,
                                     asleep: true,
@@ -917,7 +905,7 @@ impl<D: DataSource> Runner<D> {
                     // successful reuse skips validation; fresh/baked/fallback
                     // answers still cross the shape boundary below.
                     let reused = reuse.is_some();
-                    let mut checked = false; // a reconciling answer's shape is checked as it is asked
+                    let mut checked = false; // an answer now is checked as it is asked
                                              // A reused value keeps what an earlier pass recorded;
                                              // anything else is recorded by the branch that takes it.
                     let compiled = std::mem::replace(&mut adopted[i], false);
@@ -1015,11 +1003,9 @@ impl<D: DataSource> Runner<D> {
                             // An upload's arguments answer as it ended (D10).
                             let ledger = self.ledger_answer(i, mark.as_ref());
                             let asked = match ledger.unwrap_or_else(|| self.query(i, &args)) {
-                                // A reconciling answer outside its shape fails
-                                // the resource too.
-                                Ok(Answer::Now(v)) if reconciling => {
+                                Ok(Answer::Now(v)) => {
                                     checked = true;
-                                    self.check_shape(i, &v).map(|_| Answer::Now(v))
+                                    self.shaped_answer(i, v)
                                 }
                                 other => other,
                             };
@@ -1050,10 +1036,13 @@ impl<D: DataSource> Runner<D> {
                                 {
                                     let failure = crate::failure::Failure::of(&e);
                                     self.count_failure(i);
-                                    self.alert(super::lines::failed_now(
-                                        self.plan.str(row.name),
-                                        &failure.message,
-                                    ));
+                                    self.source_alert(
+                                        super::lines::failed_now(
+                                            self.plan.str(row.name),
+                                            &failure.message,
+                                        ),
+                                        failure.is_overrun(),
+                                    );
                                     self.resources[i].failed_args = Some(args.clone());
                                     self.resources[i].failed_why = Some(failure);
                                     force.retain(|forced| *forced != i);
@@ -1154,11 +1143,8 @@ impl<D: DataSource> Runner<D> {
                                     self.count_failure(i);
                                     self.alert(super::lines::failed_now(&resource, &why));
                                     self.resources[i].failed_args = Some(args.clone());
-                                    self.resources[i].failed_why = Some(crate::failure::Failure {
-                                        code,
-                                        message: why,
-                                        reason,
-                                    });
+                                    self.resources[i].failed_why =
+                                        Some(crate::failure::Failure::source(code, why, reason));
                                     kept
                                 }
                                 // A turn over its budget (`overrun.rs`): the
@@ -1198,10 +1184,13 @@ impl<D: DataSource> Runner<D> {
                                         effects[i] = RequestEffect::Answered;
                                         pending_res[i] = false;
                                         self.count_failure(i);
-                                        self.alert(super::lines::failed_now(
-                                            self.plan.str(row.name),
-                                            &why.message,
-                                        ));
+                                        self.source_alert(
+                                            super::lines::failed_now(
+                                                self.plan.str(row.name),
+                                                &why.message,
+                                            ),
+                                            why.is_overrun(),
+                                        );
                                         self.resources[i].failed_args = Some(args.clone());
                                         self.resources[i].failed_why = Some(why);
                                     }
@@ -1315,6 +1304,12 @@ impl<D: DataSource> Runner<D> {
                         .as_ref()
                         .map_or((kept_slept, 0), |s| (s.slept, s.origin));
                     let slept = was.0 && was.1 == origin && !placeholder;
+                    // The page's answer stands while its origin does, as no stand-in
+                    let from_page = states[i]
+                        .as_ref()
+                        .is_some_and(|s| s.from_page && s.origin == origin)
+                        && !placeholder
+                        && !value.is_compiled();
                     states[i] = Some(ResourceState {
                         inspection_generation: generation,
                         args: value_args,
@@ -1322,6 +1317,7 @@ impl<D: DataSource> Runner<D> {
                         store_revision: self.store.revision(),
                         placeholder,
                         kept_seed,
+                        from_page,
                         origin,
                         answered_for,
                         asleep: false,
@@ -1344,10 +1340,11 @@ impl<D: DataSource> Runner<D> {
             // A resource later in plan order may have written after an
             // earlier reader settled. Repeat against the tentative states;
             // the writer's state already carries the new revision, so it
-            // does not refresh itself, and a reader asleep behind a closed
-            // gate asks nothing (LLP 1161.002 D2).
+            // does not refresh itself, and only live readers can ask again
+            // (LLP 1161.002 D2).
             let stale_store_reader = states.iter().enumerate().any(|(i, state)| {
                 self.asks_on_store_change(i)
+                    && !self.settles_to_nothing(i)
                     && !self.asks_again_after_reply(i)
                     && state
                         .as_ref()

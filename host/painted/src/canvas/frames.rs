@@ -5,13 +5,13 @@
 //! GPU canvases too (`gpu_period`, LLP 1009), and each canvas's frame-rate
 //! cap back to the reader (`Native.frameRates`).
 //!
-//! Collection runs only in a driver's launch (`EXACT_AGENT=1`), which a
+//! Collection runs only in a driver's launch, which a
 //! production bake never is (LLP 1069.007 D2). Under the driver's clock a
 //! frame is virtual and nothing is recorded; a capture lease lends the
 //! display the clock ([`super::agent::lend`]) so its frames are real.
 
 use super::{agent, reader::monotonic_ns, CanvasHost};
-use crate::frame_health::android::{Lend, Reader};
+use crate::frame_health::android::{FrameClock, Lend, Reader};
 use exact_runner::DataSource;
 use std::cell::RefCell;
 
@@ -21,11 +21,7 @@ thread_local! {
 
 fn with<T>(f: impl FnOnce(&mut Reader) -> T) -> T {
     READER.with_borrow_mut(|r| {
-        f(
-            r.get_or_insert_with(|| {
-                Reader::new(std::env::var("EXACT_AGENT").as_deref() == Ok("1"))
-            }),
-        )
+        f(r.get_or_insert_with(|| Reader::new(exact_runner::agent::carried())))
     })
 }
 
@@ -96,8 +92,14 @@ impl<D: DataSource + Default> CanvasHost<D> {
         if agent::lent() && !with(|r| r.app.leased(now)) {
             agent::unlend(&mut self.p);
         }
-        let virtual_clock = agent::clock(&self.p).is_some();
-        with(|r| r.clock(virtual_clock, now));
+        let clock = if agent::clock(&self.p).is_some() {
+            FrameClock::Held
+        } else if agent::lent() {
+            FrameClock::Lent
+        } else {
+            FrameClock::Platform
+        };
+        with(|r| r.clock(clock, now));
     }
 
     /// A `perf` request with `frames`, answered without a turn; `None` for

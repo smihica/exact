@@ -32,6 +32,21 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
+    #[cfg(target_os = "android")]
+    pub(crate) fn development_status(&self) -> i32 {
+        use crate::fetch::LoopStatus;
+        let Some(dev) = &self.dev else { return 0 };
+        match (dev.status, dev.held.as_ref()) {
+            (LoopStatus::Following, Some(_))
+                if matches!(self.waiting, Some(Waiting::Generation(..))) =>
+            {
+                LoopStatus::Preparing as i32
+            }
+            (LoopStatus::Following, Some(_)) => LoopStatus::Failed as i32,
+            (status, _) => status as i32,
+        }
+    }
+
     /// Connect the existing development URL loop; polling starts after first
     /// pixel. A generation the loop it replaces brought, held, goes with it.
     pub fn set_development(&mut self, url: Option<String>, identity: Option<String>) {
@@ -241,8 +256,14 @@ impl<D: DataSource> Presenter<D> {
 
     /// First pixel (LLP 1026 D11): the selection that booted is good.
     pub fn first_pixel(&mut self) {
+        // A snapshot can succeed while a direct window shows an older picture.
+        #[cfg(windows)]
+        if (self.surfaces.direct_window.as_ref()).is_some_and(|d| !d.presented) {
+            return;
+        }
         if self.display.blocked()
             || self.dirty
+            || self.picture_dirty
             || !self.last_frame_succeeded
             || self.activation_failed.is_some()
         {
@@ -562,7 +583,7 @@ impl<D: DataSource> Presenter<D> {
         // begun to go out; the rest never left (LLP 1016.000 D10).
         self.executor.forget(|_| false);
         let started = self.executor.let_go_started(|_| false);
-        self.executor = self.host.executor();
+        self.executor = self.host.executor_with(self.start_executor);
         self.host.runner_mut().uploads_started(&started);
         self.replaced();
         if self.display.new_session() {

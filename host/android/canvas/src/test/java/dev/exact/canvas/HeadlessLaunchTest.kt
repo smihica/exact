@@ -56,7 +56,7 @@ class HeadlessLaunchTest {
             @JvmStatic @Implementation fun launchShare(request: String) { told += "launchShare $request" }
             @JvmStatic @Implementation fun open(href: String) { told += "open $href" }
             @JvmStatic @Implementation fun share(request: String) { told += "share $request" }
-            @JvmStatic @Implementation fun frame(): ByteBuffer? { told += "frame"; return null }
+            @JvmStatic @Implementation fun frame(vsync: Boolean): ByteBuffer? { told += "frame"; return null }
             @JvmStatic @Implementation fun dataActive(unshown: Boolean): Int { turns += "dataActive $unshown"; return 1 }
             @JvmStatic @Implementation fun fds() = IntArray(0)
             @JvmStatic @Implementation fun background(applying: Boolean): Double { turns += "background"; return -1.0 }
@@ -133,13 +133,33 @@ class HeadlessLaunchTest {
         assertTrue(Host.turns.indexOf("environment") in 0 until Host.turns.indexOf("start"))
     }
 
+    @Test fun aLoopSelectionBelongsToOneInstallAndDrivesCanOverrideIt() {
+        val app = RuntimeEnvironment.getApplication()
+        val saved = "http://127.0.0.1:8765/"
+        val other = "http://127.0.0.1:9123/"
+        val select = Intent().setClassName(app, "dev.exact.app.DevLoop").putExtra("x_dev_plan", saved)
+        assertEquals(saved, DevLoop.atLaunch(app, select))
+        assertEquals(saved, DevLoop.atLaunch(app, null))
+        assertEquals(saved, DevLoop.atLaunch(app, Intent(Intent.ACTION_MAIN)))
+        assertEquals(other, DevLoop.atLaunch(app, Intent().putExtra("x_dev_plan", other)))
+        assertNull(DevLoop.atLaunch(app, Intent().putExtra("x_agent", "1")))
+        assertNull(DevLoop.atLaunch(app, Intent().putExtra("x_plan", "/fixture")))
+        assertEquals(saved, DevLoop.atLaunch(app, Intent().setClassName(app, "dev.exact.app.Notify")))
+        val prefs = app.getSharedPreferences("exact.devLoop", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putLong("installed", -2).commit()
+        assertNull(DevLoop.atLaunch(app, Intent(Intent.ACTION_MAIN)))
+    }
+
     @Test fun aDriverLaunchTransfersItsEnvironmentBeforeBoot() {
         val app = RuntimeEnvironment.getApplication()
         app.applicationInfo.metaData = Bundle().apply { putBoolean("dev.exact.development", true) }
+        val stored = """[["pace","\"2:15\""]]"""
         activity(Intent(Intent.ACTION_MAIN).putExtra("x_agent", "1")
-            .putExtra("x_agent_storage", "a=b é").putExtra("x_agent_epoch", "1234"))
+            .putExtra("x_agent_storage", "a=b é").putExtra("x_agent_stored", stored)
+            .putExtra("x_agent_epoch", "1234"))
         assertEquals("1", Host.environment["EXACT_AGENT"])
         assertEquals("a=b é", Host.environment["EXACT_AGENT_STORAGE"])
+        assertEquals(stored, Host.environment["EXACT_AGENT_STORED"])
         assertEquals("1234", Host.environment["EXACT_AGENT_EPOCH"])
         assertTrue(Host.turns.indexOf("environment") in 0 until Host.turns.indexOf("start"))
     }

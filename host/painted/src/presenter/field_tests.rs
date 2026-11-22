@@ -347,6 +347,12 @@ fn set_range_text_command_preserves_selection_and_reports_one_input() {
     body = v
     count = count + 1
     caret = `${e.selectionStart}-${e.selectionEnd}|${e.inputType}`
+  action bindLines
+    body = "A\u{000d}\nBC\u{000d}D"
+  action insert
+    setRangeText("editor", "X", 3, 3, "select")
+  action overwrite
+    setRangeText("editor", "q")
   action replace
     setSelectionRange("editor", 3, 5)
     setRangeText("editor", "XY", 1, 3)
@@ -354,6 +360,9 @@ fn set_range_text_command_preserves_selection_and_reports_one_input() {
     column
       textarea id="editor" testId="editor" value=body input=edited
       button "Replace" testId="replace" press=replace
+      button "Bind" testId="bind" press=bindLines
+      button "Insert" testId="insert" press=insert
+      button "Overwrite" testId="overwrite" press=overwrite
       text `${body}|${count}|${caret}` testId="result"
 "#;
     let (mut p, error) = Presenter::boot_with_fixture_fonts(
@@ -376,6 +385,58 @@ fn set_range_text_command_preserves_selection_and_reports_one_input() {
         Some(id(&p, "editor")),
         "a script is no pending user change"
     );
+    let editor = id(&p, "editor");
+    for (button, expected) in [
+        ("bind", "A\nBC\nD"),
+        ("insert", "A\nBXC\nD"),
+        ("overwrite", "A\nBqC\nD"),
+    ] {
+        p.tap(id(&p, button)).unwrap();
+        p.run_commands(<()>::default);
+        assert_eq!(p.field_text(editor), expected, "{button}");
+        if button == "insert" {
+            let selection = p.field_selection(editor);
+            assert_eq!((selection.start, selection.end), (3, 4));
+        }
+    }
+}
+
+#[test]
+fn markdown_toolbar_commands_explain_why_the_source_stayed_the_same() {
+    let plan = crate::test_plan(
+        r#"component Editor
+  state body = "**note**"
+  action edit(value: string)
+    body = value
+  action toolbar
+    setSelectionRange("source", 2, 6)
+    format("source", "bold")
+    setRangeText("source", "rewrite")
+  view
+    column
+      textarea id="source" testId="source" markup="markdown" value=body input=edit
+      button "Format" testId="toolbar" press=toolbar
+"#,
+    );
+    let (mut p, _) = Presenter::boot_with_fixture_fonts(
+        &plan,
+        (),
+        (400., 600.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    p.tap(id(&p, "toolbar")).unwrap();
+    p.run_commands(<()>::default);
+    let source = id(&p, "source");
+    assert_eq!(p.field_text(source), "**note**");
+    let selection = p.field_selection(source);
+    assert_eq!((selection.start, selection.end), (2, 6));
+    for command in ["format", "setRangeText"] {
+        let why = format!("{command} \"source\" refused: this host edits Markdown as plain source");
+        assert!(p.host().runner().journal().any(|line| line.contains(&why)));
+    }
 }
 
 #[test]

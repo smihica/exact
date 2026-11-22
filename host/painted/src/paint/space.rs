@@ -64,7 +64,7 @@ pub(crate) fn mul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
 fn shadow_reach(node: &exact_kernel::NodeRef<'_>) -> (f32, f32, f32, f32) {
     let mut out = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for s in node.style.box_shadow.shadows().iter().filter(|s| !s.inset) {
-        let r = 1.5 * s.blur + s.spread.max(0.0) + 1.0;
+        let r = super::shadow::shadow_outset(s.blur, s.spread);
         out.0 = out.0.max(r - s.offset.x);
         out.1 = out.1.max(r - s.offset.y);
         out.2 = out.2.max(r + s.offset.x);
@@ -309,6 +309,7 @@ impl Painter {
             return false;
         }
         if w <= 0.0 || h <= 0.0 {
+            self.boxless_audio(walk, node);
             return true;
         }
         let parent = self.split_parent(walk.scene.kernel, node);
@@ -339,6 +340,7 @@ impl Painter {
         let facing = m[2][2] * if m[3][3] < 0.0 { -1.0 } else { 1.0 };
         let turned = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * m[3][3] < 0.0 || facing < 0.0;
         if turned && s.backface_visibility == exact_kernel::BackfaceVisibility::Hidden {
+            self.boxless_audio(walk, node);
             return true;
         }
         let island = (x - left, y - top, iw, ih);
@@ -351,6 +353,7 @@ impl Painter {
                 let flatten = self.flatten.replace(node.id);
                 let mut child_walk = Walk {
                     scene: walk.scene,
+                    scrollbar_cover: walk.scrollbar_cover,
                     hit_space: None,
                     boxes: Vec::new(),
                     text: BTreeMap::new(),
@@ -360,6 +363,7 @@ impl Painter {
                     replay: None,
                     ranks: Rc::clone(&walk.ranks),
                     reveal: walk.reveal,
+                    alert: walk.alert,
                     dialog: walk.dialog,
                 };
                 self.node_at(
@@ -379,6 +383,7 @@ impl Painter {
         }
         let device = crate::placement::compose(plane, ts, 0.0, 0.0);
         let Some(inv) = crate::placement::inverse(device) else {
+            self.boxless_audio(walk, node);
             return true;
         };
         let mut painter = Painter::new(
@@ -392,6 +397,7 @@ impl Painter {
         painter.placements = self.placements.clone();
         painter.canvases = self.canvases.clone();
         painter.flatten = Some(node.id);
+        painter.capture_boxless_audio(walk.scene.kernel);
         // An offscreen subtree includes the same outgoing drawings as the
         // live walk, under this plane's current placement and compositing.
         painter.stage = std::mem::take(&mut self.stage);
@@ -400,6 +406,7 @@ impl Painter {
         painter.backend.begin(iw, ih, self.scale);
         let mut child_walk = Walk {
             scene: walk.scene,
+            scrollbar_cover: walk.scrollbar_cover,
             hit_space: None,
             boxes: Vec::new(),
             text: BTreeMap::new(),
@@ -409,6 +416,7 @@ impl Painter {
             replay: None,
             ranks: Rc::clone(&walk.ranks),
             reveal: walk.reveal,
+            alert: walk.alert,
             dialog: walk.dialog,
         };
         let f = node.frame;
@@ -421,6 +429,7 @@ impl Painter {
         );
         self.stage = std::mem::take(&mut painter.stage);
         self.kept = std::mem::take(&mut painter.kept);
+        self.emit_boxless_audio(walk.scene.kernel, painter.boxless_audio.take());
         let planes = [[0., 0., 1.]; 2];
         if let Ok(source) = painter.backend.finish() {
             if let Some((pixels, rect)) =

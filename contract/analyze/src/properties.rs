@@ -1,11 +1,81 @@
 //! Root property reads closed over derive and function bodies (LLP 1151 D1).
 
 use super::AnalyzeError;
-use contract_syntax::{Component, Expr, FnDecl, PropertyDecl, PropertyForm};
+use contract_syntax::inline::calls::shown;
+use contract_syntax::{
+    Component, Expanded, Expr, FnDecl, PropertyDecl, PropertyForm, PropertyKind,
+};
 use std::collections::BTreeSet;
 
+/// Resolve authored action scopes against the same component instances used by lowering.
+pub fn resolve_actions(expanded: &Expanded, properties: &mut [PropertyDecl]) -> Vec<AnalyzeError> {
+    let mut errors = Vec::new();
+    for p in properties {
+        let written = match &p.kind {
+            PropertyKind::After(action) => action,
+            PropertyKind::NeverRefuses => &p.name,
+            PropertyKind::Always | PropertyKind::Clock => continue,
+        };
+        let message = if let Some((component, action)) = written.split_once('.') {
+            let mut available = BTreeSet::new();
+            let mut matched = Vec::new();
+            for (_, name) in expanded
+                .component_actions()
+                .filter(|(i, _)| i.component == component)
+            {
+                available.insert(shown(name));
+                if shown(name) == action {
+                    matched.push(name.to_owned());
+                }
+            }
+            if !matched.is_empty() {
+                p.actions = matched;
+                continue;
+            }
+            if !expanded.instances.iter().any(|i| i.component == component) {
+                format!("the app uses no component `{component}`")
+            } else if available.is_empty() {
+                format!("`{component}` declares no actions")
+            } else {
+                format!(
+                    "`{component}` has no action `{action}`. Available actions are {}",
+                    available.into_iter().collect::<Vec<_>>().join(", ")
+                )
+            }
+        } else {
+            // Existing tests may name an expanded action directly. A wholly unknown bare
+            // name keeps its historical, unexercised scope.
+            if expanded.root.actions.iter().any(|a| a.name == *written) {
+                continue;
+            }
+            let owners: BTreeSet<_> = expanded
+                .component_actions()
+                .filter(|(_, name)| shown(name) == written)
+                .map(|(i, _)| format!("`{}.{written}`", i.component))
+                .collect();
+            if owners.is_empty() {
+                continue;
+            }
+            format!(
+                "name the child action `{written}` as {}",
+                owners.into_iter().collect::<Vec<_>>().join(" or ")
+            )
+        };
+        errors.push(AnalyzeError {
+            id: "analyze-property-action",
+            message,
+            span: p.span,
+            related: Vec::new(),
+        });
+    }
+    errors
+}
+
 /// Refuse unknown names and derives whose values depend on the oracle, clock or geometry.
-/// `root` is the expanded component that the plan compiler uses.
+/// An `always` line may read a derive over resources: it checks each printed
+/// configuration, where both sides print the oracle's answer, so it never
+/// pairs a value with a commit as `after` does. `root` is the expanded
+/// component that the plan compiler uses.
 pub fn check_properties(
     root: &Component,
     fns: &[FnDecl],
@@ -29,6 +99,7 @@ pub fn check_properties(
                     root,
                     fns,
                     seen: BTreeSet::new(),
+                    resources: property.kind == PropertyKind::Always,
                 };
                 let reason = if let Some(d) = root.derives.iter().find(|d| d.name == name) {
                     if matches!(line.form, PropertyForm::OnlyWrites(_)) {
@@ -61,6 +132,8 @@ struct Cone<'a> {
     root: &'a Component,
     fns: &'a [FnDecl],
     seen: BTreeSet<(&'static str, String)>,
+    /// Whether a resource's value may be read.
+    resources: bool,
 }
 impl Cone<'_> {
     fn base<'a>(e: &'a Expr, bound: &BTreeSet<String>) -> Option<&'a str> {
@@ -75,7 +148,7 @@ impl Cone<'_> {
         match e {
             Expr::Ident(name, _) if !bound.contains(name) => {
                 if self.root.resources.iter().any(|r| r.name == *name) {
-                    return Some(format!("resource `{name}`"));
+                    return (!self.resources).then(|| format!("resource `{name}`"));
                 }
                 if self.seen.insert(("derive", name.clone())) {
                     if let Some(d) = self.root.derives.iter().find(|d| d.name == *name) {

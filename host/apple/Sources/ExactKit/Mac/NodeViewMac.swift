@@ -54,8 +54,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     var paintLifted = false
     /// The opacity written while a reveal holds the box off screen (`holdOffstage`).
     var offstageAlpha: CGFloat?
-    /// In a subtree a staged batch prepares or has taken down: outside the committed tree (`StagingMac.swift`).
-    var held = false
+    var stage = Stage.committed
     var paintGhost = false
     var paintGhosts = 0
     weak var paintParent: PaintView?
@@ -67,13 +66,14 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// them (`textAccessibilityChildren`).
     var inlineKeyViews: [UInt32: InlineKeyView] = [:]
     var inlineAccessibility: (key: String?, elements: [NSAccessibilityElement])?
-    var inlinePressed: UInt32?
+    var inlinePressed: (id: UInt32, down: NSPoint)?
     /// An SVG element a click in this `svg` went down on (LLP 1055.000 D17).
     var svgPressed: UInt32?
     /// Its button went down as a Control-click's context click (X85).
     var contextClicked = false
     var cachedTextSpec: Spec? { didSet { cachedTextHeadroom = nil } }
     var cachedTextHeadroom: Float?
+    var proseMarker: CATextLayer?
     var textLayoutValid = false
     /// The node whose `accent-color` this view last read as its tint, nil for the system's (NodeColorMac.swift).
     var tintSource: ObjectIdentifier?
@@ -99,6 +99,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// CSS removes it with its subtree, or its texts paint at its 0×0 frame's
     /// origin (recipes F19). Reading says whether it is hidden, for either reason.
     private var hostHidden = false
+    var sectionInTable = false { didSet { if sectionInTable != oldValue { isHidden = hostHidden } } }
     /// Whether the host hid this view, whatever CSS's `display` says: what a
     /// projection or a placement saves and restores, since `isHidden` also
     /// reads `display: none` (review B1: restoring that wrote CSS's bit into
@@ -112,7 +113,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
             // projection that means it hides again on its next pass.
             let css = style["display"]?.string == "none"
             if !(newValue && css && !hostHidden && super.isHidden) { hostHidden = newValue }
-            super.isHidden = hostHidden || css
+            super.isHidden = hostHidden || css || sectionInTable
             if shadowStand != nil { followShadowStand() }
         }
     }
@@ -377,14 +378,8 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     package override func resetCursorRects() {
         super.resetCursorRects()
         guard !held else { return }
-        if let cursor = CSSCursor.value(style["cursor"]?.string ?? "auto") { addCursorRect(bounds, cursor: cursor); return }
-        // `cursor: auto` over a link is AppKit's pointing hand, as
-        // `NSTextView` shows over its links (LLP 1115 §3): a `link` node, and
-        // each `href` run of a paragraph.
-        if props["accessibilityRole"] == "link" || !(props["href"] ?? "").isEmpty {
-            addCursorRect(bounds, cursor: .pointingHand)
-            return
-        }
+        if let cursor = boxCursor { addCursorRect(bounds, cursor: cursor); return }
+        // An inline link has a pointing hand over its own fragments (LLP 1115 §3).
         for run in inlineText where run.isLink && !run.hidden {
             for rect in inlineRects(run) { addCursorRect(rect, cursor: .pointingHand) }
         }
@@ -414,6 +409,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// range is a leaf.
     package override func accessibilityChildren() -> [Any]? {
         if props["accessibilityElementsHidden"] == "true" || accessibilityHiddenWritten || held { return [] }
+        if semanticTag == "table", let native = presenter?.dataTables.native(self) { return childNodes.filter { $0.semanticTag == "caption" } + [native as NSView] }
         if actsAsButton { return withAtoms(controlAccessibilityChildren()) }
         return props["accessibilityRole"] == "img" || rangeRole != nil ? nil : withAtoms(textAccessibilityChildren() ?? inDrawnOrder(exposed(super.accessibilityChildren())))
     }
@@ -452,7 +448,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// `aria-hidden` takes the node and its subtree off the tree, as the
     /// web's does (onboarding F16: a checkbox's visible label stayed exposed).
     package override func isAccessibilityElement() -> Bool {
-        accessibilityExposed && props["accessibilityElementsHidden"] != "true" && !held && super.isAccessibilityElement()
+        accessibilityExposed && props["accessibilityElementsHidden"] != "true" && !held && (semanticTag != "table" || presenter?.dataTables.native(self) == nil) && super.isAccessibilityElement()
     }
     /// Where an image source resolves, as a page resolves `src`: an `http(s)`
     /// URL as is; a relative path under the asset root (`EXACT_ASSETS`, else
@@ -757,6 +753,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// (children the surface left in place) is tested in AppKit's order
     /// without them, and then the canvas itself is the hit.
     package override func hitTest(_ point: NSPoint) -> NSView? {
+        if isProjectedSectionWrapper { return nil }
         // A plain leaf or clipped box cannot hit beyond its frame. Visible
         // overflow and transformed or placed children still need the full walk.
         if overlay == nil, !frame.contains(point), (clipsToBounds || subviews.isEmpty),
@@ -1013,6 +1010,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
         for k in clear { next.removeValue(forKey: k) }
         for (k, v) in set { next[k] = v }
         props = next
+        if set["listMarker"] != nil || clear.contains("listMarker") { layoutProseMarker() }
         if set["groupedSeparator"] != nil || clear.contains("groupedSeparator") { applyGroupedSeparator() }
         if set["symbolEffectValue"] != nil || set["symbolColorWritten"] != nil || clear.contains("symbolColorWritten")
             || set["symbolFillRule"] != nil || clear.contains("symbolFillRule") { updateSymbol() }
@@ -1318,7 +1316,8 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     package func fitScroll() {
         guard let scroll, let document = scroll.documentView else { return }
         let visible = scroll.contentView.bounds.size, origin = scroll.kernelDocumentOrigin, o = grid?.origin ?? .zero, s = presenter?.gridScale ?? 1
-        let size = CGSize(width: max(PixelGrid.length(content.width, from: o, vertical: false, scale: s) - origin.x, visible.width), height: max(PixelGrid.length(content.height, from: o, vertical: true, scale: s) - origin.y, visible.height)) // ending where its last edge is drawn (`PixelGridMac.swift`)
+        var size = CGSize(width: max(PixelGrid.length(content.width, from: o, vertical: false, scale: s) - origin.x, visible.width), height: max(PixelGrid.length(content.height, from: o, vertical: true, scale: s) - origin.y, visible.height)) // ending where its last edge is drawn (`PixelGridMac.swift`)
+        if let height = presenter?.tables.feeds[id]?.sectionDocumentHeight { size.height = max(size.height, height) }
         if case let size = scroll.zoom?.child?.grid?.layout.size ?? size, document.frame.size != size { document.setFrameSize(size) }
     }
 
@@ -1421,9 +1420,9 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
             // natural size, `scale-down` the smaller of none and contain;
             // an unknown value is the initial `fill`.
             let fit = style["object_fit"]?.string ?? "fill"
-            let content = contentBox()
+            let content = flightLook?.contentClip ?? contentBox()
             guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-            let rect = flightLook?.image ?? RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: fit)
+            let rect = flightLook?.image ?? RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: fit, position: style["object_position"]?.array)
             ctx.saveGState()
             path.addClip()
             clipToContentEdge(ctx, content)
@@ -1454,7 +1453,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// The click that activates a window presses a control and nothing else,
     /// as in AppKit (LLP 1115.000 D7.9; `clicksThrough`, FocusMac.swift).
     /// The agent's window is never key, so its every click counts.
-    package override func acceptsFirstMouse(for event: NSEvent?) -> Bool { Self.everyClickCounts || clicksThrough }
+    package override func acceptsFirstMouse(for event: NSEvent?) -> Bool { Self.countsFirstMouse(event) || clicksThrough }
 
     // Press: down and up inside the bounds. A click on a button or a
     // pressable leaves the first responder where it is, as a click on an

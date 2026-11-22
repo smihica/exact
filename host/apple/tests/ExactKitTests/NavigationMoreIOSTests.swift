@@ -1349,7 +1349,7 @@ final class NavigationMoreIOSTests: XCTestCase {
     }
 
     /// The more-tabs fixture, skipped where UIKit's bar shows every tab.
-    private func moreFixture(_ label: String) throws -> (ExactSession, UITabBarController, UINavigationController) {
+    func moreFixture(_ label: String) throws -> (ExactSession, UITabBarController, UINavigationController) {
         let session = try fixture(label)
         let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         guard tabs.tabBar.items?.count == 5 else { throw XCTSkip("UIKit's bar shows every tab at this width: there is no More") }
@@ -1359,7 +1359,7 @@ final class NavigationMoreIOSTests: XCTestCase {
     /// A row of More's list picked: UIKit selects the tab's controller as
     /// `selectedViewController` set in code does, with no tab delegate call;
     /// More's `willShow` and `didShow` follow in a later turn (measured).
-    private func pickRow(_ tabs: UITabBarController, _ index: Int) {
+    func pickRow(_ tabs: UITabBarController, _ index: Int) {
         tabs.selectedViewController = tabs.tabControllers![index]
     }
 
@@ -1395,7 +1395,7 @@ final class NavigationMoreIOSTests: XCTestCase {
         return session
     }
 
-    private func node(_ session: ExactSession, _ testId: String) throws -> NodeView {
+    func node(_ session: ExactSession, _ testId: String) throws -> NodeView {
         try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == testId }, "no \(testId)")
     }
 

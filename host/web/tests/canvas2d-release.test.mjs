@@ -1,9 +1,12 @@
 import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
-import { expect, test } from 'bun:test';
+import { expect } from 'bun:test';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
+import { engineTests } from '../../../scripts/coverage.mjs';
 import { glueDeclarations } from './glue-fixture.mjs';
 import { standIns } from './stand-ins.mjs';
+import { decodePng } from '../../../scripts/png.mjs';
 
+const { chromium: test } = await engineTests(['chromium']);
 const host = glueDeclarations(readFileSync(new URL('../glue.js', import.meta.url), 'utf8'), ['apply', 'bootNow', 'reportColors']);
 const runtime = ['rt.js', 'clock.js', 'resources.js', 'tree.js', 'events.js', 'pieces.js', 'mount.js', 'strings.js', 'rt-link.js', 'held.js', 'font-family.js', 'observers.js', 'grid.js', 'overlay.js', 'roster.js', 'router.js', 'route-pattern.js', 'schedule.js', 'budget.js', 'elements.js', 'shape.js'];
 const standins = standIns(runtime);
@@ -34,6 +37,54 @@ function serve() {
     return new Response('<main id="exact-root"></main>', { headers: { 'content-type': 'text/html' } });
   } });
 }
+
+for (const target of ['js', 'wasm']) test(`${target}: canvas fit and position follow the wrapper after style changes`, async () => {
+  const server = serve(), browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage({ deviceScaleFactor: 1 });
+    await page.goto(`${server.url}?agent=1`);
+    await page.evaluate(async target => {
+      globalThis.exact = {};
+      await import('/canvas2d.js');
+      const el = document.createElement('div'), surface = document.createElement('canvas');
+      el.dataset.view = '1'; el.dataset.bitmapWidth = '40'; el.dataset.bitmapHeight = '20';
+      el.id = 'actual';
+      el.style.cssText = 'position:relative;isolation:isolate;width:160px;height:80px;font-size:20px;object-fit:none;object-position:7px 11px';
+      surface.dataset.surface = '';
+      surface.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;z-index:-1';
+      el.append(surface); document.getElementById('exact-root').append(el);
+      const oracle = document.createElement('canvas');
+      oracle.id = 'oracle'; oracle.width = 40; oracle.height = 20;
+      oracle.style.cssText = 'display:block;width:160px;height:80px;font-size:20px;object-fit:none;object-position:7px 11px';
+      oracle.getContext('2d').fillRect(0, 0, 40, 20); el.after(oracle);
+      if (target === 'js') {
+        const { engine } = await import('/canvas2d.js');
+        const canvases = engine({ data: {}, clock: { now: 0, agent: true }, inflight: { n: 0 }, journal: [], After: [], views: new Map([[1, el]]), viewId: () => 1 });
+        canvases.args({ e: el, name: 'dot', args: [], types: [], names: [], mounted: 0 });
+        globalThis.drawn = () => exact.canvas2dState()?.[0]?.draws > 0;
+      } else {
+        exact.send = () => {};
+        const glue = exact.canvas2dGlue({ views: new Map([[1, el]]), now: () => 0 });
+        exact.wasm = { exact_canvas_geometry() {
+          glue.op({ id: 1, fresh: true, lifetime: 1, generation: 0, w: 40, h: 20, scale: 1, stretch: true, lists: [] });
+          surface.getContext('2d').fillRect(0, 0, 20, 20);
+        } };
+        glue.op({ id: 1, watch: true }); glue.geometry(1);
+        globalThis.drawn = () => surface.width === 40;
+      }
+      // The shared fixture draws a 20px square in a 40 × 20 bitmap.
+      oracle.getContext('2d').clearRect(20, 0, 20, 20);
+    }, target);
+    await page.waitForFunction(() => drawn());
+    for (const [fit, position] of [['none', '7px 11px'], ['contain', 'right bottom'], ['cover', '25% 75%'], ['fill', 'left top'], ['scale-down', '1em 0'], ['none', '10vw 0'], ['none', 'var(--missing, 7px 11px)']]) {
+      await page.evaluate(([fit, position]) => {
+        for (const id of ['actual', 'oracle']) Object.assign(document.getElementById(id).style, { objectFit: fit, objectPosition: position });
+      }, [fit, position]);
+      const actual = decodePng(await page.locator('#actual').screenshot()), oracle = decodePng(await page.locator('#oracle').screenshot());
+      expect(Buffer.from(actual.data).equals(Buffer.from(oracle.data)), `${target}: ${fit}, ${position}`).toBe(true);
+    }
+  } finally { await browser.close(); server.stop(true); }
+}, 30000);
 
 for (const target of ['js', 'wasm', 'wasm-reload']) for (const agent of [false, true]) test(`${target}, agent=${agent}: removed Canvas 2D wrappers and bitmaps can be collected`, async () => {
   const server = serve(), browser = await suiteBrowser();

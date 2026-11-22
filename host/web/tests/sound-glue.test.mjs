@@ -314,13 +314,14 @@ for (const engine of engines) {
           await decoded(r.out);
           r.out.ops([{ op: 'play', id: 1, sound: 0, at: 0, gain: 1 }, { op: 'end', id: 1, at: 100 },
             { op: 'play', id: 2, sound: 1, at: 100, gain: 1 }]);
-          const paused = r.context.suspend(0.05);
-          const rendering = r.context.startRendering();
-          await paused;
-          r.out.ops([{ op: 'end', id: 1, at: end }, { op: 'end', id: 2, at: 100 }]);
-          if (end === 150) r.out.ops([{ op: 'play', id: 3, sound: 1, at: 150, gain: 1 }]);
-          await r.context.resume();
-          const pcm = (await rendering).getChannelData(0);
+          const edit = () => {
+            r.out.ops([{ op: 'end', id: 1, at: end }, { op: 'end', id: 2, at: 100 }]);
+            if (end === 150) r.out.ops([{ op: 'play', id: 3, sound: 1, at: 150, gain: 1 }]);
+          };
+          // Firefox edits the scheduled cut before rendering. Engines that can pause edit it during playback.
+          const resumed = r.context.suspend ? r.context.suspend(0.05).then(() => { edit(); return r.context.resume(); }) : edit();
+          const [buffer] = await Promise.all([r.context.startRendering(), resumed]);
+          const pcm = buffer.getChannelData(0);
           results.push([pcm[3599], pcm[3600], pcm[4800], pcm[7199], pcm[7200], pcm[11999], pcm[12000]]);
         }
         return results;

@@ -283,3 +283,42 @@ test("a wasm build's app.version.json carries the bake's version and whether its
   expect(JSON.parse(versionFile({ version: '', buildNumber: '', trust: 'development' }))).toEqual({ version: '', buildNumber: '', production: false });
   expect(versionFile({ version: '1', buildNumber: '1', trust: 'development' }).endsWith('}\n')).toBe(true);
 });
+
+// expo/exact#812: a dev-only bin in a dependency crate (and another build's dep-info for it)
+// is not an input of the web build.
+test('web freshness ignores dev-only bins and foreign dep-info in GPU dependencies', () => {
+  const dir = mkdtempSync(resolve(root, 'target/web-devbin-')), appDir = resolve(dir, 'app');
+  const put = (path, text) => { mkdirSync(dirname(resolve(dir, path)), { recursive: true }); writeFileSync(resolve(dir, path), text); };
+  try {
+    put('Cargo.toml', '[workspace]\nresolver="2"\nmembers=["app/web","app/gpu","physics"]\n');
+    put('app/web/Cargo.toml', '[package]\nname="devbin-web"\nversion="0.1.0"\nedition="2021"\n');
+    put('app/web/src/lib.rs', 'pub fn web() {}\n');
+    put('app/gpu/Cargo.toml', '[package]\nname="devbin-gpu"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nphysics={path="../../physics"}\n[[bin]]\nname="gallery-trace"\npath="src/bin/gallery-trace.rs"\n');
+    put('app/gpu/src/lib.rs', 'pub fn gpu() { physics::step(); }\n');
+    put('app/gpu/src/bin/gallery-trace.rs', 'fn main() {}\n');
+    put('physics/Cargo.toml', '[package]\nname="physics"\nversion="0.1.0"\nedition="2021"\n[features]\ntrace=[]\n[[bin]]\nname="trace"\npath="src/bin/trace.rs"\nrequired-features=["trace"]\n');
+    put('physics/src/lib.rs', 'pub fn step() {}\n');
+    put('physics/src/bin/trace.rs', 'fn main() {}\n');
+    put('physics/src/bin/extra.rs', 'pub fn extra() {}\n');
+    // Simulate a prior native build of `trace` leaving dep-info in target/debug.
+    put('target/debug/trace.d', `target/debug/trace: ${resolve(dir, 'physics/src/bin/trace.rs')} ${resolve(dir, 'physics/src/bin/extra.rs')}\n`);
+    const meta = spawnSync('cargo', ['metadata', '--offline', '--format-version', '1'], { cwd: dir, encoding: 'utf8' });
+    expect(meta.status).toBe(0);
+    const app = { dir: appDir, workspace: dir, target: resolve(dir, 'target'), manifest: {}, crate: kind => `devbin-${kind}` };
+    const dist = resolve(dir, 'dist'); mkdirSync(dist);
+    const inputRoots = webSourceRoots(app, false), inputs = webInputDigests(app, false, inputRoots);
+    put('dist/.exact-build.json', JSON.stringify({ target: 'wasm', inputs, inputRoots, inputsAt: Date.now() }));
+    const traceShown = resolve(dir, 'physics/src/bin/trace.rs').slice(root.length + 1);
+    const galleryShown = resolve(dir, 'app/gpu/src/bin/gallery-trace.rs').slice(root.length + 1);
+    const libShown = resolve(dir, 'physics/src/lib.rs').slice(root.length + 1);
+    expect(inputs[traceShown]).toBeUndefined();
+    expect(inputs[galleryShown]).toBeUndefined();
+    expect(inputs[libShown]).toBeString();
+    const drive = { ...app, get workspace() { throw new Error('a drive queried Cargo'); } };
+    writeFileSync(resolve(dir, 'physics/src/bin/trace.rs'), 'fn main() { println!("edit"); }\n');
+    writeFileSync(resolve(dir, 'app/gpu/src/bin/gallery-trace.rs'), 'fn main() { println!("edit"); }\n');
+    expect(webChanges(dist, drive).all).toEqual([]);
+    writeFileSync(resolve(dir, 'physics/src/lib.rs'), 'pub fn step() { let _ = 1; }\n');
+    expect(webChanges(dist, drive).shared).toContain(libShown);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

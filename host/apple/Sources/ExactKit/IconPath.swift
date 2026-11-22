@@ -7,11 +7,9 @@ import UIKit
 import ExactCore
 
 extension NodeView {
-    /// An icon path's image for this node `side` points square, when it has
-    /// one (`symbolPath`), filled by its `symbolFillRule`.
-    func iconPathImage(side: CGFloat) -> IconImage? {
+    func iconPathImage(size: CGSize, crop: CGRect? = nil) -> IconImage? {
         guard let commands = props["symbolPath"] else { return nil }
-        return IconPath.image(commands, viewBox: props["symbolViewBox"] ?? "", size: CGSize(width: side, height: side),
+        return IconPath.image(commands, viewBox: props["symbolViewBox"] ?? "", size: size, crop: crop,
                               rule: IconPath.rule(props["symbolFillRule"]))
     }
 }
@@ -32,37 +30,42 @@ extension NodeView {
     func layoutSymbol() {
         guard let leaf = symbolView else { return }
         let content = contentBox()
-        leaf.frame = content; leaf.clipsToBounds = !listSymbol // a list cell's image is its own size, centred, as UIKit's
-        switch listSymbol ? "none" : style["object_fit"]?.string ?? "fill" {
-        case "cover": leaf.contentMode = .scaleAspectFill
-        case "none": leaf.contentMode = .center
-        case "scale-down":
-            let size = image?.size ?? .zero
-            leaf.contentMode = size.width <= content.width && size.height <= content.height ? .center : .scaleAspectFit
-        // `contain`, and `fill`: a symbol is a vector glyph, which keeps its
-        // aspect in a box of another shape as an SVG's default
-        // `preserveAspectRatio` (`xMidYMid meet`) keeps it, and as the web
-        // host's symbol mask draws it (LLP 1011 §4).
-        default: leaf.contentMode = .scaleAspectFit
-        }
-        // An icon path is a vector: drawn again at the box it fills, not its em square stretched (UIKit scales a bitmap).
+        // Set the leaf's frame only where the glyph is placed: an interim frame is a change to the image view's
+        // geometry, for which UIKit sets its contents again, in every layout
+        leaf.clipsToBounds = !listSymbol
+        let fit = listSymbol ? "none" : style["object_fit"]?.string ?? "fill"
         var shown = image
-        if props["symbolPath"] != nil, let image {
-            let side = max(content.width, content.height)
-            // (Centred, it is its em square again, whatever the box was before.)
-            if leaf.contentMode == .center { shown = image }
-            else if side > 0, side != image.size.width {
-                let state = SymbolEffectState.of(leaf)
-                if state.pathTemplate?.size.width != side { state.pathTemplate = iconPathImage(side: side) }
-                shown = state.pathTemplate
+        if props["symbolPath"] != nil {
+            let box = IconPath.viewBox(props["symbolViewBox"] ?? "")
+            let rect = IconPath.placed(viewBox: box, em: number("font_size", PageFacts.defaultRootFontSize), fit: fit,
+                                       position: style["object_position"]?.array, in: content)
+            let visible = listSymbol ? rect : rect.intersection(content)
+            // Keep the full placement transform even when cover needs only a sliver of it.
+            let crop = visible.isEmpty ? .zero : visible.offsetBy(dx: -rect.minX, dy: -rect.minY)
+            let state = SymbolEffectState.of(leaf)
+            if state.pathTemplateGeometry?.size != rect.size || state.pathTemplateGeometry?.crop != crop {
+                state.pathTemplateGeometry = (rect.size, crop)
+                state.pathTemplate = iconPathImage(size: rect.size, crop: crop)
             }
+            shown = state.pathTemplate
+            leaf.frame = visible.isEmpty ? .zero : visible
+            leaf.contentMode = .scaleToFill
+        } else {
+            let rect = IconPath.placed(natural: image?.size ?? .zero, fit: fit,
+                                       position: style["object_position"]?.array, in: content)
+            leaf.frame = rect
+            leaf.contentMode = .scaleAspectFit
         }
         inkSymbolView(shown)
-        // A square box clips nothing the content box does not.
-        if cornerRadii(in: bounds).allSatisfy({ $0 == 0 }) { if leaf.layer.mask != nil { leaf.layer.mask = nil }; return }
-        let path = roundedPath(in: bounds).cgPath
+        if (listSymbol || content.contains(leaf.frame)), cornerRadii(in: bounds).allSatisfy({ $0 == 0 }) {
+            if leaf.layer.mask != nil { leaf.layer.mask = nil }; return
+        }
         var transform = CGAffineTransform(translationX: -content.minX, y: -content.minY)
-        let mask = CAShapeLayer(); mask.path = path.copy(using: &transform); leaf.layer.mask = mask
+        let mask = CAShapeLayer()
+        mask.frame = content.offsetBy(dx: -leaf.frame.minX, dy: -leaf.frame.minY)
+        mask.masksToBounds = true
+        mask.path = roundedPath(in: bounds).cgPath.copy(using: &transform)
+        leaf.layer.mask = mask
     }
 }
 #endif

@@ -106,7 +106,7 @@ impl Content {
                 };
                 let top = (y - self.offset).max(self.viewport.1);
                 let bottom = (y - self.offset + p.height).min(self.viewport.1 + self.viewport.3);
-                (bottom > top).then_some((*source, (*x, top, p.width, bottom - top)))
+                Some((*source, (*x, top, p.width, (bottom - top).max(0.))))
             })
             .collect()
     }
@@ -292,6 +292,13 @@ pub(super) fn alert(
 }
 
 impl Layout {
+    pub(in crate::presenter) fn content_offset(&self) -> f32 {
+        self.menu_scroll()
+            .map(|(offset, _)| offset)
+            .or_else(|| self.windows.as_ref().map(|content| content.offset))
+            .unwrap_or_default()
+    }
+
     pub(in crate::presenter) fn content_contains(&self, x: f32, y: f32) -> bool {
         if let Some(clip) = self.menu_clip() {
             return menu::contains(clip, x, y);

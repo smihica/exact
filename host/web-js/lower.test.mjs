@@ -5,6 +5,7 @@ import { expect, mock, test } from 'bun:test';
 const journal = [], effects = [];
 let Adopting = false;
 mock.module('./rt.js', () => ({
+  GPU_PLACEMENT: false,
   adopting: () => Adopting, effect: f => { effects.push(f); f(); }, say: l => journal.push(l),
   // As rt.js's: a number takes its unit, a blank explicitly clears.
   cssText: (prop, unit, v) => v == null ? null : typeof v === 'number' ? v + unit : !String(v).trim() && !prop.startsWith('--') ? 'unset' : String(v),

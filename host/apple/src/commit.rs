@@ -206,7 +206,9 @@ impl<D: DataSource> Host<D> {
         if layout_error.is_some() && !receipts.is_empty() {
             self.emit_ranks(&mut batch);
         }
-        self.canvas_turn(&mut batch);
+        if let Some(canvas) = self.turn.canvas {
+            (canvas.turn)(self, &mut batch);
+        }
         for s in self.runner.take_surface_updates() {
             batch.surface(&s);
         }

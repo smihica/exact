@@ -26,6 +26,7 @@ pub(crate) mod decorations;
 mod edges_tests;
 mod fallback;
 pub(crate) mod field;
+use field::WidthUse;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod flow;
@@ -67,6 +68,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tiny_skia::{IntSize, Mask, Pixmap, PixmapPaint, Transform};
+
+pub(crate) const PARAGRAPH_BREAKS: [char; 7] = [
+    '\n', '\r', '\u{1c}', '\u{1d}', '\u{1e}', '\u{85}', '\u{2029}',
+];
 
 // Ascent, descent, and leading in logical points.
 type FontMetrics = (f32, f32, f32);
@@ -401,7 +406,7 @@ impl Paragraph {
         self.owned_capacity_bytes() - self.source.accessible_capacity_bytes
     }
 
-    /// The runs it was shaped from, in the order glyphs' `metadata` index.
+    /// The canonical runs referenced by this paragraph's glyphs.
     pub fn runs(&self) -> &[Run] {
         &self.source.spec.runs
     }
@@ -472,18 +477,17 @@ impl Paragraph {
         for (line, baseline) in self.layout_runs().zip(self.baselines.iter()) {
             let mut spans: Vec<(f32, f32, usize)> = Vec::new();
             for g in line.glyphs {
-                if backgrounds.get(g.run()).copied().flatten().is_none() {
+                let run = g.run(line.run_base);
+                if backgrounds.get(run).copied().flatten().is_none() {
                     continue;
                 }
                 let (lo, hi) = (g.x.min(g.x + g.w), g.x.max(g.x + g.w));
                 match spans.last_mut() {
-                    Some(last)
-                        if last.2 == g.run() && lo <= last.1 + 0.01 && hi >= last.0 - 0.01 =>
-                    {
+                    Some(last) if last.2 == run && lo <= last.1 + 0.01 && hi >= last.0 - 0.01 => {
                         last.0 = last.0.min(lo);
                         last.1 = last.1.max(hi);
                     }
-                    _ => spans.push((lo, hi, g.run())),
+                    _ => spans.push((lo, hi, run)),
                 }
             }
             spans.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -532,13 +536,17 @@ impl Paragraph {
         &'a self,
         palette: &'a [RunPaint],
     ) -> impl Iterator<Item = (&'a LayoutGlyph, f32, RunPaint)> + 'a {
-        self.layout_runs()
-            .zip(self.baselines.iter())
-            .flat_map(move |(line, baseline)| {
-                line.glyphs
-                    .iter()
-                    .map(move |glyph| (glyph, *baseline, palette[glyph.run()]))
-            })
+        self.glyphs_with_runs()
+            .map(move |(glyph, baseline, run)| (glyph, baseline, palette[run]))
+    }
+
+    /// Positioned glyphs with their baseline and canonical run in this paragraph.
+    pub(crate) fn glyphs_with_runs(&self) -> impl Iterator<Item = (&LayoutGlyph, f32, usize)> {
+        self.layout_runs().flat_map(|line| {
+            line.glyphs
+                .iter()
+                .map(move |glyph| (glyph, line.line_y, glyph.run(line.run_base)))
+        })
     }
 }
 
@@ -638,7 +646,7 @@ pub struct TextEngine {
     pub(crate) field_faces: HashMap<(u16, u16, bool), String>,
     /// Canonical shaped-source builds, independent of width layout.
     pub shape_calls: usize,
-    layout_calls: usize,
+    pub(crate) layout_calls: usize,
     #[cfg(test)]
     before_layout: Option<Box<dyn FnMut()>>,
     #[cfg(test)]
@@ -826,21 +834,6 @@ impl TextEngine {
         self.paragraph_for(spec, width, key)
     }
 
-    /// [`TextEngine::paragraph`] for a text that replaces the one `owner`
-    /// (a field's node and which of its texts) showed before: the replaced
-    /// one is not kept ([`cache::Cache::superseding`]).
-    pub(crate) fn paragraph_replacing(
-        &mut self,
-        owner: (u32, u8),
-        spec: &Spec,
-        width: Option<f32>,
-    ) -> Rc<Paragraph> {
-        let key = self.paragraphs.identity(spec);
-        let p = self.paragraph_for(spec, width, key);
-        self.paragraphs.superseding(owner, key);
-        p
-    }
-
     fn identified_spec(
         &mut self,
         stamp: &ParagraphStamp,
@@ -891,36 +884,53 @@ impl TextEngine {
         width: Option<f32>,
         key: (u64, u64),
     ) -> Rc<Paragraph> {
+        self.layout_paragraph(width, key, WidthUse::Paint)
+    }
+
+    fn layout_paragraph(
+        &mut self,
+        width: Option<f32>,
+        key: (u64, u64),
+        usage: WidthUse,
+    ) -> Rc<Paragraph> {
         if let Some(p) = self.paragraphs.get(key, width.into()) {
             return p;
         }
         self.paragraphs.before_shape(key);
-        let source = self.source(key);
-        let p = Rc::new(self.layout_source(&source, width, true));
+        let source = self.source(key, usage.previous().map(|p| p.source.as_ref()));
+        let p = Rc::new(self.layout_source(&source, width, usage));
         self.hold(&source, &p);
         self.paragraphs.insert(key, width.into(), &p);
         p
     }
 
-    fn source(&mut self, key: (u64, u64)) -> Rc<ShapedSource> {
+    fn source(&mut self, key: (u64, u64), previous: Option<&ShapedSource>) -> Rc<ShapedSource> {
         if let Some(source) = self.paragraphs.source(key) {
             exact_ink::counters::add(exact_ink::counters::Counter::ShapeHits, 1);
             return source;
         }
         let spec = self.paragraphs.spec(key).expect("current identity");
-        let source = self.build_source(spec);
+        let source = self.build_source(spec, previous);
         self.paragraphs.set_source(key, source.clone());
         source
     }
 
-    fn build_source(&mut self, spec: Arc<Spec>) -> Rc<ShapedSource> {
+    fn build_source(
+        &mut self,
+        spec: Arc<Spec>,
+        previous: Option<&ShapedSource>,
+    ) -> Rc<ShapedSource> {
         #[cfg(target_os = "macos")]
         let _trace = exact_ink::device::apple::Trace::new(c"text shape");
         exact_ink::counters::add(exact_ink::counters::Counter::ShapeMisses, 1);
         self.shape_calls += 1;
         #[cfg(test)]
         identified_tests::shaped(&spec);
-        Rc::new(ShapedSource::new(self.catalog.clone(), spec))
+        Rc::new(ShapedSource::replacing(
+            self.catalog.clone(),
+            spec,
+            previous,
+        ))
     }
 
     /// Keep `p`'s measured lines for this frame's paint; another width of
@@ -949,13 +959,12 @@ impl TextEngine {
         }
     }
 
-    /// A width of `source`; `hold` keeps the lines it broke for this
-    /// frame's paint ([`Self::hold`]).
+    /// A width of `source`. A paint keeps the measured lines for its frame.
     fn layout_source(
         &mut self,
         source: &Rc<ShapedSource>,
         width: Option<f32>,
-        hold: bool,
+        usage: WidthUse,
     ) -> Paragraph {
         #[cfg(target_os = "macos")]
         let _trace = exact_ink::device::apple::Trace::new(c"text width layout");
@@ -964,17 +973,13 @@ impl TextEngine {
             callback();
         }
         self.layout_calls += 1;
-        if hold {
-            source.layout_held(width)
-        } else {
-            source.layout(width)
-        }
+        source.layout_as(width, false, usage)
     }
 
     #[cfg(test)]
     fn layout(&mut self, spec: &Spec, width: Option<f32>) -> Paragraph {
-        let source = self.build_source(Arc::new(spec.clone()));
-        self.layout_source(&source, width, false)
+        let source = self.build_source(Arc::new(spec.clone()), None);
+        self.layout_source(&source, width, WidthUse::Measure)
     }
 
     // Intrinsic questions retain the shared source and scalar answers only.
@@ -986,9 +991,9 @@ impl TextEngine {
         }
         self.paragraphs.release_handoff(key.1);
         self.paragraphs.before_shape(key);
-        let source = self.source(key);
+        let source = self.source(key, None);
         let width = minimum.then(|| source.min_content().ceil());
-        let mut metrics = paragraph_metrics(&self.layout_source(&source, width, false));
+        let mut metrics = paragraph_metrics(&self.layout_source(&source, width, WidthUse::Measure));
         // Min-content is the widest unbreakable run, not the widest line at that
         // width: a preserved trailing space counts toward a line but not toward
         // min-content, as in Chrome.
@@ -1097,8 +1102,7 @@ impl TextEngine {
         mask: Option<&Mask>,
         clip: (f32, f32, f32, f32),
     ) -> std::ops::Range<u32> {
-        // Glyph positions already carry device scale. The GPU stream is separate
-        // and remains full; only this CPU loop selects conservative ink spans.
+        // Glyph positions already carry device scale.
         let glyph_ts = transform.pre_scale(1.0 / scale, 1.0 / scale);
         let height = target.height();
         let mut rows = if glyph_ts.is_identity() {
@@ -1109,13 +1113,10 @@ impl TextEngine {
         paragraph.layouts();
         let mut catalog = paragraph.source.catalog.borrow_mut();
         let mut cache = paragraph.ink.borrow_mut();
-        if !cache.matches(&catalog.ink_catalog, scale) {
-            cache.reset(&catalog.ink_catalog, scale);
-            #[cfg(test)]
-            {
-                self.ink_builds += 1;
-            }
-            cache.index = ink::Index::build(&mut catalog, paragraph, scale).map(Into::into);
+        let _rebuilt = cache.prepare(&mut catalog, paragraph, scale);
+        #[cfg(test)]
+        if _rebuilt {
+            self.ink_builds += 1;
         }
         let paint = PixmapPaint::default();
         let slots = ink::slots(&mut catalog, paragraph.layouts());
@@ -1163,10 +1164,10 @@ impl TextEngine {
                 .viewport(origin, scale, glyph_ts, clip)
                 .map(|query| (index, query))
         }) {
-            let _nodes = index.visit(query, |line| {
-                let (glyphs, baseline) = index.glyphs(paragraph, line);
+            let _nodes = index.visit(query, |chunk| {
+                let (glyphs, baseline, base) = index.glyphs(paragraph, chunk);
                 for g in glyphs {
-                    draw(g, baseline, palette[g.run()]);
+                    draw(g, baseline, palette[g.run(base)]);
                 }
             });
             #[cfg(test)]
@@ -1187,36 +1188,38 @@ impl TextEngine {
     /// points from the paragraph's top-left, the same numbers the raster
     /// path snaps to pixels.
     pub fn glyph_runs(&mut self, paragraph: &Paragraph, palette: &[RunPaint]) -> Vec<GlyphRun> {
-        self.glyph_runs_mapped(paragraph, palette, |g, baseline| (g.x, baseline + g.y))
-    }
-
-    pub(crate) fn physical_glyph_runs(
-        &mut self,
-        paragraph: &Paragraph,
-        palette: &[RunPaint],
-        origin: (f32, f32),
-        scale: f32,
-    ) -> Vec<GlyphRun> {
-        self.glyph_runs_mapped(paragraph, palette, |g, baseline| {
-            exact_ink::glyph::position(g.x, g.y, baseline, origin, scale)
+        Self::glyph_runs_mapped(paragraph, palette, None, |g, baseline| {
+            (g.x, baseline + g.y)
         })
     }
 
     fn glyph_runs_mapped(
-        &mut self,
         paragraph: &Paragraph,
         palette: &[RunPaint],
+        visible: Option<(&ink::Index, ink::Bounds)>,
         position: impl Fn(&LayoutGlyph, f32) -> (f32, f32),
     ) -> Vec<GlyphRun> {
         type Key = (u16, u32, usize);
         type Runs = Vec<(Key, Vec<(u32, f32, f32)>)>;
         let mut runs: Runs = Vec::new();
-        for (g, baseline, _) in paragraph.paint_glyphs(palette) {
-            let key = (g.face, g.font_size.to_bits(), g.run());
+        let mut add = |g: &LayoutGlyph, baseline, run| {
+            let key = (g.face, g.font_size.to_bits(), run);
             let (x, y) = position(g, baseline);
             match runs.last_mut() {
                 Some((k, glyphs)) if *k == key => glyphs.push((g.glyph_id, x, y)),
                 _ => runs.push((key, vec![(g.glyph_id, x, y)])),
+            }
+        };
+        if let Some((index, query)) = visible {
+            index.visit(query, |chunk| {
+                let (glyphs, baseline, base) = index.glyphs(paragraph, chunk);
+                for glyph in glyphs {
+                    add(glyph, baseline, glyph.run(base));
+                }
+            });
+        } else {
+            for (glyph, baseline, run) in paragraph.glyphs_with_runs() {
+                add(glyph, baseline, run);
             }
         }
         let catalog = paragraph.source.catalog.borrow();

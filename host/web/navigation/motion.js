@@ -267,6 +267,7 @@ export function presenceLoader(load, root, apply, log) {
 // own time (LLP 1055 D10); every other animation follows the runner's clock.
 export function animationClock(now, settled, synced, early = () => undefined) {
   const starts = new WeakMap(), held = new WeakSet(), clocks = animationClocks(document);
+  const startOf = a => starts.get(a) ?? now();
   // A scroll-driven animation follows its scroll, not a clock.
   const timed = () => document.getAnimations().filter((a) => !a.timeline || a.timeline instanceof DocumentTimeline);
   return {
@@ -288,17 +289,16 @@ export function animationClock(now, settled, synced, early = () => undefined) {
     seek(to, sync = true) {
       for (const a of timed()) {
         const timing = a.effect?.getComputedTiming();
-        if (!timing) {
+        if (!timing || held.has(a)) {
           continue;
         }
-        const t = to - (starts.get(a) ?? now());
-        if (held.has(a)) {
-          continue;
-        } else if (t >= timing.endTime && timing.endTime !== Infinity) {
+        const start = startOf(a);
+        // Subtracting the start from settle's deadline can round below endTime.
+        if (to >= start + timing.endTime && timing.endTime !== Infinity) {
           a.finish();
         } else {
           a.pause();
-          a.currentTime = t;
+          a.currentTime = to - start;
         }
       }
       if (sync) synced();
@@ -324,7 +324,7 @@ export function animationClock(now, settled, synced, early = () => undefined) {
       for (const a of timed()) {
         const timing = a.effect?.getComputedTiming();
         if (timing && timing.endTime !== Infinity && !held.has(a)) {
-          to = Math.max(to, (starts.get(a) ?? now()) + timing.endTime);
+          to = Math.max(to, startOf(a) + timing.endTime);
         }
       }
       return to;

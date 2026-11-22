@@ -191,6 +191,27 @@ fn textures_brushes_clips_mips_and_retirement_reach_the_pixels() {
     tinted.flags = flags::TINT;
     tinted.color = [0., 0.5, 0., 0.5];
     e.push(tinted, bindings).unwrap();
+    let mut shadow = Instance::new(Kind::Shadow, Brush::Image, [0., 0., 1., 1.]);
+    shadow.flags = flags::TINT;
+    shadow.xform = [6.25, 0., 0., 8., 46.375, 4.];
+    shadow.param[0] = 0.;
+    shadow
+        .set_clip(
+            1,
+            RoundedClip {
+                rect: [49., 6., 2., 4.],
+                radii: [0.; 4],
+            },
+        )
+        .unwrap();
+    e.push(shadow, bindings).unwrap();
+    let mut band = shadow.translated([9., 0.]);
+    band.flags |= flags::RASTERED_SHADOW;
+    for x in [0., 0.5] {
+        band.rect = [x, 0., 0.5, 1.];
+        band.uv = band.rect;
+        e.push(band, bindings).unwrap();
+    }
     let mut radial = Instance::new(Kind::RoundedRect, Brush::Gradient, [24., 16., 8., 16.]);
     radial.flags = flags::RADIAL;
     radial.param = [28., 24., 4., 8.];
@@ -246,6 +267,12 @@ fn textures_brushes_clips_mips_and_retirement_reach_the_pixels() {
     near(pixel(&pixels, 64, 10, 24), [128; 4], 1);
     near(pixel(&pixels, 64, 2, 24), [0; 4], 0);
     near(pixel(&pixels, 64, 10, 18), [0; 4], 0);
+    // At the same fractional edge the raster supplies its own coverage.
+    near(pixel(&pixels, 64, 46, 8), [80; 4], 1);
+    near(pixel(&pixels, 64, 55, 8), [128; 4], 1);
+    // The two translucent bands share the centre of this pixel.
+    near(pixel(&pixels, 64, 58, 5), [128; 4], 1);
+    near(pixel(&pixels, 64, 58, 8), [0; 4], 1);
     assert!(device.completed().unwrap() >= submitted);
     assert!(device.retired_textures.is_empty());
     let copy = device.create_target(3, 1).unwrap();
@@ -289,6 +316,50 @@ fn allocation_errors_are_results_and_the_device_remains_usable() {
         [64, 0, 0, 255],
         1,
     );
+}
+
+#[test]
+fn each_mip_matches_an_area_draw_of_the_previous_level() {
+    let mut d = Wgpu::new().unwrap();
+    d.general_only = true;
+    for [width, height] in [[1, 1], [1, 17], [15, 1], [33, 22], [480, 640]] {
+        let desc = TextureDesc {
+            mipmapped: true,
+            ..TextureDesc::rgba(width, height)
+        };
+        let image = d.create_texture(desc).unwrap();
+        let mut previous = d.create_texture(TextureDesc::rgba(width, height)).unwrap();
+        let bytes: Vec<_> = (0..width * height)
+            .flat_map(|n| {
+                let alpha = (n * 113 + n / width * 17) as u8;
+                [alpha, (n as u8) & alpha, alpha / 2, alpha]
+            })
+            .collect();
+        for t in [image, previous] {
+            d.upload_texture(t, [0, 0], [width, height], &bytes)
+                .unwrap();
+        }
+        d.generate_mips(image).unwrap();
+        assert_eq!(d.readback(image).unwrap(), bytes);
+        for level in 1..desc.levels() {
+            let (w, h) = ((width >> level).max(1), (height >> level).max(1));
+            let next = d.create_target(w, h).unwrap();
+            let mut e = Encoder::new(w, h);
+            e.push(
+                Instance::new(Kind::Downsample, Brush::Solid, [0., 0., w as f32, h as f32]),
+                Bindings {
+                    image: previous,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            d.render(&e.finish(), next, Some([0.; 4])).unwrap();
+            let expected = d.readback(next).unwrap();
+            let actual = block_on(d.readback_async(image, level)).unwrap();
+            assert!(actual == expected, "{width}x{height}, level {level}");
+            previous = next;
+        }
+    }
 }
 
 #[test]

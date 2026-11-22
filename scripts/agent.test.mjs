@@ -1329,7 +1329,7 @@ test('compare on a capture: nodes where the window has them, its safe area not s
       tree: async () => ({ nodes: [{ id: 1, depth: 0, type: 'View', props: {} }, { id: 2, depth: 1, type: 'View', props: { testId: 'card' } }] }),
       op: async () => ({ node: { space } }),
     });
-    const shot = { screenshot: resolve(dir, 'shot.png'), w: 120, h: 200, scale: 2, window: true, statusBar: false, safeArea: { top: 10, bottom: 12 }, note: 'the status bar is not in the capture (simctl io screenshot: failed)' };
+    const shot = { screenshot: resolve(dir, 'shot.png'), w: 120, h: 200, scale: 2, window: true, pixels: 'app', statusBar: false, safeArea: { top: 10, bottom: 12 }, note: 'the status bar is not in the capture (simctl io screenshot: failed)' };
     const r = await compareOp(ios({ viewport: { x: 0, y: 0, w: 60, h: 200 }, window: { x: 678, y: 0, w: 60, h: 200 } }), resolve(dir, 'ref.png'), async () => ({ ...shot }));
     assert.match(r.text, /under card \[10,40 60×30\]/);
     assert.doesNotMatch(r.text, /draws at|painted by the agent/);
@@ -1345,6 +1345,7 @@ test('compare on a capture: nodes where the window has them, its safe area not s
     const { render } = await import('./agent-inspect.mjs');
     assert.match(render('layout', { viewport: { w: 402, h: 874 }, clock: 0, nodes: [], scaled: [{ route: '3', presentation: 'sheet', scale: 0.96 }] }), said);
     assert.match(r.text, /the top 10 \(status bar\) and the bottom 12 \(home indicator\) not scored/);
+    assert.match(r.text, /capture: pixels="app"/);
     assert.match(r.text, /capture: the status bar is not in the capture \(simctl io screenshot: failed\)/);
     assert.doesNotMatch(r.text, /\[40,192/);
     await assert.rejects(compareOp(ios({ viewport: { x: 0, y: 0, w: 60, h: 200 }, window: { x: 0, y: 0, w: 30, h: 100 } }), resolve(dir, 'ref.png'), async () => ({ ...shot })), (e) => e.malformed === true && /--size/.test(e.message));

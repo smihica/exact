@@ -38,8 +38,10 @@ pub struct PartDecl {
 pub struct Mark {
     /// The part it names; empty when the name isn't a string literal.
     pub part: String,
-    /// Where the name is written.
+    /// The attribute name's range.
     pub span: Span,
+    /// The string literal's range, quotes included.
+    pub literal: Option<Span>,
     /// The node's own span: what finds it in the component's view.
     pub node: Span,
     /// Whether the node is of the component's own view, not inside a used
@@ -95,13 +97,14 @@ fn walk(nodes: &mut [Node], own: bool, marks: &mut Vec<Mark>) {
                     if a.name != PART {
                         return true;
                     }
-                    let part = match &a.value {
-                        Expr::Str(s, _) => s.clone(),
-                        _ => String::new(),
+                    let (part, literal) = match &a.value {
+                        Expr::Str(s, span) => (s.clone(), Some(*span)),
+                        _ => (String::new(), None),
                     };
                     marks.push(Mark {
                         part,
                         span: a.span,
+                        literal,
                         node: node_span,
                         own,
                     });

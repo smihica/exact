@@ -46,9 +46,10 @@ package enum IconPath {
 
     /// `min-x min-y width height`, a 24-unit square when it says none.
     package static func viewBox(_ text: String) -> CGRect {
-        let v = text.split(whereSeparator: { $0 == " " || $0 == "," }).compactMap { Double($0) }
-        guard v.count == 4, v[2] > 0, v[3] > 0 else { return CGRect(x: 0, y: 0, width: 24, height: 24) }
-        return CGRect(x: v[0], y: v[1], width: v[2], height: v[3])
+        let v = text.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map { Double($0) }
+        guard v.count == 4, let x = v[0], let y = v[1], let w = v[2], let h = v[3],
+              [x, y, w, h].allSatisfy({ $0.isFinite }), w > 0, h > 0 else { return CGRect(x: 0, y: 0, width: 24, height: 24) }
+        return CGRect(x: x, y: y, width: w, height: h)
     }
 
     /// The viewBox fitted into `rect`, its aspect kept and centred.
@@ -59,20 +60,37 @@ package enum IconPath {
         return CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: dx, ty: dy)
     }
 
-    /// An icon's em square (`em` points, its natural size) placed in `box` by
-    /// `object-fit`, as Linux places it (paint/svg.rs): `fill` and `contain`
-    /// fit it in its aspect, `cover` covers, `none` keeps it, `scale-down`
-    /// keeps it unless it doesn't fit; centred.
-    package static func placed(em: CGFloat, fit: String, in box: CGRect) -> CGRect {
-        let fitted = min(box.width, box.height), covered = max(box.width, box.height)
-        let side: CGFloat
+    /// The natural glyph box: its viewBox's aspect, its longer side at one em.
+    package static func natural(_ box: CGRect, em: CGFloat) -> CGSize {
+        let scale = em / max(box.width, box.height)
+        return CGSize(width: box.width * scale, height: box.height * scale)
+    }
+
+    /// The CSS object viewport. Under `fill` it fills the content box;
+    /// SVG's default `xMidYMid meet` centres the viewBox inside it.
+    package static func placed(viewBox: CGRect, em: CGFloat, fit: String, position: [BatchValue]? = nil, in box: CGRect) -> CGRect {
+        placed(natural: natural(viewBox, em: em), fit: fit, position: position, in: box)
+    }
+
+    /// Place a native symbol's measured box or a template's natural viewport.
+    package static func placed(natural size: CGSize, fit: String, position: [BatchValue]? = nil, in box: CGRect) -> CGRect {
+        guard size.width > 0, size.height > 0, box.width > 0, box.height > 0 else { return .zero }
+        let contained = min(box.width / size.width, box.height / size.height)
+        let scale: CGFloat
         switch fit {
-        case "cover": side = covered
-        case "none": side = em
-        case "scale-down": side = min(em, fitted)
-        default: side = fitted
+        case "cover": scale = max(box.width / size.width, box.height / size.height)
+        case "none": scale = 1
+        case "scale-down": scale = min(1, contained)
+        default: scale = contained
         }
-        return CGRect(x: box.midX - side / 2, y: box.midY - side / 2, width: side, height: side)
+        let width = fit == "fill" ? box.width : size.width * scale
+        let height = fit == "fill" ? box.height : size.height * scale
+        let dx = box.width - width, dy = box.height - height
+        if let position, position.count == 2,
+           let x = position[0].length(basis: dx), let y = position[1].length(basis: dy), x.isFinite, y.isFinite {
+            return CGRect(x: box.minX + x, y: box.minY + y, width: width, height: height)
+        }
+        return CGRect(x: box.minX + dx / 2, y: box.minY + dy / 2, width: width, height: height)
     }
 
     /// Fill each path by `rule`, placed into `rect` (a top-left origin), in `ctx`'s fill colour.
@@ -81,25 +99,29 @@ package enum IconPath {
         for p in paths { if let placed = p.copy(using: &transform) { ctx.addPath(placed); ctx.fillPath(using: rule) } }
     }
 
-    /// The icon as a template image `size` big (an em square for its glyph
-    /// box, a larger one for the box it shows in), each path filled by `rule`.
-    package static func image(_ commands: String, viewBox text: String, size: CGSize, rule: CGPathFillRule = .winding) -> IconImage? {
+    /// Fit the viewBox to `size` and draw the crop in those coordinates.
+    package static func image(_ commands: String, viewBox text: String, size: CGSize, crop: CGRect? = nil,
+                              rule: CGPathFillRule = .winding) -> IconImage? {
         let paths = paths(commands)
         guard size.width > 0, size.height > 0, !paths.isEmpty else { return nil }
-        let rect = CGRect(origin: .zero, size: size)
+        let visible = crop ?? CGRect(origin: .zero, size: size)
+        guard !visible.isEmpty else { return nil }
+        let viewport = CGRect(x: -visible.minX, y: -visible.minY, width: size.width, height: size.height)
         #if os(watchOS)
         return nil // (no image renderer on watchOS; no watch host draws the path yet)
         #elseif canImport(UIKit)
         let format = UIGraphicsImageRendererFormat.preferred(); format.opaque = false
-        let image = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
-            ctx.cgContext.setFillColor(UIColor.black.cgColor); fill(paths, viewBox: text, in: rect, rule: rule, ctx.cgContext)
+        let image = UIGraphicsImageRenderer(size: visible.size, format: format).image { ctx in
+            ctx.cgContext.setFillColor(UIColor.black.cgColor); fill(paths, viewBox: text, in: viewport, rule: rule, ctx.cgContext)
         }
         return image.withRenderingMode(.alwaysTemplate)
         #else
         // A vector image: AppKit draws it again at the size and scale it shows at.
-        let image = NSImage(size: size, flipped: true) { drawn in
+        let image = NSImage(size: visible.size, flipped: true) { drawn in
             guard let cg = NSGraphicsContext.current?.cgContext else { return false }
-            cg.setFillColor(NSColor.black.cgColor); fill(paths, viewBox: text, in: drawn, rule: rule, cg)
+            let rect = viewport.applying(CGAffineTransform(scaleX: drawn.width / visible.width, y: drawn.height / visible.height))
+                .offsetBy(dx: drawn.minX, dy: drawn.minY)
+            cg.setFillColor(NSColor.black.cgColor); fill(paths, viewBox: text, in: rect, rule: rule, cg)
             return true
         }
         image.isTemplate = true

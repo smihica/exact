@@ -305,6 +305,7 @@ pub(in crate::presenter) fn label_x(p: &Paragraph, anchor: f32, alignment: f32) 
 impl Layout {
     /// Each text it draws, by the node it stands for, with its box in the
     /// surface, points: what an accessibility service reads there.
+    /// A clipped alert keeps an empty box for text scrolled out of view.
     pub fn texts(&self) -> Vec<(ViewId, Rect4)> {
         self.items
             .iter()

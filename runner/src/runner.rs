@@ -16,6 +16,7 @@ pub use retirement::{ModuleIdentity, ModuleInstance};
 mod background;
 mod commit;
 mod console;
+mod drag_files;
 pub use console::Console;
 mod completion;
 mod control;
@@ -49,6 +50,7 @@ mod reorder_group;
 pub use intersect::Intersection;
 pub use shown::BlockPlacement;
 mod box_resize;
+mod geometry_facts;
 mod resize;
 pub use resize::{ResizeRect, UNDELIVERED as RESIZE_UNDELIVERED};
 mod held;
@@ -85,8 +87,8 @@ mod source;
 mod tabs;
 pub use source::{
     Announce, BackgroundState, DataError, DataSource, DataSourceWrapper, InFlight, Interrupt,
-    Native, NativeCall, NativeHandler, Overlaid, PreloadWake, Report, Reporter, SnapshotModule,
-    Target, Write, BACKGROUND,
+    Native, NativeCall, NativeHandler, Overlaid, PreloadWake, Report, Reporter, ResourceChange,
+    SnapshotModule, Target, Write, BACKGROUND,
 };
 mod delivery;
 mod links;
@@ -138,6 +140,7 @@ pub use queue::QUEUE_BOUND;
 mod history;
 pub mod router;
 pub use crate::list_api::{ListTextPolicy, ListTextPosition};
+mod revalidation;
 mod settlement;
 pub(crate) use settlement::zero;
 mod sockets;
@@ -187,7 +190,7 @@ pub use checkpoint::Checkpoint;
 use exact_kernel::{CommitReceipt, Kernel, ViewId};
 use exact_plan::{ActionsId, Code, EventKind, MutationMode, MutationsId, NodesId, Plan, Value};
 pub use router::{launch_matches, routing, RouterChange, Routing};
-pub use split::{press_writes_router, StackSplit};
+pub use split::{press_writes_router, RouteInspector, StackSplit};
 pub use uploads::{UploadEnd, UploadMark};
 
 /// A host-facing effect an action asked for; executed after commit, in order.
@@ -217,6 +220,10 @@ struct ResourceState {
     /// readiness (LLP 1027.005 D3). Settlement and rollback copy this with
     /// its value; activation or losing that identity consumes it.
     kept_seed: bool,
+    /// The rendered page's answer, seeded from its checkpoint (LLP 1048.000
+    /// D6), until another value replaces it: what the first frame showed is
+    /// the page's, not the last session's.
+    from_page: bool,
     /// The sequence when this answer was asked (0 for a compiled, kept,
     /// carried or placeholder value): a write that landed before it is
     /// answered by it (`writes.rs`).
@@ -319,7 +326,10 @@ struct PendingReq {
     replied: bool,
     /// Never sent: when a resource an overrun refused is asked again (`overrun.rs`).
     reask_at: Option<f64>,
-    /// The wait is for the launch's own ask, so its re-ask is the launch's too.
+    /// The launch's own ask (its target was in `Runner::launch` when asked),
+    /// and what its replies ask for next: a wait for it, at the ask or after
+    /// its reply's turn over its budget, asks again as the launch's. A refresh
+    /// clears it (`force_refresh`).
     launch: bool,
     /// The re-asks after a turn over its budget this ask's streak has made.
     reasks: usize,
@@ -395,6 +405,7 @@ pub struct Runner<D: DataSource> {
     resources: Vec<resources::ResourceRow>,
     tree: Option<Tree>,
     reorder_owner: Option<exact_kernel::NodeKey>,
+    reorder_target: Option<exact_kernel::NodeKey>,
     reorder_ops: Vec<exact_kernel::Op>,
     /// The wide colours the queued patches hold, kept from the table's sweep.
     reorder_kept: exact_kernel::style::wide::Keep,
@@ -593,7 +604,10 @@ pub struct Runner<D: DataSource> {
     // @ref LLP 1039 D2 — the layout size before settlement.
     viewport: crate::Viewport,
     viewport_geometry: crate::viewport::Geometry,
+    // @ref LLP 1123 D6 — the geometry facts' answers and their bound.
+    geometry: geometry_facts::Facts,
     // @ref LLP 1069.000 D2 — visibility, connectivity, the share sheet.
+    platform: crate::page::Platform,
     page: crate::page::Page,
     presented: crate::page::Presented, // `exactPage().presented` (LLP 1069.000 D2)
     window_name: String,               // the page's `name` (LLP 1030.004 D2)
@@ -892,6 +906,7 @@ impl<D: DataSource> Runner<D> {
             tree: None,
             bake_warnings: Vec::new(),
             reorder_owner: None,
+            reorder_target: None,
             reorder_ops: Vec::new(),
             reorder_kept: Default::default(),
             design: None,
@@ -901,7 +916,7 @@ impl<D: DataSource> Runner<D> {
             roles: exact_kernel::style::roles::Installed::new(roles.clone()),
             reorder_session: None,
             dropping_from: None,
-            ids: Ids::default(),
+            ids: Ids::from_last(sequence.map_or(0, |c| c.last_view_id)),
             orientation: Default::default(),
             now_ms,
             timers: Vec::new(),
@@ -976,12 +991,14 @@ impl<D: DataSource> Runner<D> {
             delivery,
             viewport,
             viewport_geometry,
+            geometry: Default::default(),
             page: Default::default(),
             presented: crate::page::Presented::at_boot(),
             time: crate::time::launch_time(),
             live_times: Default::default(),
             text_axes: seams::TextAxesState(seams.text_axes.state()),
             place: launched_place.clone().unwrap_or_default(),
+            platform: crate::page::Platform::at_boot(),
             window_name: crate::time::launch_window_name(),
             host_direction: crate::time::launch_direction(),
             surface_records: Default::default(),
@@ -1044,6 +1061,7 @@ impl<D: DataSource> Runner<D> {
                         store_revision: runner.store.revision(),
                         placeholder: false,
                         kept_seed: false,
+                        from_page: false,
                         answered_for: None,
                         asleep: false,
                         slept: false,
@@ -1106,18 +1124,18 @@ impl<D: DataSource> Runner<D> {
         runner.keep_sent(false);
         let audio = runner.seams.audio;
         audio.transport_stood(&mut runner);
-        // First frame.
         let mut ids = std::mem::take(&mut runner.ids);
         ids.tabs.carried = carried.map(|c| c.panels.clone()).unwrap_or_default();
+        let lists = runner.prepare_view_ids(&mut ids, carried)?;
         let (tree, ops, surfaces, notes, shown) = {
-            let mut u = Update::new(runner.env(&[], &[]), &runner.sites, &mut ids);
-            u.fonts = Some(runner.fonts.clone());
+            let mut u = runner.instance_update(&mut ids);
+            u.list_seeds = Some(&lists);
             u.discard = runner.kernel.is_detached();
             let tree = Tree::create(&mut u)?;
             (tree, u.ops, u.surfaces, u.notes, u.shown)
         };
-        runner.notes = notes;
-        runner.shown = shown;
+        ids.finish_first_frame();
+        (runner.notes, runner.shown) = (notes, shown);
         runner.ids = ids;
         runner.tree = Some(tree);
         let mut receipt = runner.apply(ops)?;

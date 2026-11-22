@@ -1,8 +1,59 @@
 // Parity smoke prerequisites, and SVG fixtures declared undrawn by the schema's `hosts` column (LLP 1159.000 D6).
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { boxes, shot } from './parity.mjs';
+import { encodePng } from './png.mjs';
 import { undrawn } from './svgparity.mjs';
+
+test('parity crops a display capture at the viewport’s screen origin', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-parity-screen-'));
+  const width = 24, height = 32, data = new Uint8Array(width * height * 4).fill(255);
+  const node = { testId: 'fx-tile', x: 1, y: 2, w: 2, h: 3 };
+  const screen = { x: 3, y: 5, w: 12, h: 16 };
+  for (let y = 14; y < 20; y++) {
+    for (let x = 8; x < 12; x++) data.set([0, 0, 0, 255], (y * width + x) * 4);
+  }
+  const session = {
+    layout: async () => ({ viewport: { w: 8, h: 9 }, screen, nodes: [node] }),
+    screenshot: async path => {
+      writeFileSync(path, encodePng({ width, height, data }));
+      return { captureSpace: 'screen', w: 12, h: 16, scale: 2 };
+    },
+  };
+  try {
+    const pictured = await shot(session, 'fixture', dir, 'tile');
+    const tile = boxes(pictured, { slop: 0 })['fx-tile'];
+    expect(tile).toMatchObject({ width: 2, height: 3 });
+    expect([...tile.data]).toEqual(Array.from({ length: 6 }, () => [0, 0, 0, 255]).flat());
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('parity keeps a tile at the edge of a nonintegral display scale', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-parity-edge-'));
+  const width = 1080, height = 2340, w = 375, h = 812;
+  const node = { testId: 'fx-edge', x: 365, y: 807, w: 5, h: 5 };
+  const data = new Uint8Array(width * height * 4).fill(255);
+  // The last native row lands at y=2339 when the two pixel ratios are used.
+  for (let x = 1051; x < 1066; x++) data.set([0, 0, 0, 255], ((height - 1) * width + x) * 4);
+  const session = {
+    layout: async () => ({ viewport: { w, h }, screen: { x: 0, y: 0, w, h }, nodes: [node] }),
+    screenshot: async path => {
+      writeFileSync(path, encodePng({ width, height, data }));
+      return { captureSpace: 'screen', w, h };
+    },
+  };
+  try {
+    const pictured = await shot(session, 'fixture', dir, 'tile');
+    const tile = boxes(pictured, { slop: 0 })['fx-edge'];
+    expect(tile).toMatchObject({ width: 5, height: 5 });
+    const native = boxes(pictured, { slop: 0, native: true })['fx-edge'];
+    expect(native).toMatchObject({ width: 15, height: 14 });
+    expect([...native.data.slice(-4)]).toEqual([0, 0, 0, 255]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('a fixture is excused where the schema says the row is not drawn, and nowhere else', () => {
   expect(undrawn('ios')).toEqual([]);

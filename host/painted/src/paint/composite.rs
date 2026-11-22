@@ -19,7 +19,7 @@ impl Painter {
     /// this one's scale, onto a transparent raster: what this paint knows of
     /// the page's canvases (their bitmaps, the hatches' overlays, where
     /// surfaces place and composite their children) goes with it.
-    pub(super) fn apart(&self, width: f32, height: f32) -> Painter {
+    pub(super) fn apart(&self, kernel: &Kernel, width: f32, height: f32) -> Painter {
         let mut painter = Painter::new(
             self.text.clone(),
             self.scale,
@@ -32,16 +32,17 @@ impl Painter {
         painter.overlays = self.overlays.clone();
         painter.composites.canvases = self.composites.canvases.clone();
         painter.viewport = (width, height);
+        painter.capture_boxless_audio(kernel);
         painter.backend.begin(width, height, self.scale);
         painter
     }
 
-    /// What a painter made [`Painter::apart`] leaves this one: the pictures
-    /// of the composite canvases inside its subtree.
-    pub(super) fn gather(&mut self, apart: &mut Painter) {
+    /// Carry a subtree's pictures and audio records back to the enclosing painter.
+    pub(super) fn gather(&mut self, kernel: &Kernel, apart: &mut Painter) {
         self.composites
             .pictures
             .append(&mut apart.composites.pictures);
+        self.emit_boxless_audio(kernel, apart.boxless_audio.take());
     }
 
     /// Paint `canvas`'s `children`, in paint order, apart: its surface
@@ -60,11 +61,13 @@ impl Painter {
         self.row_refuse();
         let f = canvas.frame;
         if f.width <= 0. || f.height <= 0. {
+            self.boxless_audio(walk, canvas);
             return;
         }
-        let mut painter = self.apart(f.width, f.height);
+        let mut painter = self.apart(walk.scene.kernel, f.width, f.height);
         let mut apart = Walk {
             scene: walk.scene,
+            scrollbar_cover: walk.scrollbar_cover,
             hit_space: None,
             boxes: Vec::new(),
             text: BTreeMap::new(),
@@ -74,6 +77,7 @@ impl Painter {
             replay: None,
             ranks: Rc::clone(&walk.ranks),
             reveal: walk.reveal,
+            alert: walk.alert,
             dialog: walk.dialog,
         };
         // Kernel frames are the page's: the canvas's own origin is the picture's.
@@ -83,7 +87,7 @@ impl Painter {
         walk.text.extend(apart.text);
         walk.fields.extend(apart.fields);
         walk.inline.extend(apart.inline);
-        self.gather(&mut painter);
+        self.gather(walk.scene.kernel, &mut painter);
         if let Ok(pixels) = painter.backend.finish() {
             self.composites.pictures.push((canvas.id, Arc::new(pixels)));
         }
@@ -156,10 +160,11 @@ mod tests {
         painter.composites.canvases.insert(glass);
         let mut green = Pixmap::new(20, 20).unwrap();
         green.fill(tiny_skia::Color::from_rgba8(0, 255, 0, 255));
-        painter.canvases.insert(
+        painter.canvases.drawings.borrow_mut().insert(
             inner,
             crate::canvas2d::CanvasPaint {
                 pixels: Arc::new(green),
+                update: None,
             },
         );
         let scene = Scene {

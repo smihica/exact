@@ -232,11 +232,15 @@ fn a_let_go_post_the_source_keeps_runs_to_its_end() {
 #[test]
 fn a_request_with_effects_is_in_flight_until_it_lands_kept_or_not() {
     let (mut r, _) = boot(true);
-    let background =
-        |r: &exact_runner::Runner<_>| exact_runner::agent::handle(r, r#"{"op":"background"}"#);
+    let background = |r: &exact_runner::Runner<_>| -> bool {
+        let reply: serde_json::Value =
+            serde_json::from_str(&exact_runner::agent::handle(r, r#"{"op":"background"}"#))
+                .unwrap();
+        reply["mustFinish"].as_bool().unwrap()
+    };
     let (kept, reader) = first(&mut r);
     assert!(r.effects_in_flight(), "the POST is out");
-    assert_eq!(background(&r), r#"{"mustFinish":true}"#);
+    assert!(background(&r));
     r.act("bump", vec![]).unwrap();
     let newer = (r.take_requests().into_iter())
         .find(|o| o.request.url.contains("/row/"))
@@ -247,7 +251,7 @@ fn a_request_with_effects_is_in_flight_until_it_lands_kept_or_not() {
     r.fulfill(kept, ok()).unwrap();
     assert!(r.holds(reader), "the GET is still out");
     assert!(!r.effects_in_flight(), "a GET has no effects");
-    assert_eq!(background(&r), r#"{"mustFinish":false}"#);
+    assert!(!background(&r));
 }
 
 #[test]
@@ -258,14 +262,19 @@ fn a_held_mark_does_not_change_an_uploads_lifetime() {
         request.held = held;
         let (mut r, seen) = boot_request(true, request);
         let (upload, _) = first(&mut r);
-        let background = |r: &Runner<_>| exact_runner::agent::handle(r, r#"{"op":"background"}"#);
+        let background = |r: &Runner<_>| -> bool {
+            let reply: serde_json::Value =
+                serde_json::from_str(&exact_runner::agent::handle(r, r#"{"op":"background"}"#))
+                    .unwrap();
+            reply["mustFinish"].as_bool().unwrap()
+        };
         assert!(r.in_flight().contains(&("row".to_string(), upload)));
         assert!(!r
             .held_requests()
             .iter()
             .any(|(_, ticket)| *ticket == upload));
         assert!(r.effects_in_flight(), "held mark: {held}");
-        assert_eq!(background(&r), r#"{"mustFinish":true}"#);
+        assert!(background(&r));
 
         r.act("bump", vec![]).unwrap();
         assert!(seen.lock().unwrap().offered.contains(&(1, false)));
@@ -279,12 +288,12 @@ fn a_held_mark_does_not_change_an_uploads_lifetime() {
             .ticket;
         r.fulfill(newer, ok()).unwrap();
         assert!(r.effects_in_flight(), "the kept upload is still out");
-        assert_eq!(background(&r), r#"{"mustFinish":true}"#);
+        assert!(background(&r));
         assert!(r.fulfill(upload, ok()).unwrap().is_some());
         assert_eq!(seen.lock().unwrap().landed, [77]);
         assert!(!r.holds(upload));
         assert!(!r.effects_in_flight());
-        assert_eq!(background(&r), r#"{"mustFinish":false}"#);
+        assert!(!background(&r));
     }
 }
 

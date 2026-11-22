@@ -170,6 +170,113 @@ check('a route the app pushes before any press takes the focus with no ring', ()
   expect(await evaluate(`pop(); document.activeElement.blur(); push('t2', '/timer'); focus().slice(0, 2)`)).toEqual(['title-t2', true]);
 }));
 
+for (const engine of ['chromium', 'firefox', 'webkit']) engineTest[engine](`${engine}: closing a dialog or popover restores the route heading's focus`, async () => {
+  const server = await serve();
+  const browser = await suiteBrowser(engine);
+  try {
+    const page = await browser.newPage();
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    await page.waitForFunction(() => window.ready);
+    const focus = () => page.evaluate(() => document.activeElement.id);
+    await page.evaluate(() => push('detail', '/detail'));
+    expect(await focus()).toBe('title-detail');
+    for (const tag of ['dialog', 'div']) {
+      await page.evaluate(tag => {
+        const overlay = document.createElement(tag);
+        overlay.innerHTML = '<button id="inside-overlay" autofocus>Close</button>';
+        document.getElementById('route-detail').append(overlay);
+        if (tag === 'dialog') overlay.showModal();
+        else { overlay.popover = 'auto'; overlay.showPopover(); }
+      }, tag);
+      expect(await focus()).toBe('inside-overlay');
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('dialog:modal, :popover-open'));
+      expect(await focus()).toBe('title-detail');
+    }
+    await page.locator('#in-detail').focus();
+    expect(await page.locator('#title-detail').getAttribute('tabindex')).toBeNull();
+  } finally {
+    await browser.close();
+    server.close();
+  }
+}, 60000);
+
+for (const inDialog of [false, true]) check(`a nested navigation root ${inDialog ? 'in a dialog ' : ''}focuses its heading on push and its opener on Back`, () => inChrome(async (evaluate) => {
+  await evaluate(`push('host', '/host');
+    const host = document.getElementById('route-host');
+    const parent = ${inDialog} ? host.appendChild(document.createElement('dialog')) : host;
+    parent.insertAdjacentHTML('beforeend',
+      '<div id="nested" navigationBack="nested-back" navigationKey="first"><section navigationKey="first"><button id="nested-open">Open</button></section></div>');
+    if (${inDialog}) parent.showModal();
+    const nested = document.getElementById('nested'), opener = document.getElementById('nested-open');
+    show();
+    opener.addEventListener('click', () => {
+      nested.insertAdjacentHTML('beforeend', '<section id="nested-next" navigationKey="next"><header><h2 id="nested-title">Nested</h2></header><button id="nested-control">Inside</button></section>');
+      nested.setAttribute('navigationKey', 'next');
+      show();
+    });
+    opener.focus();
+    opener.click();
+  `);
+  expect(await evaluate('focus()[0]')).toBe('nested-title');
+  expect(await evaluate(`document.getElementById('nested-control').focus();
+    document.getElementById('nested-title').getAttribute('tabindex')
+  `)).toBeNull();
+  expect(await evaluate(`document.getElementById('nested-next').remove();
+    document.getElementById('nested').setAttribute('navigationKey', 'first');
+    show(); focus()[0]
+  `)).toBe('nested-open');
+}));
+
+check('an earlier navigation root inside a wrapper cannot claim the outer route key', () => inChrome(async (evaluate, press) => {
+  await evaluate(`document.getElementById('list').insertAdjacentHTML('beforebegin',
+    '<div><div navigationBack="nested-back" navigationKey="1"><section navigationKey="1"><header><h2>Nested</h2></header></section></div></div>');
+    show();
+  `);
+  await press('row-1');
+  expect(await evaluate('focus()[0]')).toBe('title-1');
+}));
+
+check('a direct route can also be a navigation root', () => inChrome(async (evaluate, press) => {
+  await evaluate(`then = () => {
+    const route = document.getElementById('route-1');
+    route.setAttribute('navigationBack', 'nested-back');
+    route.insertAdjacentHTML('beforeend', '<section navigationKey="1"><p>Nested route</p></section>');
+  }`);
+  await press('row-1');
+  expect(await evaluate('focus()[0]')).toBe('title-1');
+}));
+
+check('focus reuses a projected tab stack without scanning its descendants', () => inChrome(async (evaluate) => {
+  expect(await evaluate(`(() => {
+    const root = document.getElementById('nav');
+    const collect = root.getElementsByTagName;
+    let scans = 0;
+    window.then = () => {
+      root.getElementsByTagName = function (...args) { scans++; return collect.apply(this, args); };
+    };
+    try {
+      push('detail', '/detail');
+      return [focus()[0], scans];
+    } finally {
+      delete root.getElementsByTagName;
+    }
+  })()`)).toEqual(['title-detail', 0]);
+}));
+
+check('a projection without declared routes clears the focus stack', () => inChrome(async (evaluate) => {
+  expect(await evaluate(`(async () => {
+    const { focusStack } = await import('./navigation.js');
+    const nav = document.getElementById('nav'), panel = document.getElementById('p1');
+    push('detail', '/detail');
+    const before = focusStack(nav).map(route => route.id);
+    const wrapper = document.createElement('div');
+    wrapper.append(...panel.children); panel.append(wrapper);
+    show();
+    return [before, focusStack(nav).map(route => route.id)];
+  })()`)).toEqual([['list', 'route-detail'], []]);
+}));
+
 check('on a push the focus moves to the new route\'s heading, and on Back to the row that was pressed', () => inChrome(async (evaluate, press, key) => {
   // A pointer's press: the heading takes the focus (so the next Tab starts in the new route, and a screen reader reads
   // its title) with no ring, since the person is not using the keyboard; nothing scrolled.
@@ -468,6 +575,21 @@ check('a sheet sliding away is no route to the focus', () => inChrome(async (eva
   await risen('add-2');
   await press('back');
   expect(await evaluate('focus()[0]')).toBe('add-2');
+}, 600, true), 60000);
+
+check('a route takes focus while an exiting sheet with the same key precedes it', () => inChrome(async (evaluate, press) => {
+  await press('add');
+  await evaluate(`document.getElementById('route-add').getAnimations().forEach(a => a.finish())`);
+  await press('back');
+  expect(await evaluate(`(() => {
+    const exiting = document.querySelector('[data-exiting]');
+    exiting.getAnimations().forEach(a => a.pause());
+    exiting.setAttribute('navigationKey', 'add');
+    document.activeElement.blur();
+    push('add', '/replacement', { heading: 'Replacement' });
+    const routes = [...document.querySelectorAll('[navigationKey="add"]')].filter(el => el.id === 'route-add');
+    return [routes.map(el => el.hasAttribute('data-exiting')), document.activeElement.textContent === 'Replacement'];
+  })()`)).toEqual([[true, false], true]);
 }, 600, true), 60000);
 
 // A sheet closed with the focus inside it and no press there (the browser's Back, the app's own close) gives the focus

@@ -130,11 +130,12 @@ public final class ScreenCaptureModule: ExactPackage {
         let (type, quality) = captureEncoding(args)
         let ext = type == .jpeg ? "jpg" : type.preferredFilenameExtension ?? "png"
         let directory = (args["directory"] as? String ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let captureID = UUID().uuidString
         var files: [CaptureFile] = []
         var answers: [[String: Any]] = []
         do {
             for (index, screen) in screens.enumerated() {
-                let path = "\(directory)/screen-\(index).\(ext)"
+                let path = "\(directory)/screen-\(captureID)-\(index).\(ext)"
                 guard let destination = context.file(path) else { throw CaptureFailure("NotAllowedError", "capture path is not writable") }
                 let roots = ["data":context.data, "cache":context.cache, "tmp":context.temporary]
                 let name = path.dropFirst(5).split(separator: "/").first.map(String.init) ?? ""

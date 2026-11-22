@@ -57,7 +57,7 @@ extension NodeView {
 
     #if os(iOS)
     var hasOwnContextMenu: Bool { handlers.contains("contextmenu") || props["contextPopover"]?.isEmpty == false }
-    var hasInlineContextMenu: Bool { inlineText.contains { $0.handlers.contains("contextmenu") || $0.props["contextPopover"]?.isEmpty == false } }
+    package var hasInlineContextMenu: Bool { inlineText.contains { $0.handlers.contains("contextmenu") || $0.props["contextPopover"]?.isEmpty == false } }
     var hasInlinePlainContextMenu: Bool { inlineText.contains { $0.handlers.contains("contextmenu") && $0.props["contextPopover"]?.isEmpty != false } }
     func inlineContextTarget(at point: CGPoint) -> InlineText? {
         inlineRun(at: point) { $0.handlers.contains("contextmenu") || $0.props["contextPopover"]?.isEmpty == false }
@@ -79,6 +79,39 @@ extension NodeView {
         guard !hasOwnContextMenu, inlineContextTarget(at: point) == nil else { return nil }
         if let run = inlineRun(at: point, where: { $0.props["href"].map(Self.hasLinkMenu) == true }), let href = run.props["href"] { return (href, run) }
         return props["href"].flatMap { Self.hasLinkMenu($0) ? ($0, nil) : nil }
+    }
+    /// A row's menu wins a long press over selectable text; an authored
+    /// menu on the paragraph itself is the nearest menu. Disabled controls
+    /// or inert ancestry admit neither one.
+    package var contextMenuSource: NodeView? { contextMenuSource(at: nil) }
+
+    package func contextMenuSource(at point: CGPoint?) -> NodeView? {
+        guard let presenter, presenter.menus.eligible(self, contextMenu: true) else { return nil }
+        var next: UIView? = self
+        while let view = next {
+            if let node = view as? NodeView,
+               node.hasOwnContextMenu || point.map({ node.inlineContextTarget(at: node.convert($0, from: self)) != nil }) == true { return node }
+            next = presenter.listenerParent(of: view)
+        }
+        return nil
+    }
+    /// Whether this node's own long press (its `contextmenu` recognizer) takes a press at `point` that lands on
+    /// `touched`: it listens there, gives no menu there that its interaction opens, and no node nearer the touch
+    /// gives a menu or hears a long press, counted from the node that holds a native view the touch lands on.
+    func hearsLongPress(on touched: UIView?, at point: CGPoint) -> Bool {
+        guard presenter?.menus.eligible(self, contextMenu: true) == true else { return false }
+        let run = inlineContextTarget(at: point)
+        guard hasOwnContextMenu || run != nil else { return false }
+        if !ExactEnv.agentMode, (run?.props["contextPopover"] ?? (run == nil ? props["contextPopover"] : nil))?.isEmpty == false { return false }
+        guard let hit = touched.flatMap(NodeView.innermost), let source = hit.contextMenuSource(at: convert(point, to: hit)) else { return true }
+        return source === self
+    }
+    /// Dynamic failure ordering follows the current row, including a menu
+    /// added or removed after this paragraph took its text interaction.
+    package func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+        guard gesture === contextRecognizer, let paragraph = other.view as? NodeView,
+              paragraph.contextMenuSource(at: other.location(in: paragraph)) === self else { return false }
+        return presenter?.textSelection.interactionHolds(other, on: paragraph) == true
     }
 
     #endif

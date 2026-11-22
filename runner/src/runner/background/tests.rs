@@ -30,7 +30,7 @@ impl DataSource for Saving {
                 self.logs.push(format!("console: saving {n}"));
                 Ok(Answer::Now(Value::Record(vec![Value::Number(*n)].into())))
             }
-            _ => Err(DataError::Unavailable("refused".into())),
+            _ => Err(DataError::UnknownSource(source.into())),
         }
     }
 

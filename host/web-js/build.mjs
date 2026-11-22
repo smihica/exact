@@ -2,7 +2,7 @@ import { grantWords, trimGrant, knownFolderPath } from '../web/grant-admission.j
 import { asyncContext, bundleOptions, developmentLocalNetwork, lowered, packageConfig, webImplementations } from '../../js/bake/src/typescript.mjs';
 import { buildPageFiles, renderEntryPages, writeCrawlerFiles } from '../web/crawl.mjs';
 import { bakeWatchEnv, hatchWords, injectedProfiles, moduleDirectory, readManifest, resolveApp, webAppManifest, webToolchainEnv } from '../../scripts/app.mjs';
-import { rustDataOf } from '../../scripts/app-shells.mjs';
+import { authoredWebBake, webRendererHost, rustDataOf } from '../../scripts/app-shells.mjs';
 import { webIconLinks, webThemeColors } from '../../scripts/app-icons.mjs';
 import { webAudioSession, webCspFile, webHead } from '../../scripts/web-head.mjs';
 import { appSourceFiles } from '../../scripts/app-imports.mjs';
@@ -35,10 +35,10 @@ import { copyGpuCache } from './gpu-cache.mjs';
 import { absent, analyze, planRules, rootOf, tokens as pageTokens, written } from './page-style.mjs';
 import { writers } from './writers.mjs';
 import { namesStream } from './stream-names.mjs';
-import { bundleHostModule, localImports, stageHostGlue } from './glue.mjs';
+import { bundleHostModule, localImports, stageHostGlue, writeFalse } from './glue.mjs';
 import { gateAgent } from './agent-gate.mjs';
 import { contentName, contentNames } from './content-names.mjs';
-import { buildEditor, buildFlow, buildMarkdown, buildModule, buildMotion, moduleSourceDirs, undeclaredRustData, fresh, leafTaken, moduleGrants, webCompiler, inspectHooked, withInspectHooks, withoutDev, withRuntimeStamp, sizeWarning } from './module.mjs';
+import { buildEditor, buildFlow, buildMarkdown, buildModule, buildMotion, moduleSourceDirs, undeclaredRustData, fresh, leafTaken, moduleGrants, webCompiler, inspectHooked, withInspectHooks, withoutDev, withRuntimeStamp, sizeWarning, entrySizeReport } from './module.mjs';
 import { appDigest, developmentStore } from '../../scripts/agent-launch.mjs';
 import { settingLines } from '../../js/bake/src/__exact_env.mjs';
 import { colorSchemeMeta, interfaceStyle, launchBackground, schemeHead, withInterfaceStyle, withLook } from '../web/look.mjs';
@@ -83,6 +83,7 @@ if (process.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH !== '0') {
 // With no bake (an app that names no native platform, LLP 1153 D3.6), it
 // builds the app's own Contract, links its web manifest, and has no envelope.
 const production = args.includes('--production');
+const sizes = args.includes('--sizes');
 // `--dev` (host/web-js/dev.mjs): typed state checkpoint hooks that ordinary
 // and production builds neither emit nor link.
 const devReload = args.includes('--dev');
@@ -240,7 +241,7 @@ try { compiler = webCompiler(); } catch (error) { rustMissing(error); }
 let planCosts = ''; // the compiler's line of plan code by component, for the size warning at the end
 function compilePlan(undrawn, source = input) {
   rmSync(resolve(gen, 'canvas2d.flag'), { force: true });
-  const cargo = spawnSync(compiler.cmd, [...compiler.pre, 'js', source, '-o', gen, '--app', appDir, ...(production ? [] : ['--sites']), ...(devReload ? ['--dev-reload'] : [])], { cwd: root, stdio: checkOnly ? ['ignore', 'ignore', 'pipe'] : ['inherit', 'pipe', 'inherit'], encoding: 'utf8', maxBuffer: 64 << 20, env: { ...compiler.env, EXACT_JS_GPU_SURFACES: (gpuSurfaces ?? []).join(','), EXACT_JS_UNREGISTERED_SURFACES: undrawn.join(',') } });
+  const cargo = spawnSync(compiler.cmd, [...compiler.pre, 'js', source, '-o', gen, '--app', appDir, ...(production ? [] : ['--sites']), ...(devReload ? ['--dev-reload'] : []), ...(sizes ? ['--sizes'] : [])], { cwd: root, stdio: checkOnly ? ['ignore', 'ignore', 'pipe'] : ['inherit', 'pipe', 'inherit'], encoding: 'utf8', maxBuffer: 64 << 20, env: { ...compiler.env, EXACT_JS_GPU_SURFACES: (gpuSurfaces ?? []).join(','), EXACT_JS_UNREGISTERED_SURFACES: undrawn.join(',') } });
   if (!checkOnly) { process.stdout.write(cargo.stdout ?? ''); planCosts = /^ *own plan code by component[^\n]*/m.exec(cargo.stdout ?? '')?.[0].trim() ?? planCosts; }
   if (cargo.status !== 0) { if (checkOnly) process.stderr.write(cargo.stderr ?? ''); process.exit(cargo.status ?? 1); }
   compiler.done();
@@ -265,8 +266,7 @@ const tsStage = resolve(realpathSync(gen), 'typescript'), pageAppTs = resolve(ts
 const composed = mixed && !!rustData;
 const generatedWeb = composed && resolveApp(appDir).generated;
 const webCrate = generatedWeb ? resolve(appDir, '.exact/shells/web') : resolve(appDir, 'web');
-const webScript = resolve(webCrate, 'build.rs');
-if (ts && (composed || existsSync(webScript)) && (composed || !/^\s*fn main\(\)\s*\{\s*exact_js_bake::build\w*\(/m.test(readFileSync(webScript, 'utf8')))) {
+if (ts && (composed || authoredWebBake(webCrate))) {
   // With what its bake watches named, as every baking build is (`bakeWatchEnv`): unset, a check reruns it every time.
   // The workspace's lock is checked first, as every build's is, and `--locked` keeps the check from rewriting it (LLP 1153 D2.1).
   resolveApp(appDir).rust();
@@ -349,6 +349,10 @@ export { canonical, locationOf };`],
 if (!devReload) writeFileSync(resolve(gen, 'modes.js'), withoutDev(readFileSync(resolve(here, 'modes.js'), 'utf8')));
 // Inspect mode's hooks in the runtime are the dev loop's build's alone (module.mjs `withInspectHooks`).
 if (devReload) for (const f of inspectHooked) writeFileSync(resolve(gen, f), withInspectHooks(f, readFileSync(resolve(here, f), 'utf8')));
+if (!hasGpuArtifacts) {
+  const tree = resolve(gen, 'tree.js');
+  writeFileSync(tree, writeFalse(readFileSync(tree, 'utf8'), 'host/web-js/tree.js', ['GPU_PLACEMENT']));
+}
 // The arms sheet's host stamp (lower.js, LLP 1071.001 part B): a digest of the runtime array above as copied (the mode
 // and inspect transforms included), lower.js's own unstamped source among it; not the files copied after this.
 { const lower = readFileSync(resolve(here, 'lower.js'), 'utf8'); writeFileSync(resolve(gen, 'lower.js'), withRuntimeStamp(lower, runtime.map(f => ({ path: f, text: f === 'lower.js' ? lower : readFileSync(resolve(gen, f), 'utf8') })))); }
@@ -395,6 +399,8 @@ const files = existsSync(resolve(gen, 'files.flag'));
 const soundTable = existsSync(resolve(gen, 'sounds.flag')) ? readFileSync(resolve(gen, 'sounds.flag'), 'utf8') : null;
 // `wakelock` on any element (wakelock.js, LLP 1125 D11).
 const wakelock = existsSync(resolve(gen, 'wakelock.flag'));
+// A node with `draggable` (drag.js, LLP 1094.000 D2, D3).
+const drag = existsSync(resolve(gen, 'drag.flag'));
 // `orientationlock` on any element (orientationlock.js, LLP 1133.029 D7).
 const orientationlock = existsSync(resolve(gen, 'orientationlock.flag'));
 // A dialog, an alertdialog, a menu or a popover (prompt-glue.js, alert-message.js, menu-rows.js; LLP 1047.002 D1).
@@ -440,7 +446,7 @@ async function typecheck(checking) {
   const real = realpathSync(stage);
   if (real !== tsStage) throw new Error(`the TypeScript stage moved: ${real}`);
   const { rolldown } = await import('rolldown');
-  await configure(real, false, parseSync, true, rolldown);
+  const metadata = await configure(real, false, parseSync, true, rolldown);
   const backendWarning=JSON.parse(readFileSync(resolve(real,'__exact_backend.json'),'utf8')).warning;
   if (backendWarning) console.warn(`warning: ${backendWarning}`);
   // The packages whose declarations the check reads (typescript.mjs
@@ -452,7 +458,7 @@ async function typecheck(checking) {
     const read = JSON.parse(readFileSync(resolve(real, '__exact_declarations.json'), 'utf8')).packages;
     const listed = resolve(gen, 'dev-sources.json');
     const sources = existsSync(listed) ? JSON.parse(readFileSync(listed, 'utf8')) : {};
-    sources.packages = [...new Set([...(sources.packages ?? []), ...read.map(([, , dir]) => dir)])];
+    sources.trees = [...new Set([...(sources.trees ?? []), ...read.map(([, , dir]) => dir)])];
     sources.shallow = [...(sources.shallow ?? []), ...read.map(([, installed]) => [dirname(installed), basename(installed)])];
     writeFileSync(listed, JSON.stringify(sources));
   }
@@ -481,7 +487,7 @@ async function typecheck(checking) {
     const errors = [failed, ...why.map(line => new Error(line)), await typed].filter(Boolean);
     throw Object.assign(new Error(errors.map(e => e.message ?? String(e)).join('\n')), { warnings });
   }
-  const exported = await valueExports(real, libraries);
+  const { names: exported } = await valueExports(real, libraries, metadata);
   // The packages whose code it captured are inputs the dev loop watches, as
   // their declarations are: each package's tree, and each place it is
   // installed (a link retargeted, or a reinstall, is an edit there).
@@ -489,7 +495,7 @@ async function typecheck(checking) {
     const listed = resolve(gen, 'dev-sources.json');
     const sources = existsSync(listed) ? JSON.parse(readFileSync(listed, 'utf8')) : {};
     const packages = JSON.parse(readFileSync(resolve(real, '__exact_packages.json'), 'utf8')).packages;
-    sources.packages = [...new Set([...(sources.packages ?? []), ...packages.map(([, dir]) => dir)])];
+    sources.trees = [...new Set([...(sources.trees ?? []), ...packages.map(([, dir]) => dir)])];
     sources.shallow = [...(sources.shallow ?? []), ...packages.flatMap(([, , installed]) => installed.map(path => [dirname(path), basename(path)]))];
     writeFileSync(listed, JSON.stringify(sources));
   }
@@ -537,7 +543,8 @@ let moduleStorage = false, rustGrants = '', rustGrantSet = normalizeGrants('Rust
 if (rustLinked) {
   mkdirSync(resolve(out, 'rust/wasm'), { recursive: true });
   const from = opt('--data') ?? (opt('--plan') && dirname(resolve(opt('--plan'))));
-  const built = from && existsSync(resolve(from, 'rust/wasm/app.module.wasm')) ? resolve(from, 'rust/wasm/app.module.wasm') : buildModule(app, resolve(gen, 'rust-module'), canvas2d, appDir);
+  const built = from && existsSync(resolve(from, 'rust/wasm/app.module.wasm')) ? resolve(from, 'rust/wasm/app.module.wasm')
+    : buildModule(app, resolve(gen, 'rust-module'), canvas2d, appDir, { dev: devReload });
   cpSync(built, resolve(out, 'rust/wasm/app.module.wasm'));
   if (devReload) devLogic.push(['rust', createHash('sha256').update(readFileSync(resolve(out, 'rust/wasm/app.module.wasm'))).digest('hex')]);
   // The module's crates outside the app's directory (a path dependency) are inputs the dev loop watches, as the
@@ -546,7 +553,7 @@ if (rustLinked) {
   if (devReload && outside.length) {
     const listed = resolve(gen, 'dev-sources.json');
     const sources = existsSync(listed) ? JSON.parse(readFileSync(listed, 'utf8')) : {};
-    sources.packages = [...new Set([...(sources.packages ?? []), ...outside])];
+    sources.trees = [...new Set([...(sources.trees ?? []), ...outside])];
     writeFileSync(listed, JSON.stringify(sources));
   }
   rustGrants = await moduleGrants(resolve(out, 'rust/wasm/app.module.wasm'));
@@ -601,6 +608,7 @@ writeFileSync(resolve(gen, 'main.js'), [
   ...(files ? ["import './files.js';"] : []),
   ...(soundTable ? [`import { install as sounds } from './sounds.js'; sounds(${soundTable});`] : []),
   ...(wakelock ? ["import { install as wakelock } from './wakelock.js'; wakelock();"] : []),
+  ...(drag ? ["import { install as drag } from './drag.js'; import { PropHooks as dragHooks, say as dragSay } from './rt.js'; drag({ PropHooks: dragHooks, say: dragSay });"] : []),
   ...(orientationlock ? ["import { install as orientationlock } from './orientationlock.js'; orientationlock();"] : []),
   // A prompt's Return, a grouped alert's message box and a menu row's popover (host/web): glue a plan with a dialog, an
   // alert, a menu or a popover needs on the page; until LLP 1047.002 commands.js carried them for every page.
@@ -677,9 +685,10 @@ writeFileSync(resolve(gen, 'main.js'), [
   "const page = typeof document === 'object' && document.querySelector('style[data-exact-page]');",
   "const sheet = page && new Promise(r => { const l = Object.assign(document.createElement('link'), { rel: 'stylesheet', href: './__EXACT_SHEET__' }); l.onload = () => { page.remove(); r(); }; l.onerror = r; page.before(l); });",
   // A waiting page's answers past 1 KB are named, not held (LLP 1048.007 D10): the capture script fetched them as it
-  // imported this; the first render waits for them. Ones no longer kept are none, and the boot builds afresh.
+  // imported this; the first render waits for them. Ones no longer kept are none: an empty checkpoint at the page's
+  // own location, since a page made per request is served where it was made.
   "const named = typeof document === 'object' && document.querySelector('script[type=\"application/vnd.exact.checkpoint\"][data-src]');",
-  "const answers = named && (globalThis.exact?.answers ?? fetch(named.dataset.src).then(r => r.ok ? r.text() : null, () => null)).then(t => { named.textContent = t ?? '{\"time\":0,\"answers\":[]}'; });",
+  "const answers = named && (globalThis.exact?.answers ?? fetch(named.dataset.src).then(r => r.ok ? r.text() : null, () => null)).then(t => { named.textContent = t ?? JSON.stringify({ location: location.pathname, time: 0, answers: [] }); });",
   // Under the driver a TypeScript source draws the launch seed's stream (LLP 1069.005 D2b), from its first answer:
   // the first render waits for the stream's module, which no other page loads before it needs storage.
   ...(ts && !production ? ["const seeded = agentMode() && !globalThis.__exactRender && import('./storage-environment.js').then(env => { const seed = env.agentSeed(); if (seed !== null) answering.entropy = Object.assign(env.agentStream(seed, 'typescript'), { seed }); });"] : ['const seeded = null;']),
@@ -718,7 +727,7 @@ writeFileSync(resolve(gen, 'main.js'), [
   `for (const name of __EXACT_DEFERRED_CHUNKS__) document.head.append(Object.assign(document.createElement('link'), { rel: 'modulepreload', fetchPriority: 'low', href: new URL(name, ${args.includes('--inline') ? 'document.baseURI' : 'import.meta.url'}).href }));`,
 ].join('\n'));
 for (const f of ['agent.js', 'check.js', 'perf.js', 'seam.js', 'rust-data.js', 'canvas-capture.js', 'list.js', 'list-text.js', 'facts.js', 'fetches.js', 'modules.js', 'declared-values.js', 'permissions.js', 'sheets.js', 'samples.js', 'wakes.js', 'reach.js', 'devices.js', 'members.js', 'arrival.js', 'calls.js', 'update.js', 'spans.js', 'views.js', 'pictures.js', 'markdown.js', 'symbols.js', 'motion.js', 'drag-target.js', 'transform.js', 'svg-transform.js', 'dataset.js', 'format.js', 'format-locale.js', 'hatches.js', 'arrange.js', 'reorder.js', 'flow.js', 'native.js', 'shared.js', 'store-reader.js', 'iframes.js', 'list-items.js', 'button-fill.js']) cpSync(resolve(here, f), resolve(gen, f));
-writeFileSync(resolve(gen, 'modules.js'), localImports(readFileSync(resolve(here, 'modules.js'), 'utf8')));
+for (const file of ['modules.js', 'symbols.js']) writeFileSync(resolve(gen, file), localImports(readFileSync(resolve(here, file), 'utf8')));
 const mountSource = readFileSync(resolve(here, 'mount.js'), 'utf8');
 const checkpointFaultImport = "import { checkpointFaults } from '../web/faults.js';";
 if (!mountSource.includes(checkpointFaultImport)) throw new Error('mount.js no longer imports checkpointFaults');
@@ -827,7 +836,7 @@ let admission = readFileSync(resolve(here, 'admission.js'), 'utf8');
 if (siteBase !== '/') admission = admission.replace('new URL(String(input), globalThis.location?.href)',
   `new URL(String(input).slice(1), globalThis.document?.baseURI ?? new URL(${JSON.stringify(siteBase)}, globalThis.location?.href))`);
 const stubbed = [
-  ["import { answeredFetch, countFault, faultMessage, matchFault } from '../web/faults.js';", "const matchFault = () => false, countFault = () => {}, faultMessage = () => '', answeredFetch = () => null;"],
+  ["import { answeredFetch, countFault, delayFixture, faultMessage, matchFault } from '../web/faults.js';", "const matchFault = () => false, countFault = () => {}, delayFixture = () => {}, faultMessage = () => '', answeredFetch = () => null;"],
   ["import { redirectFor, reachRefusal, UNATTRIBUTED } from '../web/address-space.js';", "const redirectFor = (origin, redirect) => redirect, reachRefusal = () => null, UNATTRIBUTED = 'unattributed';"],
 ].reduce((text, [line, stub]) => {
   if (!admission.includes(line)) throw new Error(`host/web-js/admission.js: build.mjs replaces a line it no longer has: ${line}`);
@@ -851,8 +860,10 @@ cpSync(resolve(here, 'ts-stream.js'), resolve(gen, 'ts-stream.js'));
 cpSync(resolve(here, 'ts-sqlite.js'), resolve(gen, 'ts-sqlite.js'));
 cpSync(resolve(here, 'auth.js'), resolve(gen, 'auth.js'));
 cpSync(resolve(here, 'files.js'), resolve(gen, 'files.js'));
+cpSync(resolve(here, 'url.js'), resolve(gen, 'url.js'));
 cpSync(resolve(here, 'sounds.js'), resolve(gen, 'sounds.js'));
 cpSync(resolve(here, 'wakelock.js'), resolve(gen, 'wakelock.js'));
+writeFileSync(resolve(gen, 'drag.js'), localImports(readFileSync(resolve(here, 'drag.js'), 'utf8')));
 cpSync(resolve(here, 'orientationlock.js'), resolve(gen, 'orientationlock.js'));
 cpSync(resolve(here, 'transport.js'), resolve(gen, 'transport.js'));
 cpSync(resolve(here, 'clockin.js'), resolve(gen, 'clockin.js'));
@@ -864,6 +875,8 @@ writeFileSync(resolve(gen, 'main-server.js'), [
   ...(ts ? ["import './held-hooks.js';"] : []),
   `import app${rustLinked || declared ? `, { ${[rustLinked && 'sources', declared && 'prepareSources'].filter(Boolean).join(', ')} }` : ''} from './app.js';`,
   ...(soundTable ? [`import { install as sounds } from './sounds.js'; sounds(${soundTable});`] : []),
+  // A drag's data is admitted before the page is written, as the browser entry admits it (drag.js).
+  ...(drag ? ["import { install as drag } from './drag.js'; import { PropHooks as dragHooks, say as dragSay } from './rt.js'; drag({ PropHooks: dragHooks, say: dragSay, document: null });"] : []),
   "import { data, clock, inflight, Resources, Mutations, routeAt, Head, canSetStatus, resolvedLanguage, res, commit, refused } from './rt.js'; import { answersAtWork, looseOut } from './held.js';",
   "import { types, sourceTypes, pages, viewportMedia, activation, markdownPaths } from './names.js';",
   "import { segmentOf } from './router.js';",
@@ -979,7 +992,7 @@ if (!production) for (const f of readdirSync(gen).filter(f => f.endsWith('.js'))
 // with the app's native render entry where it has one (`<app>-render`, in an authored
 // crate), else under Bun (LLP 1153 D3.5).
 const renderBin = `${app}-render`;
-const renderAt = [['linux', `${app}-linux`], ['web', `${app}-web`]].find(([dir]) => existsSync(resolve(appDir, dir, 'src/bin', `${renderBin}.rs`)));
+const renderAt = webRendererHost(appDir, renderBin);
 const how = opt('--render') ?? (renderAt ? 'rust' : 'js');
 if (siteBase !== '/' && how === 'rust') throw new Error('host.web.base: the Rust renderer requires /; use --render js or --render none');
 // Inject only into the app's module graph (the capture, under gen), never
@@ -1033,7 +1046,7 @@ const replay = ts ? (await import(resolve(root, 'js/bake/src/typescript.mjs'))).
 // but suppress missing-export warnings only at the generated glue's path.
 const optionalHookWarning = (id, message) => generatedRoots.some(root => id === resolve(root, 'ts-data.js'))
   && /Import ["`](?:kept|overlay|tools)["`] will always be undefined because there is no matching export/.test(message);
-const { rolldown } = await import('rolldown');
+const { rolldown, RolldownMagicString } = await import('rolldown');
 const scopedPlugins = () => [...(replay ? [replay.rolldown] : []),
   { name: 'exact-mounts', resolveId: (source, importer) => mounted(source, importer) },
   { name: 'source-grants', transform: scopedModule }, asyncContext()];
@@ -1051,7 +1064,7 @@ const moduleImports = code => new Bun.Transpiler({ loader: 'js' }).scanImports(c
 const publicDependency = (from, specifier) => posix.resolve('/', posix.dirname(from), specifier).slice(1);
 // The files the build copies for `roots` and their imports: each one's name, the bytes it is written with, and the
 // names it gives other files. A dependency with no source here is one the build writes itself (checked when written).
-async function lazyModules(roots) {
+async function lazyModules(roots, omit = []) {
   const { webHostFiles } = await import('../../scripts/app.mjs');
   // These modules were built for this JS runtime and have already passed its
   // production gate. The wasm inventory belongs to a different build.
@@ -1072,6 +1085,7 @@ async function lazyModules(roots) {
     const names = [];
     if (code != null) for (const specifier of [...moduleImports(code), ...literalModuleURLs(code)]) {
       const dependency = publicDependency(name, specifier);
+      if (omit.includes(dependency)) continue;
       if (dependency.startsWith('..')) throw new Error(`${name}: lazy dependency leaves the build root: ${specifier}`);
       const sibling = resolve(dirname(from), specifier);
       names.push(dependency);
@@ -1105,7 +1119,8 @@ const storageLazy = files || moduleStorage || extensionFiles || pageModules || s
     extensionFiles && resolve(gen, 'modules.js'), (pageModules || extensionFiles) && resolve(gen, 'native.js')].filter(Boolean)
     .flatMap(seed => literalModuleURLs(readFileSync(seed, 'utf8'))).map(specifier => specifier.replace(/^\.\//, ''))) : null;
 // gpu-glue.js names itself (its timing filter) and the GPU files it loads by names it makes: none of them is renamed.
-const gpuLazy = hasGpuArtifacts ? await lazyModules(['gpu-glue.js', ...(declaredGpu.length ? ['gpu-modules.js'] : [])]) : null;
+const gpuLazy = hasGpuArtifacts ? await lazyModules(['gpu-glue.js', ...(declaredGpu.length ? ['gpu-modules.js'] : [])],
+  manifest.game?.render?.workers === true ? [] : ['gpu-jobs.js']) : null;
 const copiedNames = new Set([...storageLazy?.values() ?? [], ...gpuLazy?.values() ?? []].flatMap(file => file.names));
 // The leaf modules the plan uses, built at once: Markdown's pieces, the
 // motion engine (host/web-js/motion), the Markdown editor's rules
@@ -1187,10 +1202,13 @@ const prepareChunks = { name: 'exact-prepare-chunks', renderChunk(code, chunk, _
   if (!chunk.isEntry) return null;
   const eager = eagerChunks(chunk.fileName, name => meta.chunks[name]?.imports);
   const deferred = Object.keys(meta.chunks).filter(name => !eager.includes(name)).sort();
-  for (const place of ['__EXACT_DEFERRED_CHUNKS__', '__EXACT_SHEET__']) {
-    if (code.split(place).length !== 2) throw new Error(`host/web-js/build.mjs: the entry has no one place for ${place}`);
+  const edits = new RolldownMagicString(code);
+  for (const [place, value] of [['__EXACT_DEFERRED_CHUNKS__', JSON.stringify(deferred)], ['__EXACT_SHEET__', cutSheet(Object.values(meta.chunks))]]) {
+    const at = code.indexOf(place);
+    if (at < 0 || code.indexOf(place, at + place.length) >= 0) throw new Error(`host/web-js/build.mjs: the entry has no one place for ${place}`);
+    edits.overwrite(at, at + place.length, value);
   }
-  return code.replace('__EXACT_DEFERRED_CHUNKS__', () => JSON.stringify(deferred)).replace('__EXACT_SHEET__', () => cutSheet(Object.values(meta.chunks)));
+  return sizes ? { code: edits.toString(), map: edits.generateMap({ source: chunk.fileName, hires: 'boundary', includeContent: false }).toString() } : edits.toString();
 } };
 {
   const b = await rolldown({ ...bundleOptions, input: resolve(gen, 'main.js'), ...(ts ? { tsconfig: resolve(tsStage, '__exact_tsconfig.json') } : {}), transform: { ...bundleOptions.transform, define: { ...bundleOptions.transform.define, ...versionDefines, 'globalThis.__exactRender': 'false' } },
@@ -1211,7 +1229,13 @@ const prepareChunks = { name: 'exact-prepare-chunks', renderChunk(code, chunk, _
   // app's mount calls most of them (the Bluesky
   // clone's release page: runtime up at 1.7–1.9 s, 0.5 s with it; ~23 MB
   // more heap). Other browsers read a comment.
-  const built = await b.write({ dir: out, format: 'esm', minify: true, comments: false, entryFileNames: 'app-[hash].js', chunkFileNames: '[name]-[hash].js',
+  const built = await b.write({ dir: out, format: 'esm', minify: true,
+    ...(sizes ? { sourcemap: 'hidden', sourcemapExcludeSources: true, plugins: [{ name: 'exact-launch-sizes', generateBundle(_, bundle) {
+      for (const chunk of Object.values(bundle)) if (chunk.type === 'chunk') {
+        if (chunk.isEntry) console.log(entrySizeReport(chunk, out));
+        delete bundle[chunk.sourcemapFileName];
+      }
+    } }] } : {}), comments: false, entryFileNames: 'app-[hash].js', chunkFileNames: '[name]-[hash].js',
     // The seam's chunk too (LLP 1047.003 D6): a page loads it to answer at once.
     postBanner: (chunk) => chunk.isEntry || chunk.moduleIds.includes(resolve(gen, 'ts-data.js')) ? '//# allFunctionsCalledOnLoad' : undefined,
     ...(devReload && ts ? { manualChunks: (id, { getModuleInfo }) => fromData(id, getModuleInfo) ? 'dev-data' : undefined } : {}) });
@@ -1421,13 +1445,13 @@ if (markdownReaders) {
 }
 if (pages.length && !opt('--render') && !renderAt) console.log(`${app}: no ${renderBin} entry, so its pages render under Bun (--render js)`);
 if (pages.length && how === 'rust') {
-  const bin = renderBin, at = renderAt;
-  if (!at) { console.error(`--render rust: ${app} has no ${bin} entry; use --render js`); process.exit(1); }
+  const bin = renderBin;
+  if (!renderAt) { console.error(`--render rust: ${app} has no ${bin} entry; use --render js`); process.exit(1); }
   const plan = resolve(out, 'app.plan');
   // The render entry runs here as a build tool, in the app's own workspace and target (an authored app outside the
   // repository has its own, LLP 1153 D1.4): the development profile, which the Linux host an agent drives shares.
   const renderApp = resolveApp(appDir);
-  const r = spawnSync('cargo', ['run', ...injectedProfiles(renderApp), '--profile', 'host-dev', '-q', '-p', at[1], '--bin', bin, '--', '--plan', plan, '--name', manifest.name, ...(manifest.app?.origin ? ['--origin', manifest.app.origin] : []), '--shell', resolve(out, 'index.html'), '--build'],
+  const r = spawnSync('cargo', ['run', ...injectedProfiles(renderApp), '--profile', 'host-dev', '-q', '-p', `${app}-${renderAt}`, '--bin', bin, '--', '--plan', plan, '--name', manifest.name, ...(manifest.app?.origin ? ['--origin', manifest.app.origin] : []), '--shell', resolve(out, 'index.html'), '--build'],
     { cwd: renderApp.workspace, encoding: 'utf8', maxBuffer: 256 << 20, env: { ...process.env, CARGO_TARGET_DIR: renderApp.target, EXACT_UPDATE_TRUST: 'development' } });
   let docs;
   try { docs = renderEntryPages(bin, r); } catch (e) { console.error(e.message); process.exit(1); }

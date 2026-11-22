@@ -14,6 +14,7 @@ mod color_profile;
 mod component;
 mod decls;
 mod decorations;
+mod drag;
 mod expr;
 mod keyframes;
 mod layout_step;
@@ -108,7 +109,13 @@ pub struct Partial {
 
 /// [`parse_source_all`], keeping what parsed beside the refusals.
 pub fn parse_source_partial(src: &str, source_id: u32) -> Result<File, Partial> {
-    parsed_with_edits(src, source_id).0
+    parsed_with_edits(src, source_id, false).0
+}
+
+/// Parse for a view symbol lookup, recording the full authored ranges of
+/// expressions and control headers alongside the diagnostic token spans.
+pub fn parse_source_with_view_ranges(src: &str, source_id: u32) -> Result<File, Partial> {
+    parsed_with_edits(src, source_id, true).0
 }
 
 /// Parse lexer output and return its unchanged tokens for source-preserving tools.
@@ -122,6 +129,7 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     names: NameSpans,
+    view_ranges: bool,
     /// Expressions (and prefix operators) open around the current token.
     depth: u32,
     view_depth: usize,
@@ -1256,7 +1264,9 @@ impl Parser {
                     (name, aspan)
                 };
                 self.unquoted_percent(&name)?;
+                let start = self.peek().span;
                 let value = self.attr_value()?;
+                self.view_range(aspan, start);
                 self.unquoted_unit(&name, &value)?;
                 if attrs.iter().any(|a: &Attr| a.name == name) {
                     return Err(SyntaxError {
@@ -1294,7 +1304,10 @@ impl Parser {
                     ),
                 );
             } else {
-                positional.push(self.expr()?);
+                let start = self.peek().span;
+                let value = self.expr()?;
+                self.view_range(value.span(), start);
+                positional.push(value);
             }
         }
         Ok(())

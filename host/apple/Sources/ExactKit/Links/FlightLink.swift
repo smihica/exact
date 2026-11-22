@@ -15,6 +15,7 @@ import UIKit
 /// in its own bounds (`applyImageLayer` defers to it).
 package struct FlightLook {
     package var image: CGRect
+    package var contentClip: CGRect?
     /// The leaver's decoded image, drawn while the arriver's own is still
     /// loading: a new node's raster lands a turn or more after the commit
     /// that hides the leaver, and a flight drawing nothing until then showed
@@ -24,8 +25,8 @@ package struct FlightLook {
     /// keeps this scale while it flies, as a style (UIKit) or a layout
     /// (AppKit) would otherwise undo it.
     package var scale: CGFloat? = nil
-    package init(image: CGRect, stand: (any ImageLease)? = nil, scale: CGFloat? = nil) {
-        self.image = image; self.stand = stand; self.scale = scale
+    package init(image: CGRect, contentClip: CGRect? = nil, stand: (any ImageLease)? = nil, scale: CGFloat? = nil) {
+        self.image = image; self.contentClip = contentClip; self.stand = stand; self.scale = scale
     }
 }
 

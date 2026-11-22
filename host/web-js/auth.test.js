@@ -336,3 +336,26 @@ test("fragment callbacks retain their parameters and require one exact state acr
     await pending.catch(() => {});
   }
 });
+
+test("authFixture shows the full URL for both http and https loopback origins, never non-loopback", async () => {
+  clock.agent = true;
+  for (const [origin, shown] of [
+    ["http://127.0.0.1:4100", true],
+    ["https://127.0.0.1:4100", true],
+    ["https://localhost:4100", true],
+    ["https://[::1]:4100", true],
+    ["https://evil.example:4100", false],
+  ]) {
+    globalThis.location = new URL(`https://app.example/?authFixture=${encodeURIComponent(origin)}`);
+    install(`auth.session ${origin}\nauth.callback https://app.example/cb`, () => "login");
+    const url = `${origin}/authorize?code_challenge=secret&state=s`;
+    const pending = openAuthSession(url, { callback: "https://app.example/cb", state: "s" });
+    const [hold] = holds();
+    try {
+      expect(hold.device.args.url).toBe(shown ? url : undefined);
+    } finally {
+      answer({ ticket: hold.ticket, op: "tap", choice: "cancel" });
+      await pending.catch(() => {});
+    }
+  }
+});

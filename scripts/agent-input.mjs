@@ -426,8 +426,9 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
         // A move refused partway answers where the delivered samples left the contact.
         else if (phase === 'move' && Array.isArray(r.at)) s.contact = { x: r.at[0], y: r.at[1] };
       }
-      // A drag's press and hold are virtual time (platformer R7). Linux already sought and reports `clock`.
-      if (phase === 'hold' && opts.virtual && opts.ms > 0 && !(Number.isFinite(r.clock) && r.clock > before))
+      // A virtual hold seeks the clock (platformer R7). The reader can wait without a new commit.
+      if (phase === 'hold' && opts.virtual && opts.ms > 0 && !(r.waitMs > 0) &&
+          !(Number.isFinite(r.clock) && r.clock > before))
         await s.clock(`+${opts.ms}`);
       return s.landed({
         ...r,

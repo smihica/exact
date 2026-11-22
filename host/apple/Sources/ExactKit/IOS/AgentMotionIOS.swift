@@ -2,8 +2,8 @@
 // `check`), UIKit's own motion on the wall clock runs to its end — the
 // agent's clock holds the app's Contract motion, but not a segment's thumb or a switch's
 // knob, which a screenshot right after a tap caught on its old side (round
-// 5's polls). A film's frames (`screenshot … over … every …`) are taken as
-// they stand. A native module's motion on the wall clock goes on under the
+// 5's polls). Film frames and stills during held contacts skip this wait.
+// A native module's motion on the wall clock goes on under the
 // agent's: `clock` waits for its animations to end, and a tap for an overlay
 // the app laid over the screen to go.
 #if os(iOS) || os(tvOS)
@@ -31,8 +31,8 @@ extension Agent {
         #endif
     }
 
-    @discardableResult func settleMotion(bound: TimeInterval = 1.5) -> Bool {
-        guard let window = presenter.viewport.window else { return true }
+    @discardableResult func settleMotion(bound: TimeInterval = 1.5, in window: UIWindow? = nil) -> Bool {
+        guard let window = window ?? presenter.viewport.window else { return true }
         // A document picker's first presentation starts its view service, measured past 1.5 s on the iOS 27 simulator.
         let arrival = Date(timeIntervalSinceNow: 5)
         while systemSheetArriving && Date() < arrival { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.016)) }

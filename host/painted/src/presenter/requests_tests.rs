@@ -148,6 +148,67 @@ fn says(p: &Presenter<Nothing>, what: &str) -> usize {
 }
 
 #[test]
+fn a_document_title_reaches_the_shell_without_a_paint() {
+    let plan = crate::test_plan(
+        r#"component App
+  state step = 0
+  derive title = step == 0 ? "First document" : step == 1 ? "Second document 📄" : ""
+  action next
+    step = (step + 1) % 4
+  view
+    column
+      if step != 3
+        head title=title
+      button "Next" press=next testId="next"
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan,
+        Nothing,
+        (400., 800.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.serve_requests();
+    let titles = |p: &mut Presenter<Nothing>| {
+        p.tell_shell();
+        decode(p.take_requests())
+            .into_iter()
+            .filter(|r| r.0 == 22)
+            .map(|r| strings(&r.2, 0).pop())
+            .collect::<Vec<_>>()
+    };
+    let mut window = crate::window_title::WindowTitle::default();
+    for title in [
+        Some("First document"),
+        Some("Second document 📄"),
+        Some(""),
+        None,
+    ] {
+        assert!(window.update(p.host().runner()));
+        assert_eq!(window.caption("App name"), title.unwrap_or("App name"));
+        assert!(!window.update(p.host().runner()));
+        assert_eq!(titles(&mut p), [title.map(str::to_owned)]);
+        assert!(titles(&mut p).is_empty());
+        tap(&mut p, "next");
+    }
+    let first = [Some("First document".to_owned())];
+    assert_eq!(titles(&mut p), first);
+    p.requests_reset();
+    assert_eq!(titles(&mut p), first);
+    for _ in 0..3 {
+        tap(&mut p, "next");
+    }
+    assert_eq!(titles(&mut p), [None]);
+    p.requests_reset();
+    assert_eq!(titles(&mut p), [None]);
+    assert!(titles(&mut p).is_empty());
+}
+
+#[test]
 fn desktop_linux_has_no_shell_and_keeps_what_each_command_did() {
     let mut p = boot();
     for name in ["buzz", "purr", "copy", "web", "send", "mail", "thump"] {
@@ -310,6 +371,7 @@ fn the_shell_is_told_when_back_has_somewhere_to_go_and_a_field_holds_the_focus()
         p.tell_shell();
         decode(p.take_requests())
             .iter()
+            .filter(|r| r.0 != 22)
             .map(|r| (r.0, r.2[0]))
             .collect()
     };

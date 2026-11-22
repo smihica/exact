@@ -44,7 +44,7 @@ package struct RegionTextRun: Sendable {
     package let href: String
     package let range: NSRange
     package let box: InlineBox?
-    let icon: TextAtomIcon?
+    let icon: (any TextAtomIconPainting)?
     let background: InlineBackground?
 }
 
@@ -112,7 +112,7 @@ package final class RegionTextSource: Sendable {
                                  strikeColor: run.decoration.contains("line-through") ? nil : run.strikeColor.map { TextEngine.color($0).cgColor },
                                  href: run.href,
                                  range: NSRange(location: offset, length: count), box: run.box,
-                                 icon: paint[.exactAtomIcon] as? TextAtomIcon, background: paint[.exactBackground] as? InlineBackground)
+                                 icon: paint[.exactAtomIcon] as? any TextAtomIconPainting, background: paint[.exactBackground] as? InlineBackground)
         }
         rasterFormat = TextRasterJob.format(paints)
         let base = spec.strut ?? spec.runs.first

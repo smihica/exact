@@ -24,6 +24,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const EXPECTED_EVENTS = 'press;change:changed;hover:true;focus;blur;key:Enter;submit;message:hello;';
 const NOTE = 'quote " slash \\ tab\t<&>';
 
+export async function nativeFixturePixel(s, path, testId, { padding = false, device = false } = {}) {
+  const { id } = await s.target(testId);
+  await s.reveal(id); await s.clock('settle');
+  const shot = device ? await s.screenshot(path, true, 'app') : await s.screenshot(path);
+  const png = decodePng(readFileSync(path));
+  const box = device ? (await s.op({ op: 'layout', id })).node?.space?.window
+    : (await s.layout()).nodes.find((n) => n.testId === testId);
+  if (!box) return null;
+  const x = Math.round((box.x + (padding ? 3 : box.w / 2)) * png.width / shot.w);
+  const y = Math.round((box.y + box.h / 2) * png.height / shot.h);
+  if (x < 0 || x >= png.width || y < 0 || y >= png.height) return null;
+  const i = (y * png.width + x) * 4;
+  return [png.data[i], png.data[i + 1], png.data[i + 2]];
+}
+
 export async function nativeSmoke({ host, open, check: record, webDist, shots, device = false }) {
   let checks = 0, failed = 0;
   const check = (ok, what) => { checks += 1; if (!ok) failed += 1; return record(ok, what); };
@@ -59,17 +74,7 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
     return last;
   };
   const received = (st) => { const r = st.slots.received; return r.startsWith('props:') ? JSON.parse(r.slice(6)) : null; };
-  const pixel = async (s, path, testId, padding = false) => {
-    await s.reveal((await s.target(testId)).id); await s.clock('settle');
-    const shot = await s.screenshot(path);
-    const png = decodePng(readFileSync(path));
-    const box = (await s.layout()).nodes.find((n) => n.testId === testId);
-    if (!box) return null;
-    const scale = png.width / shot.w, x = Math.round((box.x + (padding ? 3 : box.w / 2)) * scale), y = Math.round((box.y + box.h / 2) * scale);
-    if (x < 0 || x >= png.width || y < 0 || y >= png.height) return null;
-    const i = (y * png.width + x) * 4;
-    return [png.data[i], png.data[i + 1], png.data[i + 2]];
-  };
+  const pixel = (s, path, testId, padding) => nativeFixturePixel(s, path, testId, { padding, device });
   const near = (rgb, hex) => rgb && [1, 3, 5].every((o, k) => Math.abs(rgb[k] - parseInt(hex.slice(o, o + 2), 16)) <= 12);
 
   // The standard artifact.
@@ -356,7 +361,7 @@ export async function nativeSmoke({ host, open, check: record, webDist, shots, d
     await s.tap('reject'); await settle(s);
     t = await s.tree();
     check(module(t, 'box')?.state === 'ready', `${host} native: an accepted replacement clears the refusal: ${JSON.stringify(module(t, 'box'))}`);
-    // Capture: the boxes, and on Apple the fixture's tokened snapshot.
+    // Apple's tokened snapshot is called by the app renderer.
     const shot = resolve(shots ?? tmp, `native-fixture-${host}.png`);
     const box = await pixel(s, shot, 'box'), plain = await pixel(s, shot, 'plain'), absent = await pixel(s, shot, 'absent');
     check(near(box, '#2266ee'), `${host} native: the capture shows the fixture's colour: ${box}`);

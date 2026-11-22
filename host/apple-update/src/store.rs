@@ -44,7 +44,6 @@ pub type DoneFn = extern "C" fn(ctx: *mut c_void, line: *const u8, len: usize);
 
 /// The head is a pointer card (LLP 1026 D11); a file is a plan or an asset.
 const MAX_HEAD_BYTES: usize = exact_update::MAX_ENVELOPE_BYTES;
-const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The one store, once opened.
 static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
@@ -516,7 +515,7 @@ fn fetch_one(
     let limit = if head == Some(url) {
         MAX_HEAD_BYTES
     } else {
-        MAX_FILE_BYTES
+        exact_update::MAX_FILE_BYTES
     };
     let mut req = ibex2::stdlib::fetch::Request::get(url);
     req.redirect = ibex2::stdlib::fetch::RedirectMode::Manual;

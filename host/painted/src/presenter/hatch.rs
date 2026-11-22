@@ -17,15 +17,6 @@ use exact_runner::ControlValue;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// The platform a hatch word names for this build, as the plan's row has it.
-const HATCH_PLATFORM: &str = if cfg!(target_os = "windows") {
-    "windows"
-} else if cfg!(target_os = "android") {
-    "android"
-} else {
-    "linux"
-};
-
 /// Where Exact stood before it dispatched an observed event, and who hears it.
 pub(crate) struct Mark {
     seq: u64,
@@ -272,7 +263,7 @@ impl<D: DataSource> Presenter<D> {
     ) {
         // A word the plan does not give this platform, or the module was not
         // built to handle (§4.3): shown, never called, journaled once, listed.
-        if !self.host.plan_gives_hatch(&word, HATCH_PLATFORM) {
+        if !self.host.plan_gives_hatch(&word, crate::PLATFORM.name()) {
             if self.hatches.first_unhandled(&word, "plan") {
                 self.host.log(format!("hatch element {word}: the plan does not give it to this platform; its nodes are shown and never called"));
             }
@@ -628,13 +619,13 @@ impl<D: DataSource> Presenter<D> {
         Some(name)
     }
 
-    /// One tick or `after`, counted against the command's cap under the agent.
+    /// Count one tick or `after` against the seek's cap.
     fn hatch_fired(&mut self) -> bool {
         self.hatches.fires = self.hatches.fires.saturating_add(1);
-        !self.agent || self.hatches.fires <= COMMAND_LIMIT
+        self.hatches.fires <= COMMAND_LIMIT
     }
 
-    fn hatch_ticks(&mut self, now: f64) -> bool {
+    fn hatch_ticks(&mut self, now: f64, capped: bool) -> bool {
         let Some(shared) = self.hatches.shared().cloned() else {
             return true;
         };
@@ -647,7 +638,7 @@ impl<D: DataSource> Presenter<D> {
             if !shared.live(token) {
                 continue;
             }
-            if !self.hatch_fired() {
+            if capped && !self.hatch_fired() {
                 return false;
             }
             self.hatches
@@ -657,12 +648,12 @@ impl<D: DataSource> Presenter<D> {
         true
     }
 
-    fn hatch_afters(&mut self, now: f64) -> bool {
+    fn hatch_afters(&mut self, now: f64, capped: bool) -> bool {
         let Some(shared) = self.hatches.shared().cloned() else {
             return true;
         };
         for token in shared.due_afters(now) {
-            if !self.hatch_fired() {
+            if capped && !self.hatch_fired() {
                 return false;
             }
             self.hatches
@@ -682,11 +673,11 @@ impl<D: DataSource> Presenter<D> {
         let shared = self.hatches.shared().cloned()?;
         let now = self.host.now();
         self.hatch_moments();
-        if shared.frame_due(now) && !self.hatch_ticks(now) {
+        if shared.frame_due(now) && !self.hatch_ticks(now, true) {
             return self.hatch_limit("HatchFireLimit");
         }
         loop {
-            if !self.hatch_afters(now) {
+            if !self.hatch_afters(now, true) {
                 return self.hatch_limit("HatchFireLimit");
             }
             let queued = shared.in_flight();
@@ -711,7 +702,7 @@ impl<D: DataSource> Presenter<D> {
     pub(crate) fn hatch_presented(&mut self, now: f64) {
         if self.hatch_ticking() {
             self.hatch_moments();
-            self.hatch_ticks(now);
+            self.hatch_ticks(now, false);
         }
         self.hatch_timers(now);
     }
@@ -720,7 +711,7 @@ impl<D: DataSource> Presenter<D> {
     pub(crate) fn hatch_timers(&mut self, now: f64) {
         let due = (self.hatches.shared()).and_then(|shared| shared.after_due());
         if self.hatches.connected() && due.is_some_and(|due| due <= now) {
-            self.hatch_afters(now);
+            self.hatch_afters(now, false);
             self.hatch_requests();
         }
     }

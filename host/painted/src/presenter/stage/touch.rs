@@ -9,7 +9,8 @@
 //! the window down, which is the route's Back. Where a scroller is under
 //! the finger, a sheet with several detents takes upward drags below its
 //! tallest and downward drags at a non-refreshing list's start. At its
-//! tallest, a new upward drag scrolls the list. Android's reader cancels the
+//! tallest, Android passes the rest of the same drag to the list. Reversing
+//! scrolls the list to its start before lowering the sheet. The reader cancels the
 //! contact, and the drag with it, where a module view under the finger
 //! asked to keep its touch (`Under::sheet` in `scrollers.rs`).
 //!
@@ -53,8 +54,9 @@ pub(in crate::presenter) enum Gesture {
 /// driver reads a contact (`agent/contact.rs`).
 #[derive(Debug, Clone, Copy)]
 pub(in crate::presenter) struct Contact {
-    at: (f32, f32),
-    event_ms: f64,
+    pub(in crate::presenter) at: (f32, f32),
+    pub(in crate::presenter) event_ms: f64,
+    pub(in crate::presenter) delivered_ms: f64,
 }
 
 impl Gesture {
@@ -210,7 +212,6 @@ impl<D: DataSource> Presenter<D> {
 
     /// Which finger directions move the sheet rather than its nested list:
     /// upward below the tallest detent, downward at a non-refreshing list's start.
-    /// Ownership stays fixed for the contact; unconsumed movement is not handed off.
     pub(in crate::presenter) fn sheet_drag_directions(&self, chain: &[Scroller]) -> (bool, bool) {
         let Some(sheet) = self.front_sheets().last() else {
             return (false, false);
@@ -236,6 +237,42 @@ impl<D: DataSource> Presenter<D> {
         )
     }
 
+    pub(in crate::presenter) fn nested_sheet_bounds(&self) -> Option<(NodeKey, [f32; 3])> {
+        let sheet = self.front_sheets().last()?;
+        if sheet.heights.len() < 2 {
+            return None;
+        }
+        let h = self.viewport.1;
+        let node = self.host.kernel().node_by_key(sheet.modal)?;
+        let lowest = if node.props.str(PropId::Closedby) == Some("none") {
+            h - sheet.heights.first()?
+        } else {
+            h
+        };
+        Some((
+            sheet.modal,
+            [self.sheet_top_now(sheet), h - sheet.heights.last()?, lowest],
+        ))
+    }
+
+    /// A native nested drag moves only the sheet hit on down, even if its route is replaced.
+    pub fn reader_sheet_drag(&mut self, modal: NodeKey, top: f32, release: Option<f32>, now: f64) {
+        let Some((front, [_, highest, lowest])) = self.nested_sheet_bounds() else {
+            return;
+        };
+        if modal != front || !top.is_finite() {
+            return;
+        }
+        let top = top.clamp(highest, lowest);
+        if let Some(velocity) = release {
+            self.settle_sheet(modal, top, velocity, now);
+        } else if let Some(sheet) = self.stage.sheets.iter_mut().find(|s| s.modal == modal) {
+            sheet.top = Glide::still(top);
+            sheet.reader_dragging = true;
+            self.dirty = true;
+        }
+    }
+
     /// A contact down: one on a scrim is the stage's; one on a sheet may
     /// become its drag.
     pub(in crate::presenter) fn stage_down(&mut self, x: f32, y: f32, now: f64) -> bool {
@@ -246,6 +283,7 @@ impl<D: DataSource> Presenter<D> {
         let contact = Contact {
             at: (x, y),
             event_ms: now,
+            delivered_ms: now,
         };
         if y < top || x < left || x >= left + width {
             self.stage.gesture = Some(Gesture::Scrim { modal, contact });
@@ -275,11 +313,9 @@ impl<D: DataSource> Presenter<D> {
     /// The contact the stage holds where no other is down (a press on a
     /// scrim, a sheet's drag past the slop): where it is and when it was
     /// last heard.
-    pub(in crate::presenter) fn stage_contact(&self) -> Option<((f32, f32), f64)> {
+    pub(in crate::presenter) fn stage_contact(&self) -> Option<Contact> {
         match self.stage.gesture? {
-            Gesture::Scrim { contact, .. } | Gesture::Drag { contact, .. } => {
-                Some((contact.at, contact.event_ms))
-            }
+            Gesture::Scrim { contact, .. } | Gesture::Drag { contact, .. } => Some(contact),
         }
     }
 
@@ -295,11 +331,18 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    pub(in crate::presenter) fn stage_move(&mut self, x: f32, y: f32, now: f64) -> bool {
+    pub(in crate::presenter) fn stage_move(
+        &mut self,
+        x: f32,
+        y: f32,
+        now: f64,
+        event: f64,
+    ) -> bool {
         if let Some(gesture) = &mut self.stage.gesture {
             *gesture.contact() = Contact {
                 at: (x, y),
-                event_ms: now,
+                event_ms: event,
+                delivered_ms: now,
             };
         }
         let h = self.viewport.1;
@@ -353,7 +396,7 @@ impl<D: DataSource> Presenter<D> {
         }) = &mut self.stage.gesture
         {
             *top = (*start + y - finger.1).clamp(highest, h);
-            let dt = (now - last.1) as f32 / 1000.0;
+            let dt = (event - last.1) as f32 / 1000.0;
             if dt > 0.0 {
                 let v = (y - last.0) / dt;
                 *velocity = if dt > 0.1 {
@@ -361,7 +404,7 @@ impl<D: DataSource> Presenter<D> {
                 } else {
                     0.6 * v + 0.4 * *velocity
                 };
-                *last = (y, now);
+                *last = (y, event);
             }
             self.dirty = true;
         }
@@ -381,9 +424,12 @@ impl<D: DataSource> Presenter<D> {
             ..
         } = &mut gesture
         {
-            // The release's own sample counts toward the speed.
+            // The release's own sample counts toward the speed; a finger
+            // still for 40 ms has stopped (Android's `VelocityTracker`).
             let dt = (event - last.1) as f32 / 1000.0;
-            if dt > 0.0 && dt <= 0.1 {
+            if dt > 0.04 {
+                *velocity = 0.0;
+            } else if dt > 0.0 {
                 *velocity = 0.6 * ((y - last.0) / dt) + 0.4 * *velocity;
             }
         }
@@ -446,6 +492,7 @@ impl<D: DataSource> Presenter<D> {
         let Some(sheet) = self.stage.sheets.iter_mut().find(|s| s.modal == modal) else {
             return;
         };
+        sheet.reader_dragging = false;
         let mut rests: Vec<f32> = sheet.heights.iter().map(|d| h - d).collect();
         if closes {
             rests.push(h);
@@ -493,6 +540,10 @@ impl<D: DataSource> Presenter<D> {
     pub(in crate::presenter) fn stage_follows_finger(&self) -> bool {
         matches!(self.stage.gesture, Some(Gesture::Drag { moving: true, .. }))
             || self.stage.preview.is_some()
+            || self
+                .front_sheets()
+                .last()
+                .is_some_and(|s| s.reader_dragging)
     }
 
     /// The person dismissed the sheet `modal` opened (a press on its scrim,

@@ -78,6 +78,8 @@ mod midi;
 mod paint;
 #[path = "paragraph.rs"]
 mod paragraph;
+#[path = "replacement.rs"]
+mod replacement;
 #[path = "root_tabs.rs"]
 mod root_tabs;
 #[cfg(test)]
@@ -101,7 +103,7 @@ mod route_parts;
 #[cfg(test)]
 #[path = "transform_drag_tests.rs"]
 mod transform_drag_tests;
-pub use covers::Restyle;
+pub use covers::{OwnerReports, Restyle};
 use exact_plan::EventKind;
 use exact_runner::{Carried, DataSource, Event, Outcome, RequestOut, Runner, RunnerError, Timed};
 pub use height::{HeightOwnerChange, HeightOwnerDisposition, HeightOwnerError};
@@ -114,6 +116,9 @@ mod activation_tests;
 #[cfg(test)]
 #[path = "box_motion_tests.rs"]
 mod box_motion_tests;
+#[cfg(test)]
+#[path = "canvas_link_tests.rs"]
+mod canvas_link_tests;
 #[cfg(test)]
 #[path = "filter_motion_tests.rs"]
 mod filter_motion_tests;
@@ -186,6 +191,7 @@ impl std::fmt::Display for HostError {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Mirror {
+    kind: Option<&'static str>,
     props: exact_kernel::SortedMap<&'static str, String>,
     /// The style the presenter last heard, one allocation per text ([`paragraph::StyleTexts`]).
     style: std::rc::Rc<str>,
@@ -202,6 +208,11 @@ pub(crate) struct Mirror {
     /// host that gives the popover its own is sent the used size again.
     implied: bool,
 }
+
+/// What a source's `captureCanvas` is answered with where canvases are not
+/// linked: the plan has none to capture.
+pub(crate) const UNLINKED_SURFACES: &str =
+    "Unlinked(\"surfaces\"): this binary links no canvas, which a capture reads; a plan with a canvas links them";
 
 /// One runner, one presenter.
 pub struct Host<D: DataSource> {
@@ -266,11 +277,15 @@ pub struct Host<D: DataSource> {
     /// Each table's and table part's record as the presenter last heard it
     /// (`tables.rs`).
     tables: IdMap<ViewId, String>,
+    changed_prose_lists: IdSet<ViewId>,
     ranks: IdMap<ViewId, i64>,
     roots: Vec<ViewId>,
     /// Last published common collection snapshot; refreshed only after layout.
     collections_json: String,
     collection_heads: Option<Vec<exact_runner::CollectionSnapshot>>,
+    /// Section indices and mounted cells in the last batch for Mac split lists.
+    #[cfg(target_os = "macos")]
+    section_tables: std::collections::BTreeMap<ViewId, exact_runner::list_api::SectionTable>,
     engine: Engine,
     paint: paint::Paint,
     holds: BTreeMap<u64, HoldToken>,
@@ -312,6 +327,7 @@ pub struct Host<D: DataSource> {
     pending_store_writes: Vec<exact_runner::StoreWrite>,
     /// A store write landed since the last batch was written (`Batch::stored`).
     stored: bool,
+    window_state_changed: bool,
     pending_store_stamps: std::collections::BTreeMap<String, exact_data::secrets::Stamp>,
     /// What the disk held for each owed name when its write first failed.
     pending_store_bases: std::collections::BTreeMap<String, Option<Vec<u8>>>,
@@ -326,7 +342,7 @@ pub struct Host<D: DataSource> {
     preload_wake: exact_runner::PreloadWake,
     doc_watch: Option<crate::doc_watch::DocWatch>,
     /// A turn's family work after its commits, in its written order.
-    turn: crate::link::TurnLinks<D>,
+    pub(crate) turn: crate::link::TurnLinks<D>,
     /// Deadline at the last successful finish with no pending resize notifications;
     /// only a receipt-free collection report can reuse its settled passes.
     finished_deadline: Option<Option<f64>>,
@@ -344,8 +360,9 @@ pub struct Host<D: DataSource> {
     colors_seen: Option<u64>,
     /// The root font size and the window's modes as a batch last said them (`Host::facts_moved`).
     facts_told: Option<(f64, Vec<(String, String)>)>,
-    /// The navigation roots' tabs as a batch last said them (`Host::root_tabs_moved`).
+    /// The navigation roots' tabs as a batch last said them (`Host::navigation_shapes`).
     root_tabs_told: Option<String>,
+    route_inspectors_told: Vec<(ViewId, exact_runner::RouteInspector)>,
     /// The holds as a batch last said them (`Host::wakelock_moved`, `Host::orientation_moved`, `Host::finish_moved`).
     holds_told: colors::Told,
     /// The top-layer boxes covered while closed (`closed.rs`).
@@ -474,6 +491,7 @@ impl<D: DataSource> Host<D> {
             start_on_frame,
             region,
             None,
+            None,
             links,
             font_hook,
             prepare,
@@ -497,6 +515,7 @@ impl<D: DataSource> Host<D> {
         start_on_frame: bool,
         region: Option<crate::content_region::ContentRegionRegistration>,
         native: Option<crate::content_region::NativeProjectionLimits>,
+        previous: Option<&Self>,
         links: crate::link::Links<D>,
         font_hook: Option<(crate::measure::FontsFn, *mut std::ffi::c_void)>,
         prepare: impl FnOnce(&mut Runner<D>) -> Result<(), HostError>,
@@ -553,18 +572,38 @@ impl<D: DataSource> Host<D> {
         }
         // A display presents its pictures: `presented` waits for the first's.
         let was = exact_runner::page::set_awaits_present(start_on_frame);
-        let runner = Runner::boot_with_delivery_linked(
-            links.runner,
-            links.modules,
-            plan,
-            data,
-            kernel,
-            carried,
-            snapshot,
-            facts,
-            viewport,
-            launch,
-        );
+        let platform = if cfg!(target_os = "macos") {
+            exact_runner::page::Platform::Macos
+        } else if cfg!(target_os = "tvos") {
+            exact_runner::page::Platform::Tvos
+        } else if cfg!(target_os = "watchos") {
+            exact_runner::page::Platform::Watchos
+        } else {
+            exact_runner::page::Platform::Ios
+        };
+        let window_state_changed = plan
+            .slots
+            .iter()
+            .any(|row| row.persist == exact_plan::PersistScope::Window)
+            || carried.is_some_and(|c| {
+                c.store
+                    .iter()
+                    .any(|(k, _)| k.starts_with(exact_runner::Store::WINDOW_STATE))
+            });
+        let runner = platform.boot(|| {
+            Runner::boot_with_delivery_linked(
+                links.runner,
+                links.modules,
+                plan,
+                data,
+                kernel,
+                carried,
+                snapshot,
+                facts,
+                viewport,
+                launch,
+            )
+        });
         exact_runner::page::set_awaits_present(was);
         let mut runner = runner.map_err(HostError::Runner)?;
         runner.read_only_store(crate::watch_sync::read_only_names());
@@ -639,10 +678,13 @@ impl<D: DataSource> Host<D> {
             timeline_scrolls: Default::default(),
             fragments: IdMap::default(),
             tables: IdMap::default(),
+            changed_prose_lists: IdSet::default(),
             ranks: IdMap::default(),
             roots: Vec::new(),
             collections_json: "[]".into(),
             collection_heads: Some(Vec::new()),
+            #[cfg(target_os = "macos")]
+            section_tables: Default::default(),
             engine: {
                 // Settled values only when the plan animates nothing (LLP 1047.001).
                 let mut engine = Engine::linked(links.engine);
@@ -697,6 +739,7 @@ impl<D: DataSource> Host<D> {
             secrets,
             pending_store_writes: Vec::new(),
             stored: false,
+            window_state_changed,
             pending_store_stamps: Default::default(),
             pending_store_bases: Default::default(),
             reported_store_failures: BTreeSet::new(),
@@ -705,6 +748,7 @@ impl<D: DataSource> Host<D> {
             colors_seen: None,
             facts_told: None,
             root_tabs_told: None,
+            route_inspectors_told: Vec::new(),
             holds_told: Default::default(),
             closed: Default::default(),
         };
@@ -714,16 +758,7 @@ impl<D: DataSource> Host<D> {
         host.close_top_layer(&order);
         host.cover_root_tablist();
         host.prepare_flat(&mut batch);
-        let handlers = host.runner.handlers();
-        for id in &order {
-            host.create(*id, handlers.get(id).map_or(&[], Vec::as_slice), &mut batch);
-        }
-        for id in &order {
-            host.emit_children(*id, &mut batch);
-        }
-        host.emit_paragraphs(&mut batch);
-        host.roots = host.runner.roots();
-        batch.roots(&host.roots.clone());
+        host.present_first_tree(previous, &order, &mut batch);
         host.emit_title(&mut batch);
         host.emit_language(&mut batch);
         colors::emit_roles(&mut batch);
@@ -756,8 +791,10 @@ impl<D: DataSource> Host<D> {
             (drag.reconcile_heights)(&mut host, &mut batch, true);
         }
         host.layout(&mut batch).map_err(HostError::Layout)?;
-        host.canvas_limits();
-        host.canvas_turn(&mut batch);
+        if let Some(canvas) = host.turn.canvas {
+            (canvas.limits)(&mut host);
+            (canvas.turn)(&mut host, &mut batch);
+        }
         // A failed first layout is a refused boot, not a partially committed
         // host. In particular, no candidate secret writes escape before this
         // point on a dev reload.
@@ -765,6 +802,9 @@ impl<D: DataSource> Host<D> {
             (drag.emit_transforms)(&mut host, &mut batch);
         }
         host.present(&mut batch, true);
+        if let Some(old) = previous {
+            host.finish_replaced_motion(old, &order, &mut batch);
+        }
         let (mut batch, _) = host.resize_rounds(batch, None);
         host.state_onto(&mut batch);
         let batch = host.write(batch, None);
@@ -979,6 +1019,25 @@ impl<D: DataSource> Host<D> {
             .unwrap_or_default()
     }
 
+    /// Surface work for the presenter (`refusal`: the host refused it). With
+    /// canvases unlinked a plan has none, so a source's `captureCanvas` is
+    /// refused by the link's name (LLP 1047.001 D5) and other work goes to
+    /// the presenter.
+    pub fn surface_work(
+        &mut self,
+        presenter: &mut crate::batch::Batch,
+        r: &RequestOut,
+        refusal: Option<&str>,
+    ) {
+        if let Some(canvas) = self.turn.canvas {
+            return (canvas.surface_work)(self, presenter, r, refusal);
+        }
+        if let Some(exact_runner::SurfaceRequest::Canvas { .. }) = r.request.surface.as_deref() {
+            return self.refuse_request(r.ticket, UNLINKED_SURFACES, r.request.is_ordered());
+        }
+        presenter.surface_work(r, refusal);
+    }
+
     /// The requests the runner handed out since the last take (LLP 1016 D2):
     /// the bridge gives them to the executor; nothing reaches the presenter.
     pub fn take_requests(&mut self) -> Vec<RequestOut> {
@@ -1154,7 +1213,9 @@ impl<D: DataSource> Host<D> {
         if !self.engine.starts_on_frame() {
             self.now_ms = a.now_ms.max(self.now_ms);
         }
-        self.runner.canvas_frame();
+        if let Some(canvas) = self.turn.canvas {
+            (canvas.frame)(self);
+        }
         let error = a.error.map(|e| format!("{e:?}"));
         self.in_inert_entry(|host| host.commit(&a.receipts, error))
     }

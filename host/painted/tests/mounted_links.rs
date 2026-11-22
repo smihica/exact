@@ -15,6 +15,7 @@ fn delivery(platform: &str) {
             output_rotation: Default::default(),
             #[cfg(target_os = "macos")]
             painted_boot: None,
+            start_executor: exact_painted::executor::Executor::start,
             content_region: None,
             launch,
             plan: plan.clone().into(),
@@ -41,6 +42,7 @@ fn delivery(platform: &str) {
             hatches: None,
             packages: Vec::new(),
             clock_started: None,
+            preferences: None,
         };
         let (mut p, error) = boot_presenter::<()>(&mut config, (390., 844.)).unwrap();
         assert!(error.is_none(), "{error:?}");

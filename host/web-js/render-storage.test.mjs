@@ -432,12 +432,12 @@ component App
       text reader testId="reader"
       text writer.toString()
 `);
-    // The writer answers after the reader's first answer, changing its arguments; its second answer reads a file.
+    // The writer answers after the reader's first answer, changing its arguments; its second answer reads a file, which
+    // the render refuses and the device does not have, so the reader's ask on the device shows.
     writeFileSync(resolve(dir, 'app.ts'), `export const grants = 'fs.read app:/data/reader';
-let readerCalls = 0;
-export const answer = async (name: string, _args: unknown[], _store: unknown, storage: any): Promise<any> => {
+export const answer = async (name: string, [written]: unknown[], _store: unknown, storage: any): Promise<any> => {
   if (name === 'writer') { await Promise.resolve(); await Promise.resolve(); return 1; }
-  if (++readerCalls === 1) return 'first';
+  if (written !== 1) return 'first';
   try { return new TextDecoder().decode(await storage.fs.readFile('app:/data/reader')); } catch { return 'asked on the device'; }
 };
 `);
@@ -458,7 +458,8 @@ export const answer = async (name: string, _args: unknown[], _store: unknown, st
     await browser.clock('settle');
     const journal = await browser.carrier.evaluate('globalThis.exact.journal');
     expect(journal.some(l => l.endsWith('adopted the document')), journal.join('\n')).toBe(true);
-    expect(journal.some(l => /^t=\d+ reader answered:/.test(l)), journal.join('\n')).toBe(true);
+    expect(await browser.carrier.evaluate(`document.querySelector('[data-testid="reader"]').textContent`), journal.join('\n')).toBe('asked on the device');
+    expect(journal.some(l => l.endsWith("reader answered differently from the page's answer: the first frame showed the rendered page's value until its source answered")), journal.join('\n')).toBe(true);
   } finally {
     await browser?.close(); site?.stop(true);
     rmSync(dir, { recursive: true, force: true });
@@ -807,6 +808,48 @@ export const answer = (): any => fetch('http://127.0.0.1:9/', { method: 'POST', 
       .toEqual({ status: 200, settled: true, pending: ['sent'], refused: [['sent', 'exactBodyFrom app:/data/b']], made: { timeout: 0, any: 0 } });
   } finally {
     Object.assign(AbortSignal, { timeout, any });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 120000);
+
+// A list's elements share its name, but each answer is its own call's: only an answer whose call watched a document, or
+// was refused storage, after an await or not, is listed in `open` for the reader's page to ask again (LLP 1048.000 D9).
+// Each use of a component is a row of its own, listed by its own answer too.
+test('a render lists in `open` only the answers whose own calls watched or were refused storage', async () => {
+  const dir = scratch();
+  try {
+    writeFileSync(resolve(dir, 'app.contract'), `component App
+  state ids: string[] = ["a", "b", "c", "d", "e"]
+  resource notes = note(id) for id in ids as shape string
+  view
+    column
+      text notes.join(",") testId="notes"
+      Note(id="x")
+      Note(id="y")
+
+component Note
+  props
+    id: string
+  resource own = note(id) as shape string
+  view
+    text own
+`);
+    writeFileSync(resolve(dir, 'app.ts'), `export const grants = 'fs.read app:/data';
+export const answer = (name: string, [id]: string[], _store: unknown, storage: any): any => {
+  if (id === 'e') return (async () => { await Promise.resolve(); storage.fs.watch('doc:/notes'); return 'note e'; })();
+  if (id === 'b' || id === 'x') storage.fs.watch('doc:/notes');
+  if (id === 'd') void storage.fs.readFile('app:/data/p');
+  return 'note ' + id;
+};
+`);
+    const dist = await build(dir);
+    const { renderer } = await import('./render.mjs');
+    const render = renderer(dist); render.ahead = false;
+    const reply = await render('/');
+    const checkpoint = JSON.parse(/<script type="application\/vnd.exact.checkpoint"[^>]*>([^<]*)<\/script>/.exec(reply.html)[1]);
+    expect(checkpoint.answers.map(a => a[3])).toEqual(['note a', 'note b', 'note c', 'note d', 'note e', 'note x', 'note y']);
+    expect((checkpoint.open ?? []).map(k => checkpoint.answers[k][3])).toEqual(['note b', 'note d', 'note e', 'note x']);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }, 120000);

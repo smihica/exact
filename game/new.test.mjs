@@ -979,7 +979,21 @@ test('SDK graph drift is repaired by the async lock refresh before locked consum
   const root = mkdtempSync(resolve(tmpdir(), 'sdk-drift-')), sdk = resolve(root, 'sdk'), dep = resolve(root, 'dep');
   mkdirSync(resolve(sdk, 'app'), {recursive:true}); mkdirSync(dep);
   const manifest = (version, name = 'sdk-drift-dependency') => `[package]\nname = "${name}"\nversion = "${version}"\nedition = "2021"\n[lib]\npath = "lib.rs"\n`;
+  const home = resolve(root, 'cargo-home'), vendor = resolve(root, 'registry');
+  const env = {...process.env, CARGO_HOME:home, CARGO_NET_OFFLINE:'true'};
+  const publish = (name, version, dependencies = '') => {
+    const dir = resolve(vendor, name + '-' + version);
+    const toml = manifest(version, name) + '[dependencies]\n' + dependencies;
+    mkdirSync(dir, {recursive:true});
+    writeFileSync(resolve(dir, 'lib.rs'), '');
+    writeFileSync(resolve(dir, 'Cargo.toml'), toml);
+    writeFileSync(resolve(dir, '.cargo-checksum.json'), JSON.stringify({files:{}, package:createHash('sha256').update(toml).digest('hex')}));
+  };
   try {
+    mkdirSync(home);
+    writeFileSync(resolve(home, 'config.toml'), `[source.crates-io]\nreplace-with = "fixture"\n[source.fixture]\ndirectory = ${JSON.stringify(vendor)}\n`);
+    publish('shared', '0.12.5');
+    publish('serde_json', '1.0.0', 'shared = "0.12"\n');
     for (const [path, name] of [['logic', 'exact-logic'], ['vendor/ibex/crates/ibex2-sqlite', 'ibex2-sqlite']]) {
       const dir = resolve(root, path);
       mkdirSync(dir, {recursive:true});
@@ -988,11 +1002,26 @@ test('SDK graph drift is repaired by the async lock refresh before locked consum
     }
     writeFileSync(resolve(dep, 'lib.rs'), ''); writeFileSync(resolve(dep, 'Cargo.toml'), manifest('0.1.0'));
     writeFileSync(resolve(sdk, 'Cargo.toml'), `[workspace]\nresolver = "2"\n[workspace.package]\nedition = "2021"\n[workspace.dependencies]\nsdk-drift-dependency = { path = "../dep" }\n`);
-    sdkLock(sdk, {update:true}); sdkLock(sdk);
-    writeFileSync(resolve(dep, 'Cargo.toml'), manifest('0.2.0'));
-    assert.throws(() => sdkLock(sdk), /stale for the SDK/);
-    sdkLock(sdk, {update:true}); sdkLock(sdk);
-    assert.match(readFileSync(resolve(sdk, 'app/shells.lock'), 'utf8'), /name = "sdk-drift-dependency"\nversion = "0.2.0"/);
+    const lock = resolve(sdk, 'app/shells.lock');
+    sdkLock(sdk, {update:true, env});
+    sdkLock(sdk, {env});
+    const before = readFileSync(lock, 'utf8');
+    assert.match(before, /name = "shared"\nversion = "0.12.5"/);
+
+    publish('shared', '0.12.7');
+    publish('new-reader', '1.0.0', 'shared = "0.12.7"\n');
+    writeFileSync(resolve(dep, 'Cargo.toml'), manifest('0.2.0') + '[dependencies]\nnew-reader = "1"\n');
+    // The checkout already resolved the new reader. The game SDK still holds the earlier patch.
+    rmSync(lock);
+    sdkLock(sdk, {update:true, env});
+    renameSync(lock, resolve(root, 'Cargo.lock'));
+    writeFileSync(lock, before);
+    assert.throws(() => sdkLock(sdk, {env}), /stale for the SDK/);
+    sdkLock(sdk, {update:true, env});
+    sdkLock(sdk, {env});
+    const updated = readFileSync(lock, 'utf8');
+    assert.match(updated, /name = "sdk-drift-dependency"\nversion = "0.2.0"/);
+    assert.match(updated, /name = "shared"\nversion = "0.12.7"/);
     const {checks} = await import('../scripts/async.mjs');
     const steps = checks('head', 'base', {lane:[],glue:[]});
     assert.ok(steps.findIndex(s => s[0] === 'game-lock') < steps.findIndex(s => s[0] === 'game'));
@@ -1077,3 +1106,44 @@ test('a game with data of its own gets a web dev bin that bakes with it; one wit
     for (const kind of ['apple', 'linux', 'android']) assert.equal(existsSync(resolve(app, '.shells', kind, 'src/bin')), false, kind);
   } finally { rmSync(parent, {recursive:true, force:true}); }
 });
+
+test('exact new on a machine that cannot build for iPhone names Exact Build', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-new-no-iphone-'));
+  try {
+    const bare = resolve(dir, 'bare'), bin = resolve(bare, 'bin');
+    mkdirSync(bin, { recursive: true });
+    symlinkSync(process.execPath, resolve(bin, 'bun'));
+    // Only Bun on PATH: no Xcode on a Mac, no cross SDK on Linux.
+    const env = { HOME: bare, PATH: bin, CARGO_HOME: resolve(bare, 'cargo'), RUSTUP_HOME: resolve(bare, 'rustup'), XDG_CACHE_HOME: resolve(bare, 'cache'), EXACT_FEEDBACK: '0' };
+    const made = spawnSync(process.execPath, [resolve(import.meta.dir, '../scripts/exact.mjs'), 'new', resolve(dir, 'no-iphone')], { encoding: 'utf8', timeout: 120_000, env });
+    assert.equal(made.status, 0, made.stderr);
+    assert.match(made.stdout, /\nThis machine lacks (Xcode|the Apple cross SDK and its tools), so it cannot build the app for iPhone\. Exact Build builds it in the cloud, and AppDrop installs it on a phone: https:\/\/exact\.appdrop\.app\/agents\.md is the guide for an agent, https:\/\/exact\.appdrop\.app\/docs the API\./);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 120_000);
+
+// The line follows the device build: on Linux, a device-only cross SDK with the tools it needs is enough, and with
+// the same tools and no SDK the line is said.
+test.skipIf(process.platform !== 'linux')('exact new names Exact Build only where a device build lacks its Apple tools', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-new-device-sdk-'));
+  try {
+    const bin = resolve(dir, 'bin'), sdk = resolve(dir, 'sdk'), phone = resolve(sdk, 'iPhoneOS.sdk'), resources = resolve(sdk, 'swift');
+    for (const path of [bin, phone, resolve(resources, 'clang/lib/darwin'), resolve(sdk, 'toolset/bin')]) mkdirSync(path, { recursive: true });
+    symlinkSync(process.execPath, resolve(bin, 'bun'));
+    const say = (name, text) => writeFileSync(resolve(bin, name), `#!/bin/sh\necho '${text}'\n`, { mode: 0o755 });
+    say('swift', 'Swift version 6.4.2');
+    say('rcodesign', 'apple-codesign 0.29.0');
+    for (const tool of ['llvm-lipo', 'dsymutil', 'llvm-ar', 'llvm-otool', 'llvm-nm', 'llvm-size', 'llvm-strip', 'llvm-install-name-tool']) say(tool, 'LLVM version 23.1.0');
+    // The iPhone device SDK alone: no simulator configuration.
+    writeFileSync(resolve(sdk, 'swift-sdk.json'), JSON.stringify({ targetTriples: { 'arm64-apple-ios': { sdkRootPath: 'iPhoneOS.sdk', swiftResourcesPath: 'swift' } } }));
+    writeFileSync(resolve(phone, 'SDKSettings.json'), JSON.stringify({ Version: '27.1' }));
+    for (const file of ['swift/clang/lib/darwin/libclang_rt.ios.a', 'toolset/bin/ld64.lld', 'toolset/bin/llvm-lib']) writeFileSync(resolve(sdk, file), '');
+    const env = { HOME: dir, PATH: bin, CARGO_HOME: resolve(dir, 'cargo'), RUSTUP_HOME: resolve(dir, 'rustup'), XDG_CACHE_HOME: resolve(dir, 'cache'), EXACT_FEEDBACK: '0' };
+    const made = (name, extra) => spawnSync(process.execPath, [resolve(import.meta.dir, '../scripts/exact.mjs'), 'new', resolve(dir, name)], { encoding: 'utf8', timeout: 120_000, env: { ...env, ...extra } });
+    const ready = made('device-sdk', { EXACT_APPLE_SDK: sdk });
+    assert.equal(ready.status, 0, ready.stderr);
+    assert.doesNotMatch(ready.stdout, /Exact Build/);
+    const lacking = made('no-sdk', { EXACT_APPLE_SDK: resolve(dir, 'absent') });
+    assert.equal(lacking.status, 0, lacking.stderr);
+    assert.match(lacking.stdout, /This machine lacks the Apple cross SDK and its tools, so it cannot build the app for iPhone\. Exact Build/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 240_000);

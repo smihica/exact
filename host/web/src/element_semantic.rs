@@ -3,7 +3,7 @@
 //! and what data can give a node, beside what its literal props and styles do:
 //! its tag, and the attributes element.rs `props_of` derives.
 
-use exact_kernel::{NodeType, PropId};
+use exact_kernel::{NodeFacts, NodeType, PropId, StyleId};
 
 /// The element for `tag`, a `semanticTag`; `None` where the node's type
 /// decides (a `textarea`, an `option`, an `audio`).
@@ -11,21 +11,63 @@ pub(super) fn element(tag: &str) -> Option<&'static str> {
     ELEMENTS.iter().find(|e| **e == tag).copied()
 }
 
+/// The layout row whose presentation belongs to the HTML element. An option
+/// remains visible in its native menu (LLP 1069.001 D2). A modal dialog is
+/// fixed to the viewport unless its author positions it.
+pub(super) fn browser_row(node: &NodeFacts<'_>) -> Option<StyleId> {
+    if exact_kernel::control::is_option_node(node.node_type, node.props) {
+        Some(StyleId::Display)
+    } else if node.props.str(PropId::SemanticTag) == Some("dialog")
+        && node.style.mask.has(StyleId::PositionType)
+        && !node.style.written.has(StyleId::PositionType)
+    {
+        Some(StyleId::PositionType)
+    } else {
+        None
+    }
+}
+
 const ELEMENTS: &[&str] = &[
-    "time", "main", "header", "nav", "section", "footer", "article", "aside", "dialog",
+    // HTML grouping and phrasing content.
+    "p",
+    "strong",
+    "em",
+    "blockquote",
+    "ol",
+    "ul",
+    "li",
+    // Landmarks, time and dialog.
+    "time",
+    "main",
+    "header",
+    "nav",
+    "section",
+    "footer",
+    "article",
+    "aside",
+    "dialog",
     // @ref LLP 1021 D1 — HTML's separator, void: the kernel gives it no
     // children, and its UA rows are the node's own.
     "hr",
     // @ref LLP 1153 D7 — HTML's own elements, laid out by the browser's
     // table algorithm and its UA sheet (`display: table` and the rest);
     // the plan carries no grid rows for them.
-    "table", "caption", "thead", "tbody", "tfoot", "tr", "th", "td", "dl", "dt", "dd",
+    "table",
+    "caption",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "dl",
+    "dt",
+    "dd",
 ];
 
 /// The tags element.rs `element` can give a node of type `node_type` as data
 /// sets `prop`, where `prop` decides the tag, and none where it does not. The
-/// JS target's compiled module makes such a node with one sample's tag, so its
-/// page's sheet keeps the rules of each (exact-web-js `style::bound_tokens`,
+/// page's sheet keeps the rules for every possible tag (exact-web-js `style::bound_tokens`,
 /// LLP 1047.003 D1). A change to `element` changes this list with it.
 pub fn tags_by_data(node_type: NodeType, prop: PropId) -> Vec<&'static str> {
     match (node_type, prop) {
@@ -50,7 +92,7 @@ pub fn tags_by_data(node_type: NodeType, prop: PropId) -> Vec<&'static str> {
 pub(super) fn not_block(tag: &str) -> bool {
     matches!(
         tag,
-        "table" | "caption" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td"
+        "li" | "table" | "caption" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td"
     )
 }
 

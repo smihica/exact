@@ -525,6 +525,7 @@ fn a_mouse_contact_goes_down_holds_and_lifts() {
     assert!(!held.contains("\"error\""), "{held}");
     let held: serde_json::Value = serde_json::from_str(&held).unwrap();
     assert_eq!(held["clock"].as_f64(), Some(before + 32.0), "{held}");
+    assert!(held.get("waitMs").is_none(), "{held}");
     let up = handle(&mut p, r#"{"op":"tap","phase":"up","mouse":true}"#);
     assert!(!up.contains("\"error\""), "{up}");
     let k = p.host().kernel();
@@ -1139,13 +1140,9 @@ fn into_alignment_is_malformed_before_any_delivery() {
                 request["into"][axis] = alignment.into();
                 let reply: serde_json::Value =
                     serde_json::from_str(&handle(&mut p, &request.to_string())).unwrap();
-                assert_eq!(
-                    reply,
-                    serde_json::json!({
-                        "error": format!("no alignment {alignment}: start, center, end or nearest"),
-                        "malformed": true
-                    })
-                );
+                let expected = format!("no alignment {alignment}: start, center, end or nearest");
+                assert_eq!(reply["error"], expected.as_str(), "{reply}");
+                assert_eq!(reply["malformed"], true, "{reply}");
             }
         }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 @testable import ExactKit
+@testable import ExactSharing
 
 // The share extension's ping (LLP 1133.024 D4) goes to one session that
 // can claim the inbox: the newest that began to listen and is not

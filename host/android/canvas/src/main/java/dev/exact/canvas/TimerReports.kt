@@ -19,6 +19,9 @@ internal class TimerReports {
     fun replace(view: Any) {
         reader = view; known = false; applied = 0; scrolling = false; sampling = false
     }
+    fun retire() {
+        reader = null; known = true; applied = publication; scrolling = false; sampling = false
+    }
     fun publish(): Long = (++publication)
     fun report(view: Any, scrolling: Boolean, sampling: Boolean, applied: Long): Boolean {
         if (reader !== view) return false

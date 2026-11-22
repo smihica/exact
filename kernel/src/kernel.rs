@@ -35,20 +35,25 @@ use history::RetainedReceipt;
 pub(crate) mod ignore;
 mod intrinsic;
 mod keyboard;
+pub(crate) mod margins;
 pub(crate) mod observe;
 pub(crate) mod owner;
+mod owner_update;
 mod provenance;
 pub(crate) mod readers;
+mod replacement;
+mod segments;
 pub(crate) mod targets;
 pub(crate) use intrinsic::apply_projection;
 mod row_memo;
+mod scroll_terms;
 mod sticky;
 mod table;
 mod trim;
 mod wide;
 
 pub(crate) use block::{apply as apply_block, publication_start, Blocks};
-pub use block::{BlockAxis, BlockMeasure, HostBlock};
+pub use block::{BlockAxis, BlockMeasure, BlockShown, HostBlock};
 pub(crate) use cover::{
     apply as apply_cover, chain_changed as cover_chain_changed,
     children_changed as cover_children_changed, contributed_padding as cover_padding,
@@ -56,7 +61,10 @@ pub(crate) use cover::{
 };
 pub use cover::{credited_edges, HostCover};
 pub use keyboard::{Keyboard, KeyboardPolicy};
+pub use margins::OwnerMargins;
+pub use owner_update::{decode_registration, encode_registration, OwnerUpdate};
 pub use provenance::{Contribution, Operation};
+pub use scroll_terms::ScrollTerms;
 pub use sticky::StickyConstraint;
 pub use table::TablePlace;
 
@@ -361,6 +369,8 @@ pub struct Kernel {
     epoch: u64,
     incarnation: u64,
     provisional_layouts: u64,
+    /// The layouts made whose frames and observations stand.
+    layouts: u64,
     receipts: VecDeque<RetainedReceipt>,
     document_commit: Option<Box<txn::DocumentCommit>>,
     region: Option<crate::region::RegionState>,
@@ -447,6 +457,7 @@ impl Kernel {
             epoch: 0,
             incarnation: 1,
             provisional_layouts: 0,
+            layouts: 0,
             receipts: VecDeque::new(),
             document_commit: None,
             region: None,
@@ -594,6 +605,7 @@ impl Kernel {
         let withheld = self.withhold_observations();
         let mut result = self.region_pass(slot, offer, inputs)?;
         self.solve_region_observations(slot, offer, inputs, &withheld, &mut result)?;
+        self.layouts += 1;
         Ok(result)
     }
 
@@ -738,6 +750,7 @@ impl Kernel {
         };
         let relayout = &mut |k: &mut Kernel| Ok(k.lay_out_roots(slot, offer)?);
         self.solve_observations(slot, relayout, &[], &mut receipt)?;
+        self.layouts += 1;
         receipt.epoch = self.epoch;
         if engine(&mut self.layout).provisional_chrome() {
             self.provisional_layouts += 1;
@@ -1063,6 +1076,7 @@ impl Kernel {
             epoch: self.epoch,
             incarnation: self.incarnation,
             provisional_layouts: self.provisional_layouts,
+            layouts: self.layouts,
             receipts: VecDeque::new(),
             document_commit: None,
             region: None,

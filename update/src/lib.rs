@@ -83,6 +83,9 @@ pub const ENVELOPE_MAJOR: u64 = 1;
 /// pointer card, not a payload). A bigger body is refused before it is parsed.
 pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 
+/// The native transport's bound for a single payload file.
+pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+
 /// The most an envelope's asset index may weigh, in bytes: about 20,000
 /// asset cards. The index is a file the envelope names by digest, so the
 /// envelope's own bound does not grow with the asset count.

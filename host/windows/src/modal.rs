@@ -263,9 +263,7 @@ mod tests {
             assert!(state.window.get().is_null());
             assert_eq!(Rc::strong_count(state), 1);
         }
-        // Winit permits one event loop per process; both deadline paths use this one.
-        crate::window::tests::about_to_wait_honors_retry_pending_redraw_and_earlier_timer(
-            event_loop,
-        );
+        // Winit permits one event loop per process.
+        crate::window::tests::run_carrier_tests(event_loop);
     }
 }

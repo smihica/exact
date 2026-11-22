@@ -57,7 +57,7 @@ object Pads : InputManager.InputDeviceListener {
 
     private fun inject(context: Context) {
         val text = android.system.Os.getenv("EXACT_AGENT_PADS")
-        if (android.system.Os.getenv("EXACT_AGENT") != "1" || text == null) return
+        if (text == null || !agentCarried()) return
         val list = try { org.json.JSONArray(text) } catch (e: org.json.JSONException) { return }
         for (i in 0 until list.length()) {
             val pad = list.optJSONObject(i) ?: continue

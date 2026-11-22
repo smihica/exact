@@ -117,7 +117,7 @@ public final class ActivityRender {
             defer { layouts += 1; nanoseconds += DispatchTime.now().uptimeNanoseconds - start }
             let snapshot = try session.resize(to: viewport)
             guard let root = Self.root(of: placement, in: snapshot) else {
-                throw HeadlessSession.Failure(description: "activity plan has no \(placement.name) placement")
+                throw ExactFailure(description: "activity plan has no \(placement.name) placement")
             }
             let box = session.placementBox(root.id)
             return Laid(snapshot: snapshot, root: root, margins: box?.margins ?? (0, 0, 0, 0), authoredWidth: box?.authoredWidth ?? false, minimumWidth: box?.minimumWidth ?? 0, viewport: viewport)

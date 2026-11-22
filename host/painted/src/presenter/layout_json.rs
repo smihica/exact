@@ -94,11 +94,22 @@ impl<D: DataSource> Presenter<D> {
                 detail,
                 ",\"visible\":{{\"hidden\":{hidden},\"inert\":{inert}}}"
             );
-            match boxes.iter().find(|b| b.id == id) {
+            match self.box_of(id) {
                 Some(b) => {
+                    let local = if self.host.kernel().node(id).is_some_and(|node| node.is_inline_run()) {
+                        self.inline_block(id).and_then(|owner| self.brush.inline_text.get(&owner)?.local_baseline(id))
+                    } else {
+                        b.baseline
+                    };
+                    let baseline = local.and_then(|(x, y)| {
+                        let y = crate::placement::map(&b.scroll_mapping()?, x, y).1;
+                        y.is_finite().then_some(y)
+                    }).map_or_else(String::new, |y| {
+                        format!(",\"baseline\":{}", num(r2(y)))
+                    });
                     let _ = write!(
                         detail,
-                        ",\"space\":{{\"viewport\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}},\"capture\":{{\"scale\":1}}}}",
+                        ",\"space\":{{\"viewport\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}{baseline},\"capture\":{{\"scale\":1}}}}",
                         num(r2(b.rect.0)),
                         num(r2(b.rect.1)),
                         num(r2(b.rect.2)),

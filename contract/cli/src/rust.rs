@@ -123,12 +123,23 @@ pub fn compile_path_for_rust(
 /// before Cargo, so Cargo watches the Rust it compiles. Direct Cargo builds
 /// watch the Contract source graph themselves.
 pub fn build_rust(path: &Path) -> Result<(), String> {
+    build_rust_output(path, "shapes", |path| {
+        let (plan, calls) = compile_path_for_rust(path).map_err(|e| format!("{e:?}"))?;
+        rust(&plan, &calls)
+    })
+}
+
+pub(crate) fn build_rust_output(
+    path: &Path,
+    name: &str,
+    generate: impl FnOnce(&Path) -> Result<String, String>,
+) -> Result<(), String> {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?)
-        .join("shapes.rs");
-    println!("cargo:rerun-if-env-changed=EXACT_RUST_SHAPES");
-    if std::env::var_os("EXACT_RUST_SHAPES").is_some() {
+        .join(format!("{name}.rs"));
+    println!("cargo:rerun-if-env-changed=EXACT_RUST_BINDINGS");
+    if std::env::var_os("EXACT_RUST_BINDINGS").is_some() {
         let source = std::path::absolute(path).map_err(|e| e.to_string())?;
-        let inputs = out.with_file_name("shapes.inputs.json");
+        let inputs = out.with_file_name(format!("{name}.inputs.json"));
         let graph = crate::source_graph(path);
         let paths: BTreeSet<_> = std::iter::once(source.clone())
             .chain(
@@ -142,11 +153,11 @@ pub fn build_rust(path: &Path) -> Result<(), String> {
             .collect();
         let text = serde_json::to_vec(&paths).map_err(|e| e.to_string())?;
         if std::fs::read(&inputs).ok().as_deref() != Some(text.as_slice()) {
-            std::fs::write(&inputs, text).map_err(|e| e.to_string())?;
+            write_output(&inputs, &text).map_err(|e| format!("{}: {e}", inputs.display()))?;
         }
         println!("cargo:rerun-if-changed={}", out.display());
         println!(
-            "cargo:metadata=exact-rust-shapes={}",
+            "cargo:metadata=exact-rust-{name}={}",
             serde_json::json!({
                 "source": source,
                 "package": std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?,
@@ -156,12 +167,29 @@ pub fn build_rust(path: &Path) -> Result<(), String> {
     } else {
         crate::rerun_if_changed(path);
     }
-    let (plan, calls) = compile_path_for_rust(path).map_err(|e| format!("{e:?}"))?;
-    let text = rust(&plan, &calls)?;
+    let text = generate(path)?;
     if std::fs::read(&out).ok().as_deref() != Some(text.as_bytes()) {
-        std::fs::write(out, text).map_err(|e| e.to_string())?;
+        write_output(&out, text.as_bytes()).map_err(|e| format!("{}: {e}", out.display()))?;
     }
     Ok(())
+}
+
+/// Publish an output by atomic replacement.
+pub fn write_output(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let written = file.write_all(bytes);
+    drop(file);
+    let result = written.and_then(|_| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Generate Rust structs for authored Contract shapes, data source signatures,

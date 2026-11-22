@@ -1,7 +1,7 @@
 //! LLP 1017 P7: `test` blocks parse to the agent's steps and print as JSON
 //! the driver reads (`scripts/agent.mjs --test`).
 
-use contract_syntax::{Expr, StateComparison, StateOperand, Step, TapForm};
+use contract_syntax::{Expr, StateOperand, Step, TapForm};
 
 #[test]
 fn a_test_answers_a_pending_presence_prompt() {
@@ -25,30 +25,7 @@ fn a_test_answers_a_pending_presence_prompt() {
     }
 }
 
-#[test]
-fn authored_http_responses_are_launch_facts_and_steps() {
-    let tests = contract::tests(
-        r#"answer fetch "https://api.example.com/" with 200 {"text":"Stubbed greeting"}
-test "inherited"
-  expect text "greeting" == "Stubbed greeting"
-test "overridden"
-  fail fetch "https://api.example.com/"
-  clock data
-  answer fetch "https://api.example.com/" with 503 "unavailable"
-  reload
-"#,
-    )
-    .unwrap();
-    let json: serde_json::Value = serde_json::from_str(&contract::tests_json(&tests)).unwrap();
-    assert_eq!(json[0]["steps"][0]["op"], "answer-fetch");
-    assert_eq!(json[0]["steps"][0]["response"]["status"], 200);
-    assert_eq!(json[1]["steps"][0]["op"], "fail-fetch");
-    assert_eq!(json[1]["steps"][2]["op"], "answer-fetch");
-    assert!(contract::tests(
-        "answer fetch \"x\" with 200\nfail fetch \"x\"\ntest \"t\"\n  clock data\n"
-    )
-    .is_err());
-}
+mod fetch;
 
 #[test]
 fn a_test_block_parses_to_the_eight_operations_and_expects() {
@@ -379,8 +356,7 @@ fn a_test_pinches_holds_a_key_and_indexes_state() {
 #[test]
 fn a_test_wheels_back_toward_the_start() {
     // Excord on macOS: a drag selects text there, so its scroll is the agent's wheel.
-    let src =
-        "test \"scroll\"\n  tap \"transcript\" wheel 0 -2500\n  tap \"strip\" wheel -4.5 30\n";
+    let src = "test \"scroll\"\n  tap \"transcript\" wheel 0 -2500\n  tap \"strip\" wheel -4.5 30\n  scroll \"save\"\n";
     let tests = contract::tests(src).unwrap();
     let t = &tests[0];
     assert!(matches!(
@@ -398,10 +374,12 @@ fn a_test_wheels_back_toward_the_start() {
         ),
         "{json}"
     );
-    assert!(
-        json.contains("\"form\":\"wheel\",\"wheel\":[-4.5,30]"),
-        "{json}"
-    );
+    for step in [
+        r#""form":"wheel","wheel":[-4.5,30]"#,
+        r#"{"op":"scroll","target":"save","line":4}"#,
+    ] {
+        assert!(json.contains(step), "{json}");
+    }
     // Both deltas are required, and nothing follows them.
     let e = contract::tests("test \"t\"\n  tap \"a\" wheel 0\n").unwrap_err();
     assert_eq!(e.id, "syntax-expected-step");
@@ -846,26 +824,26 @@ fn a_test_asserts_which_node_has_the_focus() {
 
 #[test]
 fn a_test_bounds_a_nodes_laid_out_width_or_height() {
-    let src = "test \"t\"\n  expect layout \"status-mark\" height <= 24\n  expect layout \"status-mark\" width >= 12.5\n  expect layout \"rule\" height == 1\n";
+    let src = "test \"t\"\n  expect layout \"status-mark\" height <= 24\n  expect layout \"status-mark\" width >= 12.5\n  expect layout \"rule\" height == 1\n  expect layout \"icon\" centerY == layout \"label\" centerY within 0.5\n  expect layout \"off\" left <= -10\n";
     let tests = contract::tests(src).unwrap();
-    assert!(matches!(
-        &tests[0].steps[0],
-        Step::ExpectLayout { target, dimension, comparison: StateComparison::AtMost, value, .. }
-            if target == "status-mark" && dimension == "height" && *value == 24.0
-    ));
     let json = contract::tests_json(&tests);
     for step in [
         "{\"op\":\"expect-layout\",\"target\":\"status-mark\",\"dimension\":\"height\",\"comparison\":\"at-most\",\"value\":24,\"line\":2}",
         "{\"op\":\"expect-layout\",\"target\":\"status-mark\",\"dimension\":\"width\",\"comparison\":\"at-least\",\"value\":12.5,\"line\":3}",
         "{\"op\":\"expect-layout\",\"target\":\"rule\",\"dimension\":\"height\",\"comparison\":\"equal\",\"value\":1,\"line\":4}",
+        "{\"op\":\"expect-layout\",\"target\":\"icon\",\"dimension\":\"centerY\",\"comparison\":\"equal\",\"value\":{\"target\":\"label\",\"dimension\":\"centerY\"},\"tolerance\":0.5,\"line\":5}",
     ] {
         assert!(json.contains(step), "{step}\n{json}");
     }
     for (rest, says) in [
-        ("\"mark\" x <= 24", "reads `width` or `height`, not `x`"),
+        ("\"mark\" depth <= 24", "needs a size"),
         ("\"mark\" height < 24", "takes `==`, `<=` or `>=`"),
         ("\"mark\" height <= 24px", "in points, written bare"),
         ("\"mark\" height <= -1", "a size of 0 or more"),
+        (
+            "\"mark\" right == layout \"label\" right within -1",
+            "tolerance must be nonnegative",
+        ),
         ("mark height <= 24", "a testId"),
     ] {
         let e = contract::tests(&format!("test \"t\"\n  expect layout {rest}\n")).unwrap_err();
@@ -1423,11 +1401,8 @@ fn state_relations_accept_inequality_and_paths() {
 
 #[test]
 fn state_relations_check_both_path_types_before_running() {
-    let dir = crate::scratch::Scratch::new(
-        std::env::current_dir()
-            .unwrap()
-            .join(format!("target/state-types-{}", std::process::id())),
-    );
+    let path = format!("target/state-types-{}", std::process::id());
+    let dir = crate::scratch::Scratch::new(std::path::absolute(path).unwrap());
     let app = dir.join("app.contract");
     std::fs::write(
         &app,
@@ -1449,6 +1424,10 @@ component App
 "#,
     )
     .unwrap();
+    let check = |line: &str| {
+        let source = format!("test \"relation\"\n  expect state {line}\n");
+        contract::resolve_test_states_path(&app, &mut contract::tests(&source).unwrap())
+    };
     for line in [
         "n == state doubled",
         "n != state rows.0.id",
@@ -1462,8 +1441,7 @@ component App
         "saved.id == state n",
         "n == state other.id",
     ] {
-        let tests = contract::tests(&format!("test \"valid\"\n  expect state {line}\n")).unwrap();
-        contract::check_test_states_path(&app, &tests).unwrap();
+        check(line).unwrap();
     }
     for (line, left, right) in [
         ("n == state word", "number", "string"),
@@ -1474,9 +1452,7 @@ component App
         ("n in state n", "number", "number"),
         ("saved == state wordResult", "option<Row>", "option<string>"),
     ] {
-        let source = format!("test \"invalid\"\n  expect state {line}\n");
-        let tests = contract::tests(&source).unwrap();
-        let errors = contract::check_test_states_path(&app, &tests).unwrap_err();
+        let errors = check(line).unwrap_err();
         assert_eq!(errors[0].id, "type-test-state");
         assert_eq!(errors[0].span.line, 2);
         for ty in [left, right] {

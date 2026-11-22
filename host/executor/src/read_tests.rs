@@ -105,7 +105,9 @@ impl Server {
     }
 
     fn reply(&self, ticket: u64, body: &[u8]) {
-        let mut socket = self.state.0.lock().unwrap().held.remove(&ticket).unwrap();
+        // Release the lock before unwrapping so a missing ticket does not poison `Drop`.
+        let socket = self.state.0.lock().unwrap().held.remove(&ticket);
+        let mut socket = socket.expect("server held ticket");
         write!(
             socket,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -120,14 +122,14 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         {
-            let mut state = self.state.0.lock().unwrap();
+            let mut state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
             state.stopping = true;
             for socket in state.held.values() {
                 let _ = socket.shutdown(Shutdown::Both);
             }
         }
         let _ = TcpStream::connect(self.address);
-        self.thread.take().unwrap().join().unwrap();
+        let _ = self.thread.take().unwrap().join();
     }
 }
 

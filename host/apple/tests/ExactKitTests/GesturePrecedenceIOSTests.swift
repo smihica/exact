@@ -263,7 +263,7 @@ final class GesturePrecedenceIOSTests: XCTestCase {
     func testThePhotoHandleHasATwoFingerPanAndASimultaneousPinch() throws {
         let (p, handle) = photo(handle: "none")
         let pan = try XCTUnwrap(handle.transformRecognizer)
-        let pinch = try XCTUnwrap(handle.transformContact?.pinch)
+        let pinch = try XCTUnwrap(handle.contact?.pinch)
         XCTAssertEqual(pan.maximumNumberOfTouches, 2)
         XCTAssertTrue(handle.gestureRecognizers?.contains(pinch) == true)
         XCTAssertTrue(handle.gestureRecognizer(pan, shouldRecognizeSimultaneouslyWith: pinch))
@@ -276,7 +276,7 @@ final class GesturePrecedenceIOSTests: XCTestCase {
                 "target": NSNull(), "targetKey": NSNull(), "clip": NSNull(), "clipKey": NSNull()]]))
         }
         XCTAssertNil(handle.transformRecognizer)
-        XCTAssertNil(handle.transformContact)
+        XCTAssertNil(handle.contact)
         XCTAssertFalse(handle.gestureRecognizers?.contains(pinch) == true)
     }
 
@@ -287,7 +287,7 @@ final class GesturePrecedenceIOSTests: XCTestCase {
                                                 ("auto", "auto", false), ("pinch-zoom", "manipulation", false),
                                                 ("pan-y pinch-zoom", "auto", false), ("auto", "pan-y", true)] {
             let (p, handle) = photo(handle: handleAction, clip: clipAction)
-            let pinch = try XCTUnwrap(handle.transformContact?.pinch)
+            let pinch = try XCTUnwrap(handle.contact?.pinch)
             XCTAssertEqual(handle.transformShouldBegin(pinch), app, "\(handleAction) under \(clipAction)")
             XCTAssertEqual(handle.transformShouldBegin(try XCTUnwrap(handle.transformRecognizer)), true, "the pan is unaffected")
             withExtendedLifetime(p) {}
@@ -475,7 +475,7 @@ final class GesturePrecedenceIOSTests: XCTestCase {
         pan.speed = CGPoint(x: -300, y: 0)
         handle.transformRecognizer = pan
         let pinch = Pinch()
-        handle.transformContact = TransformContact(pinch)
+        handle.contact = TransformContact(pinch)
         XCTAssertEqual(handle.transformShouldBegin(pan), false, "alone, the pager takes it")
         pinch.phase = .began
         XCTAssertEqual(handle.transformShouldBegin(pan), true, "with the pinch begun")

@@ -15,8 +15,12 @@ internal class AgentStore(private val file: File, private val log: (String) -> U
         private const val DAY = 86_400_000.0
         private const val REFUND = 3 * DAY
 
-        /** The agent clock as a Unix time, from the epoch the host reads for the agent's zero. */
-        fun unix(now: Double): Double = (System.getenv("EXACT_AGENT_EPOCH")?.toDoubleOrNull() ?: 1_767_225_600_000.0) + now
+        /** Unix time on the device in a live drive, or from the configured epoch in a seekable drive. */
+        fun unix(now: Double): Double = if (System.getenv("EXACT_AGENT") == "live") {
+            System.currentTimeMillis().toDouble()
+        } else {
+            (System.getenv("EXACT_AGENT_EPOCH")?.toDoubleOrNull() ?: 1_767_225_600_000.0) + now
+        }
 
         /** An ISO 8601 period in ms; months of 30 days, years of 365. */
         fun period(iso: String?): Double? {

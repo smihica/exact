@@ -81,9 +81,9 @@ function dropStreams(prefix) {
   }
   return { dropped: true };
 }
-import { inertAncestor, displayMode, environment, navigation, routeFlags, foldEnv, preferFold, preferDisplayMode, typedControl, settleValue, animationClock, pageReporter } from './navigation.js';
+import { inertAncestor, displayMode, environment, navigation, routeFlags, foldEnv, preferFold, FOLD_EVENT, preferDisplayMode, typedControl, settleValue, animationClock, pageReporter } from './navigation.js';
 import { backButton } from './input-glue.js';
-import { guestOutline, guestTap, guestType, viewBox, reveal, selectAll, scrollRange, typeControl, watchGlides, glidesSettled, scrollsSeen } from './agent-input.js';
+import { guestOutline, guestTap, guestType, viewBox, textBaseline, reveal, selectAll, scrollRange, typeControl, watchGlides, glidesSettled, scrollsSeen } from './agent-input.js';
 // A zoomable scroller's zoom and range (zoom.js, LLP 1057.001.000 §6).
 const zoomOf = e => (e.$zoomRange ? { scrollZoom: e.$zoom, minZoom: e.$zoomRange[0], maxZoom: e.$zoomRange[1] } : {});
 watchGlides();
@@ -96,11 +96,12 @@ const typed = (v, t) => v == null || typeof t === 'string' ? v : Array.isArray(t
 const masked = (req, reply) => { const secrets = req.reveal ? [] : [...document.querySelectorAll('#exact-root input[type=password]')].map(e => e.value).filter(Boolean), hide = v => typeof v === 'string' ? secrets.includes(v) ? '•••' : v : Array.isArray(v) ? v.map(hide) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, hide(x)])) : v; return secrets.length ? { ...reply, slots: hide(reply.slots), derives: hide(reply.derives), resources: hide(reply.resources) } : reply; };
 const PROPS = [['aria-live', 'accessibilityLive'], ['role', 'accessibilityRole'], ['data-alertpart', 'alertPart'], ['aria-controls', 'accessibilityControls'], ['aria-activedescendant', 'accessibilityActiveDescendant'], ['id', 'id'], ['aria-description', 'accessibilityHint'], ['aria-keyshortcuts', 'accessibilityKeyShortcuts'], ['aria-orientation', 'accessibilityOrientation'], ['aria-pressed', 'accessibilityPressed'], ['aria-current', 'accessibilityCurrent'], ['aria-sort', 'accessibilitySort'], ['colspan', 'colSpan', 1], ['rowspan', 'rowSpan', 1], ['scope', 'scope'], ['aria-level', 'accessibilityHeadingLevel', 1], ['aria-posinset', 'accessibilityPosInSet', 1], ['aria-setsize', 'accessibilitySetSize', 1], ['aria-valuenow', 'accessibilityValueNow'], ['aria-valuemin', 'accessibilityValueMin'], ['aria-valuemax', 'accessibilityValueMax'], ['aria-valuetext', 'accessibilityValueText'], ['placeholder', 'placeholder'], ['autocomplete', 'autocomplete'], ['viewportFit', 'viewportFit'], ['interactiveWidget', 'interactiveWidget'], ['data-hatch', 'hatch'], ['data-nativeviewmodulename', 'nativeViewModuleName'], ['data-nativeviewprops', 'nativeViewProps'],
   ['aria-invalid', 'accessibilityInvalid'],
+  ['data-datatransfertext', 'dataTransferText'], ['data-datatransferurl', 'dataTransferUrl'], ['data-datatransferfiles', 'dataTransferFiles'],
   ['navigationKey', 'navigationKey'], ['navigationBack', 'navigationBack'], ['data-navigationbar', 'navigationBar'],
   ['navigationPresentation', 'navigationPresentation'], ['type', 'type'], ['popover', 'popover'],
   ['popovertarget', 'popovertarget'], ['popovertargetaction', 'popovertargetaction'], ['commandfor', 'commandfor'], ['command', 'command'],
 ];
-const SEMANTIC_TAGS = /^(main|header|footer|section|article|aside|nav|dialog|table|caption|thead|tbody|tfoot|tr|th|td|dl|dt|dd)$/;
+const SEMANTIC_TAGS = /^(main|header|footer|section|article|aside|nav|dialog|table|caption|thead|tbody|tfoot|tr|th|td|dl|dt|dd|p|blockquote|ul|ol|li|strong|em)$/;
 const TYPES = { TEMPLATE: 'Head', BUTTON: 'Pressable', INPUT: 'TextInput', TEXTAREA: 'TextInput', VIDEO: 'Video', AUDIO: 'Video', IMG: 'Image', IFRAME: 'WebView', A: 'Pressable' };
 /** The view an operation names: its id, else the first node with that testId on an active screen, a covered
  * screen's or an unselected tab's copy only when no active one carries it, as the runner's `target`. */
@@ -153,6 +154,7 @@ export function install(exact) {
     // are the host's presentation of a modal route, not props (input-glue.js marks them; LLP 1115.000 D4.5).
     const sheet = el.hasAttribute('data-exact-dialog');
     for (const [attr, prop, num] of PROPS) if (el.hasAttribute(attr) && !(hostRole && attr === 'role')) props[prop] = num ? Number(el.getAttribute(attr)) : el.getAttribute(attr);
+    if (el.exactDraggable != null) props.draggable = el.exactDraggable;
     // The intent `tree --ax` reads (LLP 1080.002 D7), as the runner names it.
     if (el.hasAttribute('inert')) props.inert = true;
     // A disabled control, as the runner's tree gives its `disabled` prop (LLP 1116.010 D3: `expect disabled`, and a press refused the same on every host).
@@ -297,7 +299,7 @@ export function install(exact) {
       ...(globalThis.exact?.pressShown?.(el) ? { press_shown: exact.pressShown(el) } : {}),
       // A development build names the element's plan node (emit.rs `data-site`).
       ...(el.dataset?.site != null ? { site: Number(el.dataset.site) } : {}),
-      space: { viewport: rect(r), local: { w: r2(el.clientWidth), h: r2(el.clientHeight) }, capture: { scale: devicePixelRatio } },
+      space: { viewport: rect(r), ...(n.type === 'Text' ? { baseline: textBaseline(el) } : {}), local: { w: r2(el.clientWidth), h: r2(el.clientHeight) }, capture: { scale: devicePixelRatio } },
       // A box a multi-column flow fragments: one rect per column (LLP 1093 D12).
       ...(el.getClientRects().length > 1 ? { column_fragments: [...el.getClientRects()].map(rect) } : {}),
       scroll, clip,
@@ -681,7 +683,8 @@ export function install(exact) {
       // The fold group (LLP 1078 D7) likewise: through facts.js where the plan reads the fold's fields (it re-answers them), else the
       // substitute lands here for `layout.env`; without a fold group the fold stays as it is.
       // The driver's fetch faults (LLP 1103 D3), a form of `prefer`: the page's table, as glue.js answers it.
-      // A new root font size is a resize to the page's fitted texts (navigation.js `refitTexts`, the entry's copy, not this one's).
+      // A new root font size is a resize to the page's fitted texts (navigation.js `refitTexts`, the entry's copy, not this one's),
+      // and a fold group is announced (`FOLD_EVENT`) once the whole `prefer` is applied, which every copy's `onFold` hears.
       case 'midi': return exact.midi ? exact.midi.tap(req) : { error: 'tap midi: this plan hears no MIDI (no midimessage handler)' }; // @ref LLP 1125 §4
       // A system's call of a tool (LLP 1133.023 §10, calls.js): queued, then polled by its id; `--call` the same at launch.
       case 'call': return exact.calls ? exact.calls.call(req) : { error: 'call: this app declares no tool' };
@@ -689,7 +692,7 @@ export function install(exact) {
       case 'cancel': return exact.calls ? exact.calls.cancel(req.id) : { error: 'cancel: this app declares no tool' };
       case 'launchEntry': if (req.launch === 'call' && exact.calls) { const [, tool, args] = String(req.entry ?? '').trim().match(/^(\S+)\s*(.*)$/s) ?? []; return { ...exact.calls.call({ tool, args: args || '{}', door: req.door ?? 'agent', cold: true }), cold: true }; }
         return exact.extensions?.launch ? exact.extensions.launch(req) : { error: `--${req.launch}: this app reads no module` }; // LLP 1133.004 §7
-      case 'prefer': { if (req.faults) return 'dropStream' in req.faults ? dropStreams(req.faults.dropStream) : faultOp(req.faults); if (req.extension || req.permission) return exact.extensions ? exact.extensions.prefer(req) : { error: 'prefer: this app reads no module' }; if (req.midi) return exact.midi ? exact.midi.prefer(req.midi) : { error: 'prefer midi: this plan keeps no MIDI queue' }; const pins = Object.entries(req.mode ?? {}), why = req.mode && (exact.modes ? exact.modes.check(pins) : pins.length > 0 && `${pins.map(([a, v]) => `\`${a}=${v}\``).join(" ")} names an axis or value the app's design lacks, or an axis twice`); if (why) return { error: `prefer mode: ${why}` }; try { const facts = (exact.page ?? ownPage()).prefer(req.page ?? {}); if (req.page?.['root-font-size'] !== undefined) dispatchEvent(new Event('resize')); if (req.page?.['visibility-state'] !== undefined) exact.foreground?.(facts['visibility-state'] !== 'hidden'); const fold = !req.fold ? foldEnv() : exact.fold ? exact.fold.prefer(req.fold) : preferFold(Object.keys(req.fold).length ? req.fold : null); const display = req.media?.['display-mode']; if (display != null) (exact.displayMode?.prefer ?? preferDisplayMode)(display); if (req.mode) exact.modes?.set(pins); return { page: facts, fold, ...(req.mode ? { mode: exact.modes?.read() ?? {} } : {}) }; } catch (e) { return { error: e.message, ...(e.malformed === true ? { malformed: true } : {}) }; } } // @ref LLP 1121 D13 — the mode group: checked before any fact is set, set after the rest
+      case 'prefer': { if (req.faults) return 'dropStream' in req.faults ? dropStreams(req.faults.dropStream) : faultOp(req.faults); if (req.extension || req.permission) return exact.extensions ? exact.extensions.prefer(req) : { error: 'prefer: this app reads no module' }; if (req.midi) return exact.midi ? exact.midi.prefer(req.midi) : { error: 'prefer midi: this plan keeps no MIDI queue' }; const pins = Object.entries(req.mode ?? {}), why = req.mode && (exact.modes ? exact.modes.check(pins) : pins.length > 0 && `${pins.map(([a, v]) => `\`${a}=${v}\``).join(" ")} names an axis or value the app's design lacks, or an axis twice`); if (why) return { error: `prefer mode: ${why}` }; try { const facts = (exact.page ?? ownPage()).prefer(req.page ?? {}); if (req.page?.['root-font-size'] !== undefined) dispatchEvent(new Event('resize')); if (req.page?.['visibility-state'] !== undefined) exact.foreground?.(facts['visibility-state'] !== 'hidden'); const fold = !req.fold ? foldEnv() : exact.fold ? exact.fold.prefer(req.fold) : preferFold(Object.keys(req.fold).length ? req.fold : null); const display = req.media?.['display-mode']; if (display != null) (exact.displayMode?.prefer ?? preferDisplayMode)(display); if (req.mode) exact.modes?.set(pins); if (req.fold) dispatchEvent(new Event(FOLD_EVENT)); return { page: facts, fold, ...(req.mode ? { mode: exact.modes?.read() ?? {} } : {}) }; } catch (e) { return { error: e.message, ...(e.malformed === true ? { malformed: true } : {}) }; } } // @ref LLP 1121 D13 — the mode group: checked before any fact is set, set after the rest
       default: return { error: `${req.op} is not carried by the JS target` };
     }
   };

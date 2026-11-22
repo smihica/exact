@@ -105,6 +105,27 @@ import ExactAnimations
 #if EXACT_LINK_NAVIGATION
 import ExactNavigation
 #endif
+#if EXACT_LINK_TEXT_SELECTION
+import ExactTextSelection
+#endif
+#if EXACT_LINK_WIDGETS
+import ExactWidgetPublication
+#endif
+#if EXACT_LINK_TOOLS
+import ExactToolDoor
+#endif
+#if EXACT_LINK_CONTENT_INDEX
+import ExactIndexMirror
+#endif
+#if EXACT_LINK_DIALOGS
+import ExactDialogs
+#endif
+#if EXACT_LINK_SHARE
+import ExactSharing
+#endif
+#if EXACT_LINK_DRAG_OUT
+import ExactDragOut
+#endif
 public enum ExactComposition {
     public static let app: ExactApp = {
         AgentLink.install()
@@ -219,6 +240,27 @@ public enum ExactComposition {
         #endif
         #if EXACT_LINK_NAVIGATION
         ExactNavigation.install()
+        #endif
+        #if EXACT_LINK_TEXT_SELECTION
+        ExactTextSelection.install()
+        #endif
+        #if EXACT_LINK_WIDGETS
+        ExactWidgetPublication.install()
+        #endif
+        #if EXACT_LINK_TOOLS
+        ExactToolDoor.install()
+        #endif
+        #if EXACT_LINK_CONTENT_INDEX
+        ExactIndexMirror.install()
+        #endif
+        #if EXACT_LINK_DIALOGS
+        ExactDialogs.install()
+        #endif
+        #if EXACT_LINK_SHARE
+        ExactSharing.install()
+        #endif
+        #if EXACT_LINK_DRAG_OUT
+        ExactDragOut.install()
         #endif
     }
 }

@@ -92,6 +92,62 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn live_state_observes_sound_between_commits() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../web-js/conformance/sounds/app.contract");
+        let plan = contract::compile_path_source(
+            &path,
+            r#"sound "assets/kick.wav"
+component App
+  action play
+    playSound("assets/kick.wav", at=125)
+  view
+    button "Play" press=play testId="play"
+"#,
+        )
+        .unwrap();
+        let (mut p, error) = Presenter::boot_with(
+            &plan.encode(),
+            (),
+            (80., 40.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none());
+        p.frame();
+        let id = p.host().kernel().find_by_test_id("play")[0];
+        p.tap(p.host().kernel().node_by_key(id).unwrap().id)
+            .unwrap();
+        let state = |p: &mut Presenter<()>| {
+            serde_json::from_str::<Value>(&crate::agent::handle_for_window(
+                p,
+                r#"{"op":"state","sounds":"all"}"#,
+            ))
+            .unwrap()
+        };
+        let first = state(&mut p);
+        let voice = &first["sounds"]["voices"][0];
+        let at = voice["at"].as_f64().unwrap();
+        let ends = voice["ends"].as_f64().unwrap();
+        assert_eq!(voice["state"], "waiting");
+        assert_eq!(first["sounds"]["live"], 1);
+
+        let time = std::rc::Rc::new(std::cell::Cell::new(at));
+        let wall = time.clone();
+        p.set_live_clock(Some(std::rc::Rc::new(move || wall.get())));
+        let sounding = state(&mut p);
+        assert_eq!(sounding["sounds"]["voices"][0]["state"], "sounding");
+        assert_eq!(sounding["sounds"]["live"], 1);
+        time.set(ends + 1.);
+        let ended = state(&mut p);
+        assert_eq!(ended["sounds"]["voices"][0]["state"], "ended");
+        assert_eq!(ended["sounds"]["live"], 0);
+        assert_eq!(p.host().runner().now_ms(), first["clock"].as_f64().unwrap());
+    }
+
+    #[test]
     fn android_hands_runner_voices_to_the_arm_on_the_monotonic_frame_clock() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../web-js/conformance/sounds/app.contract");

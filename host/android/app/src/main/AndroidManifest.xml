@@ -25,7 +25,7 @@
          the activity from any screen. -->
     <!-- Locked secrets' files stay out of backups and transfers (res/xml/exact_backup.xml, LLP 1133.010 D6). -->
     <!-- The launcher icon and the TV banner are the app manifest's `icons` (app/build.gradle.kts, LLP 1163 D6), and the
-         launch theme its `background_color` where it names one (LLP 1115.001 D3.6). -->
+         launch theme its launch colours where it names them (LLP 1115.001 D3.6). -->
     <application android:label="${appName}" android:theme="${appTheme}" android:hardwareAccelerated="true"
         android:icon="${appIcon}" android:roundIcon="${appIcon}" android:banner="${appBanner}"
         android:enableOnBackInvokedCallback="true" android:supportsRtl="true"
@@ -53,6 +53,9 @@
         <!-- What a notification's tap starts (LLP 1133.004.000 D4): the activity under a name no other app may start, so
              an activation is read only from an intent to it, and needs no secret (`Activations.kt`). -->
         <activity-alias android:name=".Notify" android:targetActivity=".MainActivity" android:exported="false" />
+        <!-- Only adb shell selects a development loop for subsequent starts of this APK. -->
+        <activity-alias android:name=".DevLoop" android:targetActivity=".MainActivity" android:enabled="${exactDevelopment}"
+            android:exported="true" android:permission="android.permission.DUMP" />
         <!-- The app's files as content URIs an intent carries under a read grant (LLP 1133.024 D22 item 2): a mail's
              attachments. Unexported: only a URI the app granted opens. -->
         <provider android:name="dev.exact.canvas.Files" android:authorities="${applicationId}.exact.files"

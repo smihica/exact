@@ -388,11 +388,13 @@ impl<D: DataSource> Bridge<D> {
     /// The locations `plan` renders at build (LLP 1048.000 D7), as a JSON
     /// array: the web build runs no render step when there are none.
     pub fn build_locations(&mut self, plan: &[u8]) -> u32 {
-        // The routes whose pages a source lists count too, by pattern.
+        // The routes whose pages a source lists count too, by pattern, and the not-found document where a
+        // pattern takes its location: the render entry refuses it beside the build's other refusals.
         let found = exact_plan::Plan::decode(plan)
             .map_err(|e| format!("{e:?}"))
             .and_then(|plan| {
-                let mut found = crate::document::build_locations(&plan)?;
+                let (mut found, refused) = crate::document::build_locations(&plan);
+                found.extend(refused.map(|(location, _)| (location, true)));
                 for row in plan.routes.iter().filter(|r| {
                     r.render == exact_plan::RenderPolicy::Build && !plan.str(r.pages).is_empty()
                 }) {
@@ -402,16 +404,11 @@ impl<D: DataSource> Bridge<D> {
             });
         let out = match found {
             Ok(found) => {
-                let mut json = String::from("[");
-                for (i, (location, _)) in found.iter().enumerate() {
-                    if i > 0 {
-                        json.push(',');
-                    }
-                    json.push('"');
-                    json.push_str(&escape(location));
-                    json.push('"');
-                }
-                json + "]"
+                let quoted: Vec<_> = found
+                    .iter()
+                    .map(|(l, _)| format!("\"{}\"", escape(l)))
+                    .collect();
+                format!("[{}]", quoted.join(","))
             }
             Err(error) => format!("{{\"error\":\"{}\"}}", escape(&error)),
         };
@@ -1253,8 +1250,8 @@ macro_rules! host {
         /// `hlen` bytes of `name: value` header lines then `blen` bytes of
         /// body (or the message). Returns the batch's length.
         #[no_mangle]
-        pub extern "C" fn exact_fulfill(ticket: f64, kind: u32, status: u32, hlen: u32, blen: u32, now_ms: f64) -> u32 {
-            EXACT_BRIDGE.with(|b| b.borrow_mut().fulfill(ticket, kind, status, hlen as usize, blen as usize, now_ms))
+        pub extern "C" fn exact_fulfill(ticket: f64, kind: u32, status: u32, hlen: u32, blen: u32, now_ms: f64, asked_at: f64, after_ms: u32, timeout_ms: u32) -> u32 {
+            EXACT_BRIDGE.with(|b| b.borrow_mut().fulfill(ticket, kind, status, hlen as usize, blen as usize, now_ms, (asked_at, after_ms, timeout_ms)))
         }
 
         /// Whether the runner still holds request `ticket`: the page asks
@@ -1272,6 +1269,8 @@ macro_rules! host {
             EXACT_BRIDGE.with(|b| b.borrow_mut().set_update(code))
         }
 
+        /// The agent's substitute for the screen reader's state, which a
+        /// browser never reports (`Bridge::set_screen_reader`; LLP 1039 D10).
         #[no_mangle]
         pub extern "C" fn exact_set_screen_reader(code: u32) {
             EXACT_BRIDGE.with(|b| b.borrow_mut().set_screen_reader(code));

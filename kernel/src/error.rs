@@ -97,6 +97,8 @@ pub enum DecodeError {
     BadTransform,
     /// Invalid CSS `transform-origin` (LLP 1055.000 D5).
     BadTransformOrigin,
+    /// Invalid CSS `object-position`.
+    BadObjectPosition,
     /// Invalid SVG `paint-order` (LLP 1055.000 D7).
     BadPaintOrder,
     /// Invalid SVG `marker-start`/`-mid`/`-end` (LLP 1055.000 D9).
@@ -360,10 +362,14 @@ pub enum LayoutError {
     HostBlock(&'static str),
     /// A host's report of native targets refused (LLP 1123 D9).
     NativeTarget(&'static str),
+    /// A host's report of an owner's segments refused (LLP 1123 D16).
+    OwnerSegments(&'static str),
     /// A host's report of Exact's contributions refused (LLP 1123 D11).
     Contribution(&'static str),
     /// A host's report of an owner's keyboard refused (LLP 1123 D7).
     Keyboard(&'static str),
+    /// A host's report of an owner's margins refused (LLP 1123 D8).
+    Margins(&'static str),
     /// A definite available-space offer is infinite or NaN.
     InvalidOffer,
     /// The id is not live.
@@ -655,6 +661,10 @@ pub enum StyleValueError {
     },
     /// Not CSS `transform-origin`.
     BadTransformOrigin {
+        style: StyleId,
+    },
+    /// Not CSS `object-position`.
+    BadObjectPosition {
         style: StyleId,
     },
     /// Not SVG `paint-order`.

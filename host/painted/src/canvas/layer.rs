@@ -27,16 +27,24 @@ pub(super) const LAYER_FREE: u32 = 32;
 /// the reader samples tracks on the engine's clock.
 pub(crate) const CLOCK: u32 = 33;
 
+/// Inputs to the scalar tracks sent to the Android layer player. CSS permits implicit
+/// keyframes at the underlying value and percentages of the current transform box.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Basis {
+    pub(super) base: [f32; 7],
+    pub(super) reference: (f32, f32),
+}
+
 thread_local! {
     /// The layers alive after the last finished recording: id, node, base.
-    pub(crate) static ALIVE: RefCell<Vec<(u32, u64, [f32; 7])>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static ALIVE: RefCell<Vec<(u32, u64, Basis)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The recorder's layer state.
 #[derive(Default)]
 pub(super) struct Layers {
     ids: HashMap<u64, u32>,
-    info: HashMap<u32, (u64, [f32; 7])>,
+    info: HashMap<u32, (u64, Basis)>,
     next: u32,
     /// Each layer's header and drawing as last sent.
     sent: HashMap<u32, Vec<u32>>,
@@ -64,6 +72,13 @@ impl Layers {
     pub(super) fn shared_ancestors(&self) -> Vec<u32> {
         self.open.iter().map(|layer| layer.id).collect()
     }
+
+    /// How many clips were open around the innermost recording layer (none
+    /// outside a layer): the clips its reader moves it past.
+    pub(super) fn clips_outside(&self) -> usize {
+        self.open.last().map_or(0, |o| o.emitted.len())
+    }
+
     pub(super) fn needs_world(&self) -> bool {
         self.sent
             .values()
@@ -132,6 +147,7 @@ impl Recorder {
         key: u64,
         ts: Transform,
         pivot: (f32, f32),
+        reference: (f32, f32),
         base: [f32; 7],
     ) {
         // The clips around the layer stay where they are while the reader
@@ -147,7 +163,7 @@ impl Recorder {
             l.next += 1;
             l.next
         });
-        l.info.insert(id, (key, base));
+        l.info.insert(id, (key, Basis { base, reference }));
         if self.row.is_some() {
             l.row.push(id);
         } else {
@@ -262,6 +278,7 @@ mod tests {
             42,
             Transform::identity(),
             (10.0, 10.0),
+            (0., 0.),
             [0., 0., 1., 0., 1., 0., 0.]
         ));
         r.fill(
@@ -477,5 +494,62 @@ component App
         );
         let at = drawn.iter().position(|op| *op == LAYER_REF).unwrap();
         assert!(drawn[..at].iter().any(clip), "no clip around it: {drawn:?}");
+    }
+
+    /// A reel in its window: a column the reader rolls up through a clip
+    /// that shows one row of it. Its rows below the window where it rests are
+    /// still recorded in its layer, as the reader brings them into view;
+    /// the same drawing outside a layer is culled.
+    #[test]
+    fn a_layer_keeps_its_drawing_outside_the_clip_around_it() {
+        use super::super::{ROW_BEGIN, RRECT};
+        let draw = |layered: bool, inner_clip: bool| {
+            let mut r = Recorder::new();
+            r.begin(400.0, 400.0, 1.0);
+            r.push_clip(&Shape::rect((0.0, 0.0, 20.0, 18.0)), Transform::identity());
+            if layered {
+                assert!(r.layer_begin(
+                    42,
+                    Transform::identity(),
+                    (10.0, 9.0),
+                    (0., 0.),
+                    [0., 0., 1., 0., 1., 0., 0.]
+                ));
+            }
+            if inner_clip {
+                r.push_clip(&Shape::rect((0., 36., 20., 18.)), Transform::identity());
+                assert_eq!(r.clipped_out(), !layered);
+            }
+            for row in 0..10 {
+                r.fill(
+                    &Shape::rect((0.0, row as f32 * 18.0, 20.0, 18.0)),
+                    [255, 0, 0, 255],
+                    Transform::identity(),
+                );
+            }
+            if inner_clip {
+                r.pop_clip();
+            }
+            if layered {
+                r.layer_end();
+            }
+            r.pop_clip();
+            let _ = r.finish();
+            let ops = FINISHED.with(|f| f.borrow_mut().take()).unwrap();
+            let (mut drawn, mut layers) = (Vec::new(), Vec::new());
+            walk(&ops, &mut drawn, &mut layers);
+            assert!(!drawn.contains(&ROW_BEGIN));
+            let fills = |ops: &[u32]| ops.iter().filter(|op| **op == RRECT).count();
+            (
+                fills(&drawn),
+                layers.iter().map(|l| fills(l)).sum::<usize>(),
+            )
+        };
+        // Outside a layer: only the window's row.
+        assert_eq!(draw(false, false), (1, 0));
+        // In a layer: all ten rows, in the layer.
+        assert_eq!(draw(true, false), (0, 10));
+        assert_eq!(draw(false, true), (0, 0));
+        assert_eq!(draw(true, true), (0, 1));
     }
 }

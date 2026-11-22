@@ -73,6 +73,42 @@ impl<D: DataSource> Presenter<D> {
         true
     }
 
+    /// Props of a mounted audio element whose player has no reader.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn background_audio(
+        &self,
+        id: ViewId,
+        key: exact_kernel::NodeKey,
+        session: u64,
+    ) -> Option<serde_json::Value> {
+        let kernel = self.host.kernel();
+        let node = kernel.node(id)?;
+        if session != self.brush.native_session
+            || node.key != key
+            || node.node_type != NodeType::Video
+            || node.props.str(PropId::SemanticTag) != Some("audio")
+        {
+            return None;
+        }
+        let arena = kernel.arena();
+        let mut root = node.key.index;
+        while let Some(parent) = arena.parent(root) {
+            root = parent;
+        }
+        if !arena.is_root(root) {
+            return None;
+        }
+        let mut props = self.brush.media_props(&node);
+        props["focused"] = false.into();
+        props["timeupdate"] = self
+            .host
+            .runner()
+            .handlers_of(id)
+            .contains(&EventKind::Timeupdate)
+            .into();
+        Some(props)
+    }
+
     /// Keep a player's state; its video's size, once known, is the node's
     /// natural size (LLP 1042 §2), laid out again when it changes.
     #[cfg(any(target_os = "android", test))]

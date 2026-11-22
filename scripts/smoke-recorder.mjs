@@ -21,12 +21,13 @@ export const TAKES = ['Take 1 · 3.0 s · level 60%', 'Take 2 · 1.5 s · level 
 async function bars(s, path) {
   const shot = await s.screenshot(path);
   const png = decodePng(readFileSync(path));
-  const box = (await s.layout()).nodes.find((n) => n.testId === 'waveform');
+  const box = shot.captureSpace === 'screen' ? (await s.layout('waveform')).node?.space?.screen
+    : (await s.layout()).nodes.find((n) => n.testId === 'waveform');
   if (!box) return 0;
-  const scale = png.width / shot.w;
+  const sx = png.width / shot.w, sy = png.height / shot.h;
   let coloured = 0;
-  for (let y = Math.round(box.y * scale); y < Math.round((box.y + box.h) * scale); y += 2) {
-    for (let x = Math.round(box.x * scale); x < Math.round((box.x + box.w) * scale); x += 2) {
+  for (let y = Math.max(0, Math.round(box.y * sy)); y < Math.min(png.height, Math.round((box.y + box.h) * sy)); y += 2) {
+    for (let x = Math.max(0, Math.round(box.x * sx)); x < Math.min(png.width, Math.round((box.x + box.w) * sx)); x += 2) {
       const i = (y * png.width + x) * 4, [r, g, b] = [png.data[i], png.data[i + 1], png.data[i + 2]];
       if (Math.max(r, g, b) - Math.min(r, g, b) > 80) coloured += 1;
     }

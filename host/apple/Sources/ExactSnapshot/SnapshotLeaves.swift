@@ -311,7 +311,7 @@ struct SnapshotImageView: View {
                 symbol(fit: fit).clipShape(clip).widgetAccentable()
             } else if let raster = environment.rasters.decode(node.props["imageSource"], roots: environment.imageRoots, appGroup: environment.appGroup, appID: environment.appID,
                                                                 box: box.size, fit: fit, scale: displayScale) {
-                SnapshotRaster(image: Image(decorative: raster.image, scale: 1), natural: raster.natural, fit: fit, box: box.size,
+                SnapshotRaster(image: Image(decorative: raster.image, scale: 1), natural: raster.natural, fit: fit, box: box.size, position: node.style["object_position"]?.array,
                                fullColor: SnapshotAccent.group(node) == .fullColor)
                     .clipShape(clip)
             }
@@ -320,10 +320,8 @@ struct SnapshotImageView: View {
         .offset(x: box.minX, y: box.minY)
     }
 
-    /// The symbol at its natural size (the glyph's at the text's size and
-    /// weight, `SymbolMeasure.size`), fitted as a raster is: the vector
-    /// keeps its aspect under `fill` and `contain` as the running host
-    /// draws it (`xMidYMid meet`), covers under `cover`.
+    /// Place the symbol's viewport by CSS fit and position, then meet its
+    /// glyph inside that viewport, as the page hosts do.
     @ViewBuilder
     private func symbol(fit: String) -> some View {
         let name = node.props["symbolName"] ?? ""
@@ -335,16 +333,14 @@ struct SnapshotImageView: View {
             let natural = SymbolMeasure.size(name, points: points, weight: weight) ?? CGSize(width: points, height: points)
             let image = Image(systemName: name).resizable()
             let box = node.contentBox.size
-            Group {
-                switch fit {
-                case "cover": image.aspectRatio(natural, contentMode: .fill).frame(width: box.width, height: box.height).clipped()
-                case "none", "scale-down" where natural.width <= box.width && natural.height <= box.height:
-                    image.frame(width: natural.width, height: natural.height).frame(width: box.width, height: box.height)
-                default: image.aspectRatio(natural, contentMode: .fit).frame(width: box.width, height: box.height)
-                }
-            }
-            .font(.system(size: points, weight: Font.Weight(css: Int(weight))))
-            .foregroundStyle(ink)
+            let rect = IconPath.placed(natural: natural, fit: fit,
+                                       position: node.style["object_position"]?.array, in: CGRect(origin: .zero, size: box))
+            image.aspectRatio(natural.width / natural.height, contentMode: .fit)
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+                .frame(width: box.width, height: box.height)
+                .font(.system(size: points, weight: Font.Weight(css: Int(weight))))
+                .foregroundStyle(ink)
         } else if let svg = node.props["symbolAsset"],
                   let asset = IconAsset.image(named: IconAsset.name(svg),
                     bundles: environment.imageRoots.compactMap { Bundle(url: $0) }.flatMap { IconAsset.bundles(for: $0) } + SnapshotBundles.all,
@@ -358,34 +354,32 @@ struct SnapshotImageView: View {
             let image = Image(nsImage: asset)
             #endif
             let box = node.contentBox.size
-            // Symbol fill keeps the file's aspect, matching the page hosts.
-            let fit = fit == "fill" ? "contain" : fit
             SnapshotRaster(image: image.renderingMode(style.string("symbol_rendering") == "multicolor" ? .original : .template),
-                           natural: natural, fit: fit, box: box, fullColor: true)
+                           natural: natural, fit: fit, box: box, position: node.style["object_position"]?.array, fullColor: true, preserveAspect: true)
                 .foregroundStyle(ink)
         } else if let commands = node.props["symbolPath"] {
             // An icon with no SF Symbol draws its own path (LLP 1121 D10, stage 9 A), as the page hosts do: its
-            // em square placed by `object-fit` in the box, the viewBox met in that square, each path filled
+            // viewBox placed by CSS object fit and position in the box, each path filled
             // by its rule (nonzero, or even-odd by `symbolFillRule`) into one mask that its tint (else its
             // colour) shows through once.
             let style = SnapshotStyle(node)
             let ink = SnapshotColor.style(style.color("tint_color") ?? style.color("text_color"), dark: scheme == .dark, context: .ink) ?? AnyShapeStyle(.tint)
             let box = node.contentBox.size, viewBox = node.props["symbolViewBox"] ?? ""
             let points = style.number("font_size") ?? 17, evenOdd = node.props["symbolFillRule"] == "evenodd"
-            let square = IconPath.placed(em: points, fit: fit, in: CGRect(origin: .zero, size: box))
+            let square = IconPath.placed(viewBox: IconPath.viewBox(viewBox), em: points, fit: fit, position: node.style["object_position"]?.array, in: CGRect(origin: .zero, size: box))
             Rectangle().fill(ink)
                 .mask(ZStack {
                     ForEach(Array(IconPath.paths(commands).enumerated()), id: \.offset) { _, path in
                         IconShape(path: path, viewBox: viewBox, square: square).fill(Color.black, style: FillStyle(eoFill: evenOdd))
                     }
-                })
+                }.clipShape(Path(square)))
                 .frame(width: box.width, height: box.height)
                 .clipped()
         }
     }
 }
 
-/// One of an icon's paths, its viewBox met in the em square placed in the box (`IconPath.placed`, `fitted`).
+/// One of an icon's paths, its viewBox met in the viewport placed in the box (`IconPath.placed`, `fitted`).
 private struct IconShape: Shape {
     let path: CGPath, viewBox: String, square: CGRect
     func path(in rect: CGRect) -> Path {
@@ -543,20 +537,17 @@ public final class SnapshotRasters {
     }
 }
 
-/// CSS `object-fit` over the image's natural size: `fill` stretches,
-/// `contain` and `cover` keep the aspect, `scale-down` keeps the natural
-/// size when it fits, else contains; `none` is the profile's to refuse and
-/// draws as `scale-down` here. D5: under the accented mode the raster is
-/// desaturated (the default group keeps its detail) unless the author
-/// asked for full colour; the modifier is iOS 18's, and older systems draw
-/// the default.
+/// A raster's CSS object viewport, clipped by its image's content edge.
+/// Accented widgets desaturate it unless the author asks for full colour.
 @available(iOS 17.0, macOS 14.0, watchOS 10.0, visionOS 26.0, *)
 struct SnapshotRaster: View {
     let image: Image
     let natural: CGSize
     let fit: String
     let box: CGSize
+    var position: [BatchValue]? = nil
     let fullColor: Bool
+    var preserveAspect = false
 
     private func treated(_ image: Image) -> AnyView {
         if #available(iOS 18.0, macOS 15.0, watchOS 11.0, visionOS 26.0, *) {
@@ -566,18 +557,17 @@ struct SnapshotRaster: View {
     }
 
     var body: some View {
-        let resizable = treated(image.resizable())
-        switch fit {
-        case "contain": resizable.aspectRatio(natural, contentMode: .fit).frame(width: box.width, height: box.height)
-        case "cover": resizable.aspectRatio(natural, contentMode: .fill).frame(width: box.width, height: box.height).clipped()
-        case "none", "scale-down":
-            if natural.width <= box.width && natural.height <= box.height {
-                resizable.frame(width: natural.width, height: natural.height).frame(width: box.width, height: box.height)
+        let rect = IconPath.placed(natural: natural, fit: fit, position: position, in: CGRect(origin: .zero, size: box))
+        Group {
+            if preserveAspect {
+                treated(image.resizable()).aspectRatio(natural.width / natural.height, contentMode: .fit)
             } else {
-                resizable.aspectRatio(natural, contentMode: .fit).frame(width: box.width, height: box.height)
+                treated(image.resizable())
             }
-        default: resizable.frame(width: box.width, height: box.height)
-        }
+        }.frame(width: rect.width, height: rect.height)
+            .position(x: rect.midX, y: rect.midY)
+            .frame(width: box.width, height: box.height)
+            .clipped()
     }
 }
 #endif

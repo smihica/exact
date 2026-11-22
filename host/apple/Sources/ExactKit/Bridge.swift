@@ -161,6 +161,7 @@ extension Runtime {
                 case .whole?: (2, [0, 0, 0, 0])
                 case .inset(let top, let bottom)?: (3, [top, 0, bottom, 0])
                 case .gutter(let right, let bottom)?: (12, [0, right, bottom, 0])
+                case .rowSpacing(let top, let bottom)?: (25, [top, 0, bottom, 0])
                 }
                 for word in [view, kind] + edges.map({ Float($0).bitPattern }) {
                     withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
@@ -184,6 +185,23 @@ extension Runtime {
             return read(exact_host_covers(rt, write(bytes)))
         }
     }
+    /// Content owners' updates (LLP 1123 D2), each the owner by its root's view and its
+    /// update in the kernel's encoding (`OwnerUpdateIOS.encode`), and targets native code
+    /// registered (D9, `ExactNativeTarget.encode`), under one layout, checked whole:
+    /// `exact_host_covers` kinds 21 and 22, each record's length after its kind.
+    func ownerReports(updates: [(UInt32, Data)] = [], registrations: [Data] = []) -> Batch {
+        return on(layout: true) {
+            var bytes = Data()
+            let records = updates.map { ($0.0, UInt32(21), $0.1) } + registrations.map { (UInt32(0), UInt32(22), $0) }
+            for (view, kind, record) in records {
+                for word in [view, kind, UInt32(record.count)] {
+                    withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
+                }
+                bytes.append(record)
+            }
+            return read(exact_host_covers(rt, write(bytes)))
+        }
+    }
     /// The border box a person dragged `view`'s `resize` grip to, under one
     /// layout (`Runner::resize_box`); nil keeps an axis.
     func resizeBox(_ view: UInt32, width: CGFloat?, height: CGFloat?) -> Batch {
@@ -196,6 +214,21 @@ extension Runtime {
             return read(exact_host_covers(rt, write(bytes)))
         }
     }
+    #if os(macOS)
+    /// The tracks an AppKit resize changed, each by its header. A withdrawn
+    /// width returns the column to CSS automatic sizing.
+    func tableColumnWidths(_ columns: [(UInt32, CGFloat?)]) -> Batch {
+        on(layout: true) {
+            var bytes = Data(capacity: columns.count * 24)
+            for (header, width) in columns {
+                for word: UInt32 in [header, 24, Float(width ?? .nan).bitPattern, 0, 0, 0] {
+                    withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
+                }
+            }
+            return read(exact_host_covers(rt, write(bytes)))
+        }
+    }
+    #endif
     /// The margins UIKit's own list gives each grouped list's cards and
     /// cells, under one layout: the card's left and right insets, then the
     /// cell's left and right margins; nil clears them.

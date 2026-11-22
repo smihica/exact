@@ -8,6 +8,19 @@ import { fileURLToPath } from 'node:url';
 import { plistCommand } from './plist.mjs';
 import { windowsMetalCommand } from './metal.mjs';
 
+/** `EXACT_EXPERIMENTAL=1` turns on the Apple build's experimental features; each says where it applies. With any other
+ *  value, or unset, a build is byte for byte the one it is without them. */
+export const experimental = (env = process.env) => env.EXACT_EXPERIMENTAL === '1';
+/** The optimization the Swift a build compiles itself (app modules, packages, extensions) takes. Experimental: `-Onone`
+ *  in a `--development` archive, a build to iterate on rather than ship, since an optimized whole-module compile runs
+ *  mostly on one core and takes minutes for some packages and extensions. Otherwise `-O`, and so for what bakes
+ *  production trust, which build.mjs sets for every distributed build (`--distribution` with `--development` too).
+ *  Intents stay `-O`: on Linux their cache key hashes intents.mjs's own source, so any edit there invalidates it. */
+export const swiftOptimization = (env = process.env, args = process.argv) =>
+  experimental(env) && args.includes('--development') && !args.includes('--distribution') && env.EXACT_UPDATE_TRUST !== 'production' ? '-Onone' : '-O';
+/** `swiftOptimization()` as part of a cache key: empty for `-O`, so a key without the experiment is unchanged. */
+export const swiftOptimizationKey = (env = process.env, args = process.argv) => swiftOptimization(env, args) === '-O' ? [] : [swiftOptimization(env, args)];
+
 /** The watch app's deployment target: arm64 runs from watchOS 26, and the watch app is built for arm64 alone (LLP 1126.002 D7). */
 export const WATCH_MINIMUM_OS = '26.0';
 const SDK_KEYS = { iphoneos: 'arm64-apple-ios', iphonesimulator: 'arm64-apple-ios-simulator', macosx: 'arm64-apple-macosx', watchos: 'arm64-apple-watchos', watchsimulator: 'arm64-apple-watchos-simulator' };
@@ -105,7 +118,13 @@ function cargoEnvironment(args, options, env) {
       ...linkerDriver(sdk), `-Wl,${platformVersion(sdk, triple).join(',')}`];
     const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
     const script = `#!/bin/sh\nexec ${linkerArgs.map(quote).join(' ')} "$@"\n`;
-    const directory = resolve(options.cwd ?? process.cwd(), valueAfter(buildArgs, '--target-dir') ?? env.CARGO_TARGET_DIR ?? 'target', 'exact-cross-tools');
+    // The linker's path is in Cargo's configuration hash of every unit it builds, so it lives where those units do:
+    // Cargo's build directory when CARGO_BUILD_BUILD_DIR sets one, else the target directory. A build with its own
+    // --target-dir and a shared build directory (the host's module build into target/apple-modules, say) otherwise
+    // wrote the units it shares with every other build there (libc, bitflags, objc2, ...) under another hash, and each
+    // rebuilt them after the other. A templated build directory ({workspace-root}) keeps the old place.
+    const buildDir = env.CARGO_BUILD_BUILD_DIR && !env.CARGO_BUILD_BUILD_DIR.includes('{') ? env.CARGO_BUILD_BUILD_DIR : null;
+    const directory = resolve(options.cwd ?? process.cwd(), buildDir ?? valueAfter(buildArgs, '--target-dir') ?? env.CARGO_TARGET_DIR ?? 'target', 'exact-cross-tools');
     const file = resolve(directory, `${createHash('sha256').update(script).digest('hex')}-linker`);
     mkdirSync(directory, { recursive: true });
     if (!existsSync(file) || readFileSync(file, 'utf8') !== script) {

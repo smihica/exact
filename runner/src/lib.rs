@@ -94,6 +94,7 @@ pub use runner::picker::shared as share_in;
 pub mod canvas_performance;
 pub mod machine;
 pub mod midi;
+pub mod native_geometry;
 pub mod rows;
 pub mod secrets;
 pub mod share;
@@ -105,6 +106,7 @@ pub mod strings;
 pub mod surface_record;
 pub mod time;
 pub mod tools;
+mod transfer;
 pub mod transport;
 pub mod upload;
 pub mod uses;
@@ -144,11 +146,11 @@ pub use runner::{
     Geometry, GeometryLink, Hold, HoldAnswer, InFlight, InputDetails, Interrupt, Intersection,
     KeyModifiers, KeyboardEvent, Limits, ListTextPolicy, ListTextPosition, MouseEvent, Native,
     NativeCall, NativeHandler, Overlaid, Picked, PickerLinks, PickerRequest, PointerEvent,
-    PreloadWake, Report, Reporter, ResizeRect, RouterChange, RouterLink, Routing, Runner,
-    RunnerError, RunnerLinks, ScrollEvent, SelectionDirection, SnapshotModule, SocketReader,
-    SocketState, StackSplit, StreamCount, SurfaceAnswer, Target, Timed, UploadEnd, UploadMark,
-    WheelEvent, Write, BACKGROUND, JOURNAL_RING, MAX_CLOCK_MS, PICKED, QUEUE_BOUND,
-    RESIZE_UNDELIVERED, TIMER_FIRE_LIMIT, VIRTUAL_FRAME_MS,
+    PreloadWake, Report, Reporter, ResizeRect, ResourceChange, RouteInspector, RouterChange,
+    RouterLink, Routing, Runner, RunnerError, RunnerLinks, ScrollEvent, SelectionDirection,
+    SnapshotModule, SocketReader, SocketState, StackSplit, StreamCount, SurfaceAnswer, Target,
+    Timed, UploadEnd, UploadMark, WheelEvent, Write, BACKGROUND, JOURNAL_RING, MAX_CLOCK_MS,
+    PICKED, QUEUE_BOUND, RESIZE_UNDELIVERED, TIMER_FIRE_LIMIT, VIRTUAL_FRAME_MS,
 };
 pub use runner::{AppState, Forma, LiveApplied, LiveRefusal, Place};
 pub use runner::{

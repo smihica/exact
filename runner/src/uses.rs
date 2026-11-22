@@ -231,11 +231,36 @@ pub enum Capability {
     /// navigation root's or a route's props (`navigationBack`,
     /// `navigationKey`, `navigationPresentation` and the rest). Native only.
     Navigation,
+    /// Selecting non-editable text (LLP 1115.000 D11.6): a `user-select`
+    /// that can be `text` or `all`, which iOS needs to make text
+    /// selectable. Native only; the Mac's set always names it, since
+    /// AppKit's document text is selectable unsaid.
+    TextSelection,
+    /// A widget's or a Live Activity's entry (LLP 1126 D2, D8): the app's
+    /// publication of its generations to the App Group and the observation
+    /// of the store the extension writes; an entry boots only where it is
+    /// linked. An entry's plan (`snapshot_entry`) selects it, and so do Live
+    /// Activities, whose sends name the published generation. Native only.
+    Widgets,
+    /// The content index (LLP 1133.023 D4, D9): the mirror
+    /// `@exact/search-index` writes, Spotlight's index of it, and the entries
+    /// an entity parameter offers. Selected by that package's names. Native
+    /// only.
+    ContentIndex,
+    /// HTML's `dialog` shown as UIKit's sheet, or as the author's box in the
+    /// top layer when its author paints it (LLP 1115.000 D11.5, LLP 1035.001
+    /// D11): a node that can be a `dialog`. iOS and tvOS only: the Mac's
+    /// top-layer stack, which a sheet route shares, presents a `dialog` in its
+    /// core ([`Uses::MAC_CORE`]).
+    Dialogs,
+    /// A drag out of the app (LLP 1094.000 D3): a node with `draggable`,
+    /// whose host lifts it to the system with its data.
+    DragOut,
 }
 
 impl Capability {
     /// Every capability, in bit order.
-    pub const ALL: [Capability; 57] = [
+    pub const ALL: [Capability; 62] = [
         Capability::Markdown,
         Capability::Motion,
         Capability::Collections,
@@ -293,6 +318,11 @@ impl Capability {
         Capability::Sound,
         Capability::Midi,
         Capability::Navigation,
+        Capability::TextSelection,
+        Capability::Widgets,
+        Capability::ContentIndex,
+        Capability::Dialogs,
+        Capability::DragOut,
     ];
 
     /// The name an entry, a refusal and a report use.
@@ -355,6 +385,11 @@ impl Capability {
             Capability::Sound => "sound",
             Capability::Midi => "midi",
             Capability::Navigation => "navigation",
+            Capability::TextSelection => "text_selection",
+            Capability::Widgets => "widgets",
+            Capability::ContentIndex => "content_index",
+            Capability::Dialogs => "dialogs",
+            Capability::DragOut => "drag_out",
         }
     }
 
@@ -400,7 +435,16 @@ impl Uses {
         .with(Capability::WebViews)
         .with(Capability::Sound)
         .with(Capability::Midi)
-        .with(Capability::Navigation);
+        .with(Capability::Navigation)
+        .with(Capability::TextSelection)
+        .with(Capability::Widgets)
+        .with(Capability::ContentIndex)
+        .with(Capability::Dialogs);
+
+    /// The native roster's entries the Mac's core presents itself, which a
+    /// macOS set never names: a `dialog` is an entry of the top-layer stack
+    /// a sheet route presents in too.
+    pub const MAC_CORE: Uses = Uses::NONE.with(Capability::Dialogs);
 
     /// This set and `capability`.
     pub const fn with(self, capability: Capability) -> Uses {
@@ -501,7 +545,7 @@ pub fn uses(plan: &Plan) -> Uses {
     // declared source its network (LLP 1162.001 D3).
     if plan.resources.iter().any(|r| r.reader || r.keep)
         || !plan.fetches.is_empty()
-        || plan.slots.iter().any(|s| s.persist)
+        || plan.slots.iter().any(|s| s.is_persisted())
     {
         uses = uses.with(Capability::Io);
     }
@@ -533,6 +577,9 @@ pub fn uses(plan: &Plan) -> Uses {
                 Some(PropId::HeightDragFor | PropId::TransformDragFor | PropId::ReorderFor) => {
                     uses = uses.with(Capability::Motion).with(Capability::Drag);
                 }
+                // A drag's data is admitted for its host whether or not the
+                // node drags now, and `draggable=false` is the web's too.
+                Some(PropId::Draggable) => uses = uses.with(Capability::DragOut),
                 // A shared element flies between its two places (LLP 1013.000).
                 Some(PropId::SharedElement) => uses = uses.with(Capability::Transitions),
                 Some(PropId::Virtualized)
@@ -613,7 +660,8 @@ pub fn uses(plan: &Plan) -> Uses {
             EventKind::Heightrelease
             | EventKind::Transformgeometry
             | EventKind::Transformrelease
-            | EventKind::Reorderdrop => {
+            | EventKind::Reorderdrop
+            | EventKind::Reordertargetchange => {
                 uses = uses.with(Capability::Motion).with(Capability::Drag);
             }
             // Dropped and pasted files become `doc:` handles (studio diary
@@ -774,6 +822,7 @@ fn stdlib_calls(plan: &Plan) -> (bool, bool, bool) {
                     Some(
                         Stdlib::Frame
                         | Stdlib::RangeFrame
+                        | Stdlib::ScrollMetrics
                         | Stdlib::Measure
                         | Stdlib::ElementFromPoint
                         | Stdlib::ElementsFromPoint
@@ -828,19 +877,16 @@ pub fn uses_picture_in_picture(plan: &Plan) -> bool {
     runs_command(plan, &["requestPictureInPicture"])
 }
 
-/// Whether an image's, a media element's or a frame's source can be remote:
-/// an `http:` or `https:` literal, or one computed at run time, which this
-/// cannot read. The Mac App Store sandbox loads such a source only with
-/// `network.client` (LLP 1030.005 D2).
+/// A remote or computed image, media source, video poster or iframe URL
+/// requires the Mac App Store sandbox's `network.client` (LLP 1030.005 D2).
 pub fn sources_can_be_remote(plan: &Plan) -> bool {
     plan.bindings.iter().any(|binding| {
         binding.kind == BindingKind::Prop
             && matches!(
                 PropId::from_wire(binding.id),
-                Some(PropId::Src | PropId::ImageSource)
+                Some(PropId::Src | PropId::ImageSource | PropId::Poster)
             )
-            && constant_str(plan, plan.code(binding.expr))
-                .is_none_or(|src| src.starts_with("http:") || src.starts_with("https:"))
+            && constant_str(plan, plan.code(binding.expr)).is_none_or(exact_plan::has_http_scheme)
     })
 }
 
@@ -920,7 +966,7 @@ pub(super) fn decoration_rows(
     )
 }
 
-fn constant_str<'a>(plan: &'a Plan, code: &[u8]) -> Option<&'a str> {
+pub(crate) fn constant_str<'a>(plan: &'a Plan, code: &[u8]) -> Option<&'a str> {
     match plan.read_code(code).0 {
         [op, a, b, c, d, ret] if *op == Opcode::Str as u8 && *ret == Opcode::Return as u8 => {
             let id = u32::from_le_bytes([*a, *b, *c, *d]);
@@ -965,8 +1011,9 @@ mod grant_tests {
 
     #[test]
     fn persisted_slots_link_storage_without_resources() {
+        use exact_plan::PersistScope;
         use exact_plan::{asm::Asm, builder::PlanBuilder, TypeKind};
-        for persist in [false, true] {
+        for persist in [PersistScope::None, PersistScope::App, PersistScope::Window] {
             let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
             let boolean = b.primitive(TypeKind::Bool);
             let mut initial = Asm::new();
@@ -985,7 +1032,7 @@ mod grant_tests {
             );
             assert_eq!(
                 super::uses(&b.finish().unwrap()).has(Capability::Io),
-                persist
+                persist != PersistScope::None
             );
         }
     }

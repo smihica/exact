@@ -1,3 +1,4 @@
+import { symbolBox, symbolSize, symbolPlaceholder, syncSymbolPlaceholder, symbolFit, tintFit } from "../web/symbol-geometry.js";
 // Symbol images on the JS target (`image "symbol:<role>"`, LLP 1011): the
 // web host's rendering (`glue.js` `refreshSymbols`) — the role's path as a
 // mask in the node's `color` (LLP 1081 stage 2, as the Apple hosts draw a
@@ -6,27 +7,31 @@
 // dynamic source names a role from `table`, the plan's own strings that are
 // roles, or, for one its data names (ledger diary F10), from every role,
 // loaded once (`symbol-roles.js`, the build's). Imported by an app's module
-// only when its plan draws a symbol, binds an image's source, or names an
-// `app:/` file (below).
+// only when its plan draws a symbol or a tinted raster, binds an image's
+// source, or names an `app:/` file (below).
 import { After, PropHooks, Hooks, inflight, journal, clock, data, onEnd } from "./rt.js";
-// The images a commit's pass visits (`refresh`): those built or adopted with a symbol or `app:/` source (rt.js `h`,
-// through `Hooks.image`) and those a binding gives one, each until the scope that built it ends. A set walked in
-// place of two document-wide queries a commit (LLP 1071.001 A7).
+// The commit pass visits symbols, app:/ images and tinted rasters until their
+// scope ends, in place of document-wide queries (LLP 1071.001 A7).
 const Images = new Set();
 const image = e => { if (!Images.has(e)) { Images.add(e); onEnd(() => Images.delete(e)); } };
-Hooks.image = e => { const s = e.getAttribute("data-symbol-source"); if (s?.startsWith("symbol:icon|")) draw(e, s.slice(7)); else image(e); };
+Hooks.image = e => {
+  const s = e.getAttribute("data-symbol-source");
+  if (s?.startsWith("symbol:icon|")) draw(e, s.slice(7));
+  else if (s || e.hasAttribute("data-app-src")) image(e);
+  else template(e, e.getAttribute("src"));
+};
 
 let Table = {}, All = null; // every role: not asked for, loading, or loaded (true)
 let Pending = false;
 function schedule() {
   if (typeof window === "undefined" || globalThis.__exactRender) return refresh();
   if (Pending) return;
-  Pending = true; inflight.n++;
+  Pending = true;
   // After runs before navigation projection and queued root-font commands.
   // A microtask reads their final styles without waiting on a visible frame.
   queueMicrotask(() => {
     Pending = false;
-    try { refresh(); } finally { inflight.n--; }
+    refresh();
   });
 }
 // A role, or an icon token (LLP 1121 D10): by name, by `sf/<name>`, or the build's own form,
@@ -77,7 +82,7 @@ function everyRole() {
     refresh();
   }).finally(() => inflight.n--);
 }
-const STYLE = '@property --exact-tint{syntax:"<color>";inherits:false;initial-value:#000}:where(img[data-symbol-path]){--exact-tint:currentcolor}img[data-symbol-path]{background-color:var(--exact-tint)!important;mask-image:var(--exact-symbol-mask);mask-repeat:no-repeat;mask-position:center;mask-size:var(--exact-symbol-fit,contain);mask-origin:content-box;mask-clip:content-box}';
+const STYLE = '@property --exact-tint{syntax:"<color>";inherits:false;initial-value:#000}:where(img[data-symbol-path]){--exact-tint:currentcolor}img[data-symbol-path]{background-color:var(--exact-tint)!important;mask-image:var(--exact-symbol-mask);mask-repeat:no-repeat;mask-position:var(--exact-symbol-position,center);mask-size:var(--exact-symbol-fit,contain);mask-origin:content-box;mask-clip:content-box}';
 /** `table`: role → [path, filled], for sources a binding names. */
 export function symbols(table) {
   Table = table;
@@ -119,7 +124,7 @@ export function symbols(table) {
 function unsymbol(e) {
   if (!e.hasAttribute?.("data-symbol-source") && !e.hasAttribute?.("data-symbol-path")) return;
   for (const a of ["data-symbol-path", "data-symbol-fill", "data-symbol-source", "data-symbol-viewbox", "data-symbol-nonzero", "data-symbol-evenodd", "data-symbol-file"]) e.removeAttribute(a);
-  e.style.removeProperty("--exact-symbol-mask"); e.style.removeProperty("--exact-symbol-fit");
+  e.style.removeProperty("--exact-symbol-mask"); e.style.removeProperty("--exact-symbol-fit"); e.style.removeProperty("--exact-symbol-position");
   if (e.getAttribute("src") === e.symbolPlaceholder) e.removeAttribute("src");
   e.symbolKey = e.symbolMask = e.symbolPlaceholder = e.symbolRefusal = null;
 }
@@ -141,7 +146,7 @@ function appSource(e, v) {
 // A raster with a `-exact-tint-color` is a template (element.rs `host_css`, LLP
 // 1011 §3): its alpha masks the tint. A source that becomes a raster takes
 // the mask; one that becomes a symbol (or no tint) drops it.
-const TEMPLATE = ["mask-image", "mask-size", "mask-repeat", "mask-position", "mask-origin", "mask-clip", "object-position"];
+const TEMPLATE = ["mask-image", "mask-size", "mask-repeat", "mask-position", "mask-origin", "mask-clip", "--exact-tint-offset"];
 // The selectors whose rules declare `--exact-tint` (the class rules nest under the root's selector, as `& .c1`), read
 // from the sheets once, and again when a sheet is added (this module's own, a loaded piece's): the scan per image
 // built was 6% of a scrolling feed's task time (LLP 1071.001 A5).
@@ -150,21 +155,36 @@ const collect = (rules, into) => { for (const r of rules) { if (r.selectorText &
 const tints = () => { const n = document.styleSheets.length; if (!Tints || n !== Sheets) { Sheets = n; Tints = new Set(); for (const sh of document.styleSheets) { try { collect(sh.cssRules, Tints); } catch {} } } return Tints; };
 const tinted = e => !!e.style.getPropertyValue("--exact-tint") || (e.classList.length > 0 && [...e.classList].some(c => tints().has("." + c)));
 function template(e, v) {
-  if (e.localName !== "img" || !v || !tinted(e)) { if (e.$template) { for (const p of TEMPLATE) e.style.removeProperty(p); e.style.removeProperty("background-color"); e.$template = false; } return; }
-  const fit = getComputedStyle(e).objectFit, size = { fill: "100% 100%", contain: "contain", cover: "cover", none: "auto" }[fit] ?? "var(--exact-tint-fit,contain)";
+  if (e.localName !== "img" || !v || !tinted(e)) {
+    if (e.$template) {
+      for (const p of TEMPLATE) e.style.removeProperty(p);
+      e.style.removeProperty("background-color");
+      e.style.setProperty("object-position", "var(--exact-object-position,50% 50%)");
+      e.$template = false;
+    }
+    return;
+  }
+  image(e);
   e.style.setProperty("background-color", "var(--exact-tint)");
-  e.style.setProperty("mask-image", `url(${JSON.stringify(v)})`); e.style.setProperty("mask-size", size);
-  e.style.setProperty("mask-repeat", "no-repeat"); e.style.setProperty("mask-position", "center"); e.style.setProperty("mask-origin", "content-box"); e.style.setProperty("mask-clip", "content-box"); e.style.setProperty("object-position", "-100000px 0");
+  e.style.setProperty("mask-image", `url(${JSON.stringify(v)})`);
+  e.style.setProperty("mask-size", "var(--exact-tint-size,100% 100%)");
+  e.style.setProperty("mask-repeat", "no-repeat");
+  e.style.setProperty("mask-position", "var(--exact-object-position,50% 50%)");
+  e.style.setProperty("mask-origin", "content-box");
+  e.style.setProperty("mask-clip", "content-box");
+  e.style.setProperty("--exact-tint-offset", "-100000px 0");
+  e.style.setProperty("object-position", "var(--exact-tint-offset,var(--exact-object-position,50% 50%))");
   e.$template = true;
-  if (fit === "scale-down") { const set = () => { const cs = getComputedStyle(e); e.style.setProperty("--exact-tint-fit", e.naturalWidth <= e.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) && e.naturalHeight <= e.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) ? "auto" : "contain"); }; if (e.complete) set(); else e.addEventListener("load", set, { once: true }); }
+  if (!globalThis.__exactRender) tintFit(e);
 }
 function refresh() {
   if (typeof window === "undefined" || globalThis.__exactRender) return; // the render host's document answers no query and computes no style; the page's glue sizes its symbols
-  const symbols = [];
+  const symbols = [], rasters = [];
   for (const el of Images) {
     if (!el.isConnected) continue;
     if (el.$app === undefined && el.hasAttribute("data-app-src")) appSource(el, el.getAttribute("data-app-src"));
     if (el.hasAttribute("data-symbol-path")) symbols.push(el);
+    else if (el.$template) rasters.push(el);
   }
   // Batch reads before writes; computed styles are live, so keep only scalar values.
   const titles = symbols.flatMap(el => {
@@ -176,26 +196,25 @@ function refresh() {
   const configs = symbols.map(el => { const cs = getComputedStyle(el);
     return { el, point: parseFloat(cs.fontSize) * (parseFloat(cs.getPropertyValue("--exact-symbol-scale")) || 1), weight: Number(cs.fontWeight), objectFit: cs.objectFit }; });
   for (const { el, point, weight } of configs) {
-    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", key = `${path}:${filled}:${point}:${weight}:${box}:${el.hasAttribute("data-symbol-nonzero")}`;
+    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", source = el.getAttribute("data-symbol-source"), key = `${path}:${filled}:${point}:${weight}:${box}:${el.hasAttribute("data-symbol-nonzero")}:${source}`;
     // As the web host says it (glue.js `refreshSymbols`), once every role is here.
-    const source = el.getAttribute("data-symbol-source");
     if (!path && All === true && !source?.startsWith("symbol:sf/") && source !== "symbol:" && el.symbolRefusal !== source) {
       journal.push(`t=${clock.now} image ${source} refused: unknown symbol role`); el.symbolRefusal = source;
     }
     if (el.symbolKey !== key) {
       el.symbolKey = key; const stroke = 1.1 + (Math.max(100, Math.min(900, weight)) - 100) / 400;
       const paint = filled ? `fill="black" fill-rule="${el.hasAttribute("data-symbol-nonzero") ? "nonzero" : "evenodd"}"` : `fill="none" stroke="black" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"`;
-      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}" viewBox="${box}">${path.split(";").map(d => `<path d="${d}" ${paint}/>`).join("")}</svg>`)}")`;
-      el.symbolPlaceholder = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}"/>`)}`;
+      const [width, height] = symbolSize(box, point, source);
+      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" ${width === height ? `width="${width}" height="${height}" ` : ""}viewBox="${symbolBox(box).join(" ")}">${path.split(";").map(d => `<path d="${d}" ${paint}/>`).join("")}</svg>`)}")`;
+      el.symbolPlaceholder = symbolPlaceholder(width, height);
     }
-    if (el.getAttribute("src") !== el.symbolPlaceholder) el.src = el.symbolPlaceholder; el.style.setProperty("--exact-symbol-mask", el.symbolMask);
+    syncSymbolPlaceholder(el, refresh);
+    el.style.setProperty("--exact-symbol-mask", el.symbolMask);
   }
   // Sources can set intrinsic size synchronously; percentage padding must resolve against the resulting layout.
-  const fits = configs.map(({ el, point, objectFit }) => {
-    const cs = objectFit === "scale-down" ? getComputedStyle(el) : null;
-    const fits = cs && point <= el.clientWidth - (parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)) && point <= el.clientHeight - (parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom));
-    // `fill`, CSS's initial `object-fit`, keeps a symbol's aspect, as on the Apple hosts (LLP 1011 §4).
-    return [el, objectFit === "none" || (objectFit === "scale-down" && fits) ? `${point}px ${point}px` : objectFit === "scale-down" || objectFit === "fill" ? "contain" : objectFit];
-  });
-  for (const [el, fit] of fits) el.style.setProperty("--exact-symbol-fit", fit);
+  const fits = configs.map(({ el, point, objectFit }) => [el, ...symbolFit(el,
+    ...symbolSize(el.getAttribute("data-symbol-viewbox") || "0 0 24 24", point, el.getAttribute("data-symbol-source")), objectFit)]);
+  for (const [el, fit, position] of fits) { el.style.setProperty("--exact-symbol-fit", fit); el.style.setProperty("--exact-symbol-position", position); }
+  // A symbol's new intrinsic size can change the space its raster siblings have.
+  for (const el of rasters) tintFit(el);
 }

@@ -17,15 +17,28 @@ public final class CalculatedLength: Equatable {
         self.environment = environment
         self.context = context
     }
-    /// Interpret the private length wire only in a style, never app payloads.
+    /// Interpret the private length wire only in a style, never app payloads: a length, or a coordinate of
+    /// `object-position`. A value that holds no calculation keeps its storage, which the decoder shares between the
+    /// styles that repeat it (`StyleCache`).
     package static func decode(_ style: NodeStyle) -> NodeStyle {
         var resolved = style
         for (key, value) in style {
-            guard case .object(let object) = value,
-                  let calculation = CalculatedLength(object) else { continue }
-            resolved[key] = .calculation(calculation)
+            switch value {
+            case .object(let object):
+                if let calculation = CalculatedLength(object) { resolved[key] = .calculation(calculation) }
+            case .array(let coordinates) where coordinates.contains(where: isCalculation):
+                resolved[key] = .array(coordinates.map { coordinate in
+                    guard case .object(let object) = coordinate, let calculation = CalculatedLength(object) else { return coordinate }
+                    return .calculation(calculation)
+                })
+            default: break
+            }
         }
         return resolved
+    }
+    private static func isCalculation(_ value: BatchValue) -> Bool {
+        guard case .object(let object) = value else { return false }
+        return object["calc"] != nil
     }
     deinit { exact_calc_destroy(context) }
     public func length(basis: CGFloat) -> CGFloat { CGFloat(exact_calc_resolve(context, Double(basis))) }

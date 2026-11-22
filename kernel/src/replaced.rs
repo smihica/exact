@@ -187,6 +187,15 @@ pub(crate) fn symbol_role(arena: &NodeArena, slot: u32) -> Option<&str> {
         .strip_prefix("symbol:")
 }
 
+/// A template path supplies its own intrinsic aspect at the computed font size.
+pub(crate) fn template_size(arena: &NodeArena, slot: u32) -> Option<(f32, f32)> {
+    let icon = symbol_role(arena, slot).and_then(Icon::parse)?;
+    let em = arena
+        .computed_source(slot, crate::StyleId::FontSize)
+        .font_size;
+    icon.template_size(em)
+}
+
 /// The Apple system symbol a `symbol:` role draws: an `sf/<name>`'s own
 /// name, an icon token's SF Symbol (LLP 1121 D10), or a portable role's
 /// Apple name; "" for a role with none, which draws no glyph. A role is read
@@ -267,6 +276,12 @@ impl<'a> Icon<'a> {
         })
     }
 
+    /// A path-only template's intrinsic box; an SF Symbol keeps its host's metrics.
+    pub fn template_size(&self, em: f32) -> Option<(f32, f32)> {
+        (self.sf.is_empty() && !self.path.is_empty())
+            .then(|| crate::object::symbol_size(self.view_box, em))
+    }
+
     /// The file the Apple build rasterizes, when neither an SF Symbol nor
     /// a template path supplies the icon.
     pub fn apple_asset(&self) -> Option<&'a str> {
@@ -293,10 +308,11 @@ pub struct SymbolPath<'a> {
     pub d: &'a str,
     /// Filled, else stroked (a role's outline).
     pub filled: bool,
-    /// Filled even-odd (a `-fill` role's silhouette, or an icon whose SVG
-    /// says so, stage 14 C2), else nonzero.
+    /// Filled even-odd (a `-fill` role's silhouette in the table's own
+    /// paths, or an icon whose SVG says so, stage 14 C2), else nonzero.
     pub even_odd: bool,
-    /// Its viewBox, `min-x min-y width height`: a role's is `0 0 24 24`.
+    /// Its viewBox, `min-x min-y width height`: a role's is `0 0 24 24`,
+    /// Material's `0 -960 960 960`.
     pub view_box: &'a str,
 }
 
@@ -346,15 +362,23 @@ pub fn symbol_path_in(name: &str, set: SymbolSet) -> Option<SymbolPath<'_>> {
         SymbolSet::Fluent => Some("fluent"),
         SymbolSet::Material => Some("material"),
     };
-    let (d, filled) = match platform.and_then(|p| crate::generated::symbol_glyph(role, p)) {
+    let glyph = platform.and_then(|p| crate::generated::symbol_glyph(role, p));
+    let (d, filled) = match glyph {
         Some(glyph) => glyph,
         None => crate::generated::symbol(role).map(|(_, d, filled)| (d, filled))?,
     };
+    // Material's glyphs are its published paths: in its box, filled nonzero
+    // as SVG fills them.
+    let material = glyph.is_some() && set == SymbolSet::Material;
     Some(SymbolPath {
         d,
         filled,
-        even_odd: filled,
-        view_box: "0 0 24 24",
+        even_odd: filled && !material,
+        view_box: if material {
+            "0 -960 960 960"
+        } else {
+            "0 0 24 24"
+        },
     })
 }
 
@@ -460,7 +484,7 @@ mod tests {
         assert!(!fluent("back").filled && fluent("back").d != web("back").d);
         assert!(material("back").filled && material("back").d != web("back").d);
         for more in [fluent("more"), material("more")] {
-            assert!(more.filled && more.even_odd && more.d != web("more").d);
+            assert!(more.filled && more.d != web("more").d);
         }
         assert_ne!(fluent("more"), material("more"), "a row, and a column");
         assert_ne!(material("share"), web("share"));
@@ -475,6 +499,22 @@ mod tests {
         assert_eq!(symbol_path_in(&sf, SymbolSet::Fluent), Some(fluent("back")));
         let icon = "icon|chevron.backward|0 0 24 24|M0 0h1Z|icons/back.svg";
         assert_eq!(symbol_path_in(icon, SymbolSet::Material), symbol_path(icon));
+    }
+
+    /// LLP 1115.001 D14: Android draws every role in Material Symbols'
+    /// shape, its published path in its own box, filled nonzero.
+    #[test]
+    fn android_draws_every_role_in_material_symbols_shape() {
+        use super::{symbol_path_in, SymbolSet};
+        for &role in crate::generated::SYMBOL_ROLES {
+            let material = symbol_path_in(role, SymbolSet::Material).unwrap();
+            assert_ne!(material.d, symbol_path(role).unwrap().d, "{role}");
+            assert_eq!(
+                (material.filled, material.even_odd, material.view_box),
+                (true, false, "0 -960 960 960"),
+                "{role}"
+            );
+        }
     }
 
     /// A computed source spells a role as a literal may: by Apple's name or

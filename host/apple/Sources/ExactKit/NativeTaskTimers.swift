@@ -100,7 +100,7 @@ extension ExactSession {
     }
     /// A skipped batch's alerts and journal lines, written as `apply` writes them (LLP 1171 D1: never dropped).
     func logSkipped(_ batch: Batch) {
-        logAlerts(batch.alerts); logJournal(batch.journal)
+        reportAlerts(batch); logJournal(batch.journal)
         #if DEBUG
         onSkippedLogForTests?(batch.alerts, batch.journal)
         #endif
@@ -129,7 +129,7 @@ extension ExactSession {
         guard state != .destroyed, clock == nil, !ExactEnv.agentFreezes, !applying, !ownerInFlight,
               let timer = taskTimers.take() else { return }
         followOffset()
-        if ExactSession.asyncFills {
+        if postsTimerAdvances {
             advanceInFlight = true
             runtime.fireNativeTimerAsync(timer.row, now: timer.cutoff) { [weak self] completion in
                 self?.publish(.advance, completion)

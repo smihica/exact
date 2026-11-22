@@ -2,8 +2,8 @@
 
 ## Android 10 and Intl
 
-Android selects Intl from the validated bundle receipt. The pinned v6
-bundle enables it. A receipt enabling Hermes Intl must authenticate the
+Android selects Intl from the validated bundle receipt. The pinned v7
+bundles enable it. A receipt enabling Hermes Intl must authenticate the
 base, English and full ICU data tiers, as on Linux. `hermes-lean-sys` exports
 that availability to both the Ibex installer and Exact's Rust/C++ script lists.
 Only the selected data archive links; Exact selects English. The link directives
@@ -14,8 +14,7 @@ Stub builds emit empty Intl bytecode beside the other binding placeholders.
 The pinned Android bundle targets API 29. The resolver applies Android's ICU
 layout and receipt requirements to arm64 and x86_64. Local development bundles
 can be selected through `HERMES_LEAN_SYS_DIR_aarch64_linux_android` and
-`HERMES_LEAN_SYS_DIR_x86_64_linux_android`; the pinned v6 release supplies only
-Android arm64.
+`HERMES_LEAN_SYS_DIR_x86_64_linux_android`; the pinned v7 release supplies both.
 
 The installer’s `--check-dir <directory> <rust-triple>` validates a local cross
 bundle with the build resolver and cached host compiler, without installing or
@@ -96,7 +95,7 @@ with substituted Security calls; signed Keychain access still needs profiles.
 - Source trees: `crates/{ibex2,ibex2-sqlite,hermes-lean-sys,hermes-lean-sys-installer}`.
 - Data inputs: `scripts/icu74-filter-{root-en,en-intl}.json` and
   `third_party/wpt/urltestdata.json`.
-- Hermes bundle is `hermes-vanilla-d412d3bd8512-v6`, source
+- Hermes bundle is `hermes-vanilla-d412d3bd8512-v7`, source
   `d412d3bd…` / Hermes `260318099.0.4`. Repository engine-output directories
   remain absent; builds validate the paired compiler and VM in the bundle cache.
 - The two standalone `Cargo.lock` files under `ibex2` and
@@ -1068,7 +1067,7 @@ checkpoints and task delivery. These changes adopt the consumer contract from
 upstream `6ce0bf09495cee43fdc9fb2ee00ca5520796d2ef`: Hermes heap OOM requires
 immediate adapter and runtime destruction, without JavaScript, job draining or
 collection. Exact's shim recognizes that exception only when the bundle receipt
-enables exception-on-OOM and RTTI. The pinned v6 release enables both.
+enables exception-on-OOM and RTTI. The pinned v7 release enables both.
 Exact's heap tests exercise retirement and replacement with the published bundle,
 including timers, stream mappers, worker placement and in-flight storage.
 
@@ -1255,3 +1254,23 @@ reads it and gives the app the other two, so `storage.d.ts` leaves it out.
 exact2's web worker answers alike. `src/tests.rs` covers each statement
 kind, and exact2's `exact-js` `topics` test what announces. Replay on a
 refresh.
+
+## Windows recursive removal
+
+On filesystems that support POSIX disposition, a reader can keep its open
+handle while `fs.rm` removes the file's name and its parent directory.
+A recursive removal visits the other entries even when one is locked. It
+retries a sharing violation or a nonempty directory for five short intervals
+before returning the Windows error (expo/exact#1096).
+
+## Local storage without a network transport
+
+`Host::without_network` keeps the stores, filesystem providers and grants of
+a local consumer. Its HTTP and WebSocket bindings report the capability as
+unavailable. Exact gives this host to its Hermes storage context. The runner
+executes the app’s network work on a separate host with its own transports.
+
+## Standalone HTTP binding
+
+`Fetch::new` binds grants to a supplied HTTP transport. Exact's driver uses
+it for a fixture response without constructing a WebSocket client or stores.

@@ -1,6 +1,7 @@
 package dev.exact.reference
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,6 +25,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -32,6 +34,7 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
@@ -39,6 +42,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
@@ -87,6 +91,20 @@ private fun Inline(id: String) {
         "text-field-focused" -> Field("Moby-Dick", focused = true)
         "filled-button" -> Button(onClick = {}) { Text("Save") }
         "filled-button-disabled" -> Button(onClick = {}, enabled = false) { Text("Save") }
+        "outlined-button" -> OutlinedButton(onClick = {}) { Text("Save") }
+        "tonal-button" -> FilledTonalButton(onClick = {}) { Text("Save") }
+        "tonal-button-disabled" -> FilledTonalButton(onClick = {}, enabled = false) { Text("Save") }
+        "text-button" -> TextButton(onClick = {}) { Text("Save") }
+        "filled-button-icon" -> Button(onClick = {}, contentPadding = ButtonDefaults.ButtonWithIconContentPadding) {
+            Icon(Icons.Filled.Add, contentDescription = null, Modifier.size(ButtonDefaults.IconSize))
+            Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+            Text("Add")
+        }
+        "text-button-icon" -> TextButton(onClick = {}, contentPadding = ButtonDefaults.TextButtonWithIconContentPadding) {
+            Icon(Icons.Filled.Add, contentDescription = null, Modifier.size(ButtonDefaults.IconSize))
+            Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+            Text("Add")
+        }
         "checkbox-checked" -> Checkbox(checked = true, onCheckedChange = {})
         "checkbox-unchecked" -> Checkbox(checked = false, onCheckedChange = {})
         "radio-selected" -> RadioButton(selected = true, onClick = {})

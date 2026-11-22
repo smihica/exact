@@ -1,6 +1,5 @@
 # Recipe: motion
 
-
 ```contract
 keyframes rise
   from opacity=0 translate="0px 8px"
@@ -40,27 +39,26 @@ component App
 
 - **Animates:** translate, scale, rotate, opacity, colours, `box-shadow`, SVG geometry,
   numeric `height`, `font-weight`, `font-stretch`, `font-variation-settings`, `filter`
-  (transitions). Layout: `-exact-layout-transition`. Native `button`: opacity,
-  transforms.
+  (transitions). Native `button`: opacity and transforms.
 - **Spring:** `-exact-spring(stiffness, damping, mass)`: transition timing, no duration;
   not `animation`.
-- **Hover scale:** `:hover`, `:focus-visible`: `scale=1.08` with
-  `transition="scale 150ms ease"`; paint and hits grow, layout stays.
+- **Hover scale:** `scale=1.08 transition="scale 150ms ease"` on `:hover` or
+  `:focus-visible` grows paint and hits.
 - **Keyframes:** literals or app `fn` on constants.
-- **Exit:** an `if` arm or `for` row leaves layout at once, inert, and must end; siblings use
-  layout transitions. Not in a popped screen or on Linux, Windows or Android.
-- **Routes:** `::view-transition-new` / `::view-transition-old` take `animation=`:
-  opacity, translate, scale, rotate keyframes. `none` cuts; unset is the platform's.
-  Not on sheets or zooms.
+- **Exit:** an `if` arm or `for` row leaves layout and becomes inert at once.
+  Give the exit an end. Siblings use layout transitions. Apple and web outside popped screens.
+- **Routes:** `::view-transition-new` / `::view-transition-old` animate opacity,
+  translate, scale and rotate. `animation="none"` cuts. Modal sheets and routes
+  with a literal nonempty `navigationSource` reject these parts.
 - **Layout:** surfaces move/resize; children jump, unscaled. `sharedElement=` flies
   except on Linux/Windows; Android: in-page only, no native dialogs.
-- **Zoom:** `navigationSource=` names an underlying `id`: UIKit's zoom on iOS 18;
-  Android's whole-route container transform on push/fullscreen, back to a visible
-  source. Missing/hidden/clipped/off-screen: push uses shared axis, fullscreen cuts.
-  No sheets.
-- **Expand/collapse:** as above; an `if` row appears full size, siblings slide over.
-- **JS target:** bound exit/layout values must be binding literals.
+- **Zoom:** `navigationSource=` names a source `id` for iOS 18 zoom or Android's
+  container transform. Without a visible source, push uses shared axis and
+  fullscreen cuts. Sheets have their own motion.
+- **Expand/collapse:** an `if` row appears full size and siblings slide over.
+- **JS target:** exit/layout bindings must be literals.
 - **Stagger:** delays; `after(ms, action)`.
-- **Reduced motion:** gate on `exactViewport()`; drive `prefer prefers-reduced-motion reduce`.
-  Flights land; routes cut.
-- **Check:** `clock settle`; `screenshot .exact/m.png over 600 every 50` films motion.
+- **Reduced motion:** `exactViewport()` and `prefer prefers-reduced-motion reduce`.
+  Flights land and routes cut.
+- **Check:** `clock settle` or `screenshot .exact/m.png over 600 every 50`.
+  Android reader drives refuse film. Layers need `--live` or a normal run. Record with `adb shell screenrecord`.

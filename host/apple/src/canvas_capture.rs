@@ -22,7 +22,7 @@ pub(crate) struct PendingCapture {
 impl<D: DataSource> Host<D> {
     /// Surface work for the presenter: a canvas capture as its own op, any
     /// other as `Batch::surface_work`.
-    pub fn surface_work(
+    pub(crate) fn canvas_surface_work(
         &mut self,
         presenter: &mut crate::batch::Batch,
         r: &RequestOut,
@@ -52,9 +52,16 @@ impl<D: DataSource> Host<D> {
     pub(crate) fn drain_canvas_captures(&mut self, batch: &mut crate::batch::Batch) {
         for (r, refusal) in std::mem::take(&mut self.canvas_capture_waiting) {
             if self.runner.holds(r.ticket) {
-                self.surface_work(batch, &r, refusal.as_deref());
+                self.canvas_surface_work(batch, &r, refusal.as_deref());
             }
         }
+    }
+
+    /// At a turn's end: the captures that waited for their canvas's draw,
+    /// then the captures whose requests are gone let go.
+    pub(crate) fn canvas_captures_turn(&mut self, batch: &mut crate::batch::Batch) {
+        self.drain_canvas_captures(batch);
+        self.forget_canvas_captures();
     }
 
     pub(crate) fn forget_canvas_captures(&mut self) {

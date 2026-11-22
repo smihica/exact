@@ -38,21 +38,20 @@ Contract, assets and `app.ts`. A new grant or native code needs a new binary
    EXACT_UPDATE_TRUST=production EXACT_UPDATE_GENESIS=1 bun exact.mjs android --release
    ```
 
-4. **Commit, then publish.** A dry run prints what each stream takes;
-   `--yes` publishes:
+4. **Start the stream.** After a genesis build, run
+   `bun exact.mjs push --origin ../origin`. `--origin` names the directory
+   the channel serves. Omit it for `"appdrop"`.
+5. **Publish later edits.** Run `push` again (`--watch` pushes on save) or
+   deploy a snapshot:
 
    ```sh
    bun exact.mjs deploy --dirty --origin ../origin
    bun exact.mjs deploy --dirty --origin ../origin --yes
    ```
 
-   `--origin`, here and in step 5, is the directory the channel URL serves;
-   omit it for `"appdrop"`. `--dirty` publishes the working tree, uncommitted
-   edits too, and lists them; an app outside the checkout is refused without
-   it.
-5. **Send an edit now.** `bun exact.mjs push --origin ../origin` publishes
-   the working tree in seconds (`--watch`: on each save) and refuses what
-   needs a new binary.
+   `--dirty` includes working-tree edits and is required for apps outside
+   the checkout. On Apple and Linux, `deploy` starts a new stream from an
+   analysis bake for a subsequent release build.
 6. **Offer it.** `staged` is true while a downloaded update waits:
 
 ```contract

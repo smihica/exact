@@ -10,6 +10,159 @@ use super::*;
 use exact_runner::{DataError, DataSource, Runner};
 
 #[test]
+fn video_fit_distinguishes_an_absent_declaration_from_an_authored_clear() {
+    for (declaration, expected) in [
+        ("", "contain"),
+        (r#"object-fit="unset""#, "fill"),
+        (r#"object-fit="""#, "fill"),
+        (r#"object-fit="fill""#, "fill"),
+        (r#"object-fit="cover""#, "cover"),
+    ] {
+        let source = format!(
+            "component App\n  view\n    video testId=\"video\" width=160 height=80 {declaration}\n"
+        );
+        let plan = contract::compile(&source).unwrap().encode();
+        let (host, boot) = crate::Host::boot(
+            &plan,
+            NoData,
+            Box::new(exact_kernel::MonospaceMeasurer::default()),
+            400.,
+            800.,
+        )
+        .unwrap();
+        let kernel = host.runner().kernel();
+        let node = kernel
+            .node_by_key(kernel.find_by_test_id("video")[0])
+            .unwrap();
+        assert_eq!(
+            node.style.written.has(StyleId::ObjectFit),
+            !declaration.is_empty()
+        );
+        let batch: serde_json::Value = serde_json::from_str(&boot).unwrap();
+        let style = batch["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|op| op.get("style"))
+            .next_back()
+            .unwrap();
+        assert_eq!(
+            style["object_fit"].as_str().unwrap_or(""),
+            expected,
+            "{declaration}: {boot}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_object_position_coordinate_resets_both_axes() {
+    for (css, expected) in [
+        (
+            "var(--missing) 75%",
+            serde_json::json!([{"pct": 50}, {"pct": 50}]),
+        ),
+        (
+            "25% var(--missing)",
+            serde_json::json!([{"pct": 50}, {"pct": 50}]),
+        ),
+        (
+            "var(--missing, right) bottom",
+            serde_json::json!([{"pct": 100}, {"pct": 100}]),
+        ),
+        ("var(--missing, 7px 11px)", serde_json::json!([7, 11])),
+        (
+            "var(--missing, var(--other, right bottom))",
+            serde_json::json!([{"pct": 100}, {"pct": 100}]),
+        ),
+        (
+            "var(--missing, 25%) 75%",
+            serde_json::json!([{"pct": 25}, {"pct": 75}]),
+        ),
+    ] {
+        let mut style = StyleProps::default();
+        style
+            .set_dynamic(StyleId::ObjectPosition, &StyleValue::Text(css.into()))
+            .unwrap();
+        let env = Env {
+            properties: Some(Default::default()),
+            ..Env::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&style_json(&style, &env).0).unwrap();
+        assert_eq!(json["object_position"], expected, "{css}");
+    }
+}
+
+#[test]
+fn object_position_resolves_viewport_lengths_before_serializing() {
+    let plan = contract::compile(r#"component App
+  view
+    image "symbol:star" width=160 height=80 object-fit="none" object-position="calc(10vw) calc(20vh)"
+"#).unwrap().encode();
+    let (mut host, boot) = crate::Host::boot(
+        &plan,
+        NoData,
+        Box::new(exact_kernel::MonospaceMeasurer::default()),
+        400.,
+        800.,
+    )
+    .unwrap();
+    let position = |batch: &str| {
+        let json: serde_json::Value = serde_json::from_str(batch).unwrap();
+        json["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|op| op["style"].get("object_position").cloned())
+    };
+    let resized = host.resize(600., 300.);
+    assert_eq!(
+        position(&boot),
+        Some(serde_json::json!([40, 160])),
+        "{boot}"
+    );
+    assert_eq!(
+        position(&resized),
+        Some(serde_json::json!([60, 60])),
+        "{resized}"
+    );
+}
+
+#[test]
+fn object_position_relative_units_follow_the_viewport_and_root_font() {
+    for (css, initial, resized, scaled) in [
+        ("10vw 20vh", [40, 160], [60, 60], [60, 60]),
+        ("1rem 2rem", [16, 32], [16, 32], [20, 40]),
+        ("1em 2em", [16, 32], [16, 32], [20, 40]),
+    ] {
+        let source = format!("component App\n  view\n    image \"symbol:star\" width=160 height=80 object-position=\"{css}\"\n");
+        let plan = contract::compile(&source).unwrap().encode();
+        let (mut host, boot) = crate::Host::boot(
+            &plan,
+            NoData,
+            Box::new(exact_kernel::MonospaceMeasurer::default()),
+            400.,
+            800.,
+        )
+        .unwrap();
+        let mut current = serde_json::Value::Null;
+        for (batch, expected) in [
+            (boot, initial),
+            (host.resize(600., 300.), resized),
+            (host.set_root_font_size(20.), scaled),
+        ] {
+            let json: serde_json::Value = serde_json::from_str(&batch).unwrap();
+            for op in json["ops"].as_array().unwrap() {
+                if let Some(position) = op["style"].get("object_position") {
+                    current = position.clone();
+                }
+            }
+            assert_eq!(current, serde_json::json!(expected), "{css}: {batch}");
+        }
+    }
+}
+
+#[test]
 fn field_sizing_reaches_native_control_measurement() {
     for sizing in ["content", "fixed"] {
         let mut style = StyleProps::default();
@@ -279,4 +432,54 @@ fn basic_clips_cross_as_relative_geometry() {
             "shape": "polygon", "values": [4,0,0,25,0,100,0,0,0,0,0,100], "rule":"evenodd"
         })
     );
+}
+
+#[test]
+fn a_scrollers_d14_rows_cross_by_name_in_points_and_words() {
+    // @ref LLP 1123 D14 — as `ScrollInsetsIOS.Rows(style:)` reads them: lengths in points, a
+    // negative one kept, the policies by their words
+    let source = "component App\n  view\n    column testId=\"list\" overflow-y=\"scroll\" -exact-scroll-content-inset=\"10 -20 30 40\" -exact-scroll-inset-adjustment=\"scrollable-axes\" -exact-scroll-indicator-adjustment=\"none\" -exact-scroll-vertical-indicator-insets=\"1 2 3 4\" -exact-scroll-horizontal-indicator-insets=\"5 6 7 8\"\n      text \"a\"\n";
+    let plan = contract::compile(source).unwrap().encode();
+    let (_host, boot) = crate::Host::boot(
+        &plan,
+        NoData,
+        Box::new(exact_kernel::MonospaceMeasurer::default()),
+        400.,
+        800.,
+    )
+    .unwrap();
+    let batch: serde_json::Value = serde_json::from_str(&boot).unwrap();
+    let style = batch["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|op| op.get("style"))
+        .find(|style| style.get("scroll_inset_adjustment").is_some())
+        .unwrap();
+    let insets = ["top", "right", "bottom", "left"]
+        .map(|e| style[format!("scroll_content_inset_{e}")].as_f64());
+    assert_eq!(
+        insets,
+        [Some(10.0), Some(-20.0), Some(30.0), Some(40.0)],
+        "{style}"
+    );
+    let indicators = ["top", "right", "bottom", "left"]
+        .map(|e| style[format!("scroll_vertical_indicator_insets_{e}")].as_f64());
+    assert_eq!(
+        indicators,
+        [Some(1.0), Some(2.0), Some(3.0), Some(4.0)],
+        "{style}"
+    );
+    let horizontal = ["top", "right", "bottom", "left"]
+        .map(|e| style[format!("scroll_horizontal_indicator_insets_{e}")].as_f64());
+    assert_eq!(
+        horizontal,
+        [Some(5.0), Some(6.0), Some(7.0), Some(8.0)],
+        "{style}"
+    );
+    assert_eq!(
+        style["scroll_inset_adjustment"].as_str(),
+        Some("scrollable-axes")
+    );
+    assert_eq!(style["scroll_indicator_adjustment"].as_str(), Some("none"));
 }

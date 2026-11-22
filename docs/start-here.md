@@ -49,6 +49,7 @@ For an SDK-named folder such as `exact`, `--name Everbloom` supplies the crate p
 a prefix that still collides gains `-app`. The prefix stays in `package.json`'s `name` across
 updates and directory renames. Authored host crates keep their own names.
 `bun <exact2>/scripts/exact.mjs setup` takes a few minutes, a first macOS or iOS build ten to fifteen on a laptop, later builds a minute or two.
+A machine without Rust can check a Contract and TypeScript app and build it for the web with matching prebuilt tools. From the app directory, `bun <exact2>/scripts/exact.mjs setup --check --platform web` reports the tools available for this checkout. Native builds and apps containing Rust need the Rust toolchain.
 Before a platform's first build, `bun <exact2>/scripts/exact.mjs setup --check --platform ios` (or `macos`, `android`, …) names what it lacks, the Xcode it needs among them: `exact new`'s table shows the web's rows alone. A build for a phone (`share`, `ios --device`) needs more than a simulator's: add `--device`.
 Run each once and let it finish, in the background with a completion notification if your tool has one, rather than polling its log.
 
@@ -66,10 +67,10 @@ an untouched starter is replaced, but an edited or manually emptied file needs
 Your shell commands have no such help, so keep one directory.
 |`bun exact.mjs …`|What it does|
 |---|---|
-|`contract build app.contract --json --errors-only`|A CI gate: `[]` and exit zero mean no errors (omit `--errors-only` to include warnings); it rewrites the types `app.ts` imports and type-checks it.|
+|`contract build app.contract --json --errors-only`|A CI gate: `[]` and exit zero mean no errors (omit `--errors-only` for every unaccepted lowering warning); it rewrites the types `app.ts` imports and type-checks it.|
 |`verify`, `verify ios`|Builds, runs `app.test.contract` and each other `*.test.contract` beside it, `check`s the first screen and where each test ends (light, dark, two widths), reads each of those screens' accessibility tree once (`tree --ax`: a control with no name, or one a screen reader reaches though hidden or behind an open modal; counted as `check`'s findings are), relaunches once on real time, and reads those screens (on the web, also the ones the tests pass through) at the largest text size, where what spills is the app's layout to fix (the web comparison leaves out content iOS projects into its navigation bar and its tab bar, whose items UIKit keeps at one size), with a remedy that keeps the text's size (no `line-clamp` in a list's row; `hyphens="auto"` only on a text of one word, which a UILabel breaks between syllables when it is longer than its line); `verify ios` also plays real touches on a long list on the first screen, once per build, and says `scrolling: like UIKit` or what a person would notice, each with UIKit's value and its cause, counting only what the app can fix: one report. A clean run on the app's platform is done.|
 |`agent web --storage s1 "clock data" "tap add" "check both"`|Drives the app by hand, to see why something fails; `--keep-storage` reopens saved data.|
-|`web`, `ios --run`, `windows --run`|For a person watching: its URL, rebuilds on save; a simulator; a window (from SSH, on the signed-in desktop). A second web loop of the same target for this app refuses, naming the first URL and PID.|
+|`web`, `ios --run`, `android --run --url <url>`, `windows --run`|For a person watching: its URL, rebuilds on save; a simulator; an Android device following `web`'s live loop without rebuilding the APK on each edit; a window (from SSH, on the signed-in desktop). A second web loop of the same target for this app refuses, naming the first URL and PID.|
 |`share`|For a person to try an iPhone app on their own phone: prints an AppDrop link that installs it. Run it when the app is ready for them, and again after each change they should see; send the link it prints.|
 
 An unanswered modal system alert gets one `verify` finding. The screen beneath it is left unjudged,
@@ -80,6 +81,10 @@ including at the largest text size; answer the alert before the test ends to che
 DejaVu Sans with no frame; `verify windows` also captures the app as it opens on the desktop (`windows-window.png`):
 judge the look from that one. Windows uses ink by default, or CPU when the manifest declares `game`; `host.windows.painter: "ink"` or `"cpu"` selects either painter. `EXACT_PAINTER` overrides either choice. Headless drives explicitly use CPU unless overridden ([painter choices](reference.md#windows-painter)). A screenshot path with a space is quoted: `"screenshot 'C:\a b\x.png'"`. A screen you
 want checked or captured is a test's end; a drive takes any others (`resize`, `prefer …`, `screenshot`).
+To accept a lowering warning at one site, put `// exact-accept lower-symbol-alias` on the line
+immediately above the reported line, using the warning’s ID. Separate multiple IDs with spaces.
+Other sites still report that warning. Text builds show the first 20 ranked warnings after acceptance.
+
 Create seam types once with `bun exact.mjs contract types app.contract -o app.contract.d.ts`.
 `contract build`, development web builds, and native development builds (`ios`,
 `mac`, `linux`, `windows`, `android`, and `verify android`) refresh that declaration
@@ -157,10 +162,13 @@ required tool, device or simulator is unavailable, report that target as unteste
 |---|---|---|
 |Web|`bun exact.mjs verify web`|`bun exact.mjs web`|
 |iOS|`bun exact.mjs verify ios`|`bun exact.mjs ios --run`|
-|Android|`bun exact.mjs verify android`|`bun exact.mjs android --run`|
+|Android|`bun exact.mjs verify android`|Start `bun exact.mjs web`, then run `bun exact.mjs android --run --url http://127.0.0.1:8765/` in another terminal.|
 |Windows|`bun exact.mjs verify windows`|`bun exact.mjs windows --run`|
 |macOS|`bun exact.mjs test macos`, then `bun exact.mjs agent macos --chrome platform "clock data" "screenshot .exact/mac.png window"` (`check` is the web's and iOS's)|`bun exact.mjs mac --run`|
-|Linux|`bun exact.mjs linux`, then `bun exact.mjs test linux`|The Linux host is headless; inspect it with `bun exact.mjs agent linux tree` after building.|
+|Linux|`bun exact.mjs linux`, then `bun exact.mjs test linux`|Run the binary the build prints from a Wayland desktop to open a window, or from a DRM/KMS console for full screen. For a headless screenshot, run `bun exact.mjs agent linux "screenshot .exact/linux.png"`.|
+
+For Android live iteration, use the port the web loop prints. Saving a Contract
+or `app.ts` edit updates the running app without rebuilding the APK.
 
 A bare `bun exact.mjs verify`, `test` or `agent` runs on a target `app.json` names:
 the web when it names the web or nothing, else the first that runs on this machine (iOS,
@@ -217,6 +225,7 @@ For EAS Build, use [iOS](recipes/eas-ios.md) or [Android](recipes/eas-android.md
 |dice, a shuffle, a random pick or name (Contract has no `random()`: copy the recipe's `roll`)|`random-rolls`, `random-and-shuffle`|
 |location, or anything the person must allow|`permissions`|
 |another wide layout, a chart|`web-look`, `responsive-columns`, `content-design`|
+|a mini player above the tab bar (UIKit's tab bar accessory on iOS 26 and later)|`mini-player`|
 |a video, a looping hero clip, a song (the `video` and `audio` elements, with a `poster`)|["Sound, MIDI and media"](contract-for-agents.md#sound-midi-and-media)|
 |a map, the camera (drawing is boxes and SVG, not Swift)|`native-views`|
 |calibration for an open camera track, from a package|[`camera-calibration`](recipes/camera-calibration.md)|
@@ -234,6 +243,7 @@ For EAS Build, use [iOS](recipes/eas-ios.md) or [Android](recipes/eas-android.md
 |brand colours, light and dark, icon tokens|`theme`, `forma`|
 |an icon: in a button, a tab, beside a label (a symbol, never a character such as ▦ ☏ ★ or an emoji)|`symbols`|
 |a module in Swift that `app.ts` asks (a resource that reads `native.available` or calls `native.call` keeps its answer across launches); a value a launch gives is a setting, not a module (`contract vocab env`)|`native-module`|
+|a WGSL fragment shader on a canvas, including a Shadertoy port|`gpu-shader`|
 |a canvas drawn in Rust on the GPU (a `Surface`): a crate beside app.json, in a workspace exact2 generates|`gpu-module`|
 |a GPU module whose crates call into Java on Android: the app's Java VM and `Context`|`gpu-module-android`|
 |data answered in Rust instead of `app.ts` (`exact new --rust`, app.json's `rust.data`)|`bun exact.mjs docs Rust data sources`|
@@ -371,7 +381,7 @@ works (`new Date(ms)`, `Intl.DateTimeFormat`). `console.log` appears in the agen
 `logs`, its last lines in a failed test’s notes, and the device’s log, in a release build too,
 where anyone with the device can read it: keep tokens and personal data out of it. It imports its own `.ts`/`.js` and pure-JS npm
 packages (ESM or CommonJS, a `browser` build first); one needing Node (`fs`, `Buffer`), the DOM or a native
-addon is refused by name. Type an untyped one with `@types/<name>` or `declare module '<name>';` in a `.d.ts`.
+addon — or calling forbidden globals such as `Date.now`, `setInterval`, `window`, `document`, `navigator`, or `process` anywhere in `node_modules` — is refused by name. Type an untyped one with `@types/<name>` or `declare module '<name>';` in a `.d.ts`.
 
 ```ts
 import type { Answer, Result, Sources, Storage } from './app.contract.d.ts';

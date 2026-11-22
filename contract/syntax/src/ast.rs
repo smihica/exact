@@ -1,7 +1,7 @@
 //! The abstract syntax tree.
 pub use crate::colours::{ColorProfileDecl, DesignSource, ThemeDecl};
 pub use crate::tap::TapForm;
-pub use crate::test_steps::{StateComparison, StateOperand, Step, TestDecl};
+pub use crate::test_steps::{LayoutOperand, StateComparison, StateOperand, Step, TestDecl};
 use crate::Span;
 use std::collections::BTreeMap;
 /// Identifier ranges that are distinct from their AST construct's diagnostic span.
@@ -12,6 +12,9 @@ pub struct NameSpans {
     pub names: BTreeMap<Span, Span>,
     /// Data source name in a resource or send, keyed by its construct.
     pub sources: BTreeMap<Span, Span>,
+    /// Authored view ranges for focused symbol lookups, keyed by control
+    /// keyword, attribute name or positional expression span.
+    pub view_ranges: BTreeMap<Span, (Span, Span)>,
 }
 impl NameSpans {
     /// The exact identifier range, or the construct when it already names a token.
@@ -199,6 +202,10 @@ pub struct PropertyDecl {
     pub name: String,
     /// Predicates in source order.
     pub lines: Vec<PropertyLine>,
+    /// For `after` and `never refuses`, the expanded root's names of the
+    /// action named: the name as written, until the app resolves a child's
+    /// `Component.action` to the action of each of its instances.
+    pub actions: Vec<String>,
 }
 /// The observations a property quantifies over.
 #[derive(Debug, Clone, PartialEq)]
@@ -512,13 +519,20 @@ impl Component {
 pub struct Persist {
     /// The state's name.
     pub name: String,
+    /// Whether this value belongs to one window.
+    pub window: bool,
     /// Where `persist` is written.
     pub span: Span,
 }
 impl Component {
+    /// The state's storage declaration, when it has one.
+    pub fn persistence(&self, name: &str) -> Option<&Persist> {
+        self.persist.iter().find(|p| p.name == name)
+    }
+
     /// Whether the state `name` says `persist`.
     pub fn persists(&self, name: &str) -> bool {
-        self.persist.iter().any(|p| p.name == name)
+        self.persistence(name).is_some()
     }
 }
 /// `name = expr`.
@@ -878,6 +892,8 @@ pub enum Node {
         /// root's own elements are 0, a used component's are its use's;
         /// 0 as parsed. The development map and refusal diagnostics read it.
         instance: u32,
+        /// The local source step in the expansion, absent on a generated element.
+        place: Option<u32>,
     },
     /// `Name(arg=expr, …)`, with the nodes indented under it filling the
     /// component's `slot` (LLP 1017 P4b).
@@ -1234,6 +1250,13 @@ pub enum TemplatePart {
 }
 
 impl Expr {
+    /// A shape built in place, `Shape(key=value, …)`: a call whose arguments are all
+    /// named, at least one of them. Observe's commands send its fields by name.
+    pub fn constructs_shape(&self) -> bool {
+        matches!(self, Expr::Call(_, args, _)
+            if !args.is_empty() && args.iter().all(|a| matches!(a, Expr::NamedArg(..))))
+    }
+
     /// Where.
     pub fn span(&self) -> Span {
         match self {

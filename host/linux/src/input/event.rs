@@ -9,12 +9,16 @@ pub enum InputEvent {
     /// The pointer is at a fraction of the screen (an absolute device — a
     /// tablet, a KVM's mouse): `None` on an axis that did not move.
     Absolute(Option<f32>, Option<f32>),
-    /// A touchscreen contact, in normalized panel coordinates.
+    /// The touchscreen position in normalized panel coordinates.
     Touch(Option<f32>, Option<f32>),
-    /// A touchscreen contact began or ended.
-    TouchButton(bool),
-    /// The primary button went down (`true`) or up.
-    Button(bool),
+    /// Primary mouse down at the device report's time, or at receipt for VNC.
+    MouseDown(std::time::SystemTime),
+    /// The touchscreen made contact.
+    TouchDown,
+    /// The touchscreen contact was released.
+    TouchUp,
+    /// The primary mouse button was released.
+    ButtonUp,
     /// The secondary (2), middle (4), back (8) or forward (16) button, by
     /// its `PointerEvent.buttons` bit, went down (`true`) or up. Back and
     /// Forward are the last two's default action on their release (LLP

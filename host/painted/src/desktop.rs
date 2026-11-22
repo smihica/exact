@@ -22,6 +22,29 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+/// The XDG appearance setting for the lifetime of a desktop window.
+#[cfg(target_os = "linux")]
+pub struct Appearance {
+    /// The initial preference when the portal answered before first paint.
+    pub initial: Option<bool>,
+    pub(crate) socket: std::os::unix::net::UnixStream,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Appearance {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Report the initial dark or light preference and subsequent portal changes.
+/// A value of `None` restores the host default.
+#[cfg(target_os = "linux")]
+pub fn watch_appearance(changed: impl Fn(Option<bool>) + Send + 'static) -> Option<Appearance> {
+    let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()?;
+    crate::portal::watch_appearance(&address, changed)
+}
+
 /// Why a chord is not registered, in `@exact/global-shortcuts`' words.
 pub type Refusal = &'static str;
 

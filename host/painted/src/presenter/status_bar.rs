@@ -9,6 +9,7 @@ pub(super) struct Choice {
     pub style: &'static str,
     pub source: Option<ViewId>,
     pub light_icons: bool,
+    pub navigation_light_icons: bool,
     /// Whether the system bars give way, and the declaration that decided it.
     pub hidden: bool,
     pub hidden_source: Option<ViewId>,
@@ -77,10 +78,14 @@ impl<D: DataSource> Presenter<D> {
             style: "default",
             source: None,
             light_icons: self.dark(),
+            navigation_light_icons: self.dark(),
             hidden: false,
             hidden_source: None,
         };
-        if !kernel.has_prop(PropId::StatusBarStyle) && !kernel.has_prop(PropId::SystemBarsHidden) {
+        if !kernel.has_prop(PropId::StatusBarStyle)
+            && !kernel.has_prop(PropId::SystemBarsHidden)
+            && !kernel.has_prop(PropId::NavigationBarStyle)
+        {
             return choice;
         }
         let ranks: BTreeMap<_, _> = kernel
@@ -139,11 +144,6 @@ impl<D: DataSource> Presenter<D> {
                 .copied()
                 .find(|&id| declares(id) && self.status_bar_shows(id))
         };
-        let style = |id| {
-            kernel
-                .node(id)
-                .and_then(|n| n.props.str(PropId::StatusBarStyle))
-        };
         let hidden = |id| {
             kernel
                 .node(id)
@@ -151,10 +151,11 @@ impl<D: DataSource> Presenter<D> {
         };
         // Invalid bound values are unset, so an earlier valid declaration
         // can still win, as on iOS.
-        if let Some(id) =
-            winner(&|id| matches!(style(id), Some("light-content" | "dark-content" | "auto")))
-        {
-            (choice.style, choice.light_icons) = match style(id) {
+        let bar_style = |prop| {
+            let style = |id| kernel.node(id).and_then(|node| node.props.str(prop));
+            let id =
+                winner(&|id| matches!(style(id), Some("light-content" | "dark-content" | "auto")))?;
+            let (resolved, light) = match style(id) {
                 Some("light-content") => ("light-content", true),
                 Some("dark-content") => ("dark-content", false),
                 _ => match self.status_bar_scheme(id) {
@@ -163,7 +164,15 @@ impl<D: DataSource> Presenter<D> {
                     None => ("default", self.dark()),
                 },
             };
+            Some((id, resolved, light))
+        };
+        if let Some((id, style, light)) = bar_style(PropId::StatusBarStyle) {
             choice.source = Some(id);
+            choice.style = style;
+            choice.light_icons = light;
+        }
+        if let Some((_, _, light)) = bar_style(PropId::NavigationBarStyle) {
+            choice.navigation_light_icons = light;
         }
         // `false` is a declaration too: it shows the bars an ancestor hides.
         if let Some(id) = winner(&|id| hidden(id).is_some()) {

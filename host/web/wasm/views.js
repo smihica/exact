@@ -1,3 +1,5 @@
+import { symbolBox, symbolSize, symbolPlaceholder, syncSymbolPlaceholder, symbolFit, tintFit } from "../symbol-geometry.js";
+import { downForDrag, elementOf, observeDragInput, pressedAt } from "../drag-input.js";
 import { picker, track, iframeLoading, localAssetURL, host, loadAfterPaint, moduleReady, views, writeIn, now, afterNativePaint, log, retiredViews, lists, root, encoder, readOut, imageProbes, inflight, IMAGE_ERROR, CORS_ERROR, heldValues, composing, loadDecorations, markupPending, scrollDocs, followScroll, pendingScrolls, DATA_LIMIT, authoredDisabled, holdWake, holdOrientation } from "../glue.js";
 import { pageGivenFiles, commitGuestOrigin, frameURL, refuseURL, valuedControl, renderMarkup, editMenu, inertAncestor, contextAt, liveById, navigates, navigableURL, dataURL, settleValue } from "../navigation.js";
 import { send } from "./commit.js";
@@ -140,19 +142,6 @@ export function forgetList(el) {
   host.listSelection?.forget(el);
   lists.delete(el);
 }
-// A tinted raster's `scale-down` (element.rs `host_css`, LLP 1011 §3): `contain` unless its natural size fits the content box, known once it loads.
-function tintFit(el) {
-  if (!el.style.getPropertyValue("mask-size").includes("--exact-tint-fit")) {
-    return;
-  }
-  if (!el.complete) {
-    el.addEventListener("load", () => tintFit(el), { once: true });
-    return;
-  }
-  const cs = getComputedStyle(el);
-  const fits = el.naturalWidth <= el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) && el.naturalHeight <= el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
-  el.style.setProperty("--exact-tint-fit", fits ? "auto" : "contain");
-}
 export function imageEvents(el, fire) {
   const probe = (src) => {
     if (!imageProbes.has(src)) {
@@ -226,7 +215,7 @@ export function refreshSymbols() {
     };
   });
   for (const { el, point, weight } of configs) {
-    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", key = `${path}:${filled}:${point}:${weight}:${box}:${el.hasAttribute("data-symbol-nonzero")}`;
+    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", source = el.getAttribute("data-symbol-source"), key = `${path}:${filled}:${point}:${weight}:${box}:${el.hasAttribute("data-symbol-nonzero")}:${source}`;
     if (!path && !el.dataset.symbolSource?.startsWith("symbol:sf/") && el.dataset.symbolSource !== "symbol:" && el.symbolRefusal !== el.dataset.symbolSource) {
       log(`image ${el.dataset.symbolSource} refused: unknown symbol role`);
       el.symbolRefusal = el.dataset.symbolSource;
@@ -235,23 +224,19 @@ export function refreshSymbols() {
       el.symbolKey = key;
       const stroke = 1.1 + (Math.max(100, Math.min(900, weight)) - 100) / 400;
       const paint = filled ? `fill="black" fill-rule="${el.hasAttribute("data-symbol-nonzero") ? "nonzero" : "evenodd"}"` : `fill="none" stroke="black" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"`;
-      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}" viewBox="${box}">${path.split(";").map((d) => `<path d="${d}" ${paint}/>`).join("")}</svg>`)}")`;
-      el.symbolPlaceholder = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${point}" height="${point}"/>`)}`;
+      const [width, height] = symbolSize(box, point, source);
+      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" ${width === height ? `width="${width}" height="${height}" ` : ""}viewBox="${symbolBox(box).join(" ")}">${path.split(";").map((d) => `<path d="${d}" ${paint}/>`).join("")}</svg>`)}")`;
+      el.symbolPlaceholder = symbolPlaceholder(width, height);
     }
-    if (el.getAttribute("src") !== el.symbolPlaceholder) {
-      el.src = el.symbolPlaceholder;
-    }
+    syncSymbolPlaceholder(el, refreshSymbols);
     el.style.setProperty("--exact-symbol-mask", el.symbolMask);
   }
   // Sources can set intrinsic size synchronously; percentage padding must resolve against the resulting layout.
-  const fits = configs.map(({ el, point, objectFit }) => {
-    const cs = objectFit === "scale-down" ? getComputedStyle(el) : null;
-    const fits = cs && point <= el.clientWidth - (parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)) && point <= el.clientHeight - (parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom));
-    // `fill`, CSS's initial `object-fit`, keeps a symbol's aspect, as on the Apple hosts (LLP 1011 §4).
-    return [el, objectFit === "none" || objectFit === "scale-down" && fits ? `${point}px ${point}px` : objectFit === "scale-down" || objectFit === "fill" ? "contain" : objectFit];
-  });
-  for (const [el, fit] of fits) {
+  const fits = configs.map(({ el, point, objectFit }) => [el, ...symbolFit(el,
+    ...symbolSize(el.getAttribute("data-symbol-viewbox") || "0 0 24 24", point, el.getAttribute("data-symbol-source")), objectFit)]);
+  for (const [el, fit, position] of fits) {
     el.style.setProperty("--exact-symbol-fit", fit);
+    el.style.setProperty("--exact-symbol-position", position);
   }
   for (const el of rasters) {
     tintFit(el);
@@ -343,6 +328,96 @@ export function syncMarkup(el) {
     });
   }).catch((error) => console.error("exact: Markdown editor:", error));
 }
+// @ref LLP 1094.000 D6 — the first node that turns draggable loads the drag-out glue, which then hears every drag from
+// the app's live views. Until it listens, a node the app made draggable waits, written `false`, and a drag that begins
+// in it, or at an element around it where the down's point is in it, as a link's around its image pressed on the image,
+// is cancelled, a field's drag of text too, so no drag begins without the node's data. Another script's draggable keeps
+// its own drag. The presses followed from the glue's load are the listener's once it listens, so a field held then
+// keeps its node off. A load that fails, or a listener that fails as it starts, is logged and tried again on one timer
+// while a live node waits. Each retry uses a fresh URL for the entire module, including its bundled input helper,
+// since the browser keeps failures by URL.
+const liveView = (el) => views.get(Number(el.dataset?.view)) === el && !retiredViews.has(el);
+const dragOutWait = new AbortController();
+const waitingInput = typeof document === "object" ? observeDragInput(document, dragOutWait.signal) : undefined;
+
+/** Whether `el` waits; a node no longer a live view stops waiting. */
+function waitingView(el) {
+  if (!host.dragOutWaiting?.has(el)) return false;
+  if (liveView(el)) return true;
+  host.dragOutWaiting.delete(el);
+  return false;
+}
+
+export function loadDragOut() {
+  if (host.dragOutTimer) return;
+  const tries = host.dragOutTries ?? 0;
+  host.dragOutModule ??= loadAfterPaint(tries ? `./drag-out.js?try=${tries}` : "./drag-out.js", "listenDragOut").then((listen) => {
+    const controller = new AbortController(), live = new Set([...(host.dragOutWaiting ?? [])].filter(waitingView));
+    try {
+      listen(document, liveView, { signal: controller.signal, input: waitingInput, waiting: live });
+      for (const el of live) globalThis.exact.writeDraggable(el, el.exactDraggable);
+    } catch (e) {
+      // Nothing of a listener that failed stays: its listeners go, the nodes wait again, and the next try loads anew.
+      controller.abort();
+      for (const el of live) el.setAttribute("draggable", "false");
+      delete globalThis.exact.listenDragOut;
+      throw e;
+    }
+    host.dragOutListening = true;
+    dragOutWait.abort();
+    host.dragOutWaiting = null;
+  }).catch((e) => {
+    host.dragOutModule = null;
+    host.dragOutTries = tries + 1;
+    log(`drag-out module: ${e}`);
+    host.dragOutTimer = setTimeout(() => {
+      host.dragOutTimer = null;
+      for (const el of host.dragOutWaiting ?? []) waitingView(el);
+      if (host.dragOutWaiting?.size) loadDragOut();
+    }, Math.min(30000, 1000 * 2 ** tries));
+  });
+}
+
+/** Whether the nearest node the app made draggable at or above `el` waits: another script's draggable nearer to it
+ * keeps its own drag. An SVG element's `draggable` is read as the listener reads it, not at all (drag-out.js). */
+function waits(el) {
+  for (let at = elementOf(el); at; at = at.parentElement) {
+    if (waitingView(at)) return true;
+    if (at.namespaceURI !== "http://www.w3.org/2000/svg" && at.matches('[draggable="true" i]')) return false;
+  }
+  return false;
+}
+/** Cancels a waiting view's drag even when the browser starts it at an ancestor, such as a link around a pressed
+ * image. Another script's draggable keeps its own drag, including an SVG drag in Chromium or WebKit. */
+function waitingDrag(event) {
+  // A script's `dragstart` is no drag.
+  if (event.isTrusted === false) return;
+  const target = event.target;
+  if (target.matches?.('[draggable="true" i]') && !waitingView(target)) return;
+  const element = elementOf(target);
+  const down = downForDrag(waitingInput, event, element);
+  const at = (element && pressedAt(down, event, element)) ?? document.elementFromPoint?.(event.clientX, event.clientY);
+  if (waits(target) || (at && target.contains?.(at) && waits(at))) event.preventDefault();
+}
+
+/** Writes `el`'s `draggable` through the drag-out glue, which keeps the app's value on the node (drag-out.js). Until
+ * the glue listens, a node made draggable waits, `false`, which a link or an image needs to drag nothing of its own,
+ * and any other value is written as it is. */
+export function writeDraggable(el, value) {
+  if (host.dragOutListening) return void globalThis.exact.writeDraggable(el, value);
+  el.exactDraggable = value;
+  if (value === "true") {
+    if (!host.dragOutWaiting) document.addEventListener("dragstart", waitingDrag, { capture: true, signal: dragOutWait.signal });
+    (host.dragOutWaiting ??= new Set()).add(el);
+    el.setAttribute("draggable", "false");
+    loadDragOut();
+    return;
+  }
+  host.dragOutWaiting?.delete(el);
+  if (value == null) el.removeAttribute("draggable");
+  else el.setAttribute("draggable", value);
+}
+
 export function applyProps(el, set, clear, adopting = false) {
   syncMedia(el, set, clear);
   if (set && "data-scrolldocument" in set) {
@@ -350,6 +425,10 @@ export function applyProps(el, set, clear, adopting = false) {
   }
   let sandboxChanged = false;
   for (const name of clear || []) {
+    if (name === "draggable") {
+      writeDraggable(el, null);
+      continue;
+    }
     if (name === "tabindex") el.exactAuthoredTabIndex = null;
     if (el instanceof HTMLIFrameElement && name === "src") {
       appFrameSource(el, null);
@@ -400,6 +479,10 @@ export function applyProps(el, set, clear, adopting = false) {
     }
   }
   for (const [name, value] of Object.entries(set || {})) {
+    if (name === "draggable") {
+      writeDraggable(el, value);
+      continue;
+    }
     if (name === "tabindex") el.exactAuthoredTabIndex = value;
     if (el instanceof HTMLIFrameElement && name === "sandbox" && el.getAttribute("sandbox") !== value) {
       sandboxChanged = true;

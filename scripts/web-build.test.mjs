@@ -2,7 +2,7 @@ import { expect, mock, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { captureWebProducts, cargoContractReads, changedContractReads, contractReadReceipt, loopWebDist, privateNativeBuild, privateWebBuild } from './web-build.mjs';
 import { appleArtifacts } from '../host/apple/build.mjs';
@@ -10,10 +10,25 @@ import { buildFirst, failureSummary, nativeBuild, planOverride } from './agent-b
 import { webBuildFailure } from './app-cli.mjs';
 import { linkedBakeDir } from './linked-plan.mjs';
 import { resolveApp } from './app.mjs';
-import { webChanges, webInputDigests } from './agent-launch.mjs';
+import { webChanges, webInputDigests, webInputPresent } from './agent-launch.mjs';
 import { replaceBuild } from '../host/web/serve.mjs';
 let fallbackRoots = [];
 mock.module('../host/web/build.mjs', () => ({ webSourceRoots: () => fallbackRoots }));
+
+// A recorded input in a tree the build copies whole is still one only when no part of its path from the tree's root is a
+// link, as the copy requires; elsewhere the build reads through links.
+test('a copied input behind a link is not one the web build reads', () => {
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-web-input-'))), app = { dir: resolve(dir, 'app') };
+  try {
+    for (const path of ['app/assets/icons', 'app/src', 'moved/icons']) mkdirSync(resolve(dir, path), { recursive: true });
+    for (const path of ['app/assets/icons/logo.png', 'app/src/real.ts', 'moved/icons/logo.png', 'moved/logo.png']) writeFileSync(resolve(dir, path), 'bytes');
+    const present = (path) => webInputPresent(app, resolve(app.dir, path));
+    expect([present('assets/icons/logo.png'), present('assets/icons/gone.png'), present('src/real.ts')]).toEqual([true, false, true]);
+    rmSync(resolve(app.dir, 'assets/icons/logo.png')); symlinkSync(resolve(dir, 'moved/logo.png'), resolve(app.dir, 'assets/icons/logo.png'));
+    symlinkSync(resolve(dir, 'moved/icons'), resolve(app.dir, 'assets/linked')); symlinkSync(resolve(app.dir, 'src/real.ts'), resolve(app.dir, 'src/link.ts'));
+    expect([present('assets/icons/logo.png'), present('assets/linked/logo.png'), present('src/link.ts')]).toEqual([false, false, true]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 // A failed build's summary keeps the compiler's first error, which may be the cause of the rest (#705: the web
 // build said only the last, which blamed another component's action of the same name).
@@ -22,6 +37,9 @@ test("a failed build's summary keeps the compiler's first error", () => {
   const two = [error(6, 'syntax-method-call', '`.replace(…)` is a method call'), error(8, 'type-handler-action', '`follow` is an action of `Pill`')].join('\n');
   // The web build: every compiler error with its excerpt, in the order said.
   expect(webBuildFailure(`   Compiling app v0.1.0\n${two}\n`)).toEqual([two]);
+  const tail = ['  Compiling app', '  Finished preparing', '  Running compiler'];
+  expect(webBuildFailure(['earlier output', ...tail, ''].join('\r\n'))).toEqual(tail);
+  expect(webBuildFailure('')).toEqual([]);
   // A native build: from the first when the tail would leave it out.
   const many = Array.from({ length: 12 }, (_, i) => error(i + 1, 'type-unknown-name', `unknown name \`n${i}\``)).join('\n');
   expect(failureSummary(`app: the bake failed:\n${many}\n`, { host: 'macos', code: 1, log: 'x.log' })).toStartWith(error(1, 'type-unknown-name', 'unknown name `n0`'));
@@ -321,7 +339,8 @@ test('JS Rust producers generate privately and read grants from their captured m
     const env = { resolve, mkdirSync, existsSync, dirname: path => resolve(path, '..'), cpSync, readFileSync, createHash,
       rustLinked: true, root: dir, sep: '/', moduleSourceDirs: () => [], devReload: true, devLogic: [], opt: () => null, out, gen, app: 'fixture', canvas2d: false, appDir: dir, ts: false,
       normalizeGrants: () => ({ entries: [] }),
-      buildModule(app, at) {
+      buildModule(app, at, draw, appDir, options) {
+        expect(options.dev).toBe(true);
         expect(at).toBe(resolve(gen, 'rust-module')); mkdirSync(at, { recursive: true });
         const path = resolve(at, 'app.module.wasm'); writeFileSync(path, 'captured'); return path;
       },
@@ -332,7 +351,7 @@ test('JS Rust producers generate privately and read grants from their captured m
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('a Rust module holds its Cargo product claim through optimization and capture', async () => {
+test('a Rust module holds its Cargo product claim from writing inputs through capture', async () => {
   const { awaitBuildOutput } = await import('./app.mjs');
   const { lockHeld } = await import('../host/web/build-lock.mjs');
   const source = readFileSync(resolve(import.meta.dir, '../host/web-js/module.mjs'), 'utf8');
@@ -342,8 +361,8 @@ test('a Rust module holds its Cargo product claim through optimization and captu
   try {
     const env = { TARGET: dir, WEB: 'fixture', createHash, readFileSync, writeFileSync,
       WASM_OPT: () => 'fixture', OPT: [],
-      spawnSync: () => ({ status: 0, stdout: JSON.stringify({ packages: [] }) }), refreshCargoRustShapes() {},
-      resolve, dirname: path => resolve(path, '..'), mkdirSync, cpSync, existsSync, statSync, awaitBuildOutput, moduleDepInfo: new Map(),
+      moduleMetadata: () => ({ metadata: { packages: [] }, locked: false }), refreshCargoRustBindings() {},
+      resolve, dirname: path => resolve(path, '..'), realpathSync, mkdirSync, cpSync, existsSync, statSync, awaitBuildOutput, moduleDepInfo: new Map(),
       fresh: () => false, cargoWasm() {
         expect(lockHeld(lock)).toBe(true);
         const wasm = resolve(dir, 'wasm32-unknown-unknown/release/fixture.wasm');
@@ -353,7 +372,12 @@ test('a Rust module holds its Cargo product claim through optimization and captu
       replace: (path, write) => write(path), optimize(from, to) { expect(lockHeld(lock)).toBe(true); writeFileSync(to, 'captured module'); },
     };
     const build = new Function('env', `const {${Object.keys(env).join(',')}} = env; ${body}; return module;`)(env);
-    expect(readFileSync(build(resolve(dir, 'Cargo.toml'), 'fixture', out, 'fixture'), 'utf8')).toBe('captured module');
+    const manifest = resolve(dir, 'Cargo.toml');
+    const built = build(manifest, 'fixture', out, 'fixture', () => {
+      expect(lockHeld(lock)).toBe(true);
+      writeFileSync(manifest, 'wrapper manifest');
+    });
+    expect(readFileSync(built, 'utf8')).toBe('captured module');
     expect(lockHeld(lock)).toBe(false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -393,8 +417,13 @@ test('Windows test, agent and verify allocate private outputs before preparing c
   expect(result.status, result.stderr).toBe(0);
 });
 
-test('Windows packaging and preparation use the selected executable after Cargo output changes', async () => {
+test.each([
+  [[], undefined, 'development'],
+  [['--release'], undefined, 'production'],
+  [['--release'], 'development', 'development'],
+])('Windows packaging selects the executable and trust for %j with %s trust', async (args, trust, expected) => {
   const { copyFileSync } = await import('node:fs');
+  const { windowsRuntime, writePackagedReceipt } = await import('../host/windows/build.mjs');
   const { windowsBuild } = await import('./agent-build.mjs');
   const source = readFileSync(resolve(import.meta.dir, '../host/windows/build.mjs'), 'utf8');
   const start = source.indexOf('if (import.meta.main) {') + 'if (import.meta.main) {'.length;
@@ -405,11 +434,19 @@ test('Windows packaging and preparation use the selected executable after Cargo 
   try {
     process.env.EXACT_WINDOWS_OUTPUT = build.env.EXACT_WINDOWS_OUTPUT;
     const path = resolve(dir, 'fixture-windows.exe'); writeFileSync(path, 'first executable');
-    const env = { process: { platform: 'win32', argv: [], env: build.env }, guardFlags: () => [], resolveApp: () => app, prepareShaders() {},
+    const redist = resolve(dir, 'redist');
+    for (const arch of ['arm64', 'x64']) {
+      const crt = resolve(redist, arch, 'Microsoft.VC145.CRT');
+      mkdirSync(crt, { recursive: true });
+      for (const dll of ['vcruntime140.dll', 'msvcp140.dll']) writeFileSync(resolve(crt, dll), arch);
+      writeFileSync(resolve(crt, 'runtime.pdb'), 'symbols');
+    }
+    const env = { process: { platform: 'win32', argv: [], env: { ...build.env, EXACT_UPDATE_TRUST: trust } }, guardFlags: () => args, resolveApp: () => app, prepareShaders() {},
       bakeTarget: () => 'x86_64-pc-windows-msvc', pickIcon: () => null, resolve, mkdirSync, developmentBuildEnv: () => build.env,
-      copyFileSync, readFileSync, writeFileSync, createHash, windowsFile: () => 'fixture.exe', closeOpened() {}, syncStaticTree() {}, copyShaders() {},
-      writePackagedReceipt() {}, unclaimedNote: () => null, console: { log() {} },
+      copyFileSync, readFileSync, writeFileSync, createHash, windowsFile: (_app, path) => path.endsWith('.exe') ? 'fixture.exe' : basename(path), closeOpened() {}, syncStaticTree() {}, copyShaders() {},
+      windowsRuntime: target => windowsRuntime(target, { VCToolsRedistDir: redist }), writePackagedReceipt, unclaimedNote: () => null, console: { log() {} },
       buildBake(app, kind, target, options) {
+        expect(options.env.EXACT_UPDATE_TRUST).toBe(expected);
         const receipt = { products: [{ path, sha256: createHash('sha256').update('first executable').digest('hex') }], compat: {} };
         options.capture(receipt); writeFileSync(path, 'later executable'); return receipt;
       },
@@ -418,6 +455,17 @@ test('Windows packaging and preparation use the selected executable after Cargo 
     const selected = windowsBuild(app).bin;
     expect(selected).toBe(resolve(build.env.EXACT_WINDOWS_OUTPUT, 'fixture.exe'));
     expect(readFileSync(selected, 'utf8')).toBe('first executable');
+    const output = build.env.EXACT_WINDOWS_OUTPUT;
+    const receipt = JSON.parse(readFileSync(resolve(output, 'receipt.json'), 'utf8')).build;
+    for (const dll of ['vcruntime140.dll', 'msvcp140.dll']) {
+      const packaged = resolve(output, dll);
+      expect(existsSync(packaged)).toBe(args.includes('--release'));
+      if (args.includes('--release')) {
+        expect(readFileSync(packaged, 'utf8')).toBe('x64');
+        expect(receipt.products).toContainEqual({ path: dll, sha256: createHash('sha256').update('x64').digest('hex') });
+      }
+    }
+    expect(existsSync(resolve(output, 'runtime.pdb'))).toBe(false);
   } finally {
     if (before === undefined) delete process.env.EXACT_WINDOWS_OUTPUT; else process.env.EXACT_WINDOWS_OUTPUT = before;
     build.close(); rmSync(dir, { recursive: true, force: true });
@@ -469,7 +517,19 @@ test('a large built app.js warns with where its size came from', async () => {
   expect(sizeWarning('app-x.js', APP_JS_WARN_BYTES)).toBe('');
   expect(sizeWarning('app-x.js', 339_489, 'own plan code by component: App: 3895 B (1 instance)')).toBe('');
   const said = sizeWarning('app-x.js', 29_045_555, 'own plan code by component (shared bodies counted per use): Pane: 81200 B (27 instances)');
-  expect(said).toStartWith("warning: app-x.js is 27.7 MiB: a component's body is compiled in at each place it is used");
-  expect(said).toEndWith('; own plan code by component (shared bodies counted per use): Pane: 81200 B (27 instances)');
-  expect(sizeWarning('app-x.js', APP_JS_WARN_BYTES + 1)).toEndWith('used hundreds of times');
+  expect(said).toStartWith('warning: app-x.js is 27.7 MiB.');
+  expect(said).toContain('Add --sizes');
+  expect(said).toEndWith('own plan code by component (shared bodies counted per use): Pane: 81200 B (27 instances)');
+  expect(sizeWarning('app-x.js', APP_JS_WARN_BYTES + 1)).toContain('Add --sizes');
+});
+
+test('the launch size report counts UTF-8 spans and leaves unmapped code unassigned', async () => {
+  const { entrySizeReport } = await import('../host/web-js/module.mjs');
+  const out = mkdtempSync(resolve(tmpdir(), 'exact-module-sizes-'));
+  try {
+    mkdirSync(resolve(out, '.gen'));
+    const map = { sources: ['.gen/app.js', '.gen/rt.js'], mappings: ';AAAA,ECAA,E;A' };
+    const report = entrySizeReport({ code: '// banner\né😀!END\nunmapped', fileName: 'app.js', map }, realpathSync(out));
+    expect(report.split('\n').slice(2)).toEqual(['  22 B  (unmapped)', '  6 B  app.js', '  1 B  rt.js']);
+  } finally { rmSync(out, { recursive: true, force: true }); }
 });

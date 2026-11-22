@@ -92,6 +92,8 @@ pub struct NodeArena {
     /// The kind and font size each standing mark report was made under (`Kernel::mark_withdrawn`).
     pub(crate) mark_reports: IdMap<u32, (crate::ControlKind, u32)>,
     pub(crate) bar_symbols: Vec<(u32, f32)>,
+    /// Column widths chosen in the window, by the header cell that owns them.
+    pub(crate) table_column_widths: IdMap<u32, f32>,
     /// Slots that are `position: sticky` (LLP 1083 D3).
     pub(crate) sticky_slots: SlotSet,
     /// Slots whose node carries `navigationBack`, attached or not (bars.rs).
@@ -208,6 +210,7 @@ impl Clone for NodeArena {
             mark_sizes: self.mark_sizes.clone(),
             mark_reports: self.mark_reports.clone(),
             bar_symbols: self.bar_symbols.clone(),
+            table_column_widths: self.table_column_widths.clone(),
             sticky_slots: self.sticky_slots.clone(),
             navigation_slots: self.navigation_slots.clone(),
             top_layer_slots: self.top_layer_slots.clone(),
@@ -307,6 +310,7 @@ impl NodeArena {
         self.mark_sizes.clear();
         self.mark_reports.clear();
         self.bar_symbols.clear();
+        self.table_column_widths.clear();
         self.sticky_slots.clear();
         self.top_layer_slots.clear();
         self.navigation_slots.clear();
@@ -764,6 +768,11 @@ impl NodeArena {
         out: &mut Vec<TextRun<'a>>,
         boundary: &mut crate::text::case::WordBoundary,
     ) {
+        let rows = if self.strong_text(slot) {
+            rows.stronger()
+        } else {
+            rows
+        };
         let s = slot as usize;
         match self.node_types[s] {
             NodeType::TextInput => {
@@ -776,27 +785,28 @@ impl NodeArena {
                 // current value. HTML's default character width is 20; a
                 // textarea's default is two rows. Explicit CSS dimensions
                 // still win in layout. Content sizing measures the live value.
-                let text = if self.styles[s].field_sizing == FieldSizing::Fixed {
-                    if props.str(PropId::SemanticTag) == Some("textarea") {
-                        "00000000000000000000\n00000000000000000000"
+                let textarea = props.str(PropId::SemanticTag) == Some("textarea");
+                let content_sizing = self.styles[s].field_sizing == FieldSizing::Content;
+                let text = if content_sizing {
+                    let value = crate::control::bound_field_value(props);
+                    if value.is_empty() {
+                        props
+                            .str(PropId::Placeholder)
+                            .filter(|p| !p.is_empty())
+                            .unwrap_or(" ")
+                            .into()
                     } else {
-                        "00000000000000000000"
+                        value
                     }
+                } else if textarea {
+                    "00000000000000000000\n00000000000000000000".into()
                 } else {
-                    props
-                        .str(PropId::Value)
-                        .filter(|v| !v.is_empty())
-                        .or_else(|| props.str(PropId::Placeholder).filter(|p| !p.is_empty()))
-                        .unwrap_or(" ")
+                    "00000000000000000000".into()
                 };
+                let caret_line = content_sizing && textarea && text.ends_with('\n');
                 out.push(TextRun::new(text, style));
-                // A textarea's final Return creates a caret line. Paragraph
-                // shapers can omit a terminal break, so retain that line with
-                // zero-width measurement content, never in the field's value.
-                if self.styles[s].field_sizing == FieldSizing::Content
-                    && props.str(PropId::SemanticTag) == Some("textarea")
-                    && text.ends_with('\n')
-                {
+                // Shapers can omit a terminal break. Keep the final caret line in the measurement.
+                if caret_line {
                     out.push(TextRun::new("\u{200b}", style));
                 }
             }
@@ -961,6 +971,7 @@ impl NodeArena {
         self.bar_symbols.retain(|(s, _)| *s != slot);
         self.field_content.remove(&slot);
         self.mark_reports.remove(&slot);
+        self.table_column_widths.remove(&slot);
         self.exclusion_slots.remove(slot);
         self.reserving.remove(slot);
         self.ignoring.remove(slot);
@@ -1143,7 +1154,7 @@ impl NodeArena {
         self.contents[slot as usize]
     }
 
-    /// An intrinsic size, when the host has reported it.
+    /// A replaced element's measured or host-reported intrinsic size.
     pub fn intrinsic(&self, slot: u32) -> Option<(f32, f32)> {
         self.intrinsic.get(&slot).copied()
     }
@@ -1473,28 +1484,5 @@ fn bump(counts: &mut Vec<u32>, index: usize, up: bool) {
         counts[index] += 1;
     } else {
         counts[index] = counts[index].saturating_sub(1);
-    }
-}
-
-impl NodeArena {
-    /// Mark the colours its styles hold: the shared table's, which every
-    /// node's style is one of, and the control and document styles.
-    pub(crate) fn wide_colors(&mut self, m: &mut crate::style::wide::WideMark) {
-        use crate::style::wide::Colors;
-        self.shared.wide_colors(m);
-        if let Some(control) = &self.control_styles {
-            control.colors(m);
-        }
-        self.document_style.colors(m);
-    }
-
-    /// The same, visiting every style (for a clone, once).
-    fn wide_colors_shared(&self, m: &mut crate::style::wide::WideMark) {
-        use crate::style::wide::Colors;
-        self.shared.visit(m);
-        if let Some(control) = &self.control_styles {
-            control.colors(m);
-        }
-        self.document_style.colors(m);
     }
 }

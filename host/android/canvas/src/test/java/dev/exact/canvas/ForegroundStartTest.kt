@@ -72,6 +72,20 @@ class ForegroundStartTest {
         } finally { service.onDestroy() }
     }
 
+    @Test fun playbackPromotionKeepsExecutionWhileTheActivityIsStopped() {
+        Exact.hidden(true)
+        assertFalse(Exact.executionEligible())
+        try {
+            ForegroundServices.playbackPromoted(true)
+            assertTrue(Exact.executionEligible())
+            assertTrue(ExtensionInvokeTest.Host.eligibility.last())
+        } finally {
+            ForegroundServices.playbackPromoted(false)
+        }
+        assertFalse(Exact.executionEligible())
+        assertFalse(ExtensionInvokeTest.Host.eligibility.last())
+    }
+
     @Test fun aFailedPromotionCannotKeepExecutionAfterTheActivityStops() {
         var lost = false
         val claim = services.claim("call", setOf("phoneCall"), "app",
