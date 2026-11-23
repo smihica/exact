@@ -148,7 +148,10 @@ impl Painter {
         ts: Transform,
         offset: (f32, f32),
     ) -> Transform {
-        let Some((z, fit)) = self.zoom_of(node).zip(Fit::of(kernel, node)) else {
+        let Some(z) = self.zoom_of(node) else {
+            return ts;
+        };
+        let Some(fit) = Fit::of(kernel, node) else {
             return ts;
         };
         let Some(child) = kernel.node(fit.child) else {
