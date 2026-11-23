@@ -3,7 +3,7 @@
 use super::{check_region, texture_ids};
 use super::{Device, Error, Format, Info, Result, Submission, TextureDesc};
 use crate::instance::{flags, Batch, Bindings, Brush, Frame, Instance, Kind, Scissor, TextureId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -932,11 +932,21 @@ impl Device for Wgpu {
             0,
             bytemuck::cast_slice(&[desc.width as f32, desc.height as f32, 0., 0.]),
         )?;
-        let groups = frame
-            .batches
-            .iter()
-            .map(|b| self.bindings(b.bindings, &self.buffers[slot].viewport))
-            .collect::<Result<Vec<_>>>()?;
+        let groups = {
+            let mut unique: HashMap<Bindings, ::wgpu::BindGroup> =
+                HashMap::with_capacity(frame.batches.len());
+            frame
+                .batches
+                .iter()
+                .map(|batch| match unique.entry(batch.bindings) {
+                    Entry::Occupied(entry) => Ok(entry.get().clone()),
+                    Entry::Vacant(entry) => {
+                        let group = self.bindings(batch.bindings, &self.buffers[slot].viewport)?;
+                        Ok(entry.insert(group).clone())
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.encode_pass(
             &mut encoder,
