@@ -265,6 +265,12 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
+    /// A keyboard inset will move the field only after its new port is shown.
+    #[cfg(target_os = "linux")]
+    pub(super) fn reveal_waits_for_picture(&self) -> bool {
+        self.window.reveal.is_some()
+    }
+
     /// What the shell draws around the page; on a host that told no window,
     /// the viewport at the origin.
     pub fn chrome(&self) -> Chrome {

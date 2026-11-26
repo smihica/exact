@@ -429,7 +429,7 @@ pub struct Painter {
     pub(crate) lift: Lift,
     pub(crate) shared: SharedState,
     // Accepted owners retain their paragraph leases while a subsequent backend frame fails.
-    accepted_text: BTreeMap<exact_kernel::NodeKey, Rc<Paragraph>>,
+    accepted_text: Rc<BTreeMap<exact_kernel::NodeKey, Rc<Paragraph>>>,
     pub(crate) reader_highlights:
         BTreeMap<exact_kernel::NodeKey, inline_frame::selection::Highlight>,
     pub(crate) field_text: HashMap<ViewId, Rc<field::PaintedField>>,
@@ -557,7 +557,7 @@ impl Painter {
             fresh_order: HashMap::new(),
             rank_increments: 0,
             ranks: Rc::default(),
-            accepted_text: BTreeMap::new(),
+            accepted_text: Rc::default(),
             lift: Lift::default(),
             shared: SharedState::default(),
             region_picture: None,
@@ -859,7 +859,7 @@ impl Painter {
         self.labels.painted();
         self.ripples.painted(self.numerals.now, self.numerals.still);
         if finished.is_ok() {
-            self.accepted_text = walk.text;
+            self.accepted_text = Rc::new(walk.text);
             self.field_text = walk.fields;
             self.inline_text = walk.inline;
         } else {

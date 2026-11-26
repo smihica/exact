@@ -299,7 +299,7 @@ export const classifications = [
     ["painted:host/painted/src/canvas/surface.rs", "CanvasHost::acquired CanvasHost::display_frame"],
     ["painted:host/painted/src/content_region/presenter.rs", "Presenter::recycle_frame"],
     ["painted:host/painted/src/presenter/display_frame.rs",
-      "Presenter::acknowledge Presenter::display_complete Presenter::display_frame Presenter::display_presented Presenter::panel_complete Presenter::panel_frame Presenter::panel_lost " +
+      "Presenter::acknowledge Presenter::display_complete Presenter::display_frame Presenter::display_presented Presenter::panel_can_prepare_ahead Presenter::panel_complete Presenter::panel_frame Presenter::panel_frame_ahead Presenter::panel_lost " +
       "Presenter::submitted_picture SubmittedFrame::carried SubmittedFrame::image SubmittedFrame::mirror"],
   ]),
   group("hatch clocks", ["subscription"], "live hatch attachment and its timer/frame registration", "UI-owned",
