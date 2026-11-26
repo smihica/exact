@@ -36,10 +36,12 @@ Older launchers can still select 90 degrees with `KIOSK_PORTRAIT=1`. GLES compar
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
 Ink compiles thirteen fixed material and clip combinations at device creation.
 Large unclipped solid fills use a flat-color pipeline for their interior.
-The upstream display host tracks completed presentations and rotates on the GPU.
-With this integration, a Pi 4 on a 60 Hz portrait panel averaged 29.8 fps
-on the same photo-list drag that reached 59.9 fps with the previous fork.
-See the [matched integration runs](memo/kiosk-upstream.md#rich-list-and-dialog-after-merging-upstream).
+The direct Vulkan host rotates on the GPU. With three swapchain images it can
+submit one frame while the previous frame awaits presentation. Hit testing
+and animation starts follow the completed presentation. On a Pi 4 with a
+60 Hz portrait panel, a 16-second photo-list drag measured 30.0 fps with a
+single pending frame and 60.0 fps with one frame ahead. Earlier integration
+measurements are recorded in the [kiosk memo](memo/kiosk-upstream.md#rich-list-and-dialog-after-merging-upstream).
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
