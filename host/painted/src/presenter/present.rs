@@ -9,7 +9,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Carried {
     host: u64,
-    at: f64,
+    motion: crate::host::PictureMotion,
 }
 
 impl<D: DataSource> Presenter<D> {
@@ -27,9 +27,13 @@ impl<D: DataSource> Presenter<D> {
 
     /// A picture is produced now: what its present will start.
     pub fn picture_carried(&mut self) -> Carried {
+        self.capture_picture(false)
+    }
+
+    pub(super) fn capture_picture(&mut self, ahead: bool) -> Carried {
         Carried {
             host: self.hosts,
-            at: self.host.picture_carried(),
+            motion: self.host.picture_carried(ahead),
         }
     }
 
@@ -47,7 +51,7 @@ impl<D: DataSource> Presenter<D> {
         if carried.host != self.hosts {
             return None;
         }
-        let (paint, error) = self.host.picture_presented(carried.at, at_ms);
+        let (paint, error) = self.host.picture_presented(carried.motion, at_ms);
         self.dirty |= paint;
         error.or_else(|| self.after_commit())
     }

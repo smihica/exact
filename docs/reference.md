@@ -176,9 +176,10 @@ Agent screenshots show the rotated framebuffer, at the panel mode's size. Their
 replies give that image's point dimensions and clockwise `rotation` in degrees;
 comparison maps layout boxes onto those axes. Agent layout and target coordinates
 remain logical. In a headless Linux host, `EXACT_SIZE` supplies the unrotated panel
-size in points. Ink blits its retained target before readback; other painters
-upload their completed pixels for the GPU blit. KMS still reads back into dumb
-buffers.
+size in points. On a supported Vulkan display, Ink turns the image while copying
+it to the swapchain. With a VNC viewer attached, Ink rotates the image before
+readback so the viewer and the panel receive the same pixels. Other painters and
+displays without direct Vulkan presentation use KMS dumb buffers.
 
 A Linux development build can serve its screen over VNC: set `EXACT_VNC=1` and
 `EXACT_VNC_PASSWORD` to 1–8 bytes. It listens on `127.0.0.1:5900`; `EXACT_VNC=host:port`
