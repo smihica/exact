@@ -11,6 +11,35 @@ Read [KIOSK.md](../KIOSK.md) for runtime switches, prototype limits and checks.
 This memo maps the changes to their code and assesses what is worth sharing
 upstream. The assessments are the fork's, not acceptance decisions by Exact's maintainers.
 
+## What to share upstream (2026-11-26)
+
+The code comparison uses [upstream `2685f0a30`](https://github.com/expo/exact/tree/2685f0a30) and
+[kiosk `f3e0473b0`](https://github.com/smihica/exact/tree/f3e0473b0). The physical measurements below
+use the builds named in each experiment.
+
+### Five candidates for separate Gists
+
+| Item | Evidence | What to share |
+| --- | --- | --- |
+| 1. Submit one display frame ahead | On the Pi 4, a matched 16-second photo-list drag went from 29.94 to 60.00 displayed fps. Both fork builds used the upstream rotated final copy. The separate tap test checked which displayed row received the input. [Measurements and traces](https://github.com/smihica/exact/pull/11) | Answer the [maintainer's request](https://github.com/expo/exact/issues/145#issuecomment-7193253363) first. Include the per-frame GPU submit and flip times, the tap outcomes and the tests that keep presentation acknowledgement tied to the actual flip. |
+| 2. More fixed Ink shader programs | Upstream builds eight programs at startup. The fork adds five, including one for cached shadows. Existing fork timings combine these with other rendering changes. [Upstream decision](https://github.com/expo/exact/issues/145#issuecomment-6946461526) | Compare eight programs with eight plus one candidate on the same scene. Report GPU time, cold and warm startup, draw calls and pixel parity. Measure the flat interior pass separately. |
+| 3. Reuse and clip outer shadows | On an earlier fork build, shadow reuse, exterior bands and a clip shortcut together reduced headless GPU time from 49.80 to 15.10 ms at fixed list positions. [Evidence and limits](#evidence-and-its-limits) | Follow up on the [shadow Gist we offered](https://github.com/expo/exact/issues/145#issuecomment-6944035191). Use a small card list. Separate the cache and band measurements, show the pixel differences, and cover the 16 MiB budget and nested rounded clips. |
+| 4a. Generate image mip levels with fewer buffers | The mip pass saves two GPU buffer allocations per level. Five image sizes, including odd and one-pixel dimensions, matched the reference filter on Pi Vulkan and GLES. [Implementation](https://github.com/smihica/exact/commit/db40ab61a) | Isolate mip generation on upstream, with allocation counts, generation time and output pixels. This change can be evaluated independently of bitmap retention. |
+| 5. Skip unused paint geometry | Two early exits skip child layout reads on ordinary nodes and pattern construction on borders with no dotted or dashed edge. Main-thread CPU per displayed frame fell from 10.79 to 10.15 ms in the Pi photo list. Both builds ran near 60 fps. [Tests and measurements](https://github.com/smihica/exact/pull/9) | A small standalone diff can show both skipped operations, the zoom hit tests and the border pixel checks. |
+
+In the first #145 reply, give item 1 three to five lines covering the result, what the tap test established,
+and a link to the trace and prototype. A short note can point to item 3 when its Gist is ready.
+Add each Gist here as it is published, so one index link can lead readers to the other results.
+After the shadow follow-up, items 5 and 4a can stand on their own. Share item 2 once measurements
+show what one variant saves and what it costs.
+
+### Later topics
+
+- **4b. Idle bitmap reuse.** Across eight warm flicks over previously seen photos, V3D texture-formatting submissions fell from 152 to zero. Bring that trace to a discussion of the memory budget and when to release textures. [Measurements](frame-pacing.md#fast-flicks-through-photographs) and [upstream retirement policy](https://github.com/expo/exact/commit/f4ba5552c).
+- **6. Linux touchscreen scrolling.** Show the drag, fling, tap-to-stop and rubber-band behavior with a minimal list and input trace. The fork handles single-finger vertical drags. A general implementation also needs to handle nested scrolling and the reader's gesture lifecycle. Cursor visibility with mixed touch and mouse input can be reported separately. [Input limits](../KIOSK.md#limits-to-retain-during-integration).
+- **7a. Linux camera and QR.** Share the use case of a live preview and barcode recognition from the same capture. The fixed Pi camera path is a working reference for the Linux capability request. [Upstream camera scope](https://github.com/expo/exact/blob/2685f0a30/rules/DEFERRED.md#L1466-L1481).
+- **7b. Hatch connection on first presentation.** Reproduce the missing connection on current upstream with a frame awaiting presentation and newer input already dirty. If it reproduces, the regression test makes a small bug report independent of the camera. [Fix and test](https://github.com/smihica/exact/commit/d143342dc).
+
 ## Upstream and Pi 4 status on 2026-11-22
 
 The fork merged upstream `9c348ab33` into the work based on `295e852a3`.
