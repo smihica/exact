@@ -285,6 +285,27 @@ fn textures_brushes_clips_mips_and_retirement_reach_the_pixels() {
     tinted.flags = flags::TINT;
     tinted.color = [0., 0.5, 0., 0.5];
     e.push(tinted, bindings).unwrap();
+    let mut shadow = Instance::new(Kind::Shadow, Brush::Image, [0., 0., 1., 1.]);
+    shadow.flags = flags::TINT;
+    shadow.xform = [6.25, 0., 0., 8., 46.375, 4.];
+    shadow.param[0] = 0.;
+    shadow
+        .set_clip(
+            1,
+            RoundedClip {
+                rect: [49., 6., 2., 4.],
+                radii: [0.; 4],
+            },
+        )
+        .unwrap();
+    e.push(shadow, bindings).unwrap();
+    let mut band = shadow.translated([9., 0.]);
+    band.flags |= flags::RASTERED_SHADOW;
+    for x in [0., 0.5] {
+        band.rect = [x, 0., 0.5, 1.];
+        band.uv = band.rect;
+        e.push(band, bindings).unwrap();
+    }
     let mut radial = Instance::new(Kind::RoundedRect, Brush::Gradient, [24., 16., 8., 16.]);
     radial.flags = flags::RADIAL;
     radial.param = [28., 24., 4., 8.];
@@ -340,6 +361,12 @@ fn textures_brushes_clips_mips_and_retirement_reach_the_pixels() {
     near(pixel(&pixels, 64, 10, 24), [128; 4], 1);
     near(pixel(&pixels, 64, 2, 24), [0; 4], 0);
     near(pixel(&pixels, 64, 10, 18), [0; 4], 0);
+    // At the same fractional edge the raster supplies its own coverage.
+    near(pixel(&pixels, 64, 46, 8), [80; 4], 1);
+    near(pixel(&pixels, 64, 55, 8), [128; 4], 1);
+    // The two translucent bands share the centre of this pixel.
+    near(pixel(&pixels, 64, 58, 5), [128; 4], 1);
+    near(pixel(&pixels, 64, 58, 8), [0; 4], 1);
     assert!(device.completed().unwrap() >= submitted);
     assert!(device.retired_textures.is_empty());
     let copy = device.create_target(3, 1).unwrap();
