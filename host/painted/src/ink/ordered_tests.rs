@@ -115,7 +115,12 @@ pub struct Fake {
     events: Vec<Event>,
     submitted: Submission,
     copies: Vec<([u32; 2], [u32; 2])>,
-    retired: Vec<TextureId>,
+    pub(super) retired: Vec<TextureId>,
+    pub(super) complete: Option<Submission>,
+    pub(super) fail_create: Option<Error>,
+    pub(super) fail_render: Option<Error>,
+    pub(super) fail_retire: Option<Error>,
+    pub(super) fail_last_use: Option<Error>,
 }
 impl Device for Fake {
     type Buffer = Buffer;
@@ -129,6 +134,9 @@ impl Device for Fake {
         unreachable!()
     }
     fn create_texture(&mut self, _: TextureDesc) -> Result<TextureId> {
+        if let Some(error) = self.fail_create.take() {
+            return Err(error);
+        }
         let id = TextureId(self.textures.len() as u64 + 1);
         self.textures.insert(id, Submission(0));
         Ok(id)
@@ -146,6 +154,9 @@ impl Device for Fake {
         Ok(self.submitted)
     }
     fn last_use(&self, id: TextureId) -> Result<Submission> {
+        if let Some(error) = &self.fail_last_use {
+            return Err(error.clone());
+        }
         Ok(self.textures[&id])
     }
     fn generate_mips(&mut self, _: TextureId) -> Result<Submission> {
@@ -167,8 +178,30 @@ impl Device for Fake {
         Ok(self.submitted)
     }
     fn render(&mut self, f: &Frame, target: TextureId, _: Option<[f64; 4]>) -> Result<Submission> {
+        if let Some(error) = self.fail_render.take() {
+            return Err(error);
+        }
+        self.submitted.0 += 1;
         let mut sampled = Vec::new();
         for batch in &f.batches {
+            let b = batch.bindings;
+            for id in [
+                b.image,
+                b.glyph,
+                b.color,
+                b.path,
+                b.ramp,
+                b.mask,
+                b.destination,
+            ] {
+                if id.0 != 0 {
+                    assert!(!self.retired.contains(&id), "sampled a retired texture");
+                    *self
+                        .textures
+                        .get_mut(&id)
+                        .expect("sampled a texture never created") = self.submitted;
+                }
+            }
             for id in [batch.bindings.glyph, batch.bindings.color] {
                 if id.0 != 0 {
                     assert!(
@@ -180,7 +213,6 @@ impl Device for Fake {
             }
         }
         self.events.push(Event::Draw(sampled));
-        self.submitted.0 += 1;
         self.textures.insert(target, self.submitted);
         Ok(self.submitted)
     }
@@ -191,11 +223,12 @@ impl Device for Fake {
         panic!("the pass must not wait")
     }
     fn completed(&mut self) -> Result<Submission> {
-        Ok(self.submitted)
+        Ok(self.complete.unwrap_or(self.submitted))
     }
     fn retire_texture(&mut self, id: TextureId) -> Result<()> {
+        assert!(!self.retired.contains(&id), "retired a texture twice");
         self.retired.push(id);
-        Ok(())
+        self.fail_retire.take().map_or(Ok(()), Err)
     }
     fn trim(&mut self) -> Result<()> {
         Ok(())

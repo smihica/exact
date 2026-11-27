@@ -194,12 +194,21 @@ fn bands_skip_most_of_a_wide_cards_shadow_quad_without_extra_batches() {
     ink.shadows = Shadows::new(true);
     ink.shadows.bands = true;
     ink.begin(800., 1280., 1.);
+    for inset in [0.25, 1.5] {
+        ink.push_clip(
+            &Shape::new((inset, inset, 790., 1260.), [8.; 4]),
+            Transform::identity(),
+        );
+    }
     let outer = Shape::new((32., 50., 736., 160.), [16.; 4]);
     let shape = Shape::new((32., 54., 736., 160.), [16.; 4]);
     assert!(ink.blurred_shadow(&shape, SHADOW, 9., &outer, Transform::identity()));
     let frame = ink.encoder.take_frame();
     assert_eq!(frame.instances.len(), 4);
     assert_eq!(frame.batches.len(), 1);
+    assert_ne!(frame.batches[0].bindings.mask, TextureId(0));
+    ink.pop_clip();
+    ink.pop_clip();
     let area: f32 = frame
         .instances
         .iter()
@@ -209,4 +218,60 @@ fn bands_skip_most_of_a_wide_cards_shadow_quad_without_extra_batches() {
         })
         .sum();
     assert!(area < 0.4, "fraction of full quad: {area}");
+}
+
+#[test]
+fn shadow_bands_share_one_parent_mask_in_a_draw_and_a_moved_row() {
+    let mut ink = Ink::new().unwrap();
+    ink.shadows = Shadows::new(true);
+    ink.page([0; 4]);
+    let parent = Shape::new((8.5, 5.75, 84., 48.25), [12., 4., 7., 9.]);
+    let bounds = (-12., -12., 110., 75.);
+    let recorded = (6.25, 7.5);
+    for radius in [0., 8.] {
+        let shadow = |ink: &mut Ink, (x, y)| {
+            let ts = Transform::from_translate(x, y);
+            ink.push_clip(&Shape::new((-1.5, 2.25, 78., 43.), [radius; 4]), ts);
+            let outer = Shape::new((7., 8., 63., 25.), [4.; 4]);
+            let shape = Shape::new((7., 10., 63., 25.), [4.; 4]);
+            assert!(ink.blurred_shadow(&shape, SHADOW, 6., &outer, ts));
+            ink.pop_clip();
+        };
+        ink.begin(104., 72., 1.);
+        ink.shadows.bands = true;
+        let cache = (ink.shadows.rasters.len(), ink.shadows.hits);
+        ink.row_begin(1, recorded, None);
+        shadow(&mut ink, recorded);
+        ink.row_end(bounds);
+        assert_eq!((ink.shadows.rasters.len(), ink.shadows.hits), cache);
+        assert_eq!(ink.pool.used(), 0, "recording keeps the clip in row space");
+
+        for (origin, replay) in [(recorded, false), ((17.625, 13.75), true)] {
+            let mut draw = |bands| {
+                ink.begin(104., 72., 1.);
+                ink.shadows.bands = bands;
+                ink.push_clip(&parent, Transform::identity());
+                if bands && replay {
+                    ink.row_draw(1, origin, bounds);
+                } else {
+                    shadow(&mut ink, origin);
+                }
+                ink.pop_clip();
+                assert_eq!(
+                    ink.pool.used(),
+                    1,
+                    "radius {radius}, bands {bands}, row {replay}"
+                );
+                ink.finish().unwrap()
+            };
+            let full = draw(false);
+            let bands = draw(true);
+            assert!(full.data().chunks_exact(4).any(|p| p[3] > 0));
+            let (max, percent) = difference(&full, &bands);
+            assert!(
+                max <= 1 && percent < 0.1,
+                "radius {radius}, row {replay}: {max}, {percent}%"
+            );
+        }
+    }
 }

@@ -537,10 +537,16 @@ impl Encoder {
     }
 
     /// Re-clips an instance, including clips recorded inside a kept row (D4).
-    pub fn push(
+    pub fn push(&mut self, instance: Instance, bindings: Bindings) -> Result<(), NeedsLayer> {
+        self.push_parts(instance, bindings, std::iter::once)
+    }
+
+    /// Apply the effective clip once before splitting a draw into pieces.
+    pub fn push_parts<I: IntoIterator<Item = Instance>>(
         &mut self,
         mut instance: Instance,
         mut bindings: Bindings,
+        parts: impl FnOnce(Instance) -> I,
     ) -> Result<(), NeedsLayer> {
         if self.state.needs_layer {
             return Err(NeedsLayer);
@@ -568,23 +574,23 @@ impl Encoder {
         if scissor.width == 0 || scissor.height == 0 {
             return Ok(());
         }
-        let replace = instance.flags & (flags::REPLACE | flags::BLEND_MASK) != 0;
-        let index = u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
-        if let Some(batch) =
-            self.frame.batches.last_mut().filter(|b| {
+        for instance in parts(instance) {
+            let replace = instance.flags & (flags::REPLACE | flags::BLEND_MASK) != 0;
+            let index = u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
+            if let Some(batch) = self.frame.batches.last_mut().filter(|b| {
                 !replace && !b.replace && b.scissor == scissor && b.bindings == bindings
-            })
-        {
-            batch.instances.end = index + 1;
-        } else {
-            self.frame.batches.push(Batch {
-                replace,
-                instances: index..index + 1,
-                scissor,
-                bindings,
-            });
+            }) {
+                batch.instances.end = index + 1;
+            } else {
+                self.frame.batches.push(Batch {
+                    replace,
+                    instances: index..index + 1,
+                    scissor,
+                    bindings,
+                });
+            }
+            self.frame.instances.push(instance);
         }
-        self.frame.instances.push(instance);
         Ok(())
     }
 

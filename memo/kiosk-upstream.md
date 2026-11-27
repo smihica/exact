@@ -57,6 +57,37 @@ The cache remains opt-in in the fork. An upstream version needs a policy for
 fractional-position pixel differences, eviction that respects retained rows,
 release on trim, one combined clip per shadow, and device-loss handling.
 
+### Retained shadow lifetime and combined clipping
+
+A retained row stores the analytic shadow geometry and looks up the current
+raster when replayed. This lets trim and eviction release a raster while rows
+and slots remain available. The 16 MiB limit includes retired textures awaiting
+GPU completion. The painter resolves nested clips once, then emits the exterior
+bands. A regression test with nested clips used four mask targets before this
+change and one after it.
+
+On the Pi 4, the same 16-second warm photo-list scroll produced 957 completed
+flips (59.94 fps) and 12.54 ms of GPU time per flip in one run. Of 956 frame
+intervals, 955 spanned one refresh and one spanned two. Two control runs on
+`4662db6ed` measured 59.94 and 59.81 fps, with 12.53 ms per flip pooled.
+The home, initial list and warm stationary images matched the control byte
+for byte. Both use the original geometry-keyed RGBA8 raster and filtering.
+
+Fractional-position accuracy is a separate experiment. A
+[phase-keyed f32 raster](https://github.com/smihica/exact/commit/0b79a2860)
+matched the stock renderer outside the cursor in three stationary captures.
+It created 266 rasters in one measured scroll and 257 in the other, at 39.98
+fps pooled. See the [two-run results and pixel comparisons](https://github.com/smihica/exact/blob/0b79a2860/memo/kiosk-upstream.md#fractional-position-shadow-experiment).
+
+A [two-by-two coverage grid](https://github.com/smihica/exact/commit/8ea2ce919)
+reused one raster across positions. Two warm scrolls measured 53.36 and
+53.17 fps. On Vulkan and GLES, 17 of 40 headless pixel comparisons exceeded
+the experimental accuracy thresholds, with differences up to 2/255.
+On the Pi 4's V3D, the phase-keyed build passed all eleven shadow tests.
+The grid build passed nine. Its two fractional-position tests exceeded the
+thresholds. At scale 1 and phase 0.5, for example, 547 of 98,800 pixels
+differed from the analytic draw, by up to 2/255.
+
 ## What to share upstream (2026-11-26)
 
 The code comparison uses [upstream `2685f0a30`](https://github.com/expo/exact/tree/2685f0a30) and
