@@ -485,7 +485,8 @@ fn d3d11_coverage_and_shadows_agree_with_the_shader_arithmetic() {
 fn cached_shadow_exclusion_matches_the_analytic_clip() {
     let mut d = wgpu::Wgpu::new().expect("wgpu device for shadow coverage");
     let image = d.create_texture(TextureDesc::rgba(1, 1)).unwrap();
-    d.upload_texture(image, [0, 0], [1, 1], &[255; 4]).unwrap();
+    d.upload_texture(image, [0, 0], [1, 1], &1.0f32.to_le_bytes())
+        .unwrap();
     let target = d.create_target(48, 40).unwrap();
     let clip = RoundedClip {
         rect: [8.5, 9.25, 31., 22.5],
@@ -493,7 +494,7 @@ fn cached_shadow_exclusion_matches_the_analytic_clip() {
     };
     let mut i = Instance::new(Kind::Shadow, Brush::Image, [0., 0., 1., 1.]);
     i.xform = [48., 0., 0., 40., 0., 0.];
-    i.flags = flags::TINT | flags::RASTERED_SHADOW;
+    i.flags = flags::TINT | flags::RASTERED_SHADOW | flags::SHADOW_COVERAGE;
     i.set_clip(1, clip).unwrap();
     let mut encoder = Encoder::new(48, 40);
     encoder

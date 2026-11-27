@@ -57,6 +57,33 @@ The cache remains opt-in in the fork. An upstream version needs a policy for
 fractional-position pixel differences, eviction that respects retained rows,
 release on trim, one combined clip per shadow, and device-loss handling.
 
+### Fractional-position shadow experiment
+
+We stored each analytic coverage value as four bytes of an f32 and read the
+matching texel at the draw's device-pixel phase. A retained row keeps the
+analytic draw. Replaying it looks up the raster at its new position. The
+shadow budget includes textures still in flight and the painter resolves a
+combined parent clip before splitting the draw into exterior bands.
+
+On the Pi 4, we repeated the same 16-second warm photo-list scroll in
+A/B/B/A order. Fps counts completed DRM page flips. GPU time is the V3D
+render-engine time per completed flip.
+
+| Configuration | Displayed fps, two runs | GPU ms per flip, pooled | Intervals spanning two or more refreshes |
+| --- | --- | ---: | ---: |
+| Previous kiosk cache | 59.94 / 59.81 | 12.53 | 4 of 1,910 |
+| Cache by exact device-pixel phase | 39.08 / 40.88 | 23.40 | 522 of 1,274 |
+
+During the first measured scroll the previous cache created zero rasters and the
+phase-keyed cache created 266. In a separate six-cycle dialog test, the latter
+created 24–25 rasters per open/close cycle.
+
+The phase-keyed renderer matched stock RGB at the home screen and two stationary
+list captures outside the cursor bounds. In the same regions the previous cache
+changed 56, 152 and 156 pixels respectively, each by one channel level.
+Headless tests at other fractional positions still find isolated one-level
+differences. The measured scroll cost makes this an experimental comparison.
+
 ## What to share upstream (2026-11-26)
 
 The code comparison uses [upstream `2685f0a30`](https://github.com/expo/exact/tree/2685f0a30) and

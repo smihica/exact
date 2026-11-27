@@ -81,14 +81,14 @@ Subscriptions do not start capture or change preview ownership.
 - The Linux DRM host does not signal memory pressure, window hiding or focus
   loss. Idle textures stay within the budget. The next frame retires entries
   whose decoded picture has been released.
-- Shadow textures share a 16 MiB non-evicting budget. Animated dimensions,
-  scale or blur create new geometries; after the budget is reached, new shapes
-  use analytic drawing. Texture allocation failure still uses the renderer's
-  existing error handling.
-- Outer bands preserve the live border-box exclusion, but two parent rounded
-  clips can repeat the combined-mask fallback for each band. Fractional-edge
-  rectangular clips can also take that path. Keep this optimization opt-in
-  until splitting happens after clip handling, including retained-row replay.
+- The optional shadow cache keys coverage by geometry, scale and fractional
+  device position. A kept row records the analytic shadow and looks up its
+  raster at the current position on replay. The painter resolves the parent
+  clip once for all four exterior bands.
+- The 16 MiB shadow budget includes textures awaiting GPU completion. At
+  capacity, the painter evicts the least recently used eligible texture.
+  When every candidate is still in use it draws the new shadow analytically.
+  Memory trimming releases cached textures.
 - New shadow geometries incur first-use work. Warm-frame
   throughput does not measure that cost or long-running stability.
 

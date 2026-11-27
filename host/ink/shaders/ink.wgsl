@@ -272,6 +272,7 @@ fn brush(v: Vertex, data: vec2<u32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> 
             return textureSample(ramp, filtering, uv);
         }
         case 2u, 3u: {
+            if kind == 2u && (flags & 32768u) != 0u { return v.color; }
             var uv = mapped(v.local, v.rect, v.uv);
             // Coverage uses uv for its path mask; its image occupies the full slot.
             if kind == 4u { uv = (v.local - v.rect.xy) / v.rect.zw; }
@@ -471,6 +472,18 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
             // which the 0 would not cancel.
             let sigma = v.param.x;
+            if (flags & 32768u) != 0u {
+                if (flags & 2u) == 0u {
+                    // The target is cleared to zero and written once, so all four
+                    // UNORM channels can carry the bits of the analytic coverage.
+                    let bits = bitcast<u32>(shadow(v.local, v.uv, v.radii, sigma, pixel));
+                    return vec4<f32>(vec4<u32>(bits, bits >> 8u, bits >> 16u, bits >> 24u) & vec4<u32>(255u)) / 255.0;
+                }
+                let size = vec2<i32>(textureDimensions(picture));
+                let at = clamp(vec2<i32>(mapped(v.local, v.rect, v.uv) * vec2<f32>(size)), vec2<i32>(0), size - 1);
+                let bytes = vec4<u32>(round(textureLoad(picture, at, 0) * 255.0));
+                alpha = bitcast<f32>(bytes.x | (bytes.y << 8u) | (bytes.z << 16u) | (bytes.w << 24u));
+            }
             // A rastered shadow already carries coverage in the image alpha.
             if (flags & 2u) == 0u
                 && ((flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30)) {
