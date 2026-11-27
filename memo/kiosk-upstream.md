@@ -83,6 +83,10 @@ A [two-by-two coverage grid](https://github.com/smihica/exact/commit/8ea2ce919)
 reused one raster across positions. Two warm scrolls measured 53.36 and
 53.17 fps. On Vulkan and GLES, 17 of 40 headless pixel comparisons exceeded
 the experimental accuracy thresholds, with differences up to 2/255.
+On the Pi 4's V3D, the phase-keyed build passed all eleven shadow tests.
+The grid build passed nine. Its two fractional-position tests exceeded the
+thresholds. At scale 1 and phase 0.5, for example, 547 of 98,800 pixels
+differed from the analytic draw, by up to 2/255.
 
 ## What to share upstream (2026-11-26)
 
