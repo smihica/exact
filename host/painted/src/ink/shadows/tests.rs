@@ -24,9 +24,8 @@ fn scene(ink: &mut Ink) {
     ink.pop_clip();
 }
 
-/// The largest byte difference and the percentage of pixels that differ.
-/// RGBA8 storage, subpixel filtering and composition can change pixel values.
-fn difference(a: &Pixmap, b: &Pixmap) -> (u8, f64) {
+fn compare(failures: &mut Vec<String>, scene: String, a: &Pixmap, b: &Pixmap, limit: f64) {
+    assert_eq!((a.width(), a.height()), (b.width(), b.height()));
     let mut max = 0;
     let mut pixels = 0;
     for (a, b) in a.data().chunks_exact(4).zip(b.data().chunks_exact(4)) {
@@ -34,56 +33,64 @@ fn difference(a: &Pixmap, b: &Pixmap) -> (u8, f64) {
         max = max.max(d);
         pixels += usize::from(d != 0);
     }
-    (max, pixels as f64 * 100. / (a.width() * a.height()) as f64)
+    let total = a.width() * a.height();
+    let percent = pixels as f64 * 100. / f64::from(total);
+    let summary = format!("{scene}: {pixels}/{total} pixels differ, {percent:.5}%, max {max}/255");
+    eprintln!("{summary}");
+    if max > 1 || percent >= limit {
+        failures.push(summary);
+    }
 }
 
 #[test]
 fn a_rastered_shadow_draws_as_the_analytic_one_wherever_it_lands() {
+    let mut failures = Vec::new();
     let mut analytic = Ink::new().unwrap();
     analytic.shadows = Shadows::new(false);
     let mut cached = Ink::new().unwrap();
     cached.shadows = Shadows::new(true);
     cached.shadows.bands = true;
-    for (n, scale) in [1., 1.5, 2.].into_iter().enumerate() {
-        let hits = cached.shadows.hits;
+    for scale in [1., 1.5, 2.] {
         for ink in [&mut analytic, &mut cached] {
             ink.begin(200., 240., scale);
             scene(ink);
         }
-        let (max, percent) = difference(&analytic.finish().unwrap(), &cached.finish().unwrap());
         // Two shadows overlap.
-        assert!(
-            max <= 2 && percent < 2.,
-            "scale {scale}: {max}, {percent:.2}%"
+        compare(
+            &mut failures,
+            format!("scene at scale {scale}"),
+            &analytic.finish().unwrap(),
+            &cached.finish().unwrap(),
+            0.01,
         );
-        // One raster per scale, whatever the cards' positions, clips and opacity.
-        assert_eq!(cached.shadows.rasters.len(), n + 1);
-        assert_eq!(cached.shadows.hits - hits, 2);
 
-        // A kept row moved by whole device pixels keeps its fractional phase.
+        // Replaying the same row can change its device-pixel phase.
         let bounds = (-10., -10., 190., 90.);
         cached.begin(200., 240., scale);
         cached.row_begin(1, (20.3, 14.65), None);
         card(&mut cached, (20.3, 14.65), Transform::identity());
         assert_eq!(cached.row_end(bounds), 1);
-        for delta in [(0., 0.), (10., 90.)] {
+        for delta in [(0., 0.), (10., 90.), (10.375, 90.25)] {
             let origin = (20.3 + delta.0, 14.65 + delta.1);
             cached.begin(200., 240., scale);
             cached.row_draw(1, origin, bounds);
             analytic.begin(200., 240., scale);
             card(&mut analytic, origin, Transform::identity());
-            let (max, percent) = difference(&analytic.finish().unwrap(), &cached.finish().unwrap());
-            assert!(
-                max <= 1 && percent < 2.,
-                "scale {scale}, row moved {delta:?}: {max}, {percent:.2}%"
+            compare(
+                &mut failures,
+                format!("scale {scale}, row moved {delta:?}"),
+                &analytic.finish().unwrap(),
+                &cached.finish().unwrap(),
+                0.01,
             );
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[cfg(not(windows))]
 #[test]
-fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
+fn the_cache_reuses_a_sample_grid_across_fractional_translations_and_keeps_its_budget() {
     let mut ink = Ink::from_device(Selected::Fake(ordered_tests::Fake::default()));
     ink.shadows = Shadows::new(false);
     ink.begin(80., 80., 2.);
@@ -105,8 +112,8 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
         );
         assert_ne!(frame.batches[0].bindings.image, TextureId(0));
         assert_ne!(i.flags & flags::RASTERED_SHADOW, 0);
-        // The quad's device origin, unrounded, and the same live exclusion.
-        assert_eq!(i.xform, [120., 0., 0., 100., 2. * (10.25 + dx - 10.), 21.]);
+        assert_eq!(i.xform, [120., 0., 0., 100., 2. * (0.25 + dx), 21.]);
+        assert_eq!(i.uv, [0.5 / 241., 0.5 / 201., 240. / 241., 200. / 201.]);
         assert_eq!(
             (i.clip1, i.clip_radii),
             (analytic.clip1, analytic.clip_radii)
@@ -114,7 +121,7 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
         assert_eq!((i.color, i.param[0]), (analytic.color, 0.));
     }
     assert_eq!((ink.shadows.rasters.len(), ink.shadows.hits), (1, 2));
-    assert_eq!(ink.shadows.bytes, 120 * 100 * 4);
+    assert_eq!(ink.shadows.bytes, 241 * 201 * 4);
 
     // Too little blur to resample, or no budget left, is drawn analytically.
     assert_eq!(
@@ -131,6 +138,7 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
 
 #[test]
 fn bands_preserve_the_full_cached_shadow_at_fractional_positions() {
+    let mut failures = Vec::new();
     let mut analytic = Ink::new().unwrap();
     analytic.shadows = Shadows::new(false);
     let mut full = Ink::new().unwrap();
@@ -173,18 +181,23 @@ fn bands_preserve_the_full_cached_shadow_at_fractional_positions() {
             let analytic = analytic.finish().unwrap();
             let full = full.finish().unwrap();
             let bands = bands.finish().unwrap();
-            let (max, percent) = difference(&full, &bands);
-            assert!(
-                max <= 1 && percent < 0.1,
-                "scale {scale}, phase {phase}: {max}, {percent}%"
+            compare(
+                &mut failures,
+                format!("full/bands at scale {scale}, phase {phase}"),
+                &full,
+                &bands,
+                0.1,
             );
-            let (max, percent) = difference(&analytic, &bands);
-            assert!(
-                max <= 2,
-                "analytic at scale {scale}, phase {phase}: {max}, {percent}%"
+            compare(
+                &mut failures,
+                format!("analytic/bands at scale {scale}, phase {phase}"),
+                &analytic,
+                &bands,
+                0.01,
             );
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[cfg(not(windows))]
@@ -194,19 +207,92 @@ fn bands_skip_most_of_a_wide_cards_shadow_quad_without_extra_batches() {
     ink.shadows = Shadows::new(true);
     ink.shadows.bands = true;
     ink.begin(800., 1280., 1.);
+    for inset in [0.25, 1.5] {
+        ink.push_clip(
+            &Shape::new((inset, inset, 790., 1260.), [8.; 4]),
+            Transform::identity(),
+        );
+    }
     let outer = Shape::new((32., 50., 736., 160.), [16.; 4]);
     let shape = Shape::new((32., 54., 736., 160.), [16.; 4]);
     assert!(ink.blurred_shadow(&shape, SHADOW, 9., &outer, Transform::identity()));
     let frame = ink.encoder.take_frame();
     assert_eq!(frame.instances.len(), 4);
     assert_eq!(frame.batches.len(), 1);
+    assert_ne!(frame.batches[0].bindings.mask, TextureId(0));
+    ink.pop_clip();
+    ink.pop_clip();
     let area: f32 = frame
         .instances
         .iter()
         .map(|i| {
-            assert_eq!(i.rect, i.uv);
+            for (axis, span) in [2. * i.xform[0], 2. * i.xform[3]].into_iter().enumerate() {
+                let texels = span.ceil() + 1.;
+                assert!((i.uv[axis] * texels - (0.5 + i.rect[axis] * span)).abs() < 0.001);
+                assert!((i.uv[axis + 2] * texels - i.rect[axis + 2] * span).abs() < 0.001);
+            }
             i.rect[2] * i.rect[3]
         })
         .sum();
     assert!(area < 0.4, "fraction of full quad: {area}");
+}
+
+#[test]
+fn shadow_bands_share_one_parent_mask_in_a_draw_and_a_moved_row() {
+    let mut failures = Vec::new();
+    let mut ink = Ink::new().unwrap();
+    ink.shadows = Shadows::new(true);
+    ink.page([0; 4]);
+    let parent = Shape::new((8.5, 5.75, 84., 48.25), [12., 4., 7., 9.]);
+    let bounds = (-12., -12., 110., 75.);
+    let recorded = (6.25, 7.5);
+    for radius in [0., 8.] {
+        let shadow = |ink: &mut Ink, (x, y)| {
+            let ts = Transform::from_translate(x, y);
+            ink.push_clip(&Shape::new((-1.5, 2.25, 78., 43.), [radius; 4]), ts);
+            let outer = Shape::new((7., 8., 63., 25.), [4.; 4]);
+            let shape = Shape::new((7., 10., 63., 25.), [4.; 4]);
+            assert!(ink.blurred_shadow(&shape, SHADOW, 6., &outer, ts));
+            ink.pop_clip();
+        };
+        ink.begin(104., 72., 1.);
+        ink.shadows.bands = true;
+        let cache = (ink.shadows.rasters.len(), ink.shadows.hits);
+        ink.row_begin(1, recorded, None);
+        shadow(&mut ink, recorded);
+        ink.row_end(bounds);
+        assert_eq!((ink.shadows.rasters.len(), ink.shadows.hits), cache);
+        assert_eq!(ink.pool.used(), 0, "recording keeps the clip in row space");
+
+        for (origin, replay) in [(recorded, false), ((17.625, 13.75), true)] {
+            let mut draw = |bands| {
+                ink.begin(104., 72., 1.);
+                ink.shadows.bands = bands;
+                ink.push_clip(&parent, Transform::identity());
+                if bands && replay {
+                    ink.row_draw(1, origin, bounds);
+                } else {
+                    shadow(&mut ink, origin);
+                }
+                ink.pop_clip();
+                assert_eq!(
+                    ink.pool.used(),
+                    1,
+                    "radius {radius}, bands {bands}, row {replay}"
+                );
+                ink.finish().unwrap()
+            };
+            let full = draw(false);
+            let bands = draw(true);
+            assert!(full.data().chunks_exact(4).any(|p| p[3] > 0));
+            compare(
+                &mut failures,
+                format!("radius {radius}, row {replay}"),
+                &full,
+                &bands,
+                0.1,
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

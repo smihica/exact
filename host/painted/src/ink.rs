@@ -203,10 +203,24 @@ impl Ink {
                 .push(instance.translated(capture.offset(self.scale)), bindings);
             return Ok(());
         }
-        if self.encoder.push(instance, bindings).is_err() {
+        // A kept shadow can move by fractional device pixels at replay.
+        let (instance, bindings) = if instance.kind_brush == Kind::Shadow as u32 {
+            self.cached_shadow(instance, Self::shadow_reach(instance.param[0]))?
+        } else {
+            (instance, bindings)
+        };
+        let bands = instance.flags & flags::RASTERED_SHADOW != 0 && self.shadows.bands;
+        let push = |encoder: &mut Encoder| {
+            if bands {
+                encoder.push_parts(instance, bindings, Self::shadow_bands)
+            } else {
+                encoder.push(instance, bindings)
+            }
+        };
+        if push(&mut self.encoder).is_err() {
             let clip = self.combined_clip(None)?;
             self.encoder.push_combined_clip(clip);
-            let result = self.encoder.push(instance, bindings);
+            let result = push(&mut self.encoder);
             self.encoder.pop_clip();
             result.map_err(|_| Error::Invalid("instance clips".into()))?;
         }
@@ -512,6 +526,7 @@ impl Backend for Ink {
             if let Some(target) = self.rotated_target.take() {
                 self.device.retire_texture(target)?;
             }
+            self.shadows.trim(&mut self.device)?;
             self.images.trim(&mut self.device)?;
             self.pool.trim(&mut self.device)
         })();
@@ -547,6 +562,7 @@ impl Backend for Ink {
             {
                 return Err(Error::Invalid("frame dimensions or scale".into()));
             }
+            self.shadows.begin(&mut self.device)?;
             self.paths.begin(&mut self.device)?;
             self.glyphs.begin(&mut self.device)?;
             self.ramps.begin(&mut self.device)?;
@@ -623,7 +639,7 @@ impl Backend for Ink {
         {
             return false;
         }
-        let reach = 3. * sigma.max(0.) + 1.;
+        let reach = Self::shadow_reach(sigma);
         let (x, y, w, h) = shape.rect;
         let mut i = Instance::new(
             Kind::Shadow,
@@ -652,9 +668,7 @@ impl Backend for Ink {
         {
             return false;
         }
-        let result = self
-            .cached_shadow(i, reach)
-            .and_then(|(i, b)| self.emit_shadow(i, b));
+        let result = self.emit(i, Bindings::default());
         self.accept(result);
         true
     }

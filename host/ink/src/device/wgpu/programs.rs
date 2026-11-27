@@ -54,7 +54,7 @@ pub(super) const CLASSES: [Class; 13] = [
     Class::exact(
         Kind::Shadow,
         Brush::Image,
-        flags::CLIP1 | flags::TINT | flags::RASTERED_SHADOW,
+        flags::CLIP1 | flags::TINT | flags::RASTERED_SHADOW | flags::SHADOW_COVERAGE,
     ),
 ];
 
@@ -103,6 +103,9 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
     );
     let target = d.create_target(64, 48).unwrap();
     let image = d.create_texture(TextureDesc::rgba(4, 4)).unwrap();
+    let coverage = d.create_texture(TextureDesc::rgba(1, 1)).unwrap();
+    d.upload_texture(coverage, [0, 0], [1, 1], &0.5f32.to_le_bytes())
+        .unwrap();
     let alpha = d
         .create_texture(TextureDesc {
             width: 4,
@@ -194,6 +197,10 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
                 continue;
             }
             visited[index] = true;
+            let mut bindings = bindings;
+            if i.flags & flags::SHADOW_COVERAGE != 0 {
+                bindings.image = coverage;
+            }
             e.push(i, bindings).unwrap();
             let frame = e.finish();
             d.general_only = true;

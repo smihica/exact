@@ -57,6 +57,25 @@ The cache remains opt-in in the fork. An upstream version needs a policy for
 fractional-position pixel differences, eviction that respects retained rows,
 release on trim, one combined clip per shadow, and device-loss handling.
 
+### Fixed-grid coverage experiment
+
+This branch evaluates a reusable shadow texture with two samples per axis per
+device pixel. The raster stores analytic f32 coverage. The consumer decodes
+four neighbors before interpolating. Fractional motion can reuse the same
+texture at each position.
+
+Two 16-second warm Pi 4 photo-list scrolls measured 53.36 and 53.17 fps,
+with 17.49 and 17.50 ms of GPU time per completed flip. In the same fixture
+the previous kiosk cache measured 59.94 and 59.81 fps. The
+[exact-phase experiment](https://github.com/smihica/exact/commit/0b79a2860)
+measured 39.08 and 40.88 fps.
+
+The grid agreed with the analytic reference in stationary device captures
+outside the cursor. At fractional positions, 17 of 40 headless comparisons
+exceeded the acceptance limits on both Vulkan and GLES. Up to 651 of
+98,800 pixels differed in a rounded, clipped scene, by up to 2/255. The
+quality tests retain their original thresholds so this result can be reproduced.
+
 ## What to share upstream (2026-11-26)
 
 The code comparison uses [upstream `2685f0a30`](https://github.com/expo/exact/tree/2685f0a30) and

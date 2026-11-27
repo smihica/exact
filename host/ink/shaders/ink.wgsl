@@ -196,6 +196,23 @@ fn mapped(p: vec2<f32>, rect: vec4<f32>, uv: vec4<f32>) -> vec2<f32> {
     return uv.xy + (p - rect.xy) / max(rect.zw, vec2<f32>(0.00001)) * uv.zw;
 }
 
+fn shadow_sample(at: vec2<i32>) -> f32 {
+    let bytes = vec4<u32>(round(textureLoad(picture, at, 0) * 255.0));
+    return bitcast<f32>(bytes.x | (bytes.y << 8u) | (bytes.z << 16u) | (bytes.w << 24u));
+}
+
+// Packed RGBA8 stores a float's bits. Interpolate the decoded coverages.
+fn sampled_shadow(uv: vec2<f32>) -> f32 {
+    let size = vec2<i32>(textureDimensions(picture));
+    let last = size - vec2<i32>(1);
+    let p = clamp(uv * vec2<f32>(size) - vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(last));
+    let lo = vec2<i32>(p);
+    let hi = min(lo + vec2<i32>(1), last);
+    let f = fract(p);
+    return mix(mix(shadow_sample(lo), shadow_sample(vec2<i32>(hi.x, lo.y)), f.x),
+               mix(shadow_sample(vec2<i32>(lo.x, hi.y)), shadow_sample(hi), f.x), f.y);
+}
+
 fn inside(p: vec2<f32>, rect: vec4<f32>) -> f32 {
     // Keep all four comparisons in one reduction to avoid holes in masked draws on V3D GLES.
     return select(0.0, 1.0, all(vec4<bool>(p >= rect.xy, p < rect.xy + rect.zw)));
@@ -272,6 +289,7 @@ fn brush(v: Vertex, data: vec2<u32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> 
             return textureSample(ramp, filtering, uv);
         }
         case 2u, 3u: {
+            if kind == 2u && (flags & 32768u) != 0u { return v.color; }
             var uv = mapped(v.local, v.rect, v.uv);
             // Coverage uses uv for its path mask; its image occupies the full slot.
             if kind == 4u { uv = (v.local - v.rect.xy) / v.rect.zw; }
@@ -471,6 +489,15 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
             // which the 0 would not cancel.
             let sigma = v.param.x;
+            if (flags & 32768u) != 0u {
+                if (flags & 2u) == 0u {
+                    // The target is cleared to zero and written once, so all four
+                    // UNORM channels can carry the bits of the analytic coverage.
+                    let bits = bitcast<u32>(shadow(v.local, v.uv, v.radii, sigma, pixel));
+                    return vec4<f32>(vec4<u32>(bits, bits >> 8u, bits >> 16u, bits >> 24u) & vec4<u32>(255u)) / 255.0;
+                }
+                alpha = sampled_shadow(mapped(v.local, v.rect, v.uv));
+            }
             // A rastered shadow already carries coverage in the image alpha.
             if (flags & 2u) == 0u
                 && ((flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30)) {
