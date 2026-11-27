@@ -23,7 +23,9 @@ describe the four adopted proposals and the outstanding shadow work.
 We built one release app and photo set against three SDKs from that revision.
 The first used stock upstream. The second added [shadow texture reuse and exterior
 bands](https://gist.github.com/smihica/11871690659079b97dee96eb73236f9b) and
-sampled the textures with the general shader. The third added [one fixed program
+sampled the textures with the general shader. That patch also skips rounded-clip
+distance calculations for cached shadows at least four device pixels outside
+the exclusion box, where its coverage is zero. The third added [one fixed program
 for that shadow material](https://gist.github.com/smihica/882948e965dcb2e293cb2bd36a64872a).
 All three binaries embedded the same app plan. On one Pi 4 with Ink/Vulkan, an
 800 × 1280 portrait UI and a 60 Hz panel, we replayed a 16-second wheel scroll
