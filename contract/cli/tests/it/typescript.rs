@@ -672,9 +672,12 @@ fn build_reports_all_reachable_ambient_apis_before_bake() {
     );
     fixture.write(
         "app.ts",
-        "import './helper.ts';\nexport const answer = () => Date.now();\n",
+        "import './helper.ts';\nexport const answer = () => setInterval(() => {}, 10);\n",
     );
-    fixture.write("helper.ts", "export const value = Math.random();\n");
+    fixture.write(
+        "helper.ts",
+        "export const value = requestAnimationFrame(() => {});\n",
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_contract"))
         .args(["build", "app.contract", "--json"])
         .current_dir(&fixture.0)
@@ -685,8 +688,22 @@ fn build_reports_all_reachable_ambient_apis_before_bake() {
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(found.iter().all(|d| d["id"] == "analyze-ambient-api"));
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Date.now()"), "{text}");
-    assert!(text.contains("Math.random()"), "{text}");
+    assert!(text.contains("setInterval()"), "{text}");
+    assert!(text.contains("requestAnimationFrame()"), "{text}");
+
+    // Virtualized clock and randomness are allowed at build time (LLP 1195.000 Stage 1).
+    fixture.write(
+        "app.ts",
+        "import './helper.ts';\nexport const answer = () => Date.now();\n",
+    );
+    fixture.write("helper.ts", "export const value = Math.random();\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args(["build", "app.contract", "--json"])
+        .current_dir(&fixture.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"[]\n");
 }
 
 /// An import of a file git ignores (Expose's `./local`, which its hosts'
@@ -940,4 +957,45 @@ fn mutation_source_types_follow_compiled_sends_in_imported_and_inlined_actions()
     assert!(contract::typescript(&plan)
         .unwrap()
         .contains("export type MutationSource = never;"));
+}
+
+/// `Draw` types each canvas surface's `args` from the plan (LLP 1056 D1):
+/// records by field name, a named call as an object, and a surface narrowed
+/// by its name.
+#[test]
+#[ignore = "async lane: typechecks generated signatures with tsc; bun scripts/async.mjs runs it"]
+fn draw_types_each_surfaces_arguments() {
+    let plan = contract::compile(
+        "shape Node\n  x: number\n  kind: enum<\"on\", \"off\">\n\ncomponent App\n  state nodes = [Node(x=1, kind=\"on\")]\n  view\n    column\n      canvas surface=board(nodes, 2)\n      canvas surface=pin(at=nodes.at(0), label=\"a\")\n",
+    )
+    .unwrap();
+    let fixture = Fixture::new();
+    fixture.write("app.contract.d.ts", &contract::typescript(&plan).unwrap());
+    let valid = "import type { Draw } from './app.contract.d.ts';\nexport const draw: Draw = (surface, args, ctx, frame) => {\n  if (surface === 'board') { const [nodes, scale] = args; for (const n of nodes) ctx.fillRect(n.x * scale, frame.width, 1, 1); const k: 'on' | 'off' = nodes[0].kind; void k; }\n  else { const label: string = args.label; ctx.fillRect(args.at?.x ?? 0, 0, 1, label.length); }\n  return false;\n};\n";
+    let output = fixture.check(valid);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for bad in [
+        valid.replace("n.x * scale", "n.y * scale"),
+        valid.replace("args.label", "args[1]"),
+    ] {
+        let output = fixture.check(&bad);
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success() && out.contains("error TS"),
+            "{bad}\n{out}"
+        );
+    }
+    // With no canvas, a module that still draws keeps its context's types.
+    let plan = contract::compile("component App\n  view\n    text \"a\"\n").unwrap();
+    fixture.write("app.contract.d.ts", &contract::typescript(&plan).unwrap());
+    let output = fixture.check("import type { Draw } from './app.contract.d.ts';\nexport const draw: Draw = (surface, args, ctx, frame) => { ctx.fillRect(0, 0, frame.width, surface.length); return args === null; };\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

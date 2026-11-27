@@ -17,17 +17,23 @@ impl Painter {
         &mut self,
         walk: &mut Walk<'_, '_>,
         node: &NodeRef<'_>,
+        box_paint: &BoxPaint,
         geometry: &BoxGeometry,
-        rect: Rect4,
+        (rect, origin): (Rect4, (f32, f32)),
         (own, ancestors): (Option<Rect4>, Option<Rect4>),
         ts: Transform,
     ) -> Option<(f32, f32)> {
+        // Two texts on one baseline keep it when their boxes snap.
         let mut content = geometry.content;
+        content.0 = origin.0 + geometry.inset.0;
+        content.1 = origin.1 + geometry.inset.1;
         let s = node.style;
         let kernel = walk.scene.kernel;
         let frags = kernel.fragments(node.key).unwrap_or(&[]);
         // The width its lines broke at: a fragmented box's own, not its
-        // union's; a multi-column `text`'s column width.
+        // union's; a multi-column `text`'s column width. Layout's, where the
+        // box drawn on whole pixels is a fraction of one narrower or wider.
+        let laid = box_paint.content_width(node.frame.width);
         if let Some(item) = kernel.text_item_box(node) {
             content.0 += item.x;
         }
@@ -36,8 +42,8 @@ impl Painter {
             .map(|item| item.width)
             .unwrap_or_else(|| match frags.first() {
                 Some(g) if kernel.columns(node.key).is_some() => g.width,
-                Some(g) => g.width - (rect.2 - content.2),
-                None => content.2,
+                Some(g) => g.width - (node.frame.width - laid),
+                None => laid,
             });
         // The kernel measures a Text subtree as one paragraph. Inline
         // descendants deliberately have zero frames, not paint boxes.
@@ -47,8 +53,10 @@ impl Painter {
             // A fitted paragraph's line box is at its runs' scale (LLP 1116.001 D1.4).
             let strut = exact_kernel::TextStyle::from_style(&computed).scaled(node.fit_scale());
             spec.strut = Run::from_style("", strut);
-            spec.runs = node.text_runs().iter().map(Run::from_kernel).collect();
-            spec.shown(node.props.str(PropId::Markup) == Some("markdown"))
+            spec.shown(
+                &node.text_runs(),
+                exact_kernel::text::Markup::from_prop(node.props.str(PropId::Markup)),
+            )
         };
         let paragraph = if let Some(stamp) = node.paragraph_stamp() {
             // @ref LLP 1043.000 §3 D7 — ordinary text takes the same

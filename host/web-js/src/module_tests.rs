@@ -92,8 +92,10 @@ fn prefer(name: &str, state: &str) -> Json {
 
 type Replies = Arc<Mutex<Vec<Json>>>;
 
+/// Data code's call of a module name, in the person's cause: a call with none is refused (LLP 1133.023 D7a).
 fn data_call(r: &mut Runner<Granted>, body: &Json, replies: &Replies) {
-    let Dispatch::Run(work) = r.native_work(&Request::native(body.to_string().into_bytes())) else {
+    let request = Request::native(body.to_string().into_bytes());
+    let Dispatch::Run(work) = r.as_person(|r| r.native_work(&request)) else {
         panic!("a module call is work");
     };
     let replies = replies.clone();
@@ -398,5 +400,65 @@ fn declared_list_identity_matches_the_runner() {
                 json!({"call": {"extension": "second", "send": "stopChime", "args": {"tag": "a"}}}),
             ],
         );
+    }
+}
+
+#[test]
+fn empty_notification_tags_neither_replace_nor_close_posts() {
+    for notification in [true, false] {
+        let mut plan = plan();
+        let i = plan
+            .modules
+            .iter()
+            .position(|m| plan.str(m.declared) == "setChime")
+            .unwrap();
+        let mut sub: Json = serde_json::from_str(plan.str(plan.modules[i].substitute)).unwrap();
+        sub["list"] = json!({"state": "chimes", "key": "tag", "at": "at",
+            "show": {"event": "chimeclick", "args": ["tag"]}});
+        if notification {
+            sub["list"]["launch"] = json!("notification");
+        }
+        plan.set_module_substitute(i, &sub.to_string());
+        let post = |tag, title| schedule(json!({"tag": tag, "title": title, "at": EPOCH + 1000}));
+        let steps = [
+            prefer("chime", "granted"),
+            prefer("ping", "granted"),
+            post(json!(""), "First"),
+            post(json!(""), "Second"),
+            call("stopChime", json!({"tag": ""})),
+            post(json!("named"), "Old"),
+            post(json!("named"), "New"),
+            call("stopChime", json!({"tag": "named"})),
+            post(json!("named"), "Live old"),
+            post(json!("named"), "Live new"),
+            post(Json::Null, "Untagged"),
+            json!({"clock": 1000}),
+        ];
+        let expected = if notification {
+            vec![0, 0, 1, 2, 2, 3, 3, 2, 3, 3, 4, 4]
+        } else {
+            vec![0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 2, 2]
+        };
+        let runner = runner(&plan, &steps);
+        let js = js(&plan, &steps);
+        assert_eq!(js, json!(runner));
+        for (target, snapshots) in [("runner", &runner), ("JS", js.as_array().unwrap())] {
+            let counts: Vec<_> = snapshots
+                .iter()
+                .map(|s| s["entries"].as_array().unwrap().len())
+                .collect();
+            assert_eq!(counts, expected, "{target}, notification={notification}");
+            let last = snapshots.last().unwrap();
+            assert_eq!(
+                last["heard"],
+                if notification { 4 } else { 2 },
+                "{target}: every retained post is shown"
+            );
+            assert!(last["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["delivered"] == true));
+        }
     }
 }

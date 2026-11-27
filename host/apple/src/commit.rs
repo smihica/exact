@@ -58,7 +58,9 @@ impl<D: DataSource> Host<D> {
         let _roles = self.runner.bind_roles(); // Its own, crossing (LLP 1121 stage 5).
         self.native_retire_removed_owner(&mut batch);
         self.native_note_receipts(receipts);
-        self.route_overflow.dirty |= !receipts.is_empty();
+        // A commit that changed no node cannot move a route's overflow; marking
+        // it would wake a reply pump after every firing of an idle timer.
+        self.route_overflow.dirty |= receipts.iter().any(|t| !unchanged(&t.receipt));
         let bulk_handlers = (receipts
             .iter()
             .map(|t| t.receipt.created.len())
@@ -121,17 +123,36 @@ impl<D: DataSource> Host<D> {
                     self.update(id, &mut batch);
                 }
             }
+            if let Some(node) = r
+                .reconcile_field
+                .and_then(|k| self.runner.kernel().node_by_key(k))
+            {
+                let value = exact_kernel::control::bound_field_value(node.props);
+                batch.props(node.id, &[("value", value.into_owned())], &[]);
+            }
         }
         self.withdraw_flat_hits(&omitted_gone, &mut batch);
+        // The `portal` movers placement moved this batch or before.
+        let mut movers: Vec<ViewId> = self.declared_told.iter().map(|&(m, _)| m).collect();
+        if !receipts.is_empty() {
+            self.tell_declared_parents(&mut batch);
+            movers.extend(self.declared_told.iter().map(|&(m, _)| m));
+        }
         // Receipts share the final kernel tree. A parent touched by an early
         // timer can already name a child created by a later timer in this seek.
         // All surviving views must exist before any final child list is attached.
-        for t in receipts {
-            for key in t.receipt.created.iter().chain(t.receipt.touched.iter()) {
-                if let Some(node) = self.runner.kernel().node_by_key(*key) {
-                    self.emit_children(node.id, &mut batch);
-                }
-            }
+        let mut parents: Vec<ViewId> = (receipts.iter())
+            .flat_map(|t| t.receipt.created.iter().chain(t.receipt.touched.iter()))
+            .filter_map(|key| self.runner.kernel().node_by_key(*key).map(|n| n.id))
+            .collect();
+        // A list that receives a mover goes first, so a presenter moves its
+        // view in one step: AppKit keeps the focus of a view it moves, not of
+        // one removed and then added (LLP 1013.002 D5).
+        if !movers.is_empty() {
+            parents.sort_by_key(|&id| !self.receives(id, &movers));
+        }
+        for id in parents {
+            self.emit_children(id, &mut batch);
         }
         for id in std::mem::take(&mut self.flat.parents) {
             if self.runner.kernel().node(id).is_some() {
@@ -201,7 +222,14 @@ impl<D: DataSource> Host<D> {
         } else if inert {
             self.inert_layout(&mut batch, !receipts.is_empty()).err()
         } else {
-            self.layout(&mut batch).err()
+            // The flag ends with this layout, even when a panic unwinds
+            // through it to a caller that keeps the host
+            self.presence.committed = !receipts.is_empty();
+            let laid =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout(&mut batch)));
+            self.presence.committed = false;
+            laid.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                .err()
         };
         if layout_error.is_some() && !receipts.is_empty() {
             self.emit_ranks(&mut batch);

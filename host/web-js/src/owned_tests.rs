@@ -49,6 +49,30 @@ component Discover
         text \"Reload\"
 ";
 
+#[test]
+fn grouped_subtitle_can_read_state_owned_by_its_arm() {
+    let plan = contract::compile(
+        r#"component App
+  state show = true
+  view
+    list appearance="auto"
+      section
+        column
+          text "Title"
+          if show
+            Detail()
+
+component Detail
+  state expanded = true
+  view
+    if expanded
+      text "Supporting text"
+"#,
+    )
+    .unwrap();
+    crate::emit::emit(&plan, false, false).expect("the grouped list builds");
+}
+
 /// The row is an aggregate at the root; each instance makes its own request,
 /// which its action refreshes, and its path follows the runner's.
 #[test]
@@ -58,7 +82,9 @@ fn each_instance_makes_and_refreshes_its_own_request() {
     let js = crate::emit::emit(&plan, false, false).unwrap().js;
     assert!(js.contains(&format!("const r_0=owned({works:?})")), "{js}");
     assert!(
-        js.contains(&format!(".r0=own(r_0,()=>res({works:?},\"subjectWorks\"")),
+        js.contains(&format!(
+            ".r0=own(r_0,$path=>res({works:?},\"subjectWorks\""
+        )),
         "{js}"
     );
     assert!(js.contains(r#"R($r["r0"])"#), "{js}");
@@ -88,6 +114,28 @@ fn a_launch_instance_takes_the_bakes_answer() {
         "{js}"
     );
     assert!(js.contains("(booting()?[\"sf\"]:void 0)"), "{js}");
+}
+
+/// A store reader's instance takes the bake's answer only while the boot
+/// makes it, though the emitter writes no arguments for it. The bake gives a
+/// store-reading instance no answer (`bake_launch_answers`), so the test marks
+/// a baked row a reader.
+#[test]
+fn a_store_readers_launch_instance_takes_the_bakes_answer_only_at_boot() {
+    let first = SCREENS.replace(
+        "home \"/\"\n  discover \"/discover\"",
+        "discover \"/\"\n  home \"/home\"",
+    );
+    let mut plan = contract::bake(contract::compile(&first).unwrap(), Built).unwrap();
+    let i = (plan.resources.iter())
+        .position(|r| plan.str(r.name).starts_with("works"))
+        .unwrap();
+    plan.resources[i].reader = true;
+    let js = crate::emit::emit(&plan, false, false).unwrap().js;
+    assert!(
+        js.contains("(booting()?[!0,[\"baked sf\"]]:void 0)"),
+        "{js}"
+    );
 }
 
 /// A plan with no child's resource emits no instance paths.
@@ -214,4 +262,58 @@ fn a_use_outside_every_region_sends_as_the_root() {
     let made = js.find(&format!("const m_0=mut({detected:?}")).expect(&js);
     assert!(declared < made, "{js}");
     assert!(js.contains("m_0.then=()=>a_2(\"9\");"), "{js}");
+}
+
+/// A virtualized list inside a child component reads its enclosing instance's
+/// owned resources and mutations in `inputs`, never the throwing root stubs.
+#[test]
+fn virtualized_list_row_inputs_read_owned_resources_on_their_instance() {
+    let single = r#"shape Feed
+  prefix: string
+
+component App
+  state show = true
+  view
+    column
+      if show
+        Screen()
+
+component Screen
+  resource feed = getFeed() as shape Feed else empty(prefix="")
+  mutation save as shape Feed
+  state ids = [1, 2]
+  action run
+    send save = saveFeed()
+  view
+    list virtualized=true height=200
+      for x in ids key=x
+        text `${feed.prefix}:${pending(feed)}:${failed(feed)}:${pending(save)}:${x}`
+"#;
+    let two_uses = single
+        .replace("state show = true", "state a = true\n  state b = false")
+        .replace(
+            "      if show\n        Screen()",
+            "      if a\n        Screen()\n      if b\n        Screen()",
+        );
+    for source in [single, &two_uses] {
+        let plan = contract::compile(source).unwrap();
+        for dev_reload in [false, true] {
+            let js = crate::emit::emit(&plan, false, dev_reload).unwrap().js;
+            let inputs_at = js.find("inputs:()=>[").unwrap_or_else(|| panic!("{js}"));
+            let inputs_end = js[inputs_at..].find("],opaque:").unwrap() + inputs_at + 1;
+            let inputs = &js[inputs_at..inputs_end];
+            assert!(!inputs.contains("r_0"), "must not read root stub: {inputs}");
+            assert!(!inputs.contains("r_1"), "must not read root stub: {inputs}");
+            assert!(
+                inputs.contains(r#"["r0"]()"#)
+                    || inputs.contains(".r0()")
+                    || inputs.contains("]()"),
+                "expected owned resource read: {inputs}"
+            );
+            assert!(
+                inputs.contains(".p()") && inputs.contains(".e()"),
+                "expected pending/failed reads on owned resource/mutation: {inputs}"
+            );
+        }
+    }
 }

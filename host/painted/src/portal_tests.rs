@@ -229,6 +229,7 @@ fn a_message_reads_back_as_it_was_written() {
         "org.freedesktop.portal.FileChooser",
         "OpenFile",
         &body,
+        0,
     );
     let head: [u8; 16] = m[..16].try_into().unwrap();
     assert_eq!(wire::message_len(&head), Some(m.len()));
@@ -415,7 +416,7 @@ enum Portal {
     /// It quits with the chooser up.
     Quits,
     #[cfg(target_os = "linux")]
-    Settings { legacy: bool },
+    Settings(&'static str),
     /// The bus never says `Hello`.
     Silent,
 }
@@ -440,7 +441,7 @@ fn line(s: &mut UnixStream) -> Vec<u8> {
 
 /// An error reply to `serial`: the writer names no error, so the header
 /// is written here.
-fn error(serial: u32, name: &str, text: &str) -> Vec<u8> {
+pub(super) fn error(serial: u32, name: &str, text: &str) -> Vec<u8> {
     let field =
         |code: u8, v: Value| Value::Struct(vec![Value::Byte(code), Value::Variant(Box::new(v))]);
     let fields = vec![
@@ -493,7 +494,7 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
                         body: &[Value]| {
             serial += 1;
             let _ = s.write_all(&wire::message(
-                kind, serial, reply, "", path, iface, member, body,
+                kind, serial, reply, "", path, iface, member, body, 0,
             ));
         };
         while let Some(m) = read_message(&mut s) {
@@ -529,23 +530,24 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
                 }
                 "AddMatch" => send(&mut s, wire::METHOD_RETURN, reply, "", "", "", &[]),
                 #[cfg(target_os = "linux")]
-                "ReadOne" if matches!(portal, Portal::Settings { legacy: true }) => {
+                "ReadAll" | "ReadOne" if matches!(portal, Portal::Settings(method) if method != m.member) =>
+                {
                     s.write_all(&error(
                         m.serial,
                         "org.freedesktop.DBus.Error.UnknownMethod",
-                        "ReadOne",
+                        &m.member,
                     ))
                     .unwrap();
                 }
                 #[cfg(target_os = "linux")]
-                "Read" | "ReadOne" => {
+                "ReadAll" | "Read" | "ReadOne" => {
                     let namespace = "org.freedesktop.appearance";
                     let key = "color-scheme";
                     let variant = |v| Value::Variant(Box::new(v));
                     let path = "/org/freedesktop/portal/desktop";
                     let iface = "org.freedesktop.portal.Settings";
                     let setting = |ns, n| [Value::str(ns), Value::str(key), variant(Value::U32(n))];
-                    assert_eq!(m.body, [Value::str(namespace), Value::str(key)]);
+
                     send(
                         &mut s,
                         wire::SIGNAL,
@@ -555,11 +557,40 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
                         "SettingChanged",
                         &setting(namespace, 2),
                     );
-                    let value = variant(Value::U32(1));
-                    let result = if m.member == "Read" {
-                        variant(value)
+                    let gnome = "org.gnome.desktop.interface";
+                    let result = if m.member == "ReadAll" {
+                        assert_eq!(
+                            m.body,
+                            [Value::Array(
+                                "s".into(),
+                                vec![Value::str(namespace), Value::str(gnome)]
+                            )]
+                        );
+                        let group = |ns, entries| {
+                            Value::Entry(Box::new(Value::str(ns)), Box::new(Value::dict(entries)))
+                        };
+                        Value::Array(
+                            "{sa{sv}}".into(),
+                            vec![
+                                group(namespace, vec![(key, Value::U32(1))]),
+                                group(
+                                    gnome,
+                                    vec![
+                                        ("cursor-blink", Value::Bool(false)),
+                                        ("cursor-blink-time", Value::U32(640)),
+                                        ("cursor-blink-timeout", Value::U32(3)),
+                                    ],
+                                ),
+                            ],
+                        )
                     } else {
-                        value
+                        assert_eq!(m.body, [Value::str(namespace), Value::str(key)]);
+                        let value = variant(Value::U32(1));
+                        if m.member == "Read" {
+                            variant(value)
+                        } else {
+                            value
+                        }
                     };
                     send(&mut s, wire::METHOD_RETURN, reply, "", "", "", &[result]);
                     for (ns, n) in [("other", 0), (namespace, 2), (namespace, 2), (namespace, 0)] {
@@ -571,6 +602,21 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
                             iface,
                             "SettingChanged",
                             &setting(ns, n),
+                        );
+                    }
+                    if m.member == "ReadAll" {
+                        send(
+                            &mut s,
+                            wire::SIGNAL,
+                            None,
+                            path,
+                            iface,
+                            "SettingChanged",
+                            &[
+                                Value::str(gnome),
+                                Value::str("cursor-blink"),
+                                variant(Value::Bool(true)),
+                            ],
                         );
                     }
                 }
@@ -648,33 +694,46 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
 #[cfg(target_os = "linux")]
 #[test]
 fn desktop_appearance_follows_the_settings_portal() {
-    for legacy in [false, true] {
-        let (address, served) = bus(
-            if legacy {
-                "appearance-old"
-            } else {
-                "appearance"
-            },
-            Portal::Settings { legacy },
-        );
+    use crate::desktop::{CursorSettings, WindowSettings};
+    for method in ["ReadAll", "ReadOne", "Read"] {
+        let (address, served) = bus(method, Portal::Settings(method));
         let (send, updates) = std::sync::mpsc::channel();
-        let appearance = watch_appearance(&address, move |dark| {
-            let _ = send.send(dark);
-        })
+        let watch = watch_settings(
+            &address,
+            |s| s,
+            move |s| {
+                let _ = send.send(s);
+            },
+        )
         .unwrap();
-        for expected in [Some(true), Some(false), None] {
+        let mut cursor = if method == "ReadAll" {
+            CursorSettings {
+                blink: false,
+                cycle: Duration::from_millis(640),
+                timeout: Duration::from_secs(3),
+            }
+        } else {
+            CursorSettings::default()
+        };
+        for dark in [Some(true), Some(false), None] {
             assert_eq!(
                 updates.recv_timeout(Duration::from_secs(3)).unwrap(),
-                expected
+                WindowSettings { dark, cursor }
             );
         }
-        drop(appearance);
-        let asked = served.join().unwrap();
-        assert_eq!(asked[1].member, "AddMatch");
-        assert_eq!(asked[2].member, "ReadOne");
-        if legacy {
-            assert_eq!(asked[3].member, "Read");
+        if method == "ReadAll" {
+            cursor.blink = true;
+            assert_eq!(
+                updates.recv_timeout(Duration::from_secs(3)).unwrap(),
+                WindowSettings { dark: None, cursor }
+            );
         }
+        drop(watch);
+        let asked = served.join().unwrap();
+        let methods: Vec<_> = asked.iter().map(|m| m.member.as_str()).collect();
+        let attempts = ["Hello", "AddMatch", "ReadAll", "ReadOne", "Read"];
+        let last = attempts.iter().position(|m| *m == method).unwrap();
+        assert_eq!(methods, attempts[..=last]);
         assert!(updates.into_iter().next().is_none());
     }
 }

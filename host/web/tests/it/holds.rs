@@ -25,7 +25,7 @@ const SOURCE: &str = r##"component App
         text "retarget"
       text `${count}` testId="count"
       if shown
-        column testId="row" scale=target background-color=color transition="translate -exact-spring(180, 12, 1), scale -exact-spring(180, 12, 1)" swiperight=swipe
+        column testId="row" scale=target background-color=color transition="translate -exact-spring(180, 12, 1), scale -exact-spring(180, 12, 1)" swipe=swipe swipe-follow="right"
           text "row"
 "##;
 fn boot() -> Host<NoData> {
@@ -48,12 +48,12 @@ fn actual_browser_sample_survives_commits_and_releases_to_latest_target() {
     let mut host = boot();
     let row = id(&host, "row");
     let (hold, _) = host
-        .begin_hold(row, Property::Scale, MotionValue::new(83.0, 0.0), 100.0)
+        .begin_hold(row, Property::Scale, MotionValue::new(83.0, 83.0), 100.0)
         .unwrap()
         .unwrap();
     assert_eq!(hold.value.x, 83.0);
     assert!(host
-        .update_hold(hold.token.serial(), MotionValue::new(91.0, 0.0), 110.0)
+        .update_hold(hold.token.serial(), MotionValue::new(91.0, 91.0), 110.0)
         .unwrap()
         .is_some());
     let retarget = id(&host, "retarget");
@@ -67,14 +67,14 @@ fn actual_browser_sample_survives_commits_and_releases_to_latest_target() {
         .end_hold(
             hold.token.serial(),
             HoldEnd::Release {
-                velocity: MotionValue::new(-50.0, 0.0),
+                velocity: MotionValue::new(-50.0, -50.0),
             },
             130.0,
         )
         .unwrap()
         .unwrap();
-    assert!(release.contains("\"values\":[91,"), "{release}");
-    assert!(release.contains(",24]}"), "{release}");
+    assert!(release.contains("\"values\":[[91,91],"), "{release}");
+    assert!(release.contains(",[24,24]]}"), "{release}");
     assert!(!host.has_hold(hold.token.serial()));
     assert!(host
         .end_hold(hold.token.serial(), HoldEnd::Cancel, f64::NAN)
@@ -151,7 +151,7 @@ fn equal_target_takeover_cancels_and_same_clock_velocity_release_is_not_deduplic
     let retarget = id(&host, "retarget");
     host.dispatch_at(retarget, Event::Press, 100.0);
     let (held, cancel) = host
-        .begin_hold(row, Property::Scale, MotionValue::scalar(24.0), 100.0)
+        .begin_hold(row, Property::Scale, MotionValue::new(24.0, 24.0), 100.0)
         .unwrap()
         .unwrap();
     assert!(cancel.contains("\"values\":[]"), "{cancel}");
@@ -159,14 +159,14 @@ fn equal_target_takeover_cancels_and_same_clock_velocity_release_is_not_deduplic
         .end_hold(
             held.token.serial(),
             HoldEnd::Release {
-                velocity: MotionValue::scalar(17.0),
+                velocity: MotionValue::new(17.0, 17.0),
             },
             100.0,
         )
         .unwrap()
         .unwrap();
     assert!(release.contains("\"op\":\"animate\""), "{release}");
-    assert!(release.contains("\"values\":[24,"), "{release}");
+    assert!(release.contains("\"values\":[[24,24],"), "{release}");
 }
 
 #[test]
@@ -185,10 +185,10 @@ fn overdue_timer_retargets_live_hold_without_rewinding_its_clock() {
     .unwrap();
     let row = id(&host, "row");
     let (hold, _) = host
-        .begin_hold(row, Property::Scale, MotionValue::scalar(83.0), 150.0)
+        .begin_hold(row, Property::Scale, MotionValue::new(83.0, 83.0), 150.0)
         .unwrap()
         .unwrap();
-    host.update_hold(hold.token.serial(), MotionValue::scalar(91.0), 175.0)
+    host.update_hold(hold.token.serial(), MotionValue::new(91.0, 91.0), 175.0)
         .unwrap()
         .unwrap();
     // The runner still owes the 100ms timer; the hold is already at 175ms.
@@ -202,14 +202,14 @@ fn overdue_timer_retargets_live_hold_without_rewinding_its_clock() {
         host.springs()
             .engine()
             .value(hold.token.node(), Property::Scale),
-        Some(MotionValue::scalar(91.0))
+        Some(MotionValue::new(91.0, 91.0))
     );
     let release = host
         .end_hold(hold.token.serial(), HoldEnd::Cancel, 180.0)
         .unwrap()
         .unwrap();
-    assert!(release.contains("\"values\":[91,"), "{release}");
-    assert!(release.contains(",24]}"), "{release}");
+    assert!(release.contains("\"values\":[[91,91],"), "{release}");
+    assert!(release.contains(",[24,24]]}"), "{release}");
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn real_wasm_swipe_takeover_style_commits_and_deletion() {
       column navigationBack="back" navigationKey=(blocked ? "other" : "held")
         column navigationKey="held" testId="held-route"
           if shown
-            column testId="row" disabled=disabled swiperight=swipe touch-action="pan-y" width=300 height=90 background-color=tint transition=returning
+            column testId="row" disabled=disabled swipe=swipe swipe-follow="right" touch-action="pan-y" width=300 height=90 background-color=tint transition=returning
               text "Swipe" height=30
               text "Reply" testId="indicator" swipeIndicator=true opacity=0 scale=0.5 transition="opacity -exact-spring(180, 12, 1), scale -exact-spring(180, 12, 1)"
         column navigationKey="other"
@@ -340,15 +340,17 @@ fn hold_input_drains_other_advanced_properties_without_animating_the_hold() {
 #[test]
 fn a_completed_hold_runs_the_swipe_its_offset_points_to() {
     exact_web::link(exact_web_capabilities::ALL);
-    let source = "component App\n  state said = \"\"\n  action say(way: string)\n    said = said + way\n  view\n    column\n      text said\n      column testId=\"row\" swiperight=say(\"r\") swipeleft=say(\"l\") touch-action=\"pan-y\" transition=\"translate -exact-spring(180, 12, 1)\"\n        text \"row\"\n";
-    let mut host = Host::boot(
-        &contract::compile(source).unwrap().encode(),
-        NoData,
-        Default::default(),
-        "/",
-    )
-    .unwrap()
-    .0;
+    let source = "component App\n  state said = \"\"\n  action say(way: string)\n    said = said + way\n  view\n    column\n      text said\n      column testId=\"row\" swipe=say(\"r\") swipe-follow=\"right\" press=say(\"l\") touch-action=\"pan-y\" transition=\"translate -exact-spring(180, 12, 1)\"\n        text \"row\"\n";
+    // No source gives a node both ways (LLP 1057.001 §8), but a plan may hold
+    // them and the host still takes it: the row's `press` is made its left swipe
+    let mut plan = contract::compile(source).unwrap();
+    plan.handlers
+        .iter_mut()
+        .filter(|h| h.event == exact_plan::EventKind::Press)
+        .for_each(|h| h.event = exact_plan::EventKind::Swipeleft);
+    let mut host = Host::boot(&plan.encode(), NoData, Default::default(), "/")
+        .unwrap()
+        .0;
     let row = id(&host, "row");
     let mut now = 100.0;
     for (shown, said) in [(-70.0, "l"), (70.0, "lr"), (0.0, "lr")] {

@@ -20,7 +20,7 @@ import { acceptsHTML, appDocumentPath, webRequestURL } from '../../scripts/origi
 import { appDigest, compilerError, compilerWarnings, INPUT_TREE, OUTPUT, listenOn, oneScheme } from '../../scripts/agent-launch.mjs';
 import { builtSettings } from '../../js/bake/src/__exact_env.mjs';
 import { alsoOnIPv6Loopback, appManifestDigest, appSources, buildFileCards, listenDelay, replaceBuild, saveTrace, sendStaticBody, watchLauncher, webContentType } from '../web/serve.mjs';
-import { generationFile, generationPath, servedFile } from '../web/generations.mjs';
+import { generationFile, generationOf, generationPath, servedFile } from '../web/generations.mjs';
 import { besidePattern } from '../web/beside.mjs';
 import { agentParameters } from '../web/navigation/agent-parameters.js';
 import { cargoContractReads, changedContractReads, contractReadReceipt } from '../../scripts/web-build.mjs';
@@ -28,22 +28,24 @@ import { partitionWebRoots, webSourceRoots } from '../web/build.mjs';
 import { shaderWatchRoots } from '../../scripts/app.mjs';
 import { within } from '../../scripts/paths.mjs';
 import { localInstaller } from '../web/local-install.mjs';
+import { attachDevControls, createLaunchGate } from '../web/dev-keys.mjs';
 import { designPath, frameOnlyByTool, formaServer } from '../../scripts/forma-server.mjs';
 import { pluginOnLoopback } from '../../scripts/forma-remote.mjs';
-import { openRemoteCanvas } from '../../scripts/forma-canvas.mjs';
-import { mapCard, pullMap } from '../../scripts/forma-inspect.mjs';
+import { projectCanvas } from '../../scripts/forma-canvas.mjs';
+import { mapCard, residentPlanMaps } from '../../scripts/forma-inspect.mjs';
 import { serveCommands, serveReport, streamFrame } from '../../scripts/forma-builds.mjs';
-import { EXE, depInfoOf, fresh, freshCompiler, webCompiler } from './module.mjs';
-import { RustMissing, fromSets, launch, rustMissing, toolEnv } from '../../scripts/tools.mjs';
+import { EXE, depInfoOf, fresh, freshCompiler, webCompiler, webCompilerFrom } from './module.mjs';
+import { RustMissing, launch, rustMissing, toolEnv } from '../../scripts/tools.mjs';
 import { hostModuleSources } from './glue.mjs';
-import { engagement } from '../web/engagement.js';
+import { engagement, whenRendered } from '../web/engagement.js';
 import { schemeHead } from '../web/look.mjs';
 import { INSPECT_EVENTS } from './inspect-dev.js';
-import { galleryLoop } from './dev-gallery.mjs';
-import { inlineWhy as inlineWhyOf } from './dev-inline.mjs';
+import { frameLoops, galleryLoop } from './dev-gallery.mjs';
+import { inlineWhy as inlineWhyOf, same, sameShape } from './dev-inline.mjs';
 import { DEV_STATUS_TYPE, FAILED, PHASE, gist } from '../web/dev-phase.mjs';
 import { startupBuilds, stopBuildTree } from '../web/dev-startup.mjs';
 import { watchDirectoryInputs } from '../web/dev-watch.mjs';
+import { devAttach } from './dev-attach.mjs';
 import { fileURLToPath } from 'node:url';
 import { declaredSources, installedFileDependencies } from '../../scripts/file-dependencies.mjs';
 
@@ -199,18 +201,20 @@ function build(app, dist, keep = () => false, compiler = null, superseded = null
           rmSync(stage, { recursive: true, force: true }); done({ error: null, logic, packages, design, designSource, kept: true, warnings: compilerWarnings(log) });
         });
       }
+      let filesBuilt;
       try {
         // `sources` as host/web/build.mjs records it: null when a file came or went while it built.
         const after = appSources(app.dir, resolve(dist)).digest;
+        filesBuilt = buildFileCards(stage);
         writeFileSync(resolve(stage, '.exact-build.json'), JSON.stringify({ exactBuild: 1, target: 'js', app: { id: app.id, name: app.displayName },
-          manifestSha256: appManifestDigest(app), files: buildFileCards(stage), sources: after === sources ? after : null,
+          manifestSha256: appManifestDigest(app), files: filesBuilt, sources: after === sources ? after : null,
           reads: { contract: contractReadReceipt(resolve(stage, '.gen')), cargo }, ...builtSettings(stage) }) + '\n');
       } catch (error) { rmSync(stage, { recursive: true, force: true }); return done({ packages, error: error.message }); }
       // Once more after the watchers' events queued meanwhile are taken.
       setImmediate(() => {
         if (moved() || changedContractReads(cargo).length) return setAside();
         replaceBuild(stage, dist);
-        done({ error: null, logic, packages, design, designSource, warnings: compilerWarnings(log) });
+        done({ error: null, logic, packages, design, designSource, files: filesBuilt, warnings: compilerWarnings(log) });
       });
     }, hold)));
   });
@@ -239,20 +243,29 @@ function copyCompiler(path, copy, built) {
 const compilerCopy = (app) => resolve(app.target, `web-js-dev-compiler-${app.name.replace(/[^\w.-]/g, '_')}${EXE}`);
 
 /** Build `app` on the JS target and serve it with reload, until the process ends. */
-export async function devJs({ app, dist, port, host, origins, gate, lan, allowHosts = [], remoteAsked = { remote: null, tunnel: null, plugin: false, hosts: [] }, residentPort = 0, pairTtlMs }) {
-  let stopping = false, shutdown = null;
+export async function devJs({ app, dist, port, host, origins, gate, lan, allowHosts = [], remoteAsked = { remote: null, tunnel: null, plugin: false, hosts: [] }, residentPort = 0, pairTtlMs, devFlags = {} }) {
+  let stopping = false, shutdown = null, controls = null;
   // A design (`exact-web-js design`), read from the compiler with no build:
   // a value-only edit's and a scrub's. Optimised (host-dev), built as the
   // loop starts and again after any edit that is not a design's, so it is
   // the compiler the builds use; until it is, the debug compiler answers.
-  // Where this build is not fresh, a tool set's compiler is the reader
-  // (`set`), and nothing is built (LLP 1174 D5).
+  // A verified tool set can supply the reader while the optimized build is
+  // stale (LLP 1174 D5).
   const ownTool = resolve(process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : resolve(root, 'target'), `host-dev/exact-web-js${EXE}`);
-  const tool = { path: ownTool, set: false, ready: false, built: null, child: null, reading: null, cleaner: null };
-  // Whether the reader is still what its sources make: its own build by its dep-info, or the set it was taken from.
-  const toolCurrent = () => (tool.set ? fromSets('exact-web-js')?.path === tool.path : fresh(tool.path, depInfoOf(tool.path)));
-  const patcher = { child: null, built: null, asks: new Map(), n: 0 };
-  const toolExits = new Set(), inspections = new Set();
+  const tool = { path: ownTool, ready: false, built: null, child: null, cleaner: null };
+  const readerCompiler = () => webCompilerFrom(process.env, { rehash: true });
+  let checkedUntil = 0, current = false;
+  const toolCurrent = () => {
+    if (tool.path === ownTool) return fresh(ownTool, depInfoOf(ownTool));
+    // A scrub can ask on every frame.
+    if (performance.now() >= checkedUntil) {
+      current = readerCompiler()?.path === tool.path;
+      checkedUntil = performance.now() + 1000;
+    }
+    return current;
+  };
+  const patcher = { child: null, path: null, identity: null, asks: null, n: 0 };
+  const toolExits = new Set(), readers = new Set();
   const stopGroup = child => {
     const exit = stopBuildTree(child);
     toolExits.add(exit);
@@ -260,7 +273,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     return exit;
   };
   const stopCompilers = () => {
-    for (const child of [building, tool.child, tool.reading, tool.cleaner, patcher.child, ...inspections]) stopGroup(child);
+    for (const child of [building, tool.child, tool.cleaner, patcher.child, ...readers]) stopGroup(child);
     return Promise.all(toolExits);
   };
   const startup = startupBuilds();
@@ -327,7 +340,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // Ready lines wait for the server to answer (and its doors), as a test or an agent connects on them.
   let listening = false; const held = [], sayReady = (line) => { if (listening) console.log(line); else held.push(line); };
   // The design server's wire, once made below (a rebuild may come first).
-  let forma = null, doors = null;
+  let mounting = false, forma = null, doors = null, mounted = null, wanted = null, changing = Promise.resolve();
   const clients = new Set();
   // A batch to a page behind waits, then the latest design's notice goes instead (forma-builds.mjs).
   const push = (m) => { for (const res of clients) if (m.kind === 'forma-batch') streamFrame(res, JSON.stringify(m), () => snapshot && notice(snapshot)); else res.write(`data: ${JSON.stringify(m)}\n\n`); };
@@ -343,7 +356,6 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // instead, as the resident loop sends it (host/web/dev.mjs DESIGN_FRAME):
   // a native host's event frames are bounded (PlanURL.swift's 64 KiB).
   const framed = (batch) => (Buffer.byteLength(JSON.stringify(batch)) > 32 * 1024 ? notice(snapshot) : batch);
-  const same = (a, b) => a.value === b.value && a.slices.length === b.slices.length && a.slices.every((s, i) => s === b.slices[i]);
   // A scrub (LLP 1121 stage 4, commit 6): the design the pages run while it
   // previews, and the snapshot it put aside; the next build, or its end,
   // sends them on from it.
@@ -408,16 +420,19 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     tool.ready = false;
     const waited = tool.child || tool.cleaner;
     stopGroup(tool.child);
-    if (!fresh(ownTool, depInfoOf(ownTool))) {
-      const set = fromSets('exact-web-js');
-      if (set || rustMissing()) {
-        Object.assign(tool, { path: set?.path ?? ownTool, set: !!set, ready: !!set, built: null, child: null });
-        console.log(set ? 'design reader ready (a tool set\'s)' : `the design reader did not build (design edits take the full build):\n${new RustMissing('exact-web-js').message}`);
+    const missing = rustMissing(), ownFresh = fresh(ownTool, depInfoOf(ownTool));
+    if (missing || !ownFresh) {
+      const selected = readerCompiler();
+      if (selected?.set?.manifest.verifiedBuild === true || missing) {
+        Object.assign(tool, { path: selected?.path ?? ownTool, ready: !!selected || ownFresh, built: null, child: null });
+        current = tool.ready;
+        checkedUntil = performance.now() + 1000;
+        console.log(tool.ready ? `design reader ready${selected?.set ? " (a tool set's)" : ''}` : `the design reader did not build (design edits take the full build):\n${new RustMissing('exact-web-js').message}`);
         if (waited) resumeAfterReader();
         return;
       }
     }
-    Object.assign(tool, { path: ownTool, set: false });
+    tool.path = ownTool;
     const started = new Date();
     const child = tool.child = spawn('cargo', ['build', '-q', '--profile', 'host-dev', '-p', 'exact-web-js'], { cwd: root, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
     let err = '';
@@ -468,6 +483,38 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // (`propose`'s class, stage 10 A1), which may not start a build.
   const toolReady = () => tool.ready && toolCurrent();
   buildTool();
+  const runReader = async (args, { text, readOnly = false } = {}) => {
+    const inspect = text === undefined;
+    const read = () => new Promise((done, failed) => {
+      if (stopping) return done({ error: 'the dev loop is stopping' });
+      let compiler;
+      try {
+        if (readOnly && !toolReady()) return done({ error: 'the design reader is not built' });
+        compiler = readOnly || toolFresh() ? launch(tool.path) : webCompiler({ rehash: true });
+      } catch (error) { return done({ error: error.message }); }
+      // The Cargo fallback can start compilers of its own.
+      const child = spawn(compiler.cmd, [...compiler.pre, ...args], { cwd: root, env: compiler.env,
+        stdio: inspect ? ['ignore', 'ignore', 'pipe'] : ['pipe', 'pipe', 'pipe'], detached: true });
+      readers.add(child);
+      const untrack = () => readers.delete(child);
+      let out = '', err = '';
+      child.once('error', error => { untrack(); failed(error); });
+      child.once('close', code => {
+        untrack();
+        if (inspect && child.pid) compiler.done();
+        done({ code, out, err });
+      });
+      child.stdout?.on('data', d => { out += d; });
+      child.stderr?.on('data', d => { err += d; });
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(text);
+    });
+    try { return await read(); } catch {
+      // A selected set can be evicted before the next freshness check.
+      checkedUntil = 0;
+      try { return await read(); } catch (error) { return { error: error.message }; }
+    }
+  };
   // The page's inspect table (LLP 1122 T2b, inspect.rs), made for dist's
   // plan when the page first asks (seconds for a large app, so no build
   // makes it), kept by the plan's digest, the 4 last; it names that plan,
@@ -476,55 +523,35 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   const inspectTable = (digest, plan = resolve(dist, 'app.plan')) => {
     if (stopping) return Promise.resolve(null);
     if (!tables.has(digest)) {
-      tables.set(digest, new Promise((done) => {
-        // (this loop's own: another loop on one target/ may make the same plan's table, and removes its own)
-        const out = resolve(app.target, `inspect-${digest}-${process.pid}.json`);
-        let compiler;
-        try { compiler = toolFresh() ? launch(tool.path) : webCompiler(); } catch (error) { tables.delete(digest); console.log(`inspect table: ${error.message}`); return done(null); }
-        const child = spawn(compiler.cmd, [...compiler.pre, 'inspect-table', plan, out], { cwd: root, env: compiler.env, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
-        inspections.add(child);
-        child.once('close', () => inspections.delete(child));
-        let err = '';
-        child.stderr.on('data', (d) => { err += d; });
-        child.on('exit', (code) => {
-          compiler.done();
-          let bytes = null;
-          try { bytes = code === 0 ? readFileSync(out) : null; if (bytes && JSON.parse(bytes).plan !== digest) bytes = null; } catch { bytes = null; }
-          rmSync(out, { force: true });
-          if (!bytes) { tables.delete(digest); if (err.trim()) console.log(`inspect table: ${err.trim().split('\n').slice(-3).join('\n')}`); }
-          done(bytes);
-        });
-      }));
+      // Another loop on this target can make a table for the same plan.
+      const out = resolve(app.target, `inspect-${digest}-${process.pid}.json`);
+      const pending = runReader(['inspect-table', plan, out]).then(({ code, err, error }) => {
+        let bytes = null;
+        try { bytes = code === 0 ? readFileSync(out) : null; if (bytes && JSON.parse(bytes).plan !== digest) bytes = null; } catch { bytes = null; }
+        rmSync(out, { force: true });
+        if (!bytes) {
+          if (tables.get(digest) === pending) tables.delete(digest);
+          const message = error ?? err.trim().split('\n').slice(-3).join('\n');
+          if (message) console.log(`inspect table: ${message}`);
+        }
+        return bytes;
+      });
+      tables.set(digest, pending);
       for (const old of [...tables.keys()].slice(0, Math.max(0, tables.size - 4))) tables.delete(old);
     }
     return tables.get(digest);
   };
   // `readOnly` (what a request below write scope reaches): the built reader
   // only, as it is, never a build or the `cargo run` fallback.
-  const designOf = (text, { readOnly = false } = {}) => new Promise((done) => {
-    if (readOnly && !toolReady()) return done({ error: 'the design reader is not built' });
-    let compiler;
-    try { compiler = readOnly || toolFresh() ? launch(tool.path) : webCompiler(); } catch (error) { return done({ error: error.message }); }
-    // A group: the debug fallback is a `cargo run`, stopped with its compilers.
-    const child = tool.reading = spawn(compiler.cmd, [...compiler.pre, 'design', resolve(app.dir, 'app.contract'), '-'], { cwd: root, env: compiler.env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
-    child.on('error', (e) => done({ error: e.message }));
-    child.stdin.on('error', () => {});
-    child.stdin.end(text);
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    // `close`: its output read whole.
-    child.on('close', (code) => {
-      if (tool.reading === child) tool.reading = null;
-      try { done(code === 0 ? JSON.parse(out) : { error: err.trim().split('\n').slice(-6).join('\n') || `the compiler exited ${code}` }); } catch (e) { done({ error: e.message }); }
-    });
-  });
+  const designOf = async (text, { readOnly = false } = {}) => {
+    const { code, out, err, error } = await runReader(['design', resolve(app.dir, 'app.contract'), '-'], { text, readOnly });
+    if (error) return { error };
+    try { return code === 0 ? JSON.parse(out) : { error: err.trim().split('\n').slice(-6).join('\n') || `the compiler exited ${code}` }; } catch (e) { return { error: e.message }; }
+  };
   // The design's shape and the plan's structure (a profile colour's value
   // is in it) as a kept build requires, and each token's accent.
   // A token the page writes inline (`inline`: no property sets it in place,
   // LLP 1121 stage 6) builds when its value moves.
-  const sameShape = (from, next) => from && next && from.shape === next.shape && from.structure === next.structure && from.tokens.length === next.tokens.length
-    && next.tokens.every((t, i) => t.name === from.tokens[i].name && String(t.accent) === String(from.tokens[i].accent) && (!t.inline || same(t, from.tokens[i])));
   // A fast batch is checked by the full build after it (its verifying build): the
   // design's module inputs and its compile; a value-only edit during that
   // build is sent at once and checked after it.
@@ -558,16 +585,27 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // `.exact/backend-origin`'s bytes when the last build began (null: none).
   const backendOf = () => { try { return readFileSync(resolve(app.dir, '.exact/backend-origin'), 'utf8'); } catch { return null; } };
   let backendSeen = backendOf();
+  const pageEpoch = randomBytes(12).toString('hex');
+  let publishedGeneration = !error && generationOf(dist);
   const pending = new Map(); // seq -> the save it answers
   // The variant gallery (dev-gallery.mjs), started by its first page: told of each publication after it is out.
-  const gallery = galleryLoop({ app, root, appDist: dist, channel: () => forma?.channel, design: () => design?.digest ?? null, idleMs: Number(process.env.EXACT_DEV_GALLERY_IDLE_MS) || undefined,
+  const previewOptions = { app, root, appDist: dist, channel: () => forma?.channel, design: () => design?.digest ?? null, idleMs: Number(process.env.EXACT_DEV_GALLERY_IDLE_MS) || undefined,
     // (The reader's binary while it is fresh, asked without building it or the reader again; else no table yet.)
     tableTool: () => (tool.ready && tool.path && toolCurrent() ? launch(tool.path) : null),
     compiler: () => { const copy = compilerCopy(app); return freshCompiler(copy) ? copy : null; },
-    client: (n) => client(n, null, { base: '/__dev/gallery', stream: '/__dev/gallery/stream', page: 'gallery' }) });
-  const rebuild = async () => {
+  };
+  const gallery = galleryLoop({ ...previewOptions,
+    client: (n, epoch, numbered) => client(n, null, { epoch, numbered, base: '/__dev/gallery', stream: '/__dev/gallery/stream', page: 'gallery' }) });
+  const frames = frameLoops({ ...previewOptions, files: built.files, readDesigns: async request => {
+    const answer = await patcherAsk(request);
+    if (!answer.fallback || stopping) return answer;
+    const read = await runReader(['frame-designs', resolve(app.dir, 'app.contract')], { text: JSON.stringify(request) });
+    try { return JSON.parse(read.out); } catch { return { fallback: true }; }
+  },
+    client: (n, base, epoch, numbered) => client(n, null, { base, epoch, numbered, stream: base + '/stream', key: base }) });
+  const rebuild = async ({ force = false } = {}) => {
     // A burst a build already took (its timer still armed) is no edit.
-    if (stopping || !edited.size) return;
+    if (stopping || (!force && !edited.size)) return;
     const at = saved, t = Date.now();
     // A path that existed during the save and is gone by now (an editor's
     // or sed's temporary file) edited nothing; one already gone when its
@@ -581,6 +619,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     // (or fails) builds. Only the app's own design: another .forma may be
     // any build's input.
     const file = designPath(app.dir);
+    if (mounting) void mountForma(file).catch(failedMount);
     const fast = designOnly && design && designs.every((path) => path === file);
     // A value-only edit reads its design and sends its batch whatever builds
     // meanwhile (that build is set aside); any other waits for it.
@@ -592,6 +631,9 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     }
     // Kept until a build lands: a failed one's edits are the next build's too.
     const pendingEdits = [...edited], pendingAppeared = [...appeared];
+    if (designOnly && file && designs.every(path => path === file)) {
+      try { void frames.designEdit(readFileSync(file, 'utf8')); } catch { frames.changed(); }
+    } else frames.changed(pendingEdits);
     edited.clear(); appeared.clear();
     // Whatever waited for the reader is this pass's now (a build that fails keeps it for the next edit, as any).
     readerWait = false;
@@ -653,7 +695,8 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     // Only the binary this loop's own build left (another loop on this
     // target/ may have linked one since, not yet dated to its start).
     if (tool.ready && tool.built !== null && freshCompiler(tool.path)) copyCompiler(tool.path, copy, tool.built);
-    const compiler = freshCompiler(copy) ? copy : null;
+    const explicit = process.env.EXACT_WEB_COMPILER;
+    const compiler = explicit && freshCompiler(explicit) ? explicit : freshCompiler(copy) ? copy : null;
     // Anything else may move the compiler: the design tool is built again.
     if (!designOnly) buildTool();
     // What a full build reads from disk is what changed since it began.
@@ -736,22 +779,24 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
       const changedTokens = shaped ? next.tokens.filter((tk, i) => !same(tk, from.tokens[i])) : [];
       if (changedTokens.length) forma?.channel.broadcast(framed({ kind: 'forma-batch', structure: next.shape, base: from.digest, design: next.digest, tokens: changedTokens }));
       logicRevision = built.logic;
-      pending.set(++seq, at);
+      pending.set(++seq, at); publishedGeneration = generationOf(dist);
       sayReady(`edit → plan ready ${Date.now() - at} ms (rebuilt in ${Date.now() - t} ms) · ${clients.size} page${clients.size === 1 ? '' : 's'} reloading`);
       warn(built.warnings);
       push({ reload: seq, revision: logicRevision }); gallery.appChanged(); // after the app's reload is published
     }
     if (again) { again = false; rebuild(); }
   };
-  // An editor's temporary name for a `.forma` file beside it: the file's
+  // An editor's temporary name for a design or preview source beside it: the file's
   // name with `.tmp` (and a hex or numeric suffix, a pid or a hash), `.swp`,
   // `.swx`, `~`, JetBrains' or Emacs's marks; anchored, so no other file
   // named after it (`app.forma.tmp.png`) is one.
-  const TEMPORARY = /^(?:\.?(.+\.forma)(?:\.tmp(?:[.-][0-9a-f]+)?|\.sw[px]|~|___jb_(?:tmp|old)___)|#(.+\.forma)#|\.#(.+\.forma))$/;
-  const temporaryOfDesign = (path) => {
+  const TEMPORARY = /^(?:\.?(.+\.(?:forma|contract|fixture\.mts))(?:\.tmp(?:[.-][0-9a-f]+)?|\.sw[px]|~|___jb_(?:tmp|old)___)|#(.+\.(?:forma|contract|fixture\.mts))#|\.#(.+\.(?:forma|contract|fixture\.mts)))$/;
+  const temporaryOfSource = (path) => {
     const m = TEMPORARY.exec(basename(path));
-    const design = m && (m[1] ?? m[2] ?? m[3]);
-    return !!design && existsSync(resolve(dirname(path), design));
+    const source = m && (m[1] ?? m[2] ?? m[3]);
+    if (!source) return false;
+    if (source.endsWith('.fixture.mts')) return within(resolve(app.dir, 'frames'), path);
+    return (source.endsWith('.forma') || within(resolve(app.dir, 'frames'), path)) && existsSync(resolve(dirname(path), source));
   };
   const outputIsInput = (name) => {
     const path = resolve(app.dir, name);
@@ -784,12 +829,17 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     // An editor's temporary for a design beside it (an atomic save writes
     // `app.forma.tmp` and renames it over `app.forma`; its event can come
     // before or after the rename): never an input, whenever it comes.
-    if (name && temporaryOfDesign(path)) return;
+    if (name && temporaryOfSource(path)) return;
     // Crates can include any extension; declared inputs and input trees also keep their output-looking files.
     if (base === app.dir && OUTPUT.test(name) && !outputIsInput(name)) return;
     // A package's events are all edits: a link replaced by one to an older
     // file is newer than nothing, and its target's time says nothing of it.
     if (fresh && name && !backendMoved && !movedSince(path, since)) return;
+    // Frame Contract files have their own dependency watches. An app may also import one.
+    if (base === app.dir && (name === 'frames' || (name?.startsWith('frames/') && (name.endsWith('.contract') || name.endsWith('.fixture.mts')))) && !compilerInput(path)) {
+      if (name !== 'frames') frames.changed([path]);
+      return;
+    }
     if (!timer) saved = Date.now();
     edited.add(path);
     // A resident start that failed is tried again at the next request after
@@ -871,6 +921,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
       watchers.push(watch(at, { recursive: !file }, (event, name) => {
         if (file && name !== basename(file)) return;
         const path = resolve(dir, name ?? '');
+        if (/(?:^|[\\/])\.exact[\\/]shells(?:[\\/]|$)/.test(path)) return;
         if (!compilerInput(path) && !existsSync(path)) return;
         notify(event, name);
       }));
@@ -901,7 +952,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // A reload waits while text composes, a pointer is down or a drag is under way, then takes the newest build
   // (`replacementBoundary`).
   // A gallery page's (dev-gallery.mjs): its own stream, design and checkpoint routes, `page: 'gallery'`, no `navigate`.
-  const client = (n, revision, { base = '/__dev', stream = '/__dev/page', page = null } = {}) => `<script>(()=>{const fetch=globalThis.fetch.bind(globalThis),seq=${n},logicRevision=${JSON.stringify(revision)},es=new EventSource('${stream}');let reloading=false,latest;const boundary=globalThis.__exactDevReplacement=(${replacementBoundary.toString()})(${engagement.toString()});Promise.resolve().then(()=>ready()).then(()=>Object.assign(globalThis.exact,{replacementBoundary:boundary,devError:show}));
+  const client = (n, revision, { base = '/__dev', stream = '/__dev/page', page = null, key = page, epoch = pageEpoch, numbered = true } = {}) => `<script>(()=>{const fetch=globalThis.fetch.bind(globalThis),seq=${n},logicRevision=${JSON.stringify(revision)},es=new EventSource('${stream}');let reloading=false,latest;const boundary=globalThis.__exactDevReplacement=(${replacementBoundary.toString()})(${engagement.toString()});Promise.resolve().then(()=>ready()).then(()=>Object.assign(globalThis.exact,{replacementBoundary:boundary,devError:show}));
 let overlay;
 const errors=new Map(),show=(message,source='app')=>{
   if(message)errors.set(source,message);else if(!errors.delete(source))return;
@@ -919,16 +970,18 @@ const restored=document.querySelector('script[type="application/vnd.exact.dev-ch
 if(restored){const restoredSeq=Number(restored.dataset.seq);console.info('exact dev reload: restored',restoredSeq);const t=setInterval(()=>{const b=document.getElementById('exact-root')?.dataset.bootMs;if(b!=null){clearInterval(t);Promise.resolve(globalThis.exact?.ready).then(()=>{console.info('exact dev reload: runtime up',restoredSeq);fetch('${base}/reloaded?seq='+restoredSeq+'&boot='+b+'&at='+Date.now(),{method:'POST'})})}},2)}
 const ready=()=>globalThis.exact?Promise.resolve(globalThis.exact.ready):new Promise(ok=>{const t=setInterval(()=>{if(globalThis.exact){clearInterval(t);Promise.resolve(globalThis.exact.ready).then(ok)}},2)});
 let liveQ=Promise.resolve(),liveStatus=null;const live=m=>{liveQ=liveQ.then(async()=>{const x=await ready().then(()=>globalThis.exact),was=x?.designDigest;let sc=m.scrub;const out=x?.design?.(m);if(out?.live==='stale'){const r=await fetch('${base}/design',{cache:'no-store'});if(r.status===200){const f=await r.json();sc=f.scrub;x.design(f)}}if(x?.designDigest!==was&&ch.nonce){clearTimeout(liveStatus);if(sc)liveStatus=setTimeout(status,150);else status()}}).catch(e=>console.error('exact dev:',e))};
-const ch={nonce:null,registered:null,revision:null,before:null,told:null},cp=window!==parent&&/^exact-copy-\\d{1,2}$/.test(window.name),bk=${page ? `(cp?'exact.dev.build:'+window.name:'exact.dev.build')+':${page}'` : "cp?'exact.dev.build:'+window.name:'exact.dev.build'"},bid=(async()=>{const fresh=()=>'web-js-'+crypto.getRandomValues(new Uint32Array(2)).join('');let i;try{i=sessionStorage.getItem(bk)}catch{return fresh()}const t=typeof BroadcastChannel==='function'?new BroadcastChannel('exact.dev.build'):null;if(i&&t){const mine=i;if(await new Promise(done=>{t.onmessage=e=>{if(e.data==='taken:'+mine)done(true)};t.postMessage('who:'+mine);setTimeout(()=>done(false),60)}))i=null}i??=fresh();if(t){const own=i;t.onmessage=e=>{if(e.data==='who:'+own)t.postMessage('taken:'+own)}}try{sessionStorage.setItem(bk,i)}catch{}return i})(),post=(n,b,ms)=>fetch('/__dev/report',{method:'POST',body:JSON.stringify({nonce:n,...b}),...(ms?{signal:AbortSignal.timeout(ms)}:{})}),rep=b=>{const{nonce:n,registered:r}=ch;if(!n)return Promise.resolve();if(ch.queue?.n!==n)ch.queue={n,tail:Promise.resolve()};const q=ch.queue;return q.tail=q.tail.then(async()=>{if(!(await r)||ch.nonce!==n||ch.registered!==r)return;await post(n,b,10000).catch(()=>{})})};
+const ch={nonce:null,registered:null,revision:null,before:null,told:null},cp=window!==parent&&/^exact-copy-\\d{1,2}$/.test(window.name),bk=${key ? `(cp?'exact.dev.build:'+window.name:'exact.dev.build')+':${key}'` : "cp?'exact.dev.build:'+window.name:'exact.dev.build'"},bid=(async()=>{const fresh=()=>'web-js-'+crypto.getRandomValues(new Uint32Array(2)).join('');let i;try{i=sessionStorage.getItem(bk)}catch{return fresh()}const t=typeof BroadcastChannel==='function'?new BroadcastChannel('exact.dev.build'):null;if(i&&t){const mine=i;if(await new Promise(done=>{t.onmessage=e=>{if(e.data==='taken:'+mine)done(true)};t.postMessage('who:'+mine);setTimeout(()=>done(false),60)}))i=null}i??=fresh();if(t){const own=i;t.onmessage=e=>{if(e.data==='who:'+own)t.postMessage('taken:'+own)}}try{sessionStorage.setItem(bk,i)}catch{}return i})(),post=(n,b,ms)=>fetch('/__dev/report',{method:'POST',body:JSON.stringify({nonce:n,...b}),...(ms?{signal:AbortSignal.timeout(ms)}:{})}),rep=b=>{const{nonce:n,registered:r}=ch;if(!n)return Promise.resolve();if(ch.queue?.n!==n)ch.queue={n,tail:Promise.resolve()};const q=ch.queue;return q.tail=q.tail.then(async()=>{if(!(await r)||ch.nonce!==n||ch.registered!==r)return;if(!ch.owns||latest)delete b.rendered;await post(n,b,10000).catch(()=>{})})};
+let rendered=false;globalThis.__exactDevFirstCommit=()=>{delete globalThis.__exactDevFirstCommit;if(${numbered})(${whenRendered.toString()})(()=>{rendered=true;if(ch.owns&&!latest)status()})};
 const here=()=>{const at=location.pathname+location.search+location.hash;return at.length<=2048&&/^\\/(?![/\\\\])[\\x21-\\x5b\\x5d-\\x7e]*$/.test(at)?at:null};
 const asked=()=>{const p=ch.pin,k=globalThis.exact?.asked??{};if(!cp||!p)return null;const o={},val=f=>k[f]?.value;if(p.scheme&&val('scheme')!=null&&val('scheme')!==p.scheme)o.scheme=String(val('scheme')).slice(0,32);if(p.rootFontSize&&val('rootFontSize')!=null&&val('rootFontSize')!==p.rootFontSize)o.rootFontSize=String(val('rootFontSize')).slice(0,64);const md=Object.fromEntries(Object.keys(p.mode??{}).filter(a=>val('mode:'+a)!=null&&val('mode:'+a)!==p.mode[a]&&a.length<=64&&String(val('mode:'+a)).length<=64).map(a=>[a,val('mode:'+a)]));if(Object.keys(md).length&&new TextEncoder().encode(JSON.stringify(md)).length<=800)o.mode=md;return Object.keys(o).length?o:null};
-const facts=()=>{const s=getComputedStyle(document.documentElement),cs=s.colorScheme,x=globalThis.exact;return{kind:'status',scheme:/dark/.test(cs)&&!/light/.test(cs)?'dark':/light/.test(cs)&&!/dark/.test(cs)?'light':x?.systemScheme??(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'),contrast:matchMedia('(prefers-contrast: more)').matches?'more':matchMedia('(prefers-contrast: less)').matches?'less':'no-preference',mode:x?.modes?.read?.()??null,rootFontSize:parseFloat(s.fontSize),plan:null,planDigest:x?.plan??null,design:x?.designDigest??null,revision:ch.revision,location:here(),app:asked()??undefined}},status=()=>{clearTimeout(liveStatus);liveStatus=null;const b=facts();ch.told=JSON.stringify(b);rep(b)};for(const q of['(prefers-color-scheme: dark)','(prefers-contrast: more)','(prefers-contrast: less)'])matchMedia(q).addEventListener?.('change',()=>{if(ch.nonce)status()});
-let gate=null,held=(()=>{try{return sessionStorage.getItem('exact.dev.inspect${page ? `:${page}` : ''}')!=null}catch{return false}})();const early=()=>{for(const id of['exact-inspect-early','exact-inspect-early-shield'])document.getElementById(id)?.remove()},letGo=exit=>{held=false;early();try{const k=sessionStorage.getItem('exact.dev.inspect${page ? `:${page}` : ''}');if(exit&&k)sessionStorage.setItem('exact.dev.inspect${page ? `:${page}` : ''}.left',k);sessionStorage.removeItem('exact.dev.inspect${page ? `:${page}` : ''}')}catch{}};if(held){const sh=document.head.appendChild(Object.assign(document.createElement('style'),{id:'exact-inspect-early-shield',textContent:'iframe, frame, embed, object { pointer-events: none !important; }'}));const c=Object.assign(document.createElement('div'),{id:'exact-inspect-early'});c.style.cssText='position:fixed;inset:0;z-index:2147483644;background:transparent;touch-action:none';(document.body??document.documentElement).append(c)}for(const ty of ${JSON.stringify([...INSPECT_EVENTS, 'pointermove', 'focusin'])})addEventListener(ty,e=>{if(gate)return gate(e);if(!held)return;if(ty==='keydown'&&e.key==='Escape')letGo(true);if((ty==='focusin'||ty==='blur')&&document.activeElement?.tagName==='IFRAME')document.activeElement.blur();e.preventDefault();e.stopImmediatePropagation()},{capture:true,passive:false});
-const inspector=ready().then(()=>import('/__dev/inspect.js')).then(m=>{m.install({${page ? `key:'exact.dev.inspect:${page}',` : ''}fetch,report:rep,status:async()=>status(),facts:()=>({plan:null,design:globalThis.exact?.designDigest??null,revision:ch.revision}),nonce:()=>ch.nonce});gate=m.gate;return m}).catch(e=>{letGo(false);throw e});
+const facts=()=>{const s=getComputedStyle(document.documentElement),cs=s.colorScheme,x=globalThis.exact;return{kind:'status',scheme:/dark/.test(cs)&&!/light/.test(cs)?'dark':/light/.test(cs)&&!/dark/.test(cs)?'light':x?.systemScheme??(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'),contrast:matchMedia('(prefers-contrast: more)').matches?'more':matchMedia('(prefers-contrast: less)').matches?'less':'no-preference',mode:x?.modes?.read?.()??null,rootFontSize:parseFloat(s.fontSize),plan:null,planDigest:x?.plan??null,design:x?.designDigest??null,revision:ch.revision,location:here(),rendered:ch.owns&&rendered&&!latest?seq:undefined,app:asked()??undefined}},status=()=>{clearTimeout(liveStatus);liveStatus=null;const b=facts();ch.told=JSON.stringify(b);rep(b)};for(const q of['(prefers-color-scheme: dark)','(prefers-contrast: more)','(prefers-contrast: less)'])matchMedia(q).addEventListener?.('change',()=>{if(ch.nonce)status()});
+let gate=null,held=(()=>{try{return sessionStorage.getItem('exact.dev.inspect${key ? `:${key}` : ''}')!=null}catch{return false}})();const early=()=>{for(const id of['exact-inspect-early','exact-inspect-early-shield'])document.getElementById(id)?.remove()},letGo=exit=>{held=false;early();try{const k=sessionStorage.getItem('exact.dev.inspect${key ? `:${key}` : ''}');if(exit&&k)sessionStorage.setItem('exact.dev.inspect${key ? `:${key}` : ''}.left',k);sessionStorage.removeItem('exact.dev.inspect${key ? `:${key}` : ''}')}catch{}};if(held){const sh=document.head.appendChild(Object.assign(document.createElement('style'),{id:'exact-inspect-early-shield',textContent:'iframe, frame, embed, object { pointer-events: none !important; }'}));const c=Object.assign(document.createElement('div'),{id:'exact-inspect-early'});c.style.cssText='position:fixed;inset:0;z-index:2147483644;background:transparent;touch-action:none';(document.body??document.documentElement).append(c)}for(const ty of ${JSON.stringify([...INSPECT_EVENTS, 'pointermove', 'focusin'])})addEventListener(ty,e=>{if(gate)return gate(e);if(!held)return;if(ty==='keydown'&&e.key==='Escape')letGo(true);if((ty==='focusin'||ty==='blur')&&document.activeElement?.tagName==='IFRAME')document.activeElement.blur();e.preventDefault();e.stopImmediatePropagation()},{capture:true,passive:false});
+let at=null,am=null;const attacher=()=>am??=import('/__dev/attach.js').then(m=>m.install({fetch,doc:()=>at})).catch(e=>{am=null;throw e});addEventListener('keydown',e=>{if(at&&e.isTrusted&&e.altKey&&e.shiftKey&&e.code==='KeyA'){e.preventDefault();attacher().then(a=>a.toggle()).catch(e=>console.info('exact: Agent Attach: '+e))}},true);
+const inspector=ready().then(()=>import('/__dev/inspect.js')).then(m=>{m.install({${key ? `key:'exact.dev.inspect:${key}',` : ''}fetch${key && !page ? `: (url,options)=>fetch(url==='dev-inspect.json'?'${base}/dev-inspect.json':url==='/__dev/design'?'${base}/design':url,options)` : ''},report:rep,status:async()=>status(),facts:()=>({plan:null,design:globalThis.exact?.designDigest??null,revision:ch.revision}),nonce:()=>ch.nonce});gate=m.gate;return m}).catch(e=>{letGo(false);throw e});
 let due=false;const moved=()=>{if(due||!ch.nonce)return;due=true;setTimeout(()=>{due=false;const b=facts();if(JSON.stringify(b)!==ch.told){ch.told=JSON.stringify(b);rep(b)}},0)},seen=new MutationObserver(moved);if(cp)ready().then(()=>{globalThis.exact.onAsked=moved});seen.observe(document.documentElement,{attributes:true,attributeFilter:['style','data-x-modes']});seen.observe(document.head,{childList:true,subtree:true,characterData:true});for(const k of['pushState','replaceState']){const w=history[k];history[k]=function(...a){const o=w.apply(this,a);moved();return o}}addEventListener('popstate',moved);addEventListener('hashchange',moved);
 const nav=m=>{liveQ=liveQ.then(async()=>{await ready();const mine=()=>m.stream===ch.nonce;if(!mine())return;const x=globalThis.exact,u=new URL(m.location,location.origin),to=u.pathname+u.search,no=d=>{if(mine())rep({kind:'unsupported',what:'navigate',detail:String(d).slice(0,1024),revision:m.seq})};if(u.origin!==location.origin||u.pathname.startsWith('//'))return no("the location is no path on this page's origin");const there=()=>history.state?.url===to||location.pathname+location.search===to,before=history.state?.url;try{if(!there()){const why=typeof x?.goTo==='function'?x.goTo(to):'this page has no router';if(why)return no(why)}for(let i=0;i<100&&!there()&&history.state?.url===before;i++)await new Promise(ok=>setTimeout(ok,10));if(mine()&&there()&&u.hash!==location.hash)history.replaceState(history.state,'',location.origin+location.pathname+location.search+u.hash)}catch(e){return no(String(e))}moved()}).catch(e=>console.error('exact dev:',e))};
 const pin=m=>{liveQ=liveQ.then(async()=>{await ready();const r=document.documentElement.style,p=m.pin,x=globalThis.exact,was=x.held;let rm=0;x.held=cp&&p?Object.fromEntries([['scheme',!!p.scheme],['rootFontSize',!!p.rootFontSize],...Object.keys(p.mode??{}).map(a=>['mode:'+a,true])]):null;ch.before??={fontSize:r.fontSize,hostFont:r.getPropertyValue('--exact-host-font-size'),mode:x?.modes?.read?.()??{}};const sh=document.getElementById('exact-dev-pin')??document.head.appendChild(Object.assign(document.createElement('style'),{id:'exact-dev-pin'}));const fx=document.querySelector('meta[name="color-scheme"]')?.content,sc=p?.scheme&&(cp||!['light','dark'].includes(fx))?p.scheme:null;sh.textContent=sc?':root{color-scheme:'+sc+(cp?'!important':'')+'}':'';if(cp)x.asked?.scheme?.apply();if((x.systemScheme??null)!==sc){x.systemScheme=sc;dispatchEvent(new Event('resize'))}r.removeProperty('font-size');if(cp&&p?.rootFontSize)r.setProperty('font-size',p.rootFontSize+'px','important');else r.fontSize=p?.rootFontSize?p.rootFontSize+'px':ch.before.fontSize;if(p?.rootFontSize)r.setProperty('--exact-host-font-size',r.fontSize);else if(ch.before.hostFont)r.setProperty('--exact-host-font-size',ch.before.hostFont);else r.removeProperty('--exact-host-font-size');const last=ch.pin?.mode??{},back=Object.fromEntries(Object.entries(ch.before.mode??{}).filter(([a])=>a in last&&!(a in(p?.mode??{}))&&!(cp&&x.asked?.['mode:'+a]))),mode=Object.entries(p?(cp?{...back,...(p.mode??{})}:{...ch.before.mode,...(p.mode??{})}):back);if(mode.length&&x?.modes?.set){const why=x.modes.set(mode);if(why){rm=1;rep({kind:'unsupported',what:'pin.mode',detail:why,revision:m.revision});if(!cp)x.modes.set(Object.entries(ch.before.mode));if(x.held){for(const k of Object.keys(x.held))if(k.startsWith('mode:'))delete x.held[k];for(const [k,on]of Object.entries(was??{}))if(on&&k.startsWith('mode:'))x.held[k]=true}}dispatchEvent(new Event('resize'))}if(p?.contrast)rep({kind:'unsupported',what:'pin.contrast',detail:"a web page cannot pin the browser's contrast",revision:m.revision});for(const [f,on]of Object.entries(was??{}))if(on&&!x.held?.[f])x.asked?.[f]?.apply();if(!p)ch.before=null;ch.pin=p?(cp&&rm?{...p,mode:last}:p):null;ch.revision=m.revision;status()}).catch(e=>console.error('exact dev:',e))};
-es.onmessage=e=>{const m=JSON.parse(e.data);if(m.reload>seq)latest=m;if(m.kind==='forma-batch'||m.kind==='forma-snapshot'){live(m);return}if(m.kind==='pin'){pin(m);return}if(m.kind==='navigate'){m.stream=ch.nonce;nav(m);return}if(m.kind==='inspect'||m.kind==='outline'||m.kind==='hold'){m.stream=ch.nonce;inspector.then(i=>i.frame(m)).catch(e=>rep({kind:'unsupported',what:m.kind,detail:String(e)}));return}if(m.nonce&&m.nonce!==ch.nonce){const n=ch.nonce=m.nonce;ch.registered=ready().then(async()=>{const id=await bid,got=await post(n,{kind:'register',id,host:'web-js',capabilities:${page ? `['pin','inspect','copies','hold'],page:'${page}'` : "['pin','inspect','copies','hold','navigate']"},plan:null,planDigest:globalThis.exact?.plan??null,design:globalThis.exact?.designDigest??null}),ok=got.ok;if(!ok)console.warn('exact dev: the dev loop refused the register of this page ('+got.status+'), so no tool sees it');if(ok&&window!==parent)parent.postMessage({type:'exact-build',id},'*');return ok}).catch(e=>{console.warn('exact dev: this page could not register with the dev loop, so no tool sees it: '+e);return false});status()}if(m.error!==undefined)show(m.error);if(m.reload>seq&&!reloading)reload()};
+es.addEventListener('error',()=>am?.then(a=>a.reset()));es.onmessage=e=>{const m=JSON.parse(e.data);if(m.reload>seq)latest=m;if('attach' in m&&m.attach!==at){at=window===parent&&!admission?m.attach:null;am?.then(a=>a.reset())}if(String(m.kind).startsWith('attach-')){if(at)attacher().then(a=>a.frame(m));return}if(m.kind==='forma-batch'||m.kind==='forma-snapshot'){live(m);return}if(m.kind==='pin'){pin(m);return}if(m.kind==='navigate'){m.stream=ch.nonce;nav(m);return}if(m.kind==='inspect'||m.kind==='outline'||m.kind==='hold'){m.stream=ch.nonce;inspector.then(i=>i.frame(m)).catch(e=>rep({kind:'unsupported',what:m.kind,detail:String(e)}));return}if(m.nonce&&m.nonce!==ch.nonce){const n=ch.nonce=m.nonce;ch.owns=e.lastEventId==='${epoch}';ch.registered=ready().then(async()=>{const id=await bid,got=await post(n,{kind:'register',id,host:'web-js',capabilities:${page ? `['pin','inspect','copies','hold'],page:'${page}'` : "['pin','inspect','copies','hold','navigate']"},plan:null,planDigest:globalThis.exact?.plan??null,design:globalThis.exact?.designDigest??null}),ok=got.ok;if(!ok)console.warn('exact dev: the dev loop refused the register of this page ('+got.status+'), so no tool sees it');if(ok&&window!==parent)parent.postMessage({type:'exact-build',id},'*');return ok}).catch(e=>{console.warn('exact dev: this page could not register with the dev loop, so no tool sees it: '+e);return false});status()}if(m.error!==undefined)show(m.error);if(m.reload>seq&&!reloading)reload()};
 // The back-forward cache kept this document: a reload its leaving abandoned runs now.
 addEventListener('pageshow',e=>{if(e.persisted&&latest&&!reloading)reload()});
 const reload=()=>{reloading=true;if(!globalThis.exact){location.reload();return}ready().then(async()=>{let m;
@@ -964,23 +1017,30 @@ for(;;){
   const patcherAsk = (request) => new Promise((done) => {
     if (stopping) return done({ fallback: true });
     if (!toolFresh()) return done({ fallback: true });
-    if (!patcher.child || patcher.built !== tool.built) {
+    const executable = statSync(tool.path, { throwIfNoEntry: false });
+    if (!executable) return done({ fallback: true });
+    const identity = `${executable.dev}:${executable.ino}:${executable.mtimeMs}:${executable.size}`;
+    if (!patcher.child || patcher.path !== tool.path || patcher.identity !== identity) {
       stopGroup(patcher.child);
       const child = patcher.child = spawn(tool.path, ['design-serve', resolve(app.dir, 'app.contract')], { cwd: root, env: toolEnv(), stdio: ['pipe', 'pipe', 'ignore'], detached: true });
-      patcher.built = tool.built;
+      patcher.path = tool.path;
+      patcher.identity = identity;
+      const asks = patcher.asks = new Map();
       let buffered = '';
       child.stdin.on('error', () => {});
       child.stdout.on('data', (d) => {
         buffered += d;
         const lines = buffered.split('\n');
         buffered = lines.pop();
-        for (const line of lines) { try { const r = JSON.parse(line); patcher.asks.get(r.id)?.(r); patcher.asks.delete(r.id); } catch { /* not a reply */ } }
+        for (const line of lines) { try { const r = JSON.parse(line); asks.get(r.id)?.(r); asks.delete(r.id); } catch { /* not a reply */ } }
       });
-      child.on('exit', () => {
+      const end = () => {
         if (patcher.child === child) patcher.child = null;
-        for (const answer of patcher.asks.values()) answer({ fallback: true });
-        patcher.asks.clear();
-      });
+        for (const answer of asks.values()) answer({ fallback: true });
+        asks.clear();
+      };
+      child.once('exit', end);
+      child.once('error', end);
     }
     const id = ++patcher.n;
     patcher.asks.set(id, done);
@@ -995,7 +1055,7 @@ for(;;){
     if (!next.tokens || design !== base) return { fallback: true };
     // The committed design's rows, those it patched set again.
     const rows = new Map(next.tokens.map((t) => [t.name, t]));
-    return scrubShow({ ...base, digest: next.digest, structure: next.structure ?? base.structure, tokens: base.tokens.map((t) => rows.get(t.name) ?? t) }, frame);
+    return scrubShow({ ...base, digest: next.digest, structure: next.structure ?? base.structure, tokens: base.tokens.map((t) => rows.get(t.name) ?? t) }, frame, { patch: values.map(({ name, css }) => [name, css]) });
   }
   /** The patched frame shown, against its texts compiled whole: `{mismatch}`
    * naming the first token that differs. */
@@ -1009,7 +1069,7 @@ for(;;){
     const mismatch = i >= 0 ? `\`${next.tokens[i].name}\`: compiled ${JSON.stringify(next.tokens[i])}, patched ${JSON.stringify(shown.tokens[i])}`
       : next.tokens.length !== shown.tokens.length || next.digest !== shown.digest || next.shape !== shown.shape || next.structure !== shown.structure ? 'the designs differ' : null;
     if (mismatch) console.log(`scrub: the patched frame is not its compile (${mismatch}); the pages get the committed design back`);
-    return mismatch ? { mismatch } : {};
+    return mismatch ? { mismatch } : frames.verify(texts[file]);
   }
   /** Preview a scrub's texts: a batch from the design the pages run, as a
    * value-only edit sends one, and its snapshot for a page that asks. */
@@ -1019,11 +1079,11 @@ for(;;){
     if (!(file in texts)) { scrubRestore(frame); return {}; }
     const next = await scrubDesign(texts[file]);
     if (next.error) return next;
-    return scrubShow(next, frame);
+    return scrubShow(next, frame, { text: texts[file] });
   }
   /** Show a scrub's design `next` on the pages, its batch and snapshot
    * marked `frame` (*1.10*). */
-  function scrubShow(next, frame) {
+  async function scrubShow(next, frame, request) {
     const from = scrubbed ?? design;
     if (!from || from.shape !== next.shape || from.tokens.length !== next.tokens.length
       || next.tokens.some((t, i) => t.name !== from.tokens[i].name || String(t.accent) !== String(from.tokens[i].accent))) return { error: 'it changes the design\'s shape: a rebuild applies on release' };
@@ -1034,6 +1094,8 @@ for(;;){
     // A token the page writes inline has no property to preview through.
     const inline = next.tokens.find((t, i) => t.inline && !same(t, from.tokens[i]));
     if (inline) return { error: `\`${inline.name}\` is written inline on this page (${inline.writer ?? 'a font weight, an SVG attribute'}): a rebuild applies on release` };
+    const previews = await frames.preview(request, frame, () => (scrubbed ?? design) === from);
+    if (previews.error || previews.fallback) return previews;
     if (!scrubbed) aside = snapshot;
     // A new preview is no released scrub's.
     scrubbed = next;
@@ -1050,11 +1112,15 @@ for(;;){
   /** Why a live proposal's texts would not apply in place on these pages
    * (dev-inline.mjs): the built reader only, so a proposal never waits on a
    * compile; with none yet, a rebuild is assumed. */
-  const inlineWhy = (texts) => inlineWhyOf({ texts, file: relative(app.dir, designPath(app.dir)), ready: toolReady,
-    read: (text) => scrubDesign(text, { readOnly: true }), pages: () => scrubbed ?? design, same });
+  const inlineWhy = async texts => {
+    const file = relative(app.dir, designPath(app.dir));
+    const why = await inlineWhyOf({ texts, file, ready: toolReady, read: text => scrubDesign(text, { readOnly: true }), pages: () => scrubbed ?? design, same });
+    return why ?? (file in texts ? frames.inlineWhy(texts[file]) : null);
+  };
   /** A scrub ended without its write: the pages back on the committed design. */
   function scrubRestore(frame) {
     released = false;
+    frames.restore(frame);
     if (!scrubbed || !design) return;
     const from = scrubbed;
     scrubbed = null;
@@ -1070,49 +1136,52 @@ for(;;){
   // The install pages (LLP 1030.003 D6a) and, from a loopback page on a Mac,
   // the local iOS build (D6b): this server's, since only it sees the real
   // peer (a forwarded request's is loopback).
-  const installer = localInstaller({ app: () => app, origins, port, gate, listener: { host, port } });
-  // The design server's wire (LLP 1121 D13), when the app has a design.
-  // `page`: this loop's own origin, which the design tool frames (LLP 1122 T2).
-  // The source maps of the plans the resident loop serves the natives
-  // (LLP 1122 T2c), by plan digest. The child says each plan it publishes,
-  // and its map's card, on a pipe this loop gave it for that alone (fd 3:
-  // nothing a request makes is written there); this loop fetches the bytes
-  // from the child and keeps them only when they match that card. No
-  // request path takes a map in, and a process that took the child's port
-  // could not make bytes match a card it did not write. The plan said last
-  // is the running one; a pull overtaken by a later card of its plan is
-  // dropped; the 8 plans said last are kept.
-  const residentMaps = new Map(), saidAt = new Map();
-  let residentPlan = null, said = 0;
-  const residentMap = async (internal, card) => {
-    const n = ++said;
-    residentPlan = card.plan;
-    saidAt.delete(card.plan); saidAt.set(card.plan, n);
-    for (const plan of [...saidAt.keys()].slice(0, Math.max(0, saidAt.size - 8))) { saidAt.delete(plan); residentMaps.delete(plan); }
-    if (!card.map) { residentMaps.delete(card.plan); return; }
-    // (A card can come before the child listens: asked again, a while, while it is still the latest.)
-    for (let tries = 0; tries < 20 && saidAt.get(card.plan) === n; tries++) {
-      const got = await pullMap(internal, { plan: card.plan, ...card.map }, `127.0.0.1:${port}`);
-      if (got) { if (saidAt.get(card.plan) === n) residentMaps.set(got.digest, got.bytes); return; }
-      await new Promise((ok) => setTimeout(ok, 250));
-    }
-  };
-  try {
-    forma = designPath(app.dir) ? formaServer({ appDir: app.dir, pairTtlMs, remote: () => doors?.list() ?? [], live: true, page: `http://127.0.0.1:${port}`, sourceMap: (digest) => (digest ? residentMaps.get(digest) ?? pageMaps.get(digest) ?? gallery.map(digest) : residentMaps.get(residentPlan)) ?? null, designServed: () => (scrubbed ? null : served), scrub: { patch: scrubPatch, verify: scrubVerify, preview: scrubPreview, restore: scrubRestore, released: (frame) => { released = scrubbed != null && (frame ?? true); }, inline: inlineWhy } }) : null;
-  } catch (e) { console.error(e.message); process.exit(2); }
-  // A polled stream (Linux, the resident loop's relay) is told the design to run.
-  forma?.channel.greet(() => snapshot && notice(snapshot));
+  const launchGate = createLaunchGate();
+  const installer = localInstaller({ app: () => app, origins, port, gate, listener: { host, port }, launchGate });
+  // An agent attached to a tab a person has open here, once they allow it there (LLP 1012.000 D2).
+  const attach = devAttach({ port, root });
+  const residentMaps = residentPlanMaps(port);
+  // Serialize lock and listener handover across deletion, recreation and manifest changes.
+  function mountForma(path) {
+    if (wanted === path && !forma?.down) return changing;
+    wanted = path;
+    changing = changing.catch(() => {}).then(async () => {
+      if (mounted === wanted && !forma?.down) return;
+      const previous = forma, oldDoors = doors;
+      forma = doors = mounted = null;
+      if (previous) {
+        for (const owner of previous.channel.owners()) previous.channel.clear(owner);
+        await Promise.all([previous.close(), oldDoors?.close()]);
+      }
+      if (wanted && !stopping) {
+        forma = formaServer({ appDir: app.dir, waitLock: true, waiterLost: () => { if (!stopping && forma?.down) void mountForma(designPath(app.dir)).catch(failedMount); }, pairTtlMs, remote: () => doors?.list() ?? [], live: true, page: `http://127.0.0.1:${port}`, sourceMap: (digest) => (digest ? residentMaps.map(digest) ?? pageMaps.get(digest) ?? gallery.map(digest) : residentMaps.map()) ?? null, designServed: () => (scrubbed ? null : served), scrub: { patch: scrubPatch, verify: scrubVerify, preview: scrubPreview, restore: scrubRestore, released: (frame) => { frames.released(frame); released = scrubbed != null && (frame ?? true); }, inline: inlineWhy } });
+        mounted = wanted;
+        forma.channel.greet(() => snapshot && notice(snapshot));
+        doors = projectCanvas(forma, remoteAsked, `http://127.0.0.1:${port}`, listening, listening ? e => console.error(`Forma remote: ${e.message}`) : failedMount);
+      }
+      // EventSource reconnects with this channel's nonce while the document keeps its state.
+      for (const res of clients) res.end();
+      gallery.reconnect(); frames.reconnect();
+    }).catch(error => { if (wanted === path) wanted = undefined; throw error; });
+    return changing;
+  }
   const server = createServer({ maxHeaderSize: 128 * 1024 }, async (req, res) => {
     // Every HTML answer is framed by the design tool only (LLP 1122 T2).
     frameOnlyByTool(res);
     // A sandboxed page's (a Figma plugin's) wire request, with --allow-plugin-origin (stage 10b): the wire's, before the gate.
-    if (remoteAsked.plugin && forma && await pluginOnLoopback(forma, req, res)) return;
-    const access = gate.check(req);
-    if (!access.allowed) { res.writeHead(421, { 'cache-control': 'no-store' }); res.end(); return; }
     const url = webRequestURL(req.url);
-    if (!url) { res.writeHead(404, { 'cache-control': 'no-store' }); res.end(); return; }
+    const wire = url && (url.pathname === '/__forma' || url.pathname.startsWith('/__forma/'));
+    const access = gate.check(req);
+    if (wire && !stopping && (access.allowed || remoteAsked.plugin)) {
+      try { await mountForma(designPath(app.dir)); }
+      catch (error) { console.error(error.message); res.writeHead(503); res.end(); return; }
+    }
+    if (remoteAsked.plugin && forma && await pluginOnLoopback(forma, req, res)) return;
+    if (!access.allowed) { res.writeHead(421, { 'cache-control': 'no-store' }); res.end(); return; }
+    if (!url || (wire && !forma)) { res.writeHead(404, { 'cache-control': 'no-store' }); res.end(); return; }
     if (forma && await forma.handle(req, res, url, access)) return;
     if (await installer.handle(req, res, url, access)) return;
+    if (await attach.handle(req, res, url)) return;
     // The build channel (LLP 1122 D4): the page's stream gives it a nonce;
     // reports come up by POST; a build with no stream here (the resident
     // loop's devices, Linux) opens a polled one.
@@ -1143,7 +1212,7 @@ for(;;){
       res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(req.method === 'HEAD' ? undefined : readFileSync(resolve(root, 'host/web-js/inspect-dev.js')));
     }
-    if (await gallery.handle(req, res, url)) return; // the variant gallery's page, files and stream (dev-gallery.mjs)
+    if (await frames.handle(req, res, url) || await gallery.handle(req, res, url)) return;
     if (url.pathname === '/__dev/report' && req.method === 'POST') {
       if (!forma) { res.writeHead(404, { 'cache-control': 'no-store' }); res.end(); return; }
       await serveReport(forma.channel, req, res);
@@ -1156,14 +1225,14 @@ for(;;){
     }
     if (url.pathname === '/__dev/page') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
-      const opened = forma?.channel.open(frame => res.write(`data: ${JSON.stringify(frame)}\n\n`));
+      const opened = forma?.channel.open(frame => res.write(`data: ${JSON.stringify(frame)}\n\n`), { map: digest => pageMaps.get(digest), sequence: () => seq }), doc = attach.stream(req, frame => res.write(`data: ${JSON.stringify(frame)}\n\n`));
       // Ended once, by whichever close comes first: under Bun a request on a socket handed to the server
       // (emit('connection'): the TLS door's, an old [::1] door's) never fires req 'close'; its res 'close' does.
       let done = false;
-      const end = () => { if (done) return; done = true; opened?.close(); clients.delete(res); };
+      const end = () => { if (done) return; done = true; opened?.close(); attach.ended(doc); clients.delete(res); };
       req.on('close', end);
       res.on('close', end);
-      res.write(`data: ${JSON.stringify({ ...(error ? { error } : {}), reload: seq, revision: logicRevision, ...(opened ? { nonce: opened.nonce } : {}) })}\n\n`);
+      res.write(`id: ${pageEpoch}\ndata: ${JSON.stringify({ ...(error ? { error } : {}), reload: seq, revision: logicRevision, ...(opened ? { nonce: opened.nonce } : {}), attach: doc?.token ?? null })}\n\n`);
       // The design the pages run, after value-only edits since the build.
       if (snapshot) res.write(`data: ${JSON.stringify(notice(snapshot))}\n\n`);
       clients.add(res);
@@ -1213,7 +1282,8 @@ for(;;){
     if (discovery || url.pathname === '/__dev' || url.pathname === '/__dev/open' || url.pathname.startsWith('/__dev/generation/')) { forward(req, res, discovery); return; }
     // From the build the page booted (host/web/generations.mjs): a document names its generation in its base, and
     // its scripts, chunks and plan are read from that build while the next one is put in place.
-    const served = await servedFile(dist, url.pathname, req.headers.accept);
+    const served = await frames.unattributedFile(req, url.pathname) ?? await servedFile(dist, url.pathname, req.headers.accept);
+    if (served.status === 301) { res.writeHead(301, { location: served.location + url.search, 'cache-control': 'no-store' }); res.end(); return; }
     if (served.status === 410 || served.status === 400 || served.status === 503) { res.writeHead(served.status, { 'cache-control': 'no-store', ...(served.status === 503 ? { 'retry-after': '1' } : {}) }); res.end(); return; }
     // A miss is a 404, with the build's page for one where it has one (serve.mjs `buildTreeFile`).
     const found = served.body ? served : null;
@@ -1234,10 +1304,12 @@ for(;;){
         const checkpoint = `<script type="application/vnd.exact.dev-checkpoint" data-seq="${carried.seq}">${text.replaceAll('<', '\\u003c')}</script><script>const u=new URL(location.href);u.searchParams.delete('__exactDev');history.replaceState(history.state,'',u.pathname+(u.search?'?'+u.searchParams:'')+u.hash)</script>`;
         body = body.replace('<script type="module"', () => checkpoint + '<script type="module"');
       }
-      body += client(seq, logicRevision);
+      body += client(seq, logicRevision, { numbered: !!found.id && found.id === publishedGeneration && !/^\/(assets|deck)\//.test(found.route) });
     }
     sendStaticBody(req, res, body, { 'content-type': webContentType(found.route), 'cache-control': 'no-store' }, found.status);
   });
+  // The attach channel's driver (dev-attach.mjs); an upgrade to anything else is closed, as with no listener.
+  server.on('upgrade', (req, socket, head) => { if (!attach.upgrade(req, socket, head)) socket.destroy(); });
   // The resident loop's producers (host/web/dev.mjs `--serve-as`: the
   // resident compiler, the TypeScript and Rust module producers, the
   // envelope and generations) on a loopback port, into their own dist; a
@@ -1265,7 +1337,7 @@ for(;;){
         let cards = '';
         residentChild.stdio[3].on('data', (d) => {
           cards += d; const lines = cards.split('\n'); cards = lines.pop();
-          for (const l of lines) { const card = mapCard(l); if (card) void residentMap(internal, card); }
+          for (const l of lines) { const card = mapCard(l); if (card) void residentMaps.keep(internal, card); }
         });
         let buf = '';
         residentChild.stdout.on('data', (d) => {
@@ -1331,12 +1403,14 @@ for(;;){
     for (const entry of packageEntries.values()) entry.watch.close();
     for (const w of watchers) w.close(); residentChild?.kill('SIGTERM'); server.close(); server.closeAllConnections?.();
     // The design server lets go of its lock before this exits.
-    await Promise.all([buildExit, forma?.close(), doors?.close(), gallery.stop()]);
+    await changing.catch(() => {});
+    await Promise.all([buildExit, forma?.close(), doors?.close(), gallery.stop(), frames.stop(), controls?.stop()]);
     // A local iOS build in flight is stopped and waited for, as the resident loop does.
     const install = installer.child;
     if (install && install.exitCode === null && install.signalCode === null) { const exit = new Promise((ok) => install.once('exit', ok)); install.kill('SIGTERM'); await exit; }
     process.exit(process.exitCode ?? 0);
   })();
+  const failedMount = e => { console.error(`cannot mount Forma: ${e.message}`); if (!listening) { process.exitCode = 1; void stop(); } };
   startup.handoff(stop);
   watchLauncher(stop);
   await listenDelay();
@@ -1344,15 +1418,23 @@ for(;;){
   const six = await alsoOnIPv6Loopback(server, port).catch(async (e) => { console.error(`cannot listen on [::1]:${port}: ${e.code} (another server there would answer a localhost URL; --port <n> picks another)`); stopping = true; stopGroup(tool.child); stopGroup(tool.cleaner); await forma?.close(); process.exit(1); });
   await new Promise((ok, fail) => { server.on('error', fail); server.listen(port, host, ok); })
     .catch(async (e) => { console.error(`cannot listen on ${host}:${port}: ${e.code ?? e.message}${e.code === 'EADDRINUSE' ? ' (another dev loop? --port <n> picks another)' : ''}`); six?.close(); stopping = true; stopGroup(tool.child); stopGroup(tool.cleaner); await forma?.close(); process.exit(1); });
-  doors = forma ? await openRemoteCanvas(forma, remoteAsked, `http://127.0.0.1:${port}`).catch(async (e) => { console.error(`cannot listen: ${e.message}`); process.exitCode = 1; await stop(); }) : null;
+  mounting = true;
+  await mountForma(designPath(app.dir)).catch(failedMount);
+  if (remoteAsked.remote || remoteAsked.tunnel != null || remoteAsked.relay) await doors?.ready;
   const urls = origins.map((o) => `${o.origin}/`);
   console.log(urls.join('\n'));
   console.log(urls.map(url => `  Open in native: ${url}__dev/open`).join('\n'));
   if (allowHosts.length) console.log(`  also answering to ${allowHosts.join(', ')} (--allow-host)`);
   console.log(`  (dev loop on the JS target: ${app.dir.replace(root + '/', '')} and host/web-js rebuild and reload the page; a native client's requests go to the resident loop's producers, started at the first; ${lan ? 'LAN bind — any peer on this network can read the app and its compile errors' : 'loopback only — --lan to serve a phone on this network'}; ctrl-c to stop)`);
+  console.log('  (⌥⇧A in a page here turns Agent Attach on in it: `bun exact.mjs agent web --attach …` reads that tab once you allow it there)');
   // Said once the server answers, not at the first build: a test or an agent takes it as the cue to connect.
   console.log('plan ready');
   listening = true; for (const line of held.splice(0)) console.log(line);
+  controls = attachDevControls({
+    app, root, url: `http://127.0.0.1:${port}/`, wasm: false, flags: devFlags, launchGate,
+    onReload: () => { void rebuild({ force: true }); },
+    onStop: stop,
+  });
   await new Promise(() => {});
 }
 

@@ -87,10 +87,12 @@ impl<F, Q: Send + 'static> Presents<F, Q> {
             .spawn(move || {
                 for frame in frames {
                     let result = frame.and_then(&wait).map(|()| Instant::now());
-                    let failed = result.is_err();
-                    if done.send(result).is_err() || signal.send(&[1]).is_err() || failed {
-                        break;
-                    }
+                    // Keep draining every already-queued present until `jobs`
+                    // drops, so Drop waits all in-flight presents before
+                    // destroying the swapchain and never triggers a premature
+                    // POLLHUP on the wake socket.
+                    let _ = done.send(result);
+                    let _ = signal.send(&[1]);
                 }
             })?;
         Ok(Self {

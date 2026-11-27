@@ -54,6 +54,9 @@
 //     }
 //     #endif
 import Foundation
+#if canImport(ExactPackage)
+import ExactPackage
+#endif
 import Security
 #if os(macOS)
 import AppKit
@@ -96,7 +99,11 @@ public final class ExactModuleContext: @unchecked Sendable {
     // has the hatch table (before its hatches are called), and what each token calls.
     typealias FramesFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, Int32) -> Void
     typealias AfterFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, Double) -> Void
+    typealias AssetFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, UInt32, UnsafeMutablePointer<UInt8>?, UInt32) -> UInt32
     var framesFn: FramesFn?, afterFn: AfterFn?, coalescingAfterFn: AfterFn?
+    private let assetLock = NSLock()
+    private var assetFn: AssetFn?
+    func setAssetFn(_ fn: AssetFn?) { assetLock.withLock { assetFn = fn } }
     var ticks: [UInt64: (ExactFrame) -> Void] = [:], afters: [UInt64: () -> Void] = [:]
     private var nextToken: UInt64 = 1
 
@@ -178,6 +185,27 @@ public final class ExactModuleContext: @unchecked Sendable {
     public func wrote(_ path: String = "app:/data") {
         changed(path.hasPrefix("app:/") ? path : "app:/" + path)
     }
+
+    /// Resolve an `app:/` path (`app:/data/...`, `app:/cache/...`, `app:/tmp/...`) inside session storage (LLP 1156.008.000 D6.6).
+    public func file(_ path: String) -> URL? { ExactExtensions.file(path, self) }
+
+    /// Resolve a declared asset under `assets/` from the active generation (embedded, dev, or OTA), or `nil` if absent/invalid (LLP 1067.001). Any thread once connected.
+    public func asset(_ path: String) -> URL? {
+        guard let fn = assetLock.withLock({ assetFn }) else { return nil }
+        let input = Array(path.utf8)
+        guard !input.isEmpty else { return nil }
+        var cap = 256
+        for _ in 0..<3 {
+            var buf = [UInt8](repeating: 0, count: cap)
+            let needed = input.withUnsafeBufferPointer { s in
+                buf.withUnsafeMutableBufferPointer { d in Int(fn(host, s.baseAddress, UInt32(s.count), d.baseAddress, UInt32(d.count))) }
+            }
+            guard needed > 0 else { return nil }
+            if needed <= cap { return String(bytes: buf.prefix(needed), encoding: .utf8).map(URL.init(fileURLWithPath:)) }
+            cap = needed
+        }
+        return nil
+    }
 }
 
 /// One frame of a `frames` ticket: the session clock's time in milliseconds,
@@ -246,7 +274,9 @@ open class ExactModule {
         reply.fail("\(type(of: self)) answers no native.later")
     }
     /// A cheap query answered now (`native.call`), on the main thread and
-    /// inside the asking answer's 100 ms budget. Throw to refuse.
+    /// inside the asking answer's 100 ms budget. Throw to refuse. The page
+    /// cannot lay out until it returns, so an animated frame change of an
+    /// Exact window asked here runs after it (`ExactSessionWindow`).
     open func call(_ request: [String: Any]) throws -> [String: Any] {
         throw ExactNativeRefusal("\(type(of: self)) answers no native.call")
     }
@@ -912,7 +942,8 @@ public final class ExactElement {
     /// The first child is primary and the second secondary. Exact manages their child controllers
     /// and containment; supply a detached controller with empty content slots. The app configures
     /// the native arrangement, including animated updates. Navigation stays in the enclosing
-    /// controller, with its native policies unchanged. Pass nil to restore authored layout.
+    /// controller, with its native policies unchanged. Pass nil to give the element back to its author's
+    /// layout, in CSS or by its `arrangement`.
     @available(iOS 27.1, *)
     @discardableResult
     public func arrange(using controller: UIArrangementViewController?) -> Bool {
@@ -1095,6 +1126,9 @@ private let moduleWillQuit: @convention(c) (UnsafeMutableRawPointer?, UnsafeMuta
 // after the session's module is made; then each moment is one call.
 private let moduleConnect: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?) -> Void = { raw, table in
     guard let m = module(raw), let table else { return }
+    let asset = table.load(as: UInt32.self) >= 216
+        ? table.load(fromByteOffset: 208, as: UnsafeRawPointer?.self).map { unsafeBitCast($0, to: ExactModuleContext.AssetFn.self) } : nil
+    m.context.setAssetFn(asset)
     m.hatches = ExactHatches(host: m.context.host, table: table)
     m.context.diagnostics.recordFn = m.hatches?.recordFn
     m.context.framesFn = m.hatches?.framesFn
@@ -1389,8 +1423,14 @@ private let moduleSessionView: @convention(c) (UnsafeMutableRawPointer?, UnsafeM
     module(raw)?.context.sessionView = view.map { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() }
 }
 
-/// The ABI major this artifact was built against; the host refuses others.
-private let major: UInt32 = 4
+private let moduleBindings: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void = { raw, bytes, length in
+    #if canImport(ExactPackage)
+    guard let m = module(raw) else { return }
+    guard let bytes else { return ExactExtensions.tracks(m).endViewBindings() }
+    let snapshot = try? JSONDecoder().decode(ExactTracks.ViewBindings.self, from: Data(bytes: bytes, count: length))
+    if let apply = ExactExtensions.tracks(m).commitViewBindings(snapshot ?? [:]) { DispatchQueue.main.async(execute: apply) }
+    #endif
+}
 
 private let table: UnsafeMutableRawPointer = {
     // Beside the tags, under a key no tag can take (a tag has a hyphen): the
@@ -1401,10 +1441,14 @@ private let table: UnsafeMutableRawPointer = {
         // `app.onLine` is asked of the host (`on_line`), not read from the facts.
         + ",\"facts\":{\"onLine\":\"asks\"}"
     let roster = ExactNativeViewABI.roster
+    // Track views require committed binding delivery. An older host refuses this major at load.
+    let major: UInt32 = roster.values.contains { !$0.trackProps.isEmpty } ? 5 : 4
     let text = "{" + (roster.keys.sorted().map { tag in
-        "\"\(tag)\":{\"snapshot\":\(roster[tag]!.snapshot),\"reuse\":\(roster[tag]!.reuse),\"firstFrame\":\(roster[tag]!.firstFrame)}"
+        let factory = roster[tag]!
+        let trackProps = factory.trackProps.map { "\"\($0)\"" }.joined(separator: ",")
+        return "\"\(tag)\":{\"snapshot\":\(factory.snapshot),\"reuse\":\(factory.reuse),\"firstFrame\":\(factory.firstFrame),\"trackProps\":[\(trackProps)]}"
     } + [words]).joined(separator: ",") + "}"
-    let size = 256
+    let size = 272
     let t = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 8)
     t.initializeMemory(as: UInt8.self, repeating: 0, count: size)
     t.storeBytes(of: major, as: UInt32.self)
@@ -1439,6 +1483,8 @@ private let table: UnsafeMutableRawPointer = {
     t.storeBytes(of: unsafeBitCast(moduleAuthenticate, to: UnsafeRawPointer.self), toByteOffset: 232, as: UnsafeRawPointer.self)
     t.storeBytes(of: unsafeBitCast(moduleImage, to: UnsafeRawPointer.self), toByteOffset: 240, as: UnsafeRawPointer.self)
     t.storeBytes(of: unsafeBitCast(moduleSessionView, to: UnsafeRawPointer.self), toByteOffset: 248, as: UnsafeRawPointer.self)
+    t.storeBytes(of: unsafeBitCast(moduleBindings, to: UnsafeRawPointer.self), toByteOffset: 256, as: UnsafeRawPointer.self)
+    t.storeBytes(of: unsafeBitCast(ExactNativeViewABI.safeArea, to: UnsafeRawPointer.self), toByteOffset: 264, as: UnsafeRawPointer.self)
     return t
 }()
 

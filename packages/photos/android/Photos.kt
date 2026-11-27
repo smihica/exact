@@ -10,8 +10,10 @@
 //   `ACCESS_MEDIA_LOCATION` in the same request. Adding asks nothing (API 29 and later).
 // - The app's own photos are read under the add line (D6): the runner lets a picture or a copy through as `owned`,
 //   and MediaStore decides by opening the id.
-// - Android has no event for a change in Settings: each resume reads the status again and, when it changed,
-//   announces it, and revokes the pictures it drew that the app may no longer read (D6).
+// - Android has no event for a change in Settings, and the module observes none in MediaStore (LLP 1133.019.000 D1):
+//   each resume reads the status again, announces it when it changed and the library's readers under a grant, and
+//   revokes the pictures it drew that the app may no longer read (D6).
+// - `photoChanges` is rescan-only (LLP 1133.019.000 D3): a token answers `expired`, and the app lists again.
 // - Tier 3 (D9): `queryArgsHatch` sees each `photoAssets` query's `Bundle` after the module's arguments, on the
 //   module's thread, and a page's key is joined to its selection after; `insertValuesHatch` each add's
 //   `ContentValues`, likewise.
@@ -30,6 +32,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Size
+import dev.exact.canvas.Cause
 import dev.exact.canvas.ExactExtension
 import dev.exact.canvas.ExtensionContext
 import org.json.JSONArray
@@ -72,25 +75,38 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
     private fun say(line: String) = context.log("photos: $line")
     private fun error(code: String, message: String? = null) = JSONObject().put("error", code).apply { if (message != null) put("message", message) }
 
-    override fun later(name: String, args: JSONObject, reply: (JSONObject) -> Unit) {
+    override fun later(name: String, args: JSONObject, reply: (JSONObject) -> Unit) = later(name, args, null, Cause.none, reply)
+
+    override fun later(name: String, args: JSONObject, preferred: Any?, cause: Cause, reply: (JSONObject) -> Unit) {
         if (context.agent) return agent(name, args, reply)
         when (name) {
             "photoLibraryStatus" -> reply(status())
-            "photoAssets" -> readable(reply) { work.execute { reply(assets(args)) } }
-            "copyPhotoAsset" -> copy(args, reply)
+            "photoAssets" -> readable(cause, reply) { work.execute { reply(assets(args)) } }
+            "photoChanges" -> readable(cause, reply) { reply(changes(args)) }
+            "copyPhotoAsset" -> copy(args, cause, reply)
             "addToPhotoLibrary" -> work.execute { reply(add(args)) }
-            "managePhotoSelection" -> manage(reply)
+            "managePhotoSelection" -> manage(cause, reply)
             else -> reply(error("NotSupportedError"))
         }
     }
 
+    /** The module observes no MediaStore change (LLP 1133.019.000 D1), and a selection can change in Settings with
+     * the same status, so each resume under a grant announces the readers: an app replaces its index then. Otherwise
+     * they are announced only when the read itself changed: a read announced while `prompt` asks again, so the resume
+     * after a person's refusal would show the dialog a second time. */
     override fun resumed() {
         if (context.agent) return
-        val before = said ?: return
+        val last = said
         val now = status()
-        if (now.toString() == before) return
-        context.changed("photos.photoLibraryStatus")
-        context.changed("photos.photoAssets")
+        if (last != null) {
+            if (now.toString() != last) context.changed("photos.photoLibraryStatus")
+            val read = { status: JSONObject -> status.getString("state") to status.getString("access") }
+            if (now.getString("state") == "granted" || read(now) != read(JSONObject(last))) {
+                context.changed("photos.photoAssets")
+                context.changed("photos.photoChanges")
+            }
+        }
+        // A picture can be drawn from an id the app kept, with no status read before.
         if (now.getString("access") != "full") withdraw()
     }
 
@@ -98,7 +114,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
     private fun withdraw() {
         val ids = drawn.toList()
         work.execute {
-            val gone = ids.filter { !opens(Uri.parse(it)) }
+            val gone = ids.filter { unreadable(Uri.parse(it)) }
             main.post { gone.forEach { drawn.remove(it); context.revokePicture("photos:$it") } }
         }
     }
@@ -119,9 +135,15 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
             else -> listOf(Manifest.permission.READ_EXTERNAL_STORAGE)
         }.filter { it in declared }
 
-    private fun status(): JSONObject {
+    /** `full`, `limited` or `none`, from the permissions alone. */
+    private fun access(): String {
         val full = reads.firstOrNull()?.let { it != SELECTED && has(it) } == true
-        val limited = !full && SELECTED in reads && has(SELECTED)
+        return if (full) "full" else if (SELECTED in reads && has(SELECTED)) "limited" else "none"
+    }
+
+    private fun status(): JSONObject {
+        val access = access()
+        val (full, limited) = (access == "full") to (access == "limited")
         val granted = full || limited
         // Neither: the state is the host's history of the request (LLP 1133.008 D8 item 7).
         val history = reads.firstOrNull()?.let { context.permission(it) }
@@ -129,34 +151,36 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         val out = JSONObject()
             .put("available", true)
             .put("state", state)
-            .put("access", if (full) "full" else if (limited) "limited" else "none")
+            .put("access", access)
             .put("addState", "granted")
             .put("apple", JSONObject.NULL)
             .put("android", JSONObject()
                 .put("shouldShowRationale", history?.shouldShowRationale == true)
                 .put("permanentlyDenied", !granted && history?.permanentlyDenied == true)
-                .put("generation", MediaStore.getVersion(app)))
+                .put("generation", try { MediaStore.getVersion(app) } catch (e: RuntimeException) { JSONObject.NULL }))
         said = out.toString()
         return out
     }
 
-    /** [then] once the app may read: asked in one request while `prompt`; refused while `denied` or undeclared. */
-    private fun readable(reply: (JSONObject) -> Unit, then: () -> Unit) {
+    /** [then] once the app may read: asked in one request while `prompt`, by the app's own code or a person only (D7);
+     * refused while `denied` or undeclared. */
+    private fun readable(cause: Cause, reply: (JSONObject) -> Unit, then: () -> Unit) {
         val state = status()
         when {
             reads.isEmpty() -> reply(error("NotAllowedError", "the manifest declares no read permission"))
             state.getString("state") == "granted" -> then()
             state.getString("state") == "denied" -> reply(error("NotAllowedError"))
-            else -> ask { if (status().getString("state") == "granted") then() else reply(error("NotAllowedError")) }
+            !cause.app -> reply(error("NotAllowedError", "person-required"))
+            else -> ask(cause) { if (status().getString("state") == "granted") then() else reply(error("NotAllowedError")) }
         }
     }
 
     /** The platform's dialog for the read permissions and the location one, then [done]. */
-    private fun ask(done: () -> Unit) {
+    private fun ask(cause: Cause, done: () -> Unit) {
         val location = listOf(Manifest.permission.ACCESS_MEDIA_LOCATION).filter { it in declared }
         val asked = (reads + location).toTypedArray()
         val first = reads.first()
-        context.requestPermissions(asked) { answered ->
+        context.requestPermissions(cause, asked) { answered ->
             // A refusal with no rationale owed after it is permanent: the history `permission` reads, as
             // `askPermission` keeps it for one permission.
             val activity = context.activity
@@ -171,11 +195,12 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
     /** API 34's selection dialog: the read request again, while access is limited (D6). Answers the status. The dialog
      * can answer with the activity still resumed, and a limited library changed within itself reads the same status,
      * so the pictures of photos it took out are withdrawn here, not at a resume. */
-    private fun manage(reply: (JSONObject) -> Unit) {
+    private fun manage(cause: Cause, reply: (JSONObject) -> Unit) {
         if (Build.VERSION.SDK_INT < 34 || status().getString("access") != "limited") return reply(status())
-        context.requestPermissions(reads.toTypedArray()) {
+        context.requestPermissions(cause, reads.toTypedArray()) {
             context.changed("photos.photoLibraryStatus")
             context.changed("photos.photoAssets")
+            context.changed("photos.photoChanges")
             val now = status()
             if (now.getString("access") != "full") withdraw()
             reply(now)
@@ -191,7 +216,23 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         MediaStore.Images.Media.OWNER_PACKAGE_NAME, MediaStore.Images.Media.MIME_TYPE, MediaStore.Images.Media.DISPLAY_NAME,
     ) + if (Build.VERSION.SDK_INT >= 30) arrayOf(MediaStore.MediaColumns.IS_FAVORITE) else emptyArray()
 
-    private fun assets(args: JSONObject): JSONObject {
+    /** `photoAssets`. No cursor, or a failure of the provider or of the app's hatch, answers an error, never an empty
+     * last page, which would let a replacement drop the app's index (LLP 1133.019.000 D3). */
+    private fun assets(args: JSONObject): JSONObject = try {
+        page(args)
+    } catch (e: SecurityException) {
+        failed("NotAllowedError", e.javaClass.name)
+    } catch (e: android.os.OperationCanceledException) {
+        failed("AbortError", e.javaClass.name)
+    } catch (e: RuntimeException) { failed("UnknownError", e.javaClass.name) }
+
+    /** A failure of `photoAssets`, logged by its names alone: no ids, no selection, no provider message. */
+    private fun failed(code: String, cause: String): JSONObject {
+        say("photoAssets: $code ($cause)")
+        return error(code)
+    }
+
+    private fun page(args: JSONObject): JSONObject {
         val limit = args.optInt("limit", 60).coerceIn(1, 500)
         // The key's numbers: the date taken and the date added, either null, and the row.
         val after = try {
@@ -216,28 +257,53 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
                 query.putInt(android.content.ContentResolver.QUERY_ARG_LIMIT, fetched)
             }
         }
-        // The page's key joins the app's selection; its values are numbers the cursor held, written as literals, so
-        // the app's selection arguments keep their places.
-        if (after != null) {
-            val keys = listOf(MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DATE_ADDED, MediaStore.Images.Media._ID)
-            val ours = olderThan(keys.zip(after))
+        // The subtype filter and the page's key join the app's selection; the key's values are numbers the cursor
+        // held, written as literals, so the app's selection arguments keep their places.
+        val keys = listOf(MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DATE_ADDED, MediaStore.Images.Media._ID)
+        val ours = listOfNotNull(subtypeSelection(args), after?.let { olderThan(keys.zip(it)) })
+        if (ours.isNotEmpty()) {
             val theirs = query.getString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION)
-            query.putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION, if (theirs.isNullOrBlank()) ours else "($theirs) AND ($ours)")
+            val joined = (listOfNotNull(theirs?.ifBlank { null }) + ours).joinToString(" AND ") { "($it)" }
+            query.putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION, joined)
         }
         val out = JSONArray()
         var last: List<Long?>? = null
         var more = false
-        try {
-            app.contentResolver.query(IMAGES, columns, query, null)?.use { c ->
-                while (c.moveToNext()) {
-                    if (out.length() == limit) { more = true; break }
-                    out.put(asset(c))
-                    last = listOf(if (c.isNull(4)) null else c.getLong(4), if (c.isNull(5)) null else c.getLong(5), c.getLong(0))
-                }
+        val c = app.contentResolver.query(IMAGES, columns, query, null) ?: return failed("UnknownError", "no cursor")
+        c.use {
+            while (c.moveToNext()) {
+                if (out.length() == limit) { more = true; break }
+                out.put(asset(c))
+                last = listOf(if (c.isNull(4)) null else c.getLong(4), if (c.isNull(5)) null else c.getLong(5), c.getLong(0))
             }
-        } catch (e: SecurityException) { return error("NotAllowedError", e.message) }
+        }
         val cursor = last?.takeIf { more }?.let { PageCursor.text("mediastore", it.map { v -> v?.toString() }) }
         return JSONObject().put("assets", out).put("cursor", cursor ?: JSONObject.NULL)
+    }
+
+    /** `subtypes`' selection (LLP 1133.019.000 D4), null for every image: `screenshot` is a row whose `RELATIVE_PATH`'s
+     * last nonempty segment is the screenshots directory (`Pictures/Screenshots/`, `DCIM/Screenshots/`), in any case,
+     * as SQLite's `LIKE` compares. */
+    private fun subtypeSelection(args: JSONObject): String? {
+        if (!screenshots(args)) return null
+        val (path, dir) = "rtrim(${MediaStore.Images.Media.RELATIVE_PATH}, '/')" to android.os.Environment.DIRECTORY_SCREENSHOTS
+        return "$path LIKE '$dir' OR $path LIKE '%/$dir'"
+    }
+
+    private fun screenshots(args: JSONObject): Boolean =
+        args.optJSONArray("subtypes")?.let { a -> (0 until a.length()).any { a.optString(it) == "screenshot" } } == true
+
+    /** What changed since `since` (LLP 1133.019.000 D1, D3): every view is rescan-only on Android, so a token answers
+     * `expired` with a fresh one, and the app replaces its index from `photoAssets`. */
+    private fun changes(args: JSONObject): JSONObject {
+        val here = ChangeToken("mediastore", access(), ChangeToken.subtypes(args))
+        val since = try { ChangeToken.parse(args.opt("since"), "mediastore") } catch (e: IllegalArgumentException) { return ChangeToken.refused() }
+        // Every token this answers is a rescan-only one.
+        return when {
+            since == null -> here.answer()
+            since.rescan && since.epoch == null -> here.answer(expired = true)
+            else -> ChangeToken.refused()
+        }
     }
 
     /** What sorts after [key] under a sort of its columns, each descending with a null last; the last is never null. */
@@ -251,21 +317,29 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
 
     private fun asset(c: android.database.Cursor): JSONObject {
         val id = ContentUris.withAppendedId(IMAGES, c.getLong(0)).toString()
-        val turned = c.getInt(3) % 180 != 0
-        val (w, h) = c.getInt(1) to c.getInt(2)
+        val (w, h) = upright(c.getInt(1), c.getInt(2), c.getInt(3))
         val taken = if (c.isNull(4)) null else c.getLong(4).toDouble()
         val text = { i: Int -> if (c.isNull(i)) JSONObject.NULL else c.getString(i) }
         return JSONObject()
             .put("id", id)
             .put("mediaType", "image")
-            .put("width", if (turned) h else w)
-            .put("height", if (turned) w else h)
+            .put("width", w)
+            .put("height", h)
             .put("creationDate", taken ?: (c.getLong(5) * 1000.0))
             .put("favorite", c.columnCount > 11 && c.getInt(11) == 1)
             .put("picture", "photos:$id")
             .put("apple", JSONObject.NULL)
             .put("android", JSONObject().put("relativePath", text(6)).put("bucketDisplayName", text(7)).put("ownerPackageName", text(8)))
     }
+
+    /** A photo's sides as it is shown: MediaStore keeps them as stored, before its [orientation] turns it. */
+    private fun upright(width: Int, height: Int, orientation: Int) = if (orientation % 180 != 0) height to width else width to height
+
+    /** Whether the app may no longer open [uri]: refused, or no row. A query that fails otherwise, or answers no
+     * cursor, is no answer, and the picture stays. */
+    private fun unreadable(uri: Uri): Boolean = try {
+        app.contentResolver.query(uri, arrayOf(MediaStore.Images.Media._ID), null, null, null)?.use { !it.moveToFirst() } ?: false
+    } catch (e: SecurityException) { true } catch (e: RuntimeException) { false }
 
     /** Whether the app may open [uri] now. */
     private fun opens(uri: Uri): Boolean = try {
@@ -278,8 +352,9 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         val uri = Uri.parse(id)
         work.execute {
             try {
-                val size = app.contentResolver.query(uri, arrayOf(MediaStore.Images.Media.WIDTH, MediaStore.Images.Media.HEIGHT), null, null, null)
-                    ?.use { if (it.moveToFirst()) it.getInt(0) to it.getInt(1) else null }
+                val columns = arrayOf(MediaStore.Images.Media.WIDTH, MediaStore.Images.Media.HEIGHT, MediaStore.Images.Media.ORIENTATION)
+                val size = app.contentResolver.query(uri, columns, null, null, null)
+                    ?.use { if (it.moveToFirst()) upright(it.getInt(0), it.getInt(1), it.getInt(2)) else null }
                     ?: return@execute reply(null, "NotFoundError")
                 val longest = longest(size, width, height, fit)
                 val bitmap = app.contentResolver.loadThumbnail(uri, Size(longest, longest), null)
@@ -303,14 +378,14 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
 
     // Copies and adds
 
-    private fun copy(args: JSONObject, reply: (JSONObject) -> Unit) {
+    private fun copy(args: JSONObject, cause: Cause, reply: (JSONObject) -> Unit) {
         val uri = Uri.parse(args.optString("asset"))
         // Opened as the app's own when it is (D6); else a read of the library, asked while `prompt`.
         work.execute {
             if (opens(uri)) return@execute reply(copied(uri, args))
             main.post {
                 if (reads.isEmpty()) return@post reply(error("NotFoundError"))
-                readable(reply) { work.execute { reply(if (opens(uri)) copied(uri, args) else error("NotFoundError")) } }
+                readable(cause, reply) { work.execute { reply(if (opens(uri)) copied(uri, args) else error("NotFoundError")) } }
             }
         }
     }
@@ -368,7 +443,10 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
             resolver.delete(uri, null, null)
             return error("UnknownError")
         }
-        main.post { context.changed("photos.photoAssets") }
+        main.post {
+            context.changed("photos.photoAssets")
+            context.changed("photos.photoChanges")
+        }
         // The app reads its own photo whatever its read permission (D6).
         return JSONObject().put("asset", uri.toString())
     }
@@ -379,6 +457,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         when (name) {
             "photoLibraryStatus", "managePhotoSelection" -> reply(agentStatus())
             "photoAssets" -> reply(agentAssets(args))
+            "photoChanges" -> reply(agentChanges(args))
             "copyPhotoAsset" -> reply(agentCopy(args))
             "addToPhotoLibrary" -> reply(agentAdd(args))
             else -> reply(error("NotSupportedError"))
@@ -389,20 +468,32 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
      * read is revoked. */
     override fun preferred(values: JSONObject) {
         if (!context.agent) return
-        val before = library.visible
-        values.optJSONObject("photoLibraryStatus")?.optString("access")?.ifEmpty { null }?.let { library.access = it }
-        library.selection = values.optJSONArray("selection")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: AgentLibrary.defaultSelection
-        val after = library.visible
-        for (id in (before - after).sorted()) {
-            say("revoked photos:$id")
-            context.revokePicture("photos:$id")
+        val strings = { k: String -> values.optJSONArray(k)?.let { a -> (0 until a.length()).map { a.getString(it) } } }
+        change {
+            values.optJSONObject("photoLibraryStatus")?.optString("access")?.ifEmpty { null }?.let { access = it }
+            selection = strings("selection") ?: AgentLibrary.defaultSelection
+            deleted = strings("deleted").orEmpty().toSet()
         }
-        if (before != after) context.changed("photos.photoAssets")
     }
 
     override fun permissions(states: JSONObject) {
         // Denied reading: nothing is readable, whatever the status said before.
-        if (context.agent && states.optString("photos") == "denied") preferred(JSONObject().put("photoLibraryStatus", JSONObject().put("access", "none")))
+        if (context.agent && states.optString("photos") == "denied") change { access = "none" }
+    }
+
+    /** The agent's library changed by [edit]: a photo that left what the app may read is revoked, and the readers of
+     * what moved are announced. */
+    private fun change(edit: AgentLibrary.() -> Unit) {
+        val seen = library.visible
+        val moved = Triple(library.access, library.epoch, library.journal.size)
+        library.edit()
+        val after = library.visible
+        for (id in (seen - after).sorted()) {
+            say("revoked photos:$id")
+            context.revokePicture("photos:$id")
+        }
+        if (seen != after) context.changed("photos.photoAssets")
+        if (seen != after || moved != Triple(library.access, library.epoch, library.journal.size)) context.changed("photos.photoChanges")
     }
 
     private fun agentStatus() = JSONObject()
@@ -412,15 +503,37 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
     private fun agentAssets(args: JSONObject): JSONObject {
         val after = try { PageCursor.key("agent", args.opt("cursor"), 2) } catch (e: IllegalArgumentException) { return PageCursor.refused() }
         val created = after?.get(0)?.toDoubleOrNull()
-        val (page, more) = library.page(args.optInt("limit", 60).coerceIn(1, 500), after?.let { (created ?: Double.NEGATIVE_INFINITY) to it[1]!! })
+        val (page, more) = library.page(args.optInt("limit", 60).coerceIn(1, 500), after?.let { (created ?: Double.NEGATIVE_INFINITY) to it[1]!! }, screenshots(args))
         val cursor = page.lastOrNull()?.takeIf { more }?.let { PageCursor.text("agent", listOf(it.created.toString(), it.id)) }
         return JSONObject().put("assets", JSONArray(page.map(::agentAsset))).put("cursor", cursor ?: JSONObject.NULL)
+    }
+
+    /** The agent's journal from `since` (LLP 1133.019.000 D1, D5). A walk fixes its end on its first page; each page
+     * after takes up after the last photo the one before answered. */
+    private fun agentChanges(args: JSONObject): JSONObject {
+        val count = library.journal.size
+        val here = ChangeToken("agent", library.access, ChangeToken.subtypes(args), library.epoch, count.toString())
+        val since = try { ChangeToken.parse(args.opt("since"), "agent") } catch (e: IllegalArgumentException) { return ChangeToken.refused() }
+            ?: return here.answer()
+        // The agent answers no rescan-only token, and each of its tokens names its store and a position.
+        val from = since.at?.toIntOrNull()
+        val fixed = since.end?.let { it.toIntOrNull() ?: -1 }
+        if (since.epoch == null || from == null || from < 0 || (fixed != null && fixed < from)) return ChangeToken.refused()
+        if (!here.sameView(since) || since.epoch != library.epoch) return here.answer(expired = true)
+        // Positions in this store: a walk's end, else now.
+        val end = fixed ?: count
+        if (from > end || end > count) return ChangeToken.refused()
+        val page = library.changes(from, end, since.after, ChangeToken.limit(args), "screenshot" in here.subtypes) ?: return ChangeToken.refused()
+        val next = if (page.more) here.copy(at = from.toString(), end = end.toString(), after = page.last) else here.copy(at = end.toString())
+        return next.answer(page.upserts.filter { it.second }.map { agentAsset(it.first) }, page.upserts.filter { !it.second }.map { agentAsset(it.first) },
+            page.removed, page.more)
     }
 
     private fun agentAsset(a: AgentLibrary.Asset) = JSONObject()
         .put("id", a.id).put("mediaType", "image").put("width", a.width).put("height", a.height).put("creationDate", a.created)
         .put("favorite", false).put("picture", "photos:${a.id}").put("apple", JSONObject.NULL)
-        .put("android", JSONObject().put("relativePath", JSONObject.NULL).put("bucketDisplayName", JSONObject.NULL)
+        .put("android", JSONObject().put("relativePath", if (a.screenshot) "Pictures/Screenshots/" else JSONObject.NULL)
+            .put("bucketDisplayName", if (a.screenshot) "Screenshots" else JSONObject.NULL)
             .put("ownerPackageName", if (a.own) app.packageName else JSONObject.NULL))
 
     private fun agentPicture(id: String, width: Int, height: Int, fit: String, owned: Boolean, reply: (Bitmap?, String?) -> Unit) {
@@ -456,6 +569,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         val asset = library.add(bytes, context.now()) { context.file("app:/tmp/photos-library/$it") } ?: return error("DataError")
         say("added ${asset.id} from $path sha256 ${AgentLibrary.sha256(bytes)} ${asset.width}x${asset.height} ${asset.type}")
         context.changed("photos.photoAssets")
+        context.changed("photos.photoChanges")
         // The app reads its own photo whatever its read permission (D6).
         return JSONObject().put("asset", asset.id)
     }

@@ -22,6 +22,11 @@ function swiftFiles(dir) {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? swiftFiles(join(dir, e.name)) : e.name.endsWith('.swift') ? [join(dir, e.name)] : []);
 }
 
+function appleSourceFiles(dir, exts) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? appleSourceFiles(join(dir, e.name), exts) : exts.some((ext) => e.name.endsWith(ext)) ? [join(dir, e.name)] : []);
+}
+
 test('Package.swift defines EXACT_INSPECT for development and not for production', () => {
   const defines = (trust) => {
     const out = appleSpawnSync('swift', ['package', 'dump-package'], { cwd: resolve(root, 'host/apple'), env: { ...process.env, EXACT_UPDATE_TRUST: trust }, encoding: 'utf8' });
@@ -30,6 +35,22 @@ test('Package.swift defines EXACT_INSPECT for development and not for production
   };
   expect(defines('development')).toBe(true);
   expect(defines('production')).toBe(false);
+});
+
+test('Package.swift compiles agent attach only for a local development build (LLP 1012.000 D2)', () => {
+  const dump = (env) => appleSpawnSync('swift', ['package', 'dump-package'], { cwd: resolve(root, 'host/apple'), env: { ...process.env, ...env }, encoding: 'utf8' });
+  const attach = (env) => {
+    const out = dump(env);
+    expect(out.status).toBe(0);
+    const kit = JSON.parse(out.stdout).targets.find((t) => t.name === 'ExactKit');
+    const files = ['AgentAttach.swift', 'Mac/AgentAttachMac.swift', 'IOS/AgentAttachIOS.swift'];
+    const compiled = files.filter((f) => !kit.exclude.includes(f));
+    expect([0, files.length]).toContain(compiled.length);
+    return { defined: out.stdout.includes('"EXACT_ATTACH"'), compiled: compiled.length > 0 };
+  };
+  expect(attach({ EXACT_UPDATE_TRUST: 'development', EXACT_ATTACH: '1' })).toEqual({ defined: true, compiled: true });
+  expect(attach({ EXACT_UPDATE_TRUST: 'development', EXACT_ATTACH: '0' })).toEqual({ defined: false, compiled: false });
+  expect(attach({ EXACT_UPDATE_TRUST: 'production', EXACT_ATTACH: '1' })).toEqual({ defined: false, compiled: false });
 });
 
 /** Whether an `#if` or `#elseif` condition holds only where one of `flags`
@@ -132,6 +153,29 @@ test('shipped code names no private class', () => {
   expect(lines.filter(({ code }) => namesAClass(code)).map(({ at, code }) => `${at}: ${code.trim()}`)).toEqual([]);
 });
 
+// Shipped Objective-C and C headers under host/apple/ and packages/*/apple/ (LLP 1156.008.001 A3)
+// must likewise use only Apple public APIs and name no private classes or undocumented keys.
+test('shipped Objective-C sources under host/apple and packages/*/apple name no private class or undocumented key', () => {
+  const pkgAppleDirs = readdirSync(resolve(root, 'packages'), { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => resolve(root, 'packages', e.name, 'apple'))
+    .filter(existsSync);
+  const files = [
+    ...appleSourceFiles(resolve(root, 'host/apple'), ['.m', '.h'])
+      .map((f) => f.slice(root.length + 1))
+      .filter((p) => !notShipped.test(p) && !p.startsWith('host/apple/include/')),
+    ...pkgAppleDirs.flatMap((d) => appleSourceFiles(d, ['.m', '.h']).map((f) => f.slice(root.length + 1))),
+  ];
+  expect(files).toContain('packages/media-capture/apple/MediaCaptureBridge.m');
+  expect(files).toContain('packages/media-capture/apple/MediaCaptureBridge.h');
+  const violations = files.flatMap((path) =>
+    linesOutside(readFileSync(resolve(root, path), 'utf8'), development)
+      .filter(({ code }) => namesAClass(code) || undocumented.test(code))
+      .map(({ line, code }) => `${path}:${line}: ${code.trim()}`),
+  );
+  expect(violations).toEqual([]);
+});
+
 test('the shipped-code check sees what it refuses', () => {
   for (const code of ['NSClassFromString("UISegment")', 'let resolve = NSClassFromString', 'objc_getClass("UISegment")',
     'String(describing: type(of: v)).contains("PIPPanel")', 'let name = NSStringFromClass(type(of: layer))', 'if v.className == "X"',
@@ -169,8 +213,36 @@ test.skipIf(productionBinaries().length === 0)('a production Mac bake has none o
     const strings = spawnSync('strings', [binary], { encoding: 'utf8', maxBuffer: 1 << 28 }).stdout;
     expect(strings).not.toContain('not a view of the app');
     expect(strings).not.toContain('identity alone is larger than a report');
+    for (const attach of ['Enable Agent Attach', 'Agent Attached', 'exact-attach', 'live-clock']) expect(strings).not.toContain(attach);
     for (const word of ['CGEventSetWindowLocation', 'inputRadius', 'captureOnly', 'AppleInterfaceStyle', 'AppleInterfaceThemeChangedNotification', 'AppleICUForce24HourTime', 'AppleICUForce12HourTime', 'ApplePersistence']) expect(strings).not.toContain(word);
     const symbols = spawnSync('nm', [binary], { encoding: 'utf8', maxBuffer: 1 << 28 }).stdout;
-    expect(symbols.split('\n').filter((s) => /InspectHost|InspectOverlay|7Inspect/.test(s))).toEqual([]);
+    expect(symbols.split('\n').filter((s) => /InspectHost|InspectOverlay|7Inspect|AgentAttach|AttachConnection|AttachSurface/.test(s))).toEqual([]);
+  }
+});
+
+/** The main executable of each production iOS bake on disk, simulator or device, of any app
+ *  (`EXACT_UPDATE_TRUST=production bun host/apple/build.mjs <app> --ios --no-install`). */
+const productionIOSBinaries = () => {
+  const found = [];
+  const dirs = (path) => { try { return readdirSync(path); } catch { return []; } };
+  for (const hash of dirs(bake)) for (const app of dirs(join(bake, hash))) for (const platform of ['ios-simulator', 'ios']) {
+    for (const triple of dirs(join(bake, hash, app, platform))) for (const mode of dirs(join(bake, hash, app, platform, triple))) {
+      const standalone = join(bake, hash, app, platform, triple, mode, 'production/standalone');
+      for (const bundle of dirs(standalone).filter((d) => d.endsWith('.app'))) {
+        const executable = join(standalone, bundle, bundle.slice(0, -'.app'.length));
+        if (existsSync(executable)) found.push(executable);
+      }
+    }
+  }
+  return found;
+};
+
+// LLP 1012.000 D2: a production simulator or device bake carries no agent attach.
+test.skipIf(productionIOSBinaries().length === 0)('a production iOS bake has none of agent attach\'s strings or symbols', () => {
+  for (const binary of productionIOSBinaries()) {
+    const strings = spawnSync('strings', [binary], { encoding: 'utf8', maxBuffer: 1 << 28 }).stdout;
+    for (const attach of ['Enable Agent Attach', 'Agent Attached', 'exact-attach', 'live-clock']) expect(strings).not.toContain(attach);
+    const symbols = spawnSync('nm', [binary], { encoding: 'utf8', maxBuffer: 1 << 28 }).stdout;
+    expect(symbols.split('\n').filter((s) => /AgentAttach|AttachConnection|AttachSurface|AttachListener/.test(s))).toEqual([]);
   }
 });

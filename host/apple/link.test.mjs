@@ -20,7 +20,7 @@ import { keepRoster, keptRoster, probeDigest } from './arms.mjs';
 import { writeDataKeys } from './data-keys.mjs';
 import { appleImplementations } from '../../js/bake/src/typescript.mjs';
 
-test.skipIf(process.platform !== 'darwin')('static SwiftPM XCFrameworks have one owner across app Swift and implementations', () => {
+test.skipIf(process.platform !== 'darwin')('static SwiftPM XCFrameworks have one owner across app Swift and implementations', async () => {
   useXcode();
   const root = resolve(import.meta.dir, '../..');
   mkdirSync(resolve(root, 'target'), { recursive: true });
@@ -28,16 +28,15 @@ test.skipIf(process.platform !== 'darwin')('static SwiftPM XCFrameworks have one
   const execute = appleToolchain.spawnSync;
   const run = (command, args, options = {}) => {
     const result = execute(command, args, { encoding: 'utf8', ...options });
-    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-    return result.stdout;
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`); return result.stdout;
   };
   const write = (name, contents) => { const file = resolve(dir, name); writeFileSync(file, contents); return file; };
-  let swift;
+  const slices = []; let swift;
   try {
-    mkdirSync(vendor);
+    mkdirSync(resolve(vendor, 'Sources/UseVendor'), { recursive: true });
+    write('vendor/Sources/UseVendor/UseVendor.swift', 'import Vendor\n@_cdecl("vendor_consumer") public func vendorConsumer() -> Int32 { vendor_get() }\n');
     const source = write('Vendor.c', 'static int value; int vendor_get(void) { return value; } void vendor_set(int next) { value = next; }\n');
     const extra = write('Extra.c', 'int vendor_unreferenced(void) { return 751; }\n');
-    const slices = [];
     for (const [sdk, triple] of [['macosx', 'macos14.0'], ['iphonesimulator', 'ios17.0-simulator']]) {
       const framework = resolve(dir, sdk, 'Vendor.framework'); slices.push(framework);
       mkdirSync(resolve(framework, 'Headers'), { recursive: true }); mkdirSync(resolve(framework, 'Modules'));
@@ -52,8 +51,8 @@ test.skipIf(process.platform !== 'darwin')('static SwiftPM XCFrameworks have one
     run('xcrun', ['xcodebuild', '-create-xcframework', ...slices.flatMap(path => ['-framework', path]), '-output', resolve(vendor, 'Vendor.xcframework')]);
     writeFileSync(resolve(vendor, 'Package.swift'), `// swift-tools-version:5.9
 import PackageDescription
-let package = Package(name: "Vendor", products: [.library(name: "Vendor", targets: ["Vendor"])],
-  targets: [.binaryTarget(name: "Vendor", path: "Vendor.xcframework")])
+let package = Package(name: "Vendor", products: [.library(name: "Vendor", targets: ["UseVendor"])],
+  targets: [.binaryTarget(name: "Vendor", path: "Vendor.xcframework"), .target(name: "UseVendor", dependencies: ["Vendor"])])
 `);
     // The remote declaration resolves to a versioned local fixture; compilation and linking use real SwiftPM.
     const git = args => run('git', args, { cwd: vendor });
@@ -97,13 +96,14 @@ print("shared static SDK state")
       const compiler = packageCompiler({ app, packages: [p], extensions: {}, packageDir: destination,
         packageTargets: new Map([[destination, [sdkName, target]]]), packageCopies: [[implementation]],
         seam: resolve(root, 'host/apple/modules/ExactPackage.swift'), packagesRoot: dir, swiftc: 'fixture', production: ios, ios });
-      compiler.place(destination);
+      await compiler.place(destination);
       const core = resolve(destination, 'libexact_modules.dylib');
       run('xcrun', ['swiftc', ...target, '-parse-as-library', '-emit-library', own, resolve(destination, 'ExactPackage.o'),
         ...compiler.imports(destination), ...compiler.link(destination), ...moduleLibraryLinkArgs({ wrapped: ios }), '-o', core]);
       assert.equal(compiler.frameworks.length, 0, 'static frameworks are owned by the shared library');
       const shared = compiler.libraries.find(lib => lib.framework === 'ExactSwiftDependencies');
-      assert.match(run('xcrun', ['nm', '-gU', shared.built]), /_vendor_unreferenced/);
+      const exports = run('xcrun', ['nm', '-gU', shared.built]);
+      for (const symbol of [/_vendor_consumer$/m, /_vendor_unreferenced$/m]) assert.match(exports, symbol);
       for (const file of [core, resolve(destination, 'ExactPkg_vendor.dylib')]) {
         assert.doesNotMatch(run('xcrun', ['nm', '-gU', file]), /_vendor_(get|set|unreferenced)/);
       }
@@ -117,7 +117,7 @@ print("shared static SDK state")
   } finally { swift?.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
 }, 120_000);
 
-test.skipIf(process.platform !== 'darwin')('SwiftPM frameworks load from a relocated Mac app without a host run path', () => {
+test.skipIf(process.platform !== 'darwin')('SwiftPM frameworks load from a relocated Mac app without a host run path', async () => {
   useXcode();
   const root = resolve(import.meta.dir, '../..');
   mkdirSync(resolve(root, 'target'), { recursive: true });
@@ -170,7 +170,7 @@ public final class Implementation: ExactPackage {
     const compiler = packageCompiler({ app, packages: [p], extensions: {}, packageDir: destination,
       packageTargets: new Map([[destination, ['macosx', []]]]), packageCopies: [[source]],
       seam: resolve(root, 'host/apple/modules/ExactPackage.swift'), packagesRoot: dir, swiftc: 'fixture' });
-    compiler.place(destination);
+    await compiler.place(destination);
     const own = write('Own.swift', `import Vendor
 @_cdecl("app_value") public func appValue() -> Int32 { Vendor_value() }
 `);
@@ -269,7 +269,7 @@ import ExactPkg_queue
       const compiler = packageCompiler({ packages: [p], packageDir: destination, packageTargets: new Map([[destination, [sdkName, target]]]),
         packageCopies: [p.sources], seam: resolve(root, 'host/apple/modules/ExactPackage.swift'), packagesRoot: dir,
         swiftc: 'fixture', production: ios, distribution: false, ios, tv: false, app });
-      compiler.place(destination);
+      await compiler.place(destination);
       assert.ok(existsSync(resolve(destination, 'ExactPkg_queue.dylib')));
       const output = resolve(destination, 'libexact_modules.dylib');
       const compiled = spawnSync('xcrun', ['--sdk', sdkName, 'swiftc', '-parse-as-library', '-emit-library', '-module-name', 'ExactAppModules',
@@ -342,7 +342,7 @@ public final class Member: ExactPackage, ExactCredentialMember {
     ];
     const graph = [...implemented, { extension: 'missing', module: 'Missing', className: 'Missing' },
       { extension: 'broken', module: 'Broken', className: 'Broken' }];
-    packageCompiler({ packages: implemented, packageDir: dir, packageTargets: new Map([[dir, ['macosx', []]]]),
+    await packageCompiler({ packages: implemented, packageDir: dir, packageTargets: new Map([[dir, ['macosx', []]]]),
       packageCopies: implemented.map(p => p.sources), seam: resolve(root, 'host/apple/modules/ExactPackage.swift'),
       packagesRoot: dir, swiftc: 'fixture', production: false, distribution: false, ios: false, tv: false }).place(dir);
     const broken = write('Broken.swift', `import Owner
@@ -496,7 +496,7 @@ let exactModule: ExactModule.Type = ImportedModule.self
         swiftc: 'fixture', production: false, distribution: false, ios: false, tv: false });
       const library = Object.assign(async () => { copyFileSync(cached, `${built}.dylib`); return true; }, { cached });
       const placed = rosterProbe({ library, launcher: async () => true, built, packagesIn, packages: implemented,
-        placePackages: where => { placements++; compiler.place(where); }, frameworks: [] });
+        placePackages: async where => { placements++; await compiler.place(where); }, frameworks: [] });
       assert.equal(await placed(), true);
       rmSync(build, { recursive: true });
       return placed;
@@ -535,7 +535,7 @@ test.skipIf(process.platform !== 'darwin' || !process.env.EXACT_LANE_SIM)('the b
     const target = ['-target', `${process.arch === 'arm64' ? 'arm64' : 'x86_64'}-apple-ios17.0-simulator`, '-sdk', sdk];
     const p = { extension: 'in-app-browser', module: 'ExactPkg_in_app_browser', className: 'InAppBrowserModule',
       sources: [resolve(root, 'packages/in-app-browser/apple/InAppBrowser.swift')] };
-    packageCompiler({ packages: [p], packageDir: dir, packageTargets: new Map([[dir, ['iphonesimulator', target]]]),
+    await packageCompiler({ packages: [p], packageDir: dir, packageTargets: new Map([[dir, ['iphonesimulator', target]]]),
       packageCopies: [p.sources], seam: resolve(root, 'host/apple/modules/ExactPackage.swift'), packagesRoot: dir,
       swiftc: 'fixture', production: true, distribution: false, ios: true, tv: false }).place(dir);
     const composed = write('ExactComposed.swift', composedModule([p], false)), keys = resolve(dir, 'ExactDataKeys.swift');
@@ -608,7 +608,7 @@ import ExactPkg_in_app_browser
       packageTargets: new Map([[packagesIn, ['iphonesimulator', target]]]), packageCopies: [p.sources],
       seam: resolve(root, 'host/apple/modules/ExactPackage.swift'), packagesRoot: dir,
       swiftc: 'fixture', production: true, distribution: false, ios: true, tv: false });
-    compiler.place(packagesIn);
+    await compiler.place(packagesIn);
     const framework = resolve(dir, 'RosterDependency.framework');
     mkdirSync(framework);
     const dependency = write('Dependency.swift', '@_cdecl("roster_dependency") public func dependency() -> Int32 { 42 }');
@@ -958,11 +958,11 @@ test('production links the baked set; development links costly frameworks by use
   assert.deepEqual(appleComposition(graph, true, [], baked(graph.uses)), { link: 'markdown,picker', products: ['ExactMarkdown', 'ExactPickers'] });
   assert.deepEqual(appleComposition({ uses: [] }, true, [], baked([])), { link: 'none', products: [] });
   assert.deepEqual(appleComposition(graph, true, [], baked([...graph.uses, 'auth_session'])).products, ['ExactMarkdown', 'ExactPickers', 'ExactAuthSession']);
-  assert.deepEqual(appleComposition(graph, false).products, ['ExactGroupedLists', 'ExactMarkdown', 'ExactCollections', 'ExactSurfaces', 'ExactDrag', 'ExactPickers', 'ExactPresence', 'ExactEffects', 'ExactSvg', 'ExactImages', 'ExactNativeViews', 'ExactControls', 'ExactFlights', 'ExactSticky', 'ExactNotifications', 'ExactHostEventMailbox', 'ExactActivities', 'ExactWakeCarriers', 'ExactGradients', 'ExactTraces', 'ExactWakeLock', 'ExactContentRegions', 'ExactVideo', 'ExactWebViews', 'ExactSound', 'ExactMIDI', 'ExactAnimations', 'ExactNavigation', 'ExactTextSelection', 'ExactWidgetPublication', 'ExactToolDoor', 'ExactIndexMirror', 'ExactDialogs', 'ExactSharing']);
+  assert.deepEqual(appleComposition(graph, false).products, ['ExactGroupedLists', 'ExactMarkdown', 'ExactCollections', 'ExactSurfaces', 'ExactDrag', 'ExactPickers', 'ExactPresence', 'ExactEffects', 'ExactSvg', 'ExactImages', 'ExactNativeViews', 'ExactControls', 'ExactFlights', 'ExactSticky', 'ExactNotifications', 'ExactHostEventMailbox', 'ExactActivities', 'ExactWakeCarriers', 'ExactGradients', 'ExactTraces', 'ExactWakeLock', 'ExactContentRegions', 'ExactVideo', 'ExactWebViews', 'ExactSound', 'ExactMIDI', 'ExactAnimations', 'ExactNavigation', 'ExactTextSelection', 'ExactWidgetPublication', 'ExactToolDoor', 'ExactIndexMirror', 'ExactDialogs', 'ExactSharing', 'ExactDragOut', 'ExactDragIn']);
   assert.deepEqual(appleComposition(graph, false, [], auth).products,
-    ['ExactGroupedLists', 'ExactMarkdown', 'ExactCollections', 'ExactSurfaces', 'ExactDrag', 'ExactPickers', 'ExactAuthSession', 'ExactPresence', 'ExactEffects', 'ExactSvg', 'ExactImages', 'ExactNativeViews', 'ExactControls', 'ExactFlights', 'ExactSticky', 'ExactNotifications', 'ExactHostEventMailbox', 'ExactActivities', 'ExactWakeCarriers', 'ExactGradients', 'ExactTraces', 'ExactWakeLock', 'ExactContentRegions', 'ExactVideo', 'ExactWebViews', 'ExactSound', 'ExactMIDI', 'ExactAnimations', 'ExactNavigation', 'ExactTextSelection', 'ExactWidgetPublication', 'ExactToolDoor', 'ExactIndexMirror', 'ExactDialogs', 'ExactSharing']);
+    ['ExactGroupedLists', 'ExactMarkdown', 'ExactCollections', 'ExactSurfaces', 'ExactDrag', 'ExactPickers', 'ExactAuthSession', 'ExactPresence', 'ExactEffects', 'ExactSvg', 'ExactImages', 'ExactNativeViews', 'ExactControls', 'ExactFlights', 'ExactSticky', 'ExactNotifications', 'ExactHostEventMailbox', 'ExactActivities', 'ExactWakeCarriers', 'ExactGradients', 'ExactTraces', 'ExactWakeLock', 'ExactContentRegions', 'ExactVideo', 'ExactWebViews', 'ExactSound', 'ExactMIDI', 'ExactAnimations', 'ExactNavigation', 'ExactTextSelection', 'ExactWidgetPublication', 'ExactToolDoor', 'ExactIndexMirror', 'ExactDialogs', 'ExactSharing', 'ExactDragOut', 'ExactDragIn']);
   assert.deepEqual(appleComposition({ uses: ['picker', 'media_picker'] }, false, [], auth).products,
-    ['ExactGroupedLists', 'ExactMarkdown', 'ExactCollections', 'ExactSurfaces', 'ExactDrag', 'ExactPickers', 'ExactMediaPicker', 'ExactAuthSession', 'ExactPresence', 'ExactEffects', 'ExactSvg', 'ExactImages', 'ExactNativeViews', 'ExactControls', 'ExactFlights', 'ExactSticky', 'ExactNotifications', 'ExactHostEventMailbox', 'ExactActivities', 'ExactWakeCarriers', 'ExactGradients', 'ExactTraces', 'ExactWakeLock', 'ExactContentRegions', 'ExactVideo', 'ExactWebViews', 'ExactSound', 'ExactMIDI', 'ExactAnimations', 'ExactNavigation', 'ExactTextSelection', 'ExactWidgetPublication', 'ExactToolDoor', 'ExactIndexMirror', 'ExactDialogs', 'ExactSharing']);
+    ['ExactGroupedLists', 'ExactMarkdown', 'ExactCollections', 'ExactSurfaces', 'ExactDrag', 'ExactPickers', 'ExactMediaPicker', 'ExactAuthSession', 'ExactPresence', 'ExactEffects', 'ExactSvg', 'ExactImages', 'ExactNativeViews', 'ExactControls', 'ExactFlights', 'ExactSticky', 'ExactNotifications', 'ExactHostEventMailbox', 'ExactActivities', 'ExactWakeCarriers', 'ExactGradients', 'ExactTraces', 'ExactWakeLock', 'ExactContentRegions', 'ExactVideo', 'ExactWebViews', 'ExactSound', 'ExactMIDI', 'ExactAnimations', 'ExactNavigation', 'ExactTextSelection', 'ExactWidgetPublication', 'ExactToolDoor', 'ExactIndexMirror', 'ExactDialogs', 'ExactSharing', 'ExactDragOut', 'ExactDragIn']);
   assert.deepEqual(appleComposition(graph, false, ['auth_session']).products.includes('ExactAuthSession'), true);
   assert.deepEqual(appleComposition({ uses: ['numerals'] }, false).products.includes('ExactNumerals'), true);
   assert.ok(!appleComposition(graph, false).products.includes('ExactNumerals'));

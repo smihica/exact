@@ -1,14 +1,20 @@
 import { createHash } from 'node:crypto';
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, symlinkSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { availableParallelism } from 'node:os';
+import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { directDependencies } from '../../scripts/package-libraries.mjs';
-import { spawnSync, swiftOptimization } from './toolchain.mjs';
-import { evictArms, probeDigest } from './arms.mjs';
+import { within } from '../../scripts/paths.mjs';
+import { directDependencies, swiftPackageFiles, swiftPackageInventories, swiftPackageOutputs } from '../../scripts/package-libraries.mjs';
+import { spawn, spawnSync, swiftOptimization } from './toolchain.mjs';
+import { evictArms, isPathSensitive, packageKeyArgs, probeDigest } from './arms.mjs';
+import { staleModuleCache } from './extensions.mjs';
 import { swiftPackagesProblems } from '../../scripts/app.mjs';
 import { appleImplementations, moduleInterfaces } from '../../js/bake/src/typescript.mjs';
+import { packageConfig, sourceString } from '../../js/bake/src/package-config.mjs';
 import { machOType } from './assets.mjs';
 import { capturePrivacyManifest } from './privacy.mjs';
+const exactRoot = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 // The Swift that composes an app's module with its packages' implementations (LLP 1133.001 D5), which
 // host/apple/build.mjs writes beside the module's sources and never commits.
 
@@ -48,7 +54,7 @@ export function rosterProbe({ library, launcher, built, packagesIn, packages, pl
       const ready = await launcher();
       if (ready !== true) return ready;
     }
-    placePackages(packagesIn);
+    await placePackages(packagesIn);
     const name = `${basename(built)}-artifact`, dir = dirname(library.cached);
     const making = resolve(dir, `${name}.${process.pid}.tmp`);
     rmSync(making, { recursive: true, force: true });
@@ -102,8 +108,14 @@ public func exactPackageCreate(_ raw: UnsafeMutableRawPointer) -> UnsafeMutableR
 `;
 }
 
-/** The initial library contains metadata and factories, without importing a package's implementation. */
-export function composedModule(packages, ownModule) {
+/** Each used package's configuration for an Apple `target` (`ios`, `macos` or `tvos`), by extension, refused as
+ * package-config.mjs says; `release` is a production or distributed build. */
+export const appleConfig = (app, target, extensions, release) =>
+  packageConfig(app.dir, target, { extensions, release, development: !release, warn: (m) => console.warn(`${app.name}: ${m}`) });
+
+/** The initial library contains metadata and factories, without importing a package's implementation, and each
+ * package's configuration (`config`, [appleConfig]'s) as JSON, which `ExactPackageContext.config` reads. */
+export function composedModule(packages, ownModule, config = new Map()) {
   const authenticator = packages.find(p => p.authenticator);
   const lines = ['// Written by host/apple/build.mjs; never edited.'];
   lines.push(`let exactAuthenticator: String? = ${authenticator ? JSON.stringify(authenticator.extension) : 'nil'}`);
@@ -112,7 +124,9 @@ export function composedModule(packages, ownModule) {
   lines.push(`let exactCredentialMembers: [String: String] = [${members.join(', ') || ':'}]`);
   lines.push(`let exactExtensions: [String: (ExactModule, String) -> ExactExtensionAdapter] = [${packages.map(p => `${JSON.stringify(p.extension)}: { ExactPackageLibrary.adapter($0, ${JSON.stringify(p.extension)}, module: ${JSON.stringify(p.module)}, session: $1) }`).join(', ') || ':'}]`);
   lines.push(`let exactPackageModules: [String: String] = [${packages.map(p => `${JSON.stringify(p.extension)}: ${JSON.stringify(p.module)}`).join(', ') || ':'}]`);
-  const views = packages.flatMap(p => (p.views ?? []).map(tag => `${JSON.stringify(tag)}: ExactNativeFactory(package: { try ExactExtensions.view($0, ${JSON.stringify(p.extension)}, ${JSON.stringify(tag)}, id: $1, props: $2, events: $3) })`));
+  const configured = packages.filter(p => Object.keys(config.get(p.extension) ?? {}).length);
+  lines.push(`let exactPackageConfig: [String: String] = [${configured.map(p => `${JSON.stringify(p.extension)}: ${sourceString(JSON.stringify(config.get(p.extension)), 'swift')}`).join(', ') || ':'}]`);
+  const views = packages.flatMap(p => (p.views ?? []).map(tag => `${JSON.stringify(tag)}: ExactNativeFactory(trackProps: ${JSON.stringify(p.trackProps?.[tag] ?? [])}, package: { try ExactExtensions.view($0, ${JSON.stringify(p.extension)}, ${JSON.stringify(tag)}, id: $1, props: $2, events: $3) })`));
   lines.push(`let exactPackageViews: [String: ExactNativeFactory] = [${views.join(', ') || ':'}]`);
   if (!ownModule) lines.push('final class ExactComposedModule: ExactModule {}', 'let exactModule: ExactModule.Type = ExactComposedModule.self');
   return lines.join('\n') + '\n';
@@ -121,32 +135,73 @@ export function composedModule(packages, ownModule) {
 /** Compile each package against the seam's link stub, then link its independent library.
  * The final app library supplies the seam; the stub permits app Swift to import a package
  * without a build-time link cycle (LLP 1067.000.001 D1, D5). */
-export function packageCompiler({ packages, packageDir, packageTargets, packageCopies, seam, packagesRoot, swiftc, production, distribution, ios, tv, minimum, app, extensions }) {
-  const graph = app ? appSwiftPackageGraph(app, packages, extensions) : swiftPackageGraph(app, packages);
+export function packageCompiler({ packages, packageDir, packageTargets, packageCopies, seam, packagesRoot, swiftc, production, distribution, ios, tv, frameworkBundles = ios && production, minimum, app, extensions, swiftInputs }) {
+  const destination = tv ? 'tvos' : ios ? 'ios' : 'macos';
+  const cache = { snapshots: new Map(), manifests: new Map(), destination };
+  const graph = app ? appSwiftPackageGraph(app, packages, extensions, cache) : swiftPackageGraph(app, packages, cache);
+  if (swiftInputs) {
+    const captured = swiftInputs.filter(i => i.kind === 'swift-package').map(i => i.identity);
+    const current = swiftPackageInventories(app, packages, destination, cache.snapshots).map(i => i.identity);
+    const changed = [...captured.filter(row => !current.some(i => isDeepStrictEqual(i, row))), ...current.filter(row => !captured.some(i => isDeepStrictEqual(i, row)))];
+    if (changed.length) throw new Error(`${changed[0].interface}/${changed[0].directory} changed after its bake. Run the build again.`);
+  }
   if (graph.length) assertSwiftLock(app, graph);
-  const placed = new Set();
+  const placed = new Map();
   const productsByDirectory = new Map(), resources = [], frameworks = [];
-  const run = args => {
-    const result = spawnSync('xcrun', args, { encoding: 'utf8' });
-    if (result.status !== 0) throw new Error(`host/apple: package compilation failed:\n${result.stderr ?? result.error ?? ''}`);
+  const swiftRootDir = app ? swiftRoot(app) : undefined;
+  let tmpNonce = 0, cacheGen = 0, stopped = false;
+  const stoppers = new Set();
+  const stopAllPlacements = () => { stopped = true; for (const fn of stoppers) fn(); };
+  const makeRunner = () => {
+    const children = new Set();
+    let aborted = false;
+    const stop = () => { aborted = true; for (const c of children) if (c.exitCode === null && !c.killed) c.kill(); };
+    stoppers.add(stop);
+    const run = args => new Promise((accept, reject) => {
+      if (aborted || stopped) return reject(new Error('host/apple: package compilation aborted'));
+      const child = spawn('xcrun', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      if (children.size === 0) process.once('exit', stop);
+      children.add(child);
+      let stderr = '', stdout = '', settled = false;
+      child.stdout?.on('data', chunk => { stdout += chunk; });
+      child.stderr?.on('data', chunk => { stderr += chunk; });
+      const finish = (status, error) => {
+        if (settled) return;
+        settled = true;
+        children.delete(child);
+        if (children.size === 0) process.removeListener('exit', stop);
+        if (status === 0 && !error) return accept();
+        const output = `${stdout}${stderr}${error?.message ?? ''}`;
+        const err = new Error(`host/apple: package compilation failed:\n${stderr || error?.message || stdout}`);
+        err.staleCache = staleModuleCache(args, output);
+        reject(err);
+      };
+      child.once('error', error => finish(null, error));
+      child.once('close', status => finish(status, null));
+    });
+    return { run, stop, isAborted: () => aborted || stopped, release: () => { stoppers.delete(stop); process.removeListener('exit', stop); } };
   };
-  const flags = dir => ['--sdk', packageTargets.get(dir)[0], 'swiftc',
-    '-module-cache-path', resolve(packagesRoot, 'modules-module-cache'),
+  const flags = (dir, cachePath) => ['--sdk', packageTargets.get(dir)[0], 'swiftc',
+    '-module-cache-path', cachePath,
     '-parse-as-library', swiftOptimization(), '-swift-version', '5', ...packageTargets.get(dir)[1]];
-  const objectArgs = (name, sources, dir, linkName = name) => [...flags(dir), '-wmo', '-module-name', name,
+  const objectArgs = (name, sources, dir, cachePath, linkName = name) => [...flags(dir, cachePath), '-wmo', '-module-name', name,
     ...(linkName ? ['-module-link-name', linkName] : []),
     '-emit-module', '-emit-module-path', resolve(dir, `${name}.swiftmodule`),
     '-I', dir, '-c', ...sources, '-o', resolve(dir, `${name}.o`)];
-  const kept = (name, args, sources, imports, dir, compile) => {
-    const key = createHash('sha256').update(JSON.stringify([name, args.map(a => a.replaceAll(dir, '<dir>')), sources.map(f => readFileSync(f, 'utf8')), imports, swiftc])).digest('hex').slice(0, 20);
+  const copies = new Set(packageCopies?.flat());
+  const kept = async (name, args, sources, imports, dir, compile, keyOptions) => {
+    const sourceTexts = sources.map(f => readFileSync(f, 'utf8'));
+    const pathSensitive = keyOptions?.pathSensitive ?? sourceTexts.some(isPathSensitive);
+    const keyArgs = packageKeyArgs(args, dir, packageDir, copies, name, { root: exactRoot, appDir: app?.dir, swiftRootDir, pathSensitive });
+    const key = createHash('sha256').update(JSON.stringify([name, keyArgs, sourceTexts, imports, swiftc])).digest('hex').slice(0, 20);
     const entry = resolve(packagesRoot, 'packages-kept', `${name}-${key}`);
     const outputs = d => readdirSync(d).filter(f => f.startsWith(`${name}.`));
     if (existsSync(entry)) {
       for (const f of outputs(entry)) copyFileSync(resolve(entry, f), resolve(dir, f));
       return key;
     }
-    compile();
-    const making = `${entry}.${process.pid}.tmp`;
+    await compile();
+    const making = `${entry}.${process.pid}.${++tmpNonce}.tmp`;
     rmSync(making, { recursive: true, force: true });
     mkdirSync(making, { recursive: true });
     for (const f of outputs(dir)) copyFileSync(resolve(dir, f), resolve(making, f));
@@ -154,18 +209,29 @@ export function packageCompiler({ packages, packageDir, packageTargets, packageC
     catch { rmSync(making, { recursive: true, force: true }); }
     return key;
   };
+  const headerStamp = headerDir => readdirSync(headerDir, { withFileTypes: true })
+    .filter(e => e.isFile() && /\.(?:h|hh|hpp|modulemap)$/.test(e.name))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(e => [e.name, readFileSync(resolve(headerDir, e.name), 'utf8')]);
   const libraries = packages.map(p => ({ module: p.module, load: `lib${p.module}.dylib`, framework: p.module,
     built: resolve(packageDir, `${p.module}.dylib`), placed: resolve(packageDir, `${p.module}.framework`),
     privacyManifest: p.privacyManifest }));
-  const place = dir => {
-    if (placed.has(dir)) return;
+  const placeImpl = async dir => {
+    const runner = makeRunner();
+    let cachePath = dir === packageDir ? resolve(packagesRoot, 'modules-module-cache') : resolve(packagesRoot, `probe-module-cache-${basename(dir)}`);
+    const nextCache = () => { cachePath = resolve(dir, `retry-module-cache-${++cacheGen}`); return cachePath; };
+    try {
     mkdirSync(dir, { recursive: true });
-    const wrapped = dir === packageDir && ios && production;
+    const wrapped = dir === packageDir && frameworkBundles;
     const os = packageTargets.get(dir)[1].some(arg => /-apple-(ios|tvos)/.test(arg)) ? 'ios' : 'macos';
-    const declarations = swiftPackageGraph({ dir: app?.dir, manifest: { host: { [os]: app?.manifest.host?.[os] } } }, packages);
-    const product = declarations.length ? buildSwiftDependencies({ app, graph, declarations,
-      compile: flags(dir).slice(3), sdkName: packageTargets.get(dir)[0], directory: dir, wrapped }) : null;
+    const platform = dir === packageDir ? destination : packageTargets.get(dir)[1].some(arg => arg.endsWith('-macabi')) ? 'maccatalyst' : os;
+    const traitChecks = [];
+    const declarations = swiftPackageGraph({ dir: app?.dir, manifest: { host: { [os]: app?.manifest.host?.[os] } } }, packages, { ...cache, traitChecks }, platform);
+    verifySwiftCopies(cache.snapshots);
+    const product = declarations.length ? buildSwiftDependencies({ app, graph, declarations, traitChecks,
+      compile: flags(dir, cachePath).slice(3), sdkName: packageTargets.get(dir)[0], directory: dir, wrapped }) : null;
     if (product) {
+      verifySwiftCopies(cache.snapshots);
       for (const library of product.libraries) library.privacyManifestPaths = packages
         .filter(p => p.swiftPackages?.length).map(p => p.privacyManifest);
       productsByDirectory.set(dir, [product]);
@@ -175,70 +241,329 @@ export function packageCompiler({ packages, packageDir, packageTargets, packageC
         resources.push(...product.resources);
       }
     }
-    if (!packages.length) { placed.add(dir); return; }
+    if (!packages.length) return;
     const coreName = wrapped ? '@rpath/ExactModules.framework/ExactModules' : '@rpath/libexact_modules.dylib';
-    const seamObject = objectArgs('ExactPackage', [seam], dir, null);
-    const stub = [...flags(dir), '-module-name', 'ExactPackage', '-emit-module',
-      '-emit-module-path', resolve(dir, 'ExactPackage.swiftmodule'),
-      '-emit-tbd', '-emit-tbd-path', resolve(dir, 'ExactPackage.tbd'),
-      '-Xfrontend', '-tbd-install_name', '-Xfrontend', coreName, seam];
-    const seamKey = kept('ExactPackage', [...seamObject, ...stub], [seam], [], dir, () => {
-      run(seamObject);
-      run(stub);
-    });
+    const buildCondition = production || distribution ? [] : ['-D', 'EXACT_DEVELOPMENT'];
+    const seamArgs = cp => [
+      [...objectArgs('ExactPackage', [seam], dir, cp, null), ...buildCondition],
+      [...flags(dir, cp), ...buildCondition, '-module-name', 'ExactPackage', '-emit-module',
+        '-emit-module-path', resolve(dir, 'ExactPackage.swiftmodule'),
+        '-emit-tbd', '-emit-tbd-path', resolve(dir, 'ExactPackage.tbd'),
+        '-Xfrontend', '-tbd-install_name', '-Xfrontend', coreName, seam],
+    ];
+    const [seamObject, stub] = seamArgs(cachePath);
+    const compileSeam = async () => {
+      try { await runner.run(seamObject); await runner.run(stub); }
+      catch (err) {
+        if (!err.staleCache) throw err;
+        // Retry in an isolated cache generation rather than deleting a cache another concurrent placement may read.
+        const [retryObj, retryStub] = seamArgs(nextCache());
+        await runner.run(retryObj); await runner.run(retryStub);
+      }
+    };
+    const seamKey = await kept('ExactPackage', [...seamObject, ...stub], [seam], [], dir, compileSeam);
     copyFileSync(resolve(dir, 'ExactPackage.tbd'), resolve(dir, 'libexact_modules.tbd'));
-    packages.forEach((p, i) => {
+    const compilePackage = async (p, i, cp) => {
       const adapter = resolve(dir, `adapter-${p.module}.swift`);
       writeFileSync(adapter, packageAdapter(p));
       const sources = [...packageCopies[i], adapter];
+      // Compile package Objective-C sources via Clang module.modulemap + -I (LLP 1156.008.001 A3).
+      const objcImports = [], objcObjects = [], objcInputs = [];
+      if (p.objc?.length && p.objcModule) {
+        const objcDir = resolve(dir, `objc-${p.module}`);
+        mkdirSync(objcDir, { recursive: true });
+        const headerPath = realpathSync(p.objcModule.header);
+        const headerDir = dirname(headerPath);
+        const headers = headerStamp(headerDir);
+        const moduleMapKey = [p.objcModule.name, basename(headerPath), headers];
+        writeFileSync(resolve(objcDir, 'module.modulemap'), `module ${p.objcModule.name} {\n  header ${JSON.stringify(headerPath)}\n  export *\n}\n`);
+        objcImports.push('-I', objcDir);
+        objcInputs.push(moduleMapKey);
+        const [sdkName, targetFlags] = packageTargets.get(dir);
+        const targetAt = targetFlags.indexOf('-target'), sdkAt = targetFlags.indexOf('-sdk');
+        const clangTarget = targetAt >= 0 ? ['-target', targetFlags[targetAt + 1]] : [];
+        const clangSdk = sdkAt >= 0 ? ['-isysroot', targetFlags[sdkAt + 1]] : [];
+        const clangFsys = [];
+        for (let k = 0; k < targetFlags.length; k++) if (targetFlags[k] === '-Fsystem') clangFsys.push('-iframework', targetFlags[k + 1]);
+        const headerAllText = headers.map(([, t]) => t).join('\n');
+        for (let j = 0; j < p.objc.length; j++) {
+          const src = p.objc[j];
+          const objName = `${p.module}_objc_${j}`;
+          const objPath = resolve(dir, `${objName}.o`);
+          const clangArgs = ['--sdk', sdkName, 'clang', '-O2', '-fobjc-arc', '-fobjc-arc-exceptions', '-fmodules',
+            `-fmodules-cache-path=${cp}`, ...clangTarget, ...clangSdk, ...clangFsys, '-I', headerDir, '-c', src, '-o', objPath];
+          const objcPathSensitive = /\b(?:__FILE__|__FILE_NAME__|__builtin_FILE|assert|NSAssert)\b/.test(readFileSync(src, 'utf8') + headerAllText);
+          const objKey = await kept(objName, clangArgs, [src], [headers], dir, () => runner.run(clangArgs), { pathSensitive: objcPathSensitive });
+          objcObjects.push(objPath);
+          objcInputs.push(objKey);
+        }
+      }
       const sdkImports = p.swiftPackages?.length ? ['-D', 'SWIFT_PACKAGE', ...product.imports] : [];
-      const object = [...objectArgs(p.module, sources, dir), ...sdkImports, ...(!production && !distribution ? ['-D', 'EXACT_DEVELOPMENT'] : [])];
-      const os = dir === packageDir ? (ios ? tv ? 'tvos' : 'ios' : 'macos')
+      const object = [...objectArgs(p.module, sources, dir, cp), ...objcImports, ...sdkImports, ...buildCondition];
+      const pkgOs = dir === packageDir ? (ios ? tv ? 'tvos' : 'ios' : 'macos')
         : packageTargets.get(dir)[1].some(arg => arg.includes('-apple-ios')) ? 'ios' : 'macos';
-      const floor = minimum && typeof minimum === 'object' ? minimum[os] : minimum;
-      const link = [...flags(dir), '-emit-library', resolve(dir, `${p.module}.o`),
-        '-L', dir, '-lexact_modules', ...systemFrameworks([p], os, floor),
+      const floor = minimum && typeof minimum === 'object' ? minimum[pkgOs] : minimum;
+      const link = [...flags(dir, cp), '-emit-library', resolve(dir, `${p.module}.o`), ...objcObjects,
+        '-L', dir, '-lexact_modules', ...systemFrameworks([p], pkgOs, floor),
         ...moduleLibraryLinkArgs({ wrapped, module: p.module }), ...(p.swiftPackages?.length ? product.link : []), '-o', resolve(dir, `${p.module}.dylib`)];
-      kept(p.module, [...object, ...link], sources, [seamKey, product?.digest], dir, () => {
-        run(object);
-        run(link);
+      await kept(p.module, [...object, ...link], sources, [seamKey, product?.digest, ...objcInputs], dir, async () => {
+        await runner.run(object);
+        await runner.run(link);
       });
       copyFileSync(resolve(dir, `${p.module}.dylib`), resolve(dir, `lib${p.module}.dylib`));
-    });
-    placed.add(dir);
+    };
+    const jobs = Math.max(1, Math.min(packages.length, Number(process.env.EXACT_SWIFT_JOBS) || Math.min(availableParallelism(), 4)));
+    let cursor = 0;
+    const failed = [];
+    let staleCache = null;
+    await Promise.all(Array.from({ length: jobs }, async () => {
+      while (!runner.isAborted() && cursor < packages.length) {
+        const i = cursor++;
+        try { await compilePackage(packages[i], i, cachePath); }
+        catch (err) {
+          failed.push({ i, err });
+          if (err.staleCache) staleCache ??= err.staleCache;
+          else { runner.stop(); break; }
+        }
+      }
+    }));
+    if (failed.length && staleCache && failed.every(f => f.err.staleCache) && !runner.isAborted()) {
+      const retryCache = nextCache();
+      for (const { i } of failed) await compilePackage(packages[i], i, retryCache);
+    } else if (failed.length) {
+      throw failed[0].err;
+    }
+    } finally { runner.release(); }
+  };
+  const place = dir => {
+    if (!placed.has(dir)) {
+      const promise = placeImpl(dir).catch(err => { placed.delete(dir); throw err; });
+      placed.set(dir, promise);
+    }
+    return placed.get(dir);
   };
   const imports = dir => (productsByDirectory.get(dir) ?? []).flatMap(p => p.imports);
   const link = dir => (productsByDirectory.get(dir) ?? []).flatMap(p => p.link);
-  return { graph, place, libraries, frameworks, resources, imports, link, products: dir => productsByDirectory.get(dir) ?? [] };
+  return { graph, place, stop: stopAllPlacements, libraries, frameworks, resources, imports, link, products: dir => productsByDirectory.get(dir) ?? [] };
 }
 
-const swiftIdentity = url => new URL(url).pathname.replace(/\/+$/, '').split('/').at(-1).replace(/\.git$/i, '').toLowerCase();
+const swiftPathIdentity = path => basename(path).replace(/\.git$/i, '').toLowerCase();
+const swiftIdentity = url => swiftPathIdentity(new URL(url).pathname);
 const swiftURL = url => url.replace(/\/+$/, '').replace(/\.git$/i, '');
 
-/** One graph for both Apple destinations and the app's own Swift (LLP 1133.001 D9, amended for #751). */
-export function swiftPackageGraph(app, bound = []) {
-  const declarations = ['ios', 'macos'].map(os => ({ source: `${resolve(app?.dir ?? '.', 'app.json')} host.${os}.swiftPackages`, values: app?.manifest?.host?.[os]?.swiftPackages }));
-  for (const p of bound) declarations.push({ source: `${p.swiftPackagesSource ?? p.extension} swiftPackages`, values: p.swiftPackages });
-  const graph = new Map();
-  for (const { source, values } of declarations) {
-    const problems = swiftPackagesProblems(values, source);
-    if (problems.length) throw new Error(problems.join('\n'));
-    for (const value of values ?? []) {
-      const identity = swiftIdentity(value.url), previous = graph.get(identity);
-      if (previous && (previous.exactVersion !== value.exactVersion || swiftURL(previous.url) !== swiftURL(value.url))) {
-        throw new Error(`Swift package conflict: ${previous.source} requests ${previous.url} at ${previous.exactVersion}; ${source} requests ${value.url} at ${value.exactVersion}. Use one URL and version of ${identity}.`);
+function swiftPackageSnapshot(app, owner, snapshots) {
+  if (snapshots.has(owner)) return snapshots.get(owner);
+  const generated = swiftPackageOutputs(app, owner), omitted = [];
+  const digest = swiftPackageFiles(app.dir, owner, undefined, omitted, generated);
+  const cache = resolve(swiftRoot(app), 'sources');
+  mkdirSync(cache, { recursive: true });
+  // A changed copy can still have a reader. Publish a fresh generation beside it.
+  let path;
+  for (let generation = 0; ; generation++) {
+    const parent = resolve(cache, generation ? `${digest}-${generation}` : digest);
+    mkdirSync(parent, { recursive: true });
+    path = resolve(parent, basename(realpathSync(owner)));
+    if (!lstatSync(path, { throwIfNoEntry: false })) {
+      const making = mkdtempSync(resolve(cache, 'copy-'));
+      try {
+        if (swiftPackageFiles(app.dir, owner, making, [], generated) !== digest) throw new Error(`${owner} changed while copying the Swift package. Run the build again.`);
+        try { renameSync(making, path); break; }
+        catch (error) { if (!lstatSync(path, { throwIfNoEntry: false })) throw error; }
+      } finally { rmSync(making, { recursive: true, force: true }); }
+    }
+    try {
+      if (lstatSync(path).isDirectory() && swiftPackageFiles(null, path, undefined, omitted) === digest) break;
+    } catch { /* A damaged copy is skipped, including one with a broken link. */ }
+  }
+  const snapshot = { path: realpathSync(path), digest, omitted, generated };
+  snapshots.set(owner, snapshot);
+  return snapshot;
+}
+
+function verifySwiftCopies(snapshots) {
+  for (const [owner, { path, digest, omitted }] of snapshots) {
+    if (swiftPackageFiles(null, path, undefined, omitted) !== digest) throw new Error(`${owner}: the cached Swift package changed during the build. Run the build again.`);
+  }
+}
+
+// SwiftPM resolves a dependency's relative paths from its declared directory. dump-package
+// runs it as the root and canonicalizes that directory. Keep the declared path for both.
+function dumpShippedPackage(app, root, directory) {
+  const scratch = resolve(swiftRoot(app), 'inspect');
+  const dump = path => JSON.parse(swiftRun(['package', '--package-path', path, '--scratch-path', scratch, 'dump-package'], path));
+  if (directory === realpathSync(directory)) return dump(directory);
+  mkdirSync(scratch, { recursive: true });
+  const view = mkdtempSync(resolve(scratch, 'manifest-'));
+  try {
+    let source = root, dest = view;
+    for (const part of [...relative(root, directory).split('/'), null]) {
+      for (const name of readdirSync(source)) {
+        if (name === part) mkdirSync(resolve(dest, name));
+        else symlinkSync(resolve(source, name), resolve(dest, name));
       }
-      graph.set(identity, { ...value, identity, source, products: [...new Set([...(previous?.products ?? []), ...value.products])].sort() });
+      if (!part) break;
+      source = resolve(source, part);
+      dest = resolve(dest, part);
+    }
+    const manifest = dump(dest);
+    for (const dep of manifest.dependencies) {
+      const local = dep.fileSystem?.[0];
+      if (local && within(view, local.path)) {
+        local.path = resolve(root, relative(view, local.path));
+        local.identity = swiftPathIdentity(local.path);
+      }
+    }
+    return manifest;
+  } finally { rmSync(view, { recursive: true, force: true }); }
+}
+
+function shippedSwiftPackage(app, impl, value, { snapshots, manifests }, claim, platform, checks) {
+  const owner = impl.swiftPackageRoot, source = impl.swiftPackagesSource;
+  const snapshot = swiftPackageSnapshot(app, owner, snapshots);
+  const original = path => resolve(owner, relative(snapshot.path, path));
+  const manifest = resolve(snapshot.path, relative(owner, source));
+  if (!within(snapshot.path, manifest) || !within(snapshot.path, realpathSync(manifest))) throw new Error(`${source} escapes the package directory ${owner}`);
+  if (!isDeepStrictEqual(JSON.parse(readFileSync(manifest)).swiftPackages, impl.swiftPackages)) throw new Error(`${source} changed while capturing Swift packages. Run the build again.`);
+  const inspected = new Map();
+  function inspect(directory, identity = swiftPathIdentity(directory)) {
+    if (!within(snapshot.path, directory) || existsSync(directory) && !within(snapshot.path, realpathSync(directory))) throw new Error(`${source}: ${directory} escapes the shipped package`);
+    const physical = existsSync(directory) ? realpathSync(directory) : directory;
+    for (const name of snapshot.omitted) {
+      const link = resolve(snapshot.path, name);
+      // A workspace install beside Package.swift can be unrelated. It stays out
+      // of the copy. A Swift dependency that actually names it is refused here.
+      const workspaceInstall = /(?:^|\/)node_modules\/(?:@[^/]+\/)?[^/]+$/.test(name);
+      if (within(link, directory) || (!workspaceInstall && within(physical, link))) throw new Error(`${resolve(owner, name)} escapes the package directory ${owner} or has no target`);
+    }
+    const file = resolve(directory, 'Package.swift');
+    if (!existsSync(file) || !statSync(file).isFile()) throw new Error(`${original(directory)} has no Package.swift`);
+    claim(identity, resolve(realpathSync(owner), relative(snapshot.path, physical)), source);
+    if (inspected.has(directory)) return inspected.get(directory);
+    if (!manifests.has(directory)) {
+      try {
+        manifests.set(directory, dumpShippedPackage(app, snapshot.path, directory));
+      } catch (error) { throw new Error(`${original(file)}: ${error.message}`); }
+    }
+    const description = manifests.get(directory), locals = new Map();
+    const pkg = { description, locals, file: original(file), identity };
+    inspected.set(directory, pkg);
+    for (const dependency of description.dependencies) {
+      const local = dependency.fileSystem?.[0];
+      if (local) {
+        locals.set((local.nameForTargetDependencyResolutionOnly ?? local.identity).toLowerCase(), { traits: local.traits, load: () => inspect(local.path, local.identity) });
+        continue;
+      }
+      const dep = dependency.sourceControl?.[0], url = dep?.location.remote?.[0]?.urlString;
+      const version = dep?.requirement.exact?.[0];
+      if (!url || !version) throw new Error(`${original(file)}: ${url ?? JSON.stringify(dependency)} must be a remote URL at an exact version or a package inside ${owner}`);
+      if (!impl.swiftPackages.some(p => p.url && swiftURL(p.url) === swiftURL(url) && p.exactVersion === version)) {
+        throw new Error(`${original(file)}: list ${url} at exactVersion ${version} in ${source}`);
+      }
+    }
+    return pkg;
+  }
+  const directory = resolve(dirname(manifest), value.path), pkg = inspect(directory);
+  for (const name of value.products) if (!pkg.description.products.some(p => p.name === name)) throw new Error(`${pkg.file} does not declare product ${name} requested by ${source}`);
+  if (platform) checks.push({ pkg, names: value.products, platform });
+  return { ...value, path: directory, digest: snapshot.digest };
+}
+
+// SwiftPM evaluates the manifest on the build machine. Its platform conditions
+// select edges and settings on the destination, independently of that machine.
+function checkSwiftSettings(checks, resolved) {
+  const seen = new Map(), host = process.platform === 'darwin' ? 'macos' : process.platform;
+  let usesTraits = false;
+  function use(pkg, names, destination, requested) {
+    const declared = pkg.description.traits ?? [];
+    usesTraits ||= declared.length > 0;
+    const traits = new Set(resolved ? resolved.get(pkg.identity) : requested);
+    if (!resolved) for (const name of traits) {
+      for (const implied of declared.find(t => t.name === name)?.enabledTraits ?? []) traits.add(implied);
+    }
+    const traitKey = JSON.stringify([...traits].sort());
+    for (const name of names) visit(pkg.description.products.find(p => p.name === name), destination);
+    function visit(item, os) {
+      if (!item) return;
+      if (item.type === 'macro' || item.type === 'plugin') os = host;
+      const key = os + traitKey;
+      if (!seen.has(item)) seen.set(item, new Set());
+      if (seen.get(item).has(key)) return;
+      seen.get(item).add(key);
+      const applies = condition => (!condition?.platformNames?.length || condition.platformNames.includes(os))
+        && (!condition?.traits?.length || condition.traits.some(t => traits.has(t)));
+      if (item.settings?.some(s => Object.hasOwn(s.kind, 'unsafeFlags') && applies(s.condition))) throw new Error(`${pkg.file}: ${item.name} uses unsafeFlags`);
+      const target = name => pkg.description.targets.find(t => t.name === name);
+      for (const name of item.targets ?? []) visit(target(name), os);
+      function product(name, owner, platform) {
+        const dependency = pkg.locals.get((owner ?? name).toLowerCase());
+        // Before tools 5.2 SwiftPM looked up an unqualified product in every dependency.
+        const legacy = Bun.semver.order(pkg.description.toolsVersion._version, '5.2.0') < 0;
+        const candidates = dependency ? [dependency] : !owner && legacy ? pkg.locals.values() : [];
+        for (const dep of candidates) use(dep.load(), [name], platform,
+          (dep.traits ?? [{ name: 'default' }]).filter(t => applies(t.condition)).map(t => t.name));
+      }
+      for (const dependency of item.dependencies ?? []) {
+        const args = dependency.target ?? dependency.byName ?? dependency.product;
+        if (!applies(args.at(-1))) continue;
+        if (dependency.product) product(args[0], args[1], os);
+        else if (target(args[0])) visit(target(args[0]), os);
+        else product(args[0], undefined, os);
+      }
+      for (const { plugin } of item.pluginUsages ?? []) {
+        if (plugin[1]) product(plugin[0], plugin[1], host);
+        else visit(target(plugin[0]), host);
+      }
     }
   }
+  for (const { pkg, names, platform } of checks) use(pkg, names, platform, ['default']);
+  return usesTraits;
+}
+
+// Different consumers can enable different traits on the same package. SwiftPM
+// reports their union for the generated root after resolving the locked graph.
+function checkResolvedSwiftTraits(checks, dir, scratch) {
+  if (!checks.length) return;
+  const args = ['package', '--disable-automatic-resolution', ...(scratch ? ['--scratch-path', scratch] : []), 'show-dependencies', '--format', 'json'];
+  const traits = new Map();
+  function collect(pkg) {
+    traits.set(pkg.identity, pkg.traits ?? []);
+    for (const child of pkg.dependencies) collect(child);
+  }
+  collect(JSON.parse(swiftRun(args, dir)));
+  checkSwiftSettings(checks, traits);
+}
+
+/** One graph for both Apple destinations and the app's own Swift (LLP 1133.001 D9). */
+export function swiftPackageGraph(app, bound = [], cache = { snapshots: new Map(), manifests: new Map() }, building) {
+  const declarations = ['ios', 'macos'].map(os => ({ source: `${resolve(app?.dir ?? '.', 'app.json')} host.${os}.swiftPackages`, values: app?.manifest?.host?.[os]?.swiftPackages }));
+  for (const impl of bound) declarations.push({ source: `${impl.swiftPackagesSource ?? impl.extension} swiftPackages`, values: impl.swiftPackages, impl });
+  const graph = new Map(), origins = new Map(), checks = [];
+  function claim(identity, location, source) {
+    const previous = origins.get(identity);
+    if (previous && previous.location !== location) throw new Error(`Swift package conflict: ${previous.source} requests ${previous.location}; ${source} requests ${location}. Use one source of ${identity}.`);
+    origins.set(identity, { location, source });
+  }
+  for (const { source, values, impl } of declarations) {
+    const problems = swiftPackagesProblems(values, source, !!impl?.swiftPackageRoot);
+    if (problems.length) throw new Error(problems.join('\n'));
+    const target = impl?.swiftPackageTarget ?? cache.destination ?? 'macos';
+    const platform = building ?? (!cache.destination || cache.destination === target ? target : null);
+    for (const declared of values ?? []) {
+      const value = declared.path ? shippedSwiftPackage(app, impl, declared, cache, claim, platform, checks) : declared;
+      const identity = value.path ? swiftPathIdentity(value.path) : swiftIdentity(value.url);
+      if (value.url) claim(identity, `${swiftURL(value.url)} at ${value.exactVersion}`, source);
+      graph.set(identity, { ...value, identity, source, products: [...new Set([...(graph.get(identity)?.products ?? []), ...value.products])].sort() });
+    }
+  }
+  if (checkSwiftSettings(checks)) cache.traitChecks?.push(...checks);
   return [...graph.values()].sort((a, b) => a.identity.localeCompare(b.identity));
 }
 
 /** Bind only interfaces in the compiled plan, including views reached through Contract libraries. */
-export function appSwiftPackageGraph(app, bound = [], extensions) {
-  if (extensions && !swiftPackageGraph(app, bound).length) return [];
+export function appSwiftPackageGraph(app, bound = [], extensions, cache = { snapshots: new Map(), manifests: new Map() }) {
+  if (extensions && !swiftPackageGraph(app, bound, cache).length) return [];
   extensions ??= swiftLockExtensions(app);
-  return swiftPackageGraph(app, [...bound, ...['ios', 'macos', 'tvos'].flatMap(os => appleImplementations(app.dir, os, extensions))]);
+  return swiftPackageGraph(app, [...bound, ...['ios', 'macos', 'tvos'].flatMap(os => appleImplementations(app.dir, os, extensions))], cache);
 }
 
 function swiftLockExtensions(app) {
@@ -262,11 +587,13 @@ function swiftLockExtensions(app) {
 }
 const lockAdvice = app => `${resolve(app.dir, 'Package.resolved')}: run bun exact.mjs lock in ${app.dir}, then review and commit Package.resolved`;
 export function assertSwiftLock(app, graph) {
+  const remote = graph.filter(p => p.url);
+  if (!remote.length) return null;
   let lock;
   try { lock = JSON.parse(readFileSync(resolve(app.dir, 'Package.resolved'), 'utf8')); }
   catch { throw new Error(`Swift packages need a lock; ${lockAdvice(app)}`); }
   if (![2, 3].includes(lock.version) || !Array.isArray(lock.pins)) throw new Error(`Invalid Swift package lock; ${lockAdvice(app)}`);
-  for (const p of graph) {
+  for (const p of remote) {
     const pin = lock.pins.find(pin => pin.identity === p.identity);
     if (!pin || pin.state?.version !== p.exactVersion || swiftURL(pin.location ?? '') !== swiftURL(p.url) || !/^[0-9a-f]{40}$/.test(pin.state?.revision ?? '')) {
       throw new Error(`${p.source} requests ${p.url} at ${p.exactVersion}, which differs from the lock; ${lockAdvice(app)}`);
@@ -274,7 +601,7 @@ export function assertSwiftLock(app, graph) {
   }
   return readFileSync(resolve(app.dir, 'Package.resolved'));
 }
-const products = declarations => declarations.flatMap(p => p.products.map(name => `.product(name: ${JSON.stringify(name)}, package: ${JSON.stringify(swiftIdentity(p.url))})`));
+const products = declarations => declarations.flatMap(p => p.products.map(name => `.product(name: ${JSON.stringify(name)}, package: ${sourceString(p.identity, 'swift')})`));
 function swiftManifest(graph, name, declarations, compile = [], link = []) {
   const triple = compile[compile.indexOf('-target') + 1] ?? '';
   const os = /-apple-(macosx?|ios|tvos)([\d.]+)/.exec(triple);
@@ -284,12 +611,12 @@ function swiftManifest(graph, name, declarations, compile = [], link = []) {
 import PackageDescription
 let package = Package(name: "ExactSwiftProducts", platforms: [.macOS("${floors.macos}"), .iOS("${floors.ios}"), .tvOS("${floors.tvos}")],
   products: [.library(name: ${JSON.stringify(name)}, type: .dynamic, targets: [${JSON.stringify(name)}])],
-  dependencies: [${graph.map(p => `.package(url: ${JSON.stringify(p.url)}, exact: ${JSON.stringify(p.exactVersion)})`).join(', ')}],
+  dependencies: [${graph.map(p => p.path ? `.package(path: ${sourceString(p.path, 'swift')})` : `.package(url: ${JSON.stringify(p.url)}, exact: ${JSON.stringify(p.exactVersion)})`).join(', ')}],
   targets: [.target(name: ${JSON.stringify(name)}, dependencies: [${products(declarations).join(', ')}], path: "Sources",
     swiftSettings: [.unsafeFlags(${JSON.stringify(compile)})], linkerSettings: [.unsafeFlags(${JSON.stringify(link)})])])
 `;
 }
-const swiftRoot = app => resolve(app.target ?? resolve(app.dir, '.exact'), 'swift-packages', createHash('sha256').update(JSON.stringify([app.dir, app.id ?? app.manifest?.app?.id])).digest('hex').slice(0, 16));
+export const swiftRoot = app => resolve(app.target ?? resolve(app.dir, '.exact'), 'swift-packages', createHash('sha256').update(JSON.stringify([app.dir, app.id ?? app.manifest?.app?.id])).digest('hex').slice(0, 16));
 function swiftRun(args, cwd) {
   const env = { ...process.env }; delete env.SDKROOT;
   const result = spawnSync('swift', args, { cwd, env, encoding: 'utf8', maxBuffer: 1 << 26 });
@@ -297,15 +624,27 @@ function swiftRun(args, cwd) {
   return result.stdout;
 }
 export function lockSwiftPackages(app) {
-  const graph = appSwiftPackageGraph(app);
+  const cache = { snapshots: new Map(), manifests: new Map(), traitChecks: [] };
+  const graph = appSwiftPackageGraph(app, [], undefined, cache);
   if (!graph.length) return null;
   const dir = resolve(swiftRoot(app), 'resolve');
   mkdirSync(resolve(dir, 'Sources'), { recursive: true });
   writeFileSync(resolve(dir, 'Sources/Resolve.swift'), 'public enum ExactResolve {}\n');
   writeFileSync(resolve(dir, 'Package.swift'), swiftManifest(graph, 'ExactResolve', graph));
   const lock = resolve(app.dir, 'Package.resolved'), generated = resolve(dir, 'Package.resolved');
-  if (existsSync(lock)) copyFileSync(lock, generated);
+  const remote = graph.some(p => p.url);
+  if (remote && existsSync(lock)) copyFileSync(lock, generated);
+  if (!remote) rmSync(generated, { force: true });
+  verifySwiftCopies(cache.snapshots);
   swiftRun(['package', 'resolve'], dir);
+  checkResolvedSwiftTraits(cache.traitChecks, dir);
+  verifySwiftCopies(cache.snapshots);
+  if (!remote) {
+    if (existsSync(generated)) throw new Error(`SwiftPM resolved a remote dependency of a local-only graph in ${generated}`);
+    if (!existsSync(lock)) return null;
+    rmSync(lock);
+    return `${lock}: removed (only local Swift packages)`;
+  }
   const next = readFileSync(generated), was = existsSync(lock) && readFileSync(lock).equals(next);
   const temporary = `${lock}.${process.pid}.tmp`;
   writeFileSync(temporary, next); renameSync(temporary, lock);
@@ -343,7 +682,7 @@ export function swiftPrivacyManifests(roots) {
 
 /** All consumers link one dynamic SwiftPM product, so an SDK's static state has one owner.
  * SwiftPM keeps its checksum verification and builds only the app's resolved versions. */
-function buildSwiftDependencies({ app, graph, declarations, compile, sdkName, directory, wrapped }) {
+function buildSwiftDependencies({ app, graph, declarations, traitChecks, compile, sdkName, directory, wrapped }) {
   const name = 'ExactSwiftDependencies', link = [...moduleLibraryLinkArgs({ wrapped, module: name }),
     '-Xlinker', '-headerpad_max_install_names'];
   const output = resolve(directory, `lib${name}.dylib`);
@@ -356,7 +695,8 @@ function buildSwiftDependencies({ app, graph, declarations, compile, sdkName, di
   const source = resolve(sourceDir, 'Dependencies.swift'), content = 'public enum ExactSwiftDependencies {}\n';
   if (!existsSync(source) || readFileSync(source, 'utf8') !== content) writeFileSync(source, content);
   writeFileSync(resolve(dir, 'Package.swift'), swiftManifest(graph, name, declarations, compile, link));
-  writeFileSync(resolve(dir, 'Package.resolved'), locked);
+  const lock = resolve(dir, 'Package.resolved');
+  if (locked) writeFileSync(lock, locked);
   const at = compile.indexOf('-target'), sdkAt = compile.indexOf('-sdk');
   // The shared product supplies every consumer with the same SDK artifacts and Clang module maps.
   const scratch = resolve(swiftRoot(app), 'build', key);
@@ -364,20 +704,28 @@ function buildSwiftDependencies({ app, graph, declarations, compile, sdkName, di
     ...(at >= 0 ? ['--triple', compile[at + 1]] : []), ...(sdkAt >= 0 ? ['--sdk', compile[sdkAt + 1]] : []), '--product', name];
   const bin = swiftRun([...args, '--show-bin-path'], dir).trim(), installAt = link.indexOf('-install_name');
   try {
+    checkResolvedSwiftTraits(traitChecks, dir, scratch);
     swiftRun([...args, '--print-manifest-job-graph'], dir);
     const plan = JSON.parse(readFileSync(resolve(bin, 'description.json'), 'utf8'));
     const inputs = new Set(Object.values(plan.swiftCommands).find(c => c.moduleName === name)?.inputs?.map(input => input.name));
-    const staticLibraries = Object.values(plan.copyCommands ?? {}).filter(copy => copy.outputs.some(output => inputs.has(output.name)))
-      .flatMap(copy => copy.inputs.map(input => input.name)).flatMap(path => path.endsWith('.framework')
-        ? [resolve(path, basename(path, '.framework'))] : path.endsWith('.a') ? [path] : [])
-      .filter(path => machOType(path) !== 6);
-    // The empty shared target references no SDK symbols. Keep every archive member for its consumers.
+    const binary = path => path.endsWith('.framework') ? resolve(path, basename(path, '.framework')) : path.endsWith('.a') ? path : null;
+    const staticLibraries = Object.values(plan.copyCommands ?? {}).flatMap(copy => copy.outputs.flatMap(({ name }) => {
+      const output = binary(name);
+      if (!output || !inputs.has(name)) return [];
+      // The plan is available before SwiftPM has copied the archive.
+      const original = copy.inputs?.find(input => input.kind !== 'virtual' && basename(input.name) === basename(name));
+      const source = original && binary(original.name);
+      return source && machOType(source) !== 6 ? [output] : [];
+    }));
+    // Force-load every member so consumers can link symbols the shared product leaves unreferenced.
+    // Pass -force_load to clang before SwiftPM's inputs and use the same archive path
+    // so ld64.lld loads each member once, including when -ObjC is present.
     if (staticLibraries.length) writeFileSync(resolve(dir, 'Package.swift'), swiftManifest(graph, name, declarations, compile,
-      [...link, ...[...new Set(staticLibraries)].flatMap(path => ['-Xlinker', '-force_load', '-Xlinker', path])]));
+      [...link, ...[...new Set(staticLibraries)].flatMap(path => ['-Xclang-linker', '-force_load', '-Xclang-linker', path])]));
     swiftRun([...args, ...swiftResourceOverlay(bin)], dir);
   }
-  catch (error) { throw new Error(`${error.message}\n${lockAdvice(app)}`); }
-  if (!readFileSync(resolve(dir, 'Package.resolved')).equals(locked)) throw new Error(`SwiftPM changed the build's lock; ${lockAdvice(app)}`);
+  catch (error) { if (!locked) throw error; throw new Error(`${error.message}\n${lockAdvice(app)}`); }
+  if (locked ? !existsSync(lock) || !readFileSync(lock).equals(locked) : existsSync(lock)) throw new Error(`SwiftPM changed the build's lock; ${lockAdvice(app)}`);
   if (installAt >= 0) swiftRunTool(['install_name_tool', '-id', link[installAt + 2], resolve(bin, `lib${name}.dylib`)]);
   copyFileSync(resolve(bin, `lib${name}.dylib`), output);
   const imports = ['-I', bin, '-I', resolve(bin, 'Modules'), '-F', bin];
@@ -425,7 +773,7 @@ function buildSwiftDependencies({ app, graph, declarations, compile, sdkName, di
       swiftRunTool(['install_name_tool', '-change', `@rpath/${lib.load}`, `@rpath/${lib.framework}.framework/${lib.framework}`, file]);
     }
   }
-  const hash = createHash('sha256').update(locked);
+  const hash = createHash('sha256').update(locked ?? '');
   for (const lib of libraries) hash.update(lib.load).update(readFileSync(lib.built));
   for (const fw of frameworks) hash.update(fw.link).update(readFileSync(resolve(fw.placed, fw.link)));
   const digest = hash.digest('hex');

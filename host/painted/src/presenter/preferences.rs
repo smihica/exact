@@ -46,11 +46,21 @@ impl<D: DataSource> Presenter<D> {
 
     /// A candidate has a new runner, but belongs to the same launch.
     pub(super) fn restore_time(&self, host: &mut Host<D>) -> Result<(), HostError> {
-        host.web_mount = self.host.web_mount.clone();
+        host.incoming_links = self.host.incoming_links.clone();
         host.set_scheme(self.dark());
         // The same launch keeps what the device said about itself.
         let runner = self.host.runner();
-        let (preferences, page) = (runner.viewport().preferences, runner.page());
+        // The candidate booted under this page's facts ([`Presenter::candidate_page`])
+        // but these, whose effects only `set_page` applies.
+        let (preferences, page) = (
+            runner.viewport().preferences,
+            exact_runner::Page {
+                hidden: runner.page().hidden,
+                frozen: runner.page().frozen,
+                background: runner.page().background,
+                ..host.runner().page()
+            },
+        );
         if let Some(error) = host.set_preferences(preferences) {
             return Err(HostError::Layout(error));
         }
@@ -68,8 +78,12 @@ impl<D: DataSource> Presenter<D> {
             return Err(HostError::Layout(error));
         }
         // The room a shell's bars take, without which the new host projects no bars.
-        host.set_bar_room(self.host.bars().room)
-            .map_err(HostError::Layout)?;
+        host.set_bar_rooms(
+            self.host.bars().room,
+            self.host.bars().subtitled_above,
+            self.host.bars().sheet_above,
+        )
+        .map_err(HostError::Layout)?;
         let time = self.host.runner().wall_time();
         if let Some(error) = host.set_place(self.host.runner().place()) {
             return Err(HostError::Layout(error));
@@ -152,6 +166,9 @@ impl<D: DataSource> Presenter<D> {
     pub(crate) fn page_execution(&mut self, hidden: bool, eligible: bool, seekable: bool) -> bool {
         let page = self.host.runner().page();
         let frozen = if seekable { page.frozen } else { !eligible };
+        // A canvas's device work, its game audio among it, stops with the
+        // activity and starts again with it, as on Apple and Windows.
+        self.surface_lifecycle(hidden, false);
         if page.hidden == hidden && page.frozen == frozen {
             return false;
         }
@@ -219,8 +236,7 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// `devicePosture` and the viewport segments (LLP 1078 D7): what the
-    /// agent's `prefer posture` and `prefer segments` set on this host,
-    /// which has no fold of its own; kept for `layout.env`.
+    /// agent's `prefer posture` and `prefer segments` set on a host without a hinge.
     pub fn set_segments(
         &mut self,
         posture: exact_runner::Posture,
@@ -228,11 +244,13 @@ impl<D: DataSource> Presenter<D> {
         rows: u32,
         rects: Vec<exact_kernel::Rect>,
     ) -> Option<String> {
-        let error = self.host.set_segments(posture, cols, rows, rects.clone());
+        if self.window.has_hinge {
+            return Some("the device decides (it has a fold)".into());
+        }
+        let error = self.host.set_segments(posture, cols, rows, rects);
         if error.is_some() {
             return error;
         }
-        self.segments = rects;
         self.dirty = true;
         self.after_commit()
     }
@@ -283,6 +301,17 @@ impl<D: DataSource> Presenter<D> {
     /// The scheme a `light-dark()` colour resolves to now.
     pub fn dark(&self) -> bool {
         self.brush.dark
+    }
+
+    /// The scheme `id` paints in, as the painter carries it, so a surface
+    /// lifted out of its ancestors keeps theirs ([`crate::paint::scheme_of`]).
+    pub(super) fn scheme_of(&self, id: ViewId) -> Option<bool> {
+        crate::paint::scheme_of(self.host.kernel(), &|id| self.host.presented(id), id)
+    }
+
+    /// Whether `id` paints dark: its scheme, else the session's.
+    pub(super) fn dark_at(&self, id: ViewId) -> bool {
+        self.scheme_of(id).unwrap_or(self.dark())
     }
 
     /// A request for MIDI on the display's clock: this host has none (LLP
@@ -587,6 +616,7 @@ mod tests {
             let page = p.host.runner().page();
             assert_eq!(page.hidden, hidden);
             assert_eq!(page.frozen, frozen);
+            assert_eq!(p.surfaces.hidden, hidden, "the canvases are told");
             assert!(
                 !p.page_execution(hidden, eligible, false),
                 "duplicate reports make no commit"
@@ -601,3 +631,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scheme_tests.rs"]
+mod scheme_tests;

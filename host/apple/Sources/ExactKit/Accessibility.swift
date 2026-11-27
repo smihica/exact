@@ -61,29 +61,46 @@ extension NodeView {
 
     /// Its words: the text it shows, its descendants' joined.
     package var accessibleText: String { contentText(naming: false) }
+    package var exposedText: String { contentText(naming: false, exposedOnly: true) }
+    package var exposedContentName: String { contentText(naming: true, exposedOnly: true) }
     /// `naming`: accname's name from content (step 2F), in which a
     /// descendant's own label stands for its content, so a labelled image
     /// inside a link counts in the link's name, as on the web.
     /// `unshown`: the words of a subtree CSS or `aria-hidden` hides are read
     /// too, which only an explicit reference to it asks for (`labelledBy`).
-    private func contentText(naming: Bool, unshown: Bool = false) -> String {
-        // A Markdown text reads as the words it draws, its syntax hidden (LLP 1045,
-        // "Accessibility"), each inline atom its accessible name (LLP 1045.000 D8).
-        if let text = props["text"], props["markup"] == "markdown", let plain = MarkdownLink.installed?.plain(text, range: nil, atoms: props["atoms"] ?? "", faces: props["atomFaces"] ?? "", spoken: true) { return plain }
-        if let text = props["text"] { return text }
-        // A native button's children are its face, not views (LLP 1069.011 D5),
-        // read from the kernel, current on its first batch (LLP 1069.011.000 D1).
-        if isNativeButton { return face?.title ?? "" }
-        if isParagraph { return visibleParagraphText }
+    private func contentText(naming: Bool, unshown: Bool = false, exposedOnly: Bool = false) -> String {
+        if !exposedOnly || accessibilityExposed {
+            // A Markdown text reads as the words it draws, its syntax hidden (LLP 1045,
+            // "Accessibility"), each inline atom its accessible name (LLP 1045.000 D8).
+            if let text = props["text"], props["markup"] == "markdown", let plain = MarkdownLink.installed?.plain(text, range: nil, atoms: props["atoms"] ?? "", faces: props["atomFaces"] ?? "", spoken: true) { return plain }
+            if let text = props["text"] { return text }
+            // A native button's children are its face, not views (LLP 1069.011 D5),
+            // read from the kernel, current on its first batch (LLP 1069.011.000 D1).
+            if isNativeButton { return face?.title ?? "" }
+            if isParagraph { return visibleParagraphText }
+        }
         // accname step 2A: a child that is not rendered, or is `aria-hidden`, names
         // nothing (habits F16: a tab's icon glyph). One the host hides still
         // names: a native control draws its words (a grouped list's sections,
         // a segmented control's tabs).
         let children = childNodes.filter { unshown || !$0.leftOut }
-        return children.map { naming ? $0.authoredLabel ?? $0.contentText(naming: true) : $0.contentText(naming: false, unshown: unshown) }.filter { !$0.isEmpty }.joined(separator: " ")
+        return children.compactMap { child in
+            let words: String
+            if naming, !exposedOnly || child.accessibilityExposed, let label = child.authoredLabel {
+                words = label
+            } else {
+                words = child.contentText(naming: naming, unshown: unshown, exposedOnly: exposedOnly)
+            }
+            return words.isEmpty ? nil : words
+        }.joined(separator: " ")
     }
     /// Not rendered (`display: none`) or left out of the accessibility tree (`aria-hidden`).
     private var leftOut: Bool { style["display"]?.string == "none" || props["accessibilityElementsHidden"] == "true" }
+    /// HTML ID references split at the five ASCII whitespace bytes, even before a combining mark.
+    package static func idRefs(_ names: String) -> [String] {
+        names.utf8.split { $0 == 0x20 || $0 == 0x09 || $0 == 0x0a || $0 == 0x0c || $0 == 0x0d }
+            .map { String(decoding: $0, as: UTF8.self) }
+    }
     /// Its `aria-labelledby` text, else its `aria-label`, unless empty
     /// (accname: an empty label names nothing).
     package var authoredLabel: String? { labelledBy ?? props["accessibilityLabel"].flatMap { $0.isEmpty ? nil : $0 } }
@@ -94,15 +111,21 @@ extension NodeView {
     /// all its words are read, shown or not (step 2A's exception for a hidden
     /// node the relation references directly). Hidden by CSS or `aria-hidden`,
     /// never by a host that draws the element some other way.
-    var labelledBy: String? {
-        guard let refs = props["accessibilityLabelledBy"], let presenter else { return nil }
-        let text = refs.split(separator: " ").compactMap { presenter.chrome.named[String($0)]?.min().flatMap { presenter.views[$0] } }
-            .map { named -> String in
-                if let label = named.props["accessibilityLabel"], !label.isEmpty { return label }
-                let hidden = sequence(first: named as PlatformView, next: \.superview).contains { ($0 as? NodeView)?.leftOut == true }
-                return named.contentText(naming: false, unshown: hidden)
+    var labelledBy: String? { referencedLabel(props["accessibilityLabelledBy"]) }
+    func referencedLabel(_ refs: String?) -> String? {
+        guard let refs, let presenter else { return nil }
+        let text = Self.idRefs(refs).compactMap { ref -> String? in
+            guard let id = presenter.chrome.accessibilityID(ref), let named = presenter.textHost(id) else { return nil }
+            let run = presenter.inlineText(id)
+            if let label = (run?.props ?? named.props)["accessibilityLabel"], !label.isEmpty { return label }
+            let hidden = sequence(first: named as PlatformView, next: \.superview).contains { ($0 as? NodeView)?.leftOut == true }
+            if let run {
+                let source = named.inlineText.lazy.filter(\.paints).map(\.text).joined() as NSString
+                if hidden || run.hidden || presenter.inlineHiddenFromAccessibility(run) { return source.substring(with: run.range) }
+                return named.visibleInlineText(in: run.range, source: source)
             }
-            .filter { !$0.isEmpty }.joined(separator: " ")
+            return named.contentText(naming: false, unshown: hidden)
+        }.filter { !$0.isEmpty }.joined(separator: " ")
         return text.isEmpty ? nil : text
     }
     package var accessibleName: String { authoredLabel ?? contentText(naming: true) }
@@ -172,7 +195,7 @@ extension NodeView {
     /// `aria-describedby` names, in order, else `aria-description`'s words.
     var accessibleDescription: String? {
         if let refs = props["accessibilityDescribedBy"], let presenter {
-            let text = refs.split(separator: " ").compactMap { presenter.chrome.named[String($0)]?.min().flatMap { presenter.views[$0] } }
+            let text = Self.idRefs(refs).compactMap { presenter.chrome.named[$0]?.min().flatMap { presenter.views[$0] } }
                 .map(\.accessibleName).filter { !$0.isEmpty }.joined(separator: " ")
             if !text.isEmpty { return text }
         }
@@ -248,13 +271,15 @@ extension NodeView {
     /// changed, and an `alert` as it appears, as a browser's alert event has
     /// it (Core-AAM); one there at launch is read with the screen.
     func liveSpeaks(_ text: String, launching: Bool) -> Bool {
+        guard !text.isEmpty, liveText.map({ $0 != text }) ?? (liveRole == "alert" && !launching) else { return false }
         #if os(macOS)
-        guard liveAnnouncementView != nil, !text.isEmpty else { return false }
+        return liveAnnouncementView != nil
         #else
-        guard accessibilityVisible, !text.isEmpty else { return false }
+        // `aria-hidden` in the authored tree, which a node UIKit holds in
+        // another container (a bar's hosted item, LLP 1141.004 D3; a painted
+        // popover) still has above it.
+        return accessibilityVisible && !authoredLine.contains { $0.props["accessibilityElementsHidden"] == "true" }
         #endif
-        if let previous = liveText { return previous != text }
-        return liveRole == "alert" && !launching
     }
     #if os(macOS)
     var liveAnnouncementView: NSView? {
@@ -382,6 +407,18 @@ extension NodeView {
         if target.accessibilityTraits.contains(.notEnabled) != (disabled || ariaUnavailable) { target.accessibilityTraits.formSymmetricDifference(.notEnabled) }
         if target.accessibilityHint != description { target.accessibilityHint = description }
         #endif
+        let hasRefs = props["accessibilityActions"] != nil
+        if hasRefs || hadFormActionRefs {
+            if target !== self { syncControlActions(target) }
+            #if !os(macOS)
+            if let item = presenter?.navigation.shownBarItem(id) { syncProjectedActions(item) }
+            if let grip = projectedReorderResponder(accessibility: true) { syncProjectedActions(grip) }
+            #endif
+            hadFormActionRefs = hasRefs
+        }
+        #if os(macOS)
+        if target === self, kind == "view", props["accessibilityActions"] != nil { updateRoleAccessibility() }
+        #endif
     }
 }
 
@@ -488,13 +525,15 @@ extension NodeView {
     /// come from `syncAccessibility`.
     func updateRoleAccessibility() {
         let role = props["accessibilityRole"]
+        let declaresActions = props["accessibilityActions"].map { !Self.idRefs($0).isEmpty } ?? false
+        if !declaresActions { lastAccessibilityWrite.actionGroup = false }
         // A role over a paragraph writes over its text's (`updateTextAccessibility`).
         if actsAsButton { lastAccessibilityWrite.text = nil
             setAccessibilityElement(true)
             if let checked = checkedRole { setAccessibilityChecked(checked.role, checked.checked) }
             else { setAccessibilityToggle(pressedState, else: buttonRole) }
             // A link's `AXURL` is its `href`, as a run's is (X78).
-            let url = role == "link" ? props["href"].flatMap { URL(string: $0) } : nil
+            let url = role == "link" ? linkDestination.flatMap { URL(string: $0) } : nil
             if accessibilityURL() != url { setAccessibilityURL(url) }
             setAccessibilitySelected(props["accessibilitySelected"] == "true")
             if let expanded = props["accessibilityExpanded"] { setAccessibilityExpanded(expanded == "true") }
@@ -518,6 +557,7 @@ extension NodeView {
             // A range role is one element, its value between its bounds and
             // its `aria-valuetext` the description, as WebKit serves a drawn
             // one (LLP 1116 D8). Only a change is written: each posts.
+            // A meter names the authored view for VoiceOver. It has no native gauge to tint.
             let axRole: NSAccessibility.Role = ["slider": .slider, "meter": .levelIndicator, "scrollbar": .scrollBar, "spinbutton": .incrementor][range] ?? .progressIndicator
             setAccessibilityElement(true)
             if accessibilityRole() != axRole { setAccessibilityRole(axRole) }
@@ -533,6 +573,14 @@ extension NodeView {
             setAccessibilityElement(true)
             if accessibilityRole() != table.role { setAccessibilityRole(table.role) }
             if accessibilitySubrole() != table.subrole { setAccessibilitySubrole(table.subrole) }
+        } else if !isParagraph, field == nil, textArea == nil, kind == "view",
+                  declaresActions,
+                  hasReferencedAction() || lastAccessibilityWrite.actionGroup {
+            setAccessibilityElement(true)
+            if accessibilityRole() != .group { setAccessibilityRole(.group) }
+            lastAccessibilityWrite.actionGroup = true
+            let name = accessibleName
+            if accessibilityLabel() != name { setAccessibilityLabel(name) }
         } else if !isParagraph, super.isAccessibilityElement() {
             // None of these roles now (one removed at runtime): a plain view
             // again, as a new one is, without the role's subrole or values.
@@ -807,6 +855,9 @@ extension Presenter {
             DispatchQueue.main.async { [weak self] in self?.syncAccessibility() }
             return
         }
+        #if !os(macOS)
+        for id in chrome.inlineActionOwners { views[id]?.updateTextAccessibility() }
+        #endif
         let nodes: [NodeView]
         if let changed {
             let indexed = chrome.ids("accessibilityLive").union(chrome.ids("role:status")).union(chrome.ids("role:alert")).union(chrome.ids("autofocus"))
@@ -834,7 +885,7 @@ extension Presenter {
             nodes = views.values.sorted(by: { $0.id < $1.id })
         }
         // A description reads the text of the elements it names, wherever they changed.
-        let described = changed == nil ? [] : chrome.ids("accessibilityDescribedBy").subtracting(nodes.map(\.id)).compactMap { views[$0] }
+        let described = changed == nil ? [] : chrome.ids("accessibilityDescribedBy").union(chrome.ids("accessibilityActions")).subtracting(nodes.map(\.id)).compactMap { views[$0] }
         for node in described { node.applyFormAccessibility() }
         // A name read from other elements follows their text (ledger2 Rough 3).
         for node in chrome.ids("accessibilityLabelledBy").compactMap({ views[$0] }) {
@@ -874,7 +925,8 @@ extension Presenter {
             // A native button's control is its accessibility element (LLP 1069.011 D4).
             if (node.actsAsButton || node.props["accessibilityRole"] == "button") && !node.isNativeButton {
                 #if os(macOS)
-                node.setAccessibilityLabel(node.accessibleName)
+                let name = node.accessibleName
+                if node.accessibilityLabel() != name { node.setAccessibilityLabel(name) }
                 #else
                 node.accessibilityLabel = node.accessibleName
                 #endif
@@ -886,7 +938,7 @@ extension Presenter {
                     NSAccessibility.post(element: node.liveAnnouncementView ?? node.paragraphOwner, notification: .announcementRequested,
                         userInfo: [.announcement: text, .priority: (live == "assertive" ? NSAccessibilityPriorityLevel.high : .low).rawValue])
                     #else
-                    UIAccessibility.post(notification: .announcement, argument: NSAttributedString(string: text,
+                    Self.postAnnouncement(NSAttributedString(string: text,
                         attributes: [.accessibilitySpeechQueueAnnouncement: live == "polite"]))
                     #endif
                 }
@@ -1115,16 +1167,33 @@ extension Presenter {
             let order = a.superview?.subviews ?? []
             return (order.firstIndex(of: a) ?? 0) > (order.firstIndex(of: b) ?? 0)
         }
-        // A leaving view (hidden from accessibility as its exit starts) covers nothing.
-        func painted(_ view: UIView) -> Bool {
-            !view.isHidden && view.alpha > 0 && !view.accessibilityElementsHidden && (view as? NodeView)?.style["display"]?.string != "none"
-                && (view as? NodeView)?.drawnBySurface != true
+        // A cover is either a painted opaque node fully occluding the modal (matching macOS
+        // `macAccessibilityModal`), or a controller's view (a sheet's stack) over it.
+        func covers(_ sibling: UIView, inFrontOf at: UIView, covering modal: NodeView) -> Bool {
+            guard sibling !== at, !sibling.isHidden, !sibling.accessibilityElementsHidden,
+                  !sibling.bounds.isEmpty, inFront(sibling, of: at) else { return false }
+            if let cover = sibling as? NodeView {
+                let progressTrack = cover.kind == "control" && cover.props["type"] == "progress" && cover.props["value"] != nil
+                let fill = (segments.control(of: cover.id) == nil && !cover.groundIsSheets && !progressTrack ? cover.cgColor("background_color") : nil) ?? cover.fieldGround
+                // Read committed style rather than `layer.backgroundColor` / `layer.cornerRadius`:
+                // `syncModal()` runs at the end of `apply(_:)`, before `NodeLayer.display()` updates the layer.
+                guard !cover.cssVisibilityHidden, cover.style["display"]?.string != "none",
+                      !cover.drawnBySurface, !isLeaving(cover),
+                      cover.alpha == 1, cover.layer.shownOpacity == 1,
+                      cover.surface == nil, cover.vibrancyView == nil || cover.isParagraph,
+                      cover.backgroundClip == "border-box", fill?.alpha == 1,
+                      cover.cornerRadii(in: cover.bounds).allSatisfy({ $0 == 0 }),
+                      cover.clipPath == nil, cover.style["mask_image"] == nil, cover.layer.boxMask == nil,
+                      CATransform3DIsIdentity(cover.layer.transform)
+                else { return false }
+                // Only a painted opaque rectangle covering the entire dialog establishes occlusion.
+                return cover.convert(cover.bounds, to: modal).contains(modal.bounds)
+            }
+            guard sibling.next is UIViewController, sibling.alpha > 0 else { return false }
+            return sibling.convert(sibling.bounds, to: modal).contains(modal.bounds)
         }
-        // A cover is content: a node, or a controller's view (a sheet's
-        // stack), not the host's own helper layers.
-        func covered(_ view: UIView) -> Bool {
-            view.superview?.subviews.contains { $0 !== view && ($0 is NodeView || $0.next is UIViewController) && painted($0)
-                && inFront($0, of: view) && $0.frame.intersects(view.frame) } == true
+        func covered(_ at: UIView, covering modal: NodeView) -> Bool {
+            at.superview?.subviews.contains { covers($0, inFrontOf: at, covering: modal) } == true
         }
         func exposed(_ view: NodeView) -> Bool {
             guard view.props["accessibilityModal"] == "true", view.accessibilityVisible else { return false }
@@ -1132,7 +1201,7 @@ extension Presenter {
             var below = true // covers are judged inside the session's viewport
             for at in ancestors(view) {
                 if at === viewport || at === documentMount { below = false }
-                if at.accessibilityElementsHidden || (at as? NodeView)?.style["display"]?.string == "none" || (below && covered(at)) { return false }
+                if at.accessibilityElementsHidden || (at as? NodeView)?.style["display"]?.string == "none" || (below && covered(at, covering: view)) { return false }
             }
             return true
         }
@@ -1345,6 +1414,7 @@ extension Agent {
                 }
                 if node.props["popover"] != nil { row["open"] = presenter.menus.isOpen(node) }
                 #if os(iOS) || os(tvOS)
+                if node.video?.state()["pictureInPicture"] as? Bool == true { row["pictureInPicture"] = ["presentation": "system"] }
                 if let why = unshown[node.id] { row["unshown"] = why }
                 #endif
             }

@@ -1,34 +1,36 @@
-import { viewParent, viewChildren } from './navigation/lists.js';
 // Issue #110: an aria-keyshortcuts chord whose key types no Latin character
 // (Korean 2-Set's ㅠ on KeyB, Russian, Greek) is its physical key's (`code`),
 // as web apps match; a Latin character is the key wherever it is (AZERTY,
 // Dvorak, German's ö), so one chord fires, never two.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { formatShortcut, resolveShortcuts } from './navigation/environment.js';
+import { glueDeclarations, hostFixtureFile, inputFixtureSource } from './tests/glue-fixture.mjs';
 import { Script } from 'node:vm';
 
-let inputSource = readFileSync(new URL('./input-glue.js', import.meta.url), 'utf8').replace(/^import \{ viewChildren, viewParent \} from '\.\/navigation\.js';\n/m, '');
-for (const name of ['prompt-glue', 'alert-message']) {
-  const stripped = inputSource.replace(new RegExp(`^import\\s+["']\\./${name}\\.js["'];[^\\n]*\\n`, 'm'), '');
-  if (stripped === inputSource) throw new Error(`input glue must retain its ${name} side-effect import`);
-  inputSource = stripped;
-}
-const inputCode = inputSource.replace(/^export (async function|function|const) /gm, '$1 ');
-const inputScript = new Script(`${inputCode}\ncreateInputHandlers({ root, views: new Map(), retiredViews: new WeakSet(), ready: () => true, inertAncestor: () => false, dispatch() {} });`, { filename: 'input-glue.js' });
-// `shown`: the buttons have boxes; `marked`: each is a Back control its route's bar stands for (navigation.js).
-function page(chords, { shown = true, marked = false } = {}) {
+const inputScript = new Script(`${await inputFixtureSource()}\nexact.createInputHandlers({ root, views: new Map(), retiredViews: new WeakSet(), ready: () => true, inertAncestor: () => false, dispatch() {} });`, { filename: 'input-glue.js' });
+// `shown`: the buttons have boxes; `marked`: each is a Back control's mark (navigation.js): `""` where its route's bar
+// stands for it, `"suppressed"` where it has no Back. A chord given as `[chord, options]` sets them for its button alone,
+// and `name` is what its click records in place of the chord.
+function page(chords, { shown = true, marked = null, modals = [], ariaModals = [] } = {}) {
   const clicks = [], listeners = [];
-  const buttons = chords.map(chord => ({ isConnected: true, disabled: false, getClientRects: () => (shown ? [{}] : []),
-    hasAttribute: name => marked && name === 'data-exact-bar-back', getAttribute: () => chord, click() { clicks.push(chord); } }));
-  const context = { viewParent, viewChildren,
-    document: { addEventListener(kind, fn, capture) { if (kind === 'keydown' && capture) listeners.push(fn); }, activeElement: { closest: () => null },
+  const buttons = chords.map(given => {
+    const [chord, own] = Array.isArray(given) ? given : [given, {}], { shown: boxed = shown, marked: mark = marked, name = chord } = own;
+    const attributes = { 'aria-keyshortcuts': chord, 'data-exact-bar-back': mark };
+    return { isConnected: true, disabled: false, getClientRects: () => (boxed ? [{}] : []),
+      hasAttribute: key => attributes[key] != null, getAttribute: key => attributes[key] ?? null, click() { clicks.push(name); } };
+  });
+  const querySelectorAll = selector => selector === 'button[aria-keyshortcuts]' ? buttons
+    : selector === 'dialog:modal,:popover-open' ? modals
+    : selector === '[aria-modal="true"]' ? ariaModals : [];
+  const context = { exact: {},
+    document: { querySelectorAll, addEventListener(kind, fn, capture) { if (kind === 'keydown' && capture) listeners.push(fn); }, activeElement: { closest: () => null },
       getElementById: id => (id === 'exact-snap' ? {} : null), styleSheets: [], documentElement: { dataset: {} } },
-    getComputedStyle: () => ({ visibility: 'visible' }),
+    getComputedStyle: el => ({ visibility: el?.visibility ?? 'visible' }),
     // What the input glue reads as it starts that no chord here touches: its sheets' observers, hover, looks.
     MutationObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
     queueMicrotask, Element: class {}, matchMedia: () => ({ matches: false, addEventListener() {} }),
     addEventListener() {}, removeEventListener() {},
-    root: { querySelectorAll: s => (s.includes('aria-modal') ? [] : buttons), addEventListener() {}, contains: () => true },
+    root: { querySelectorAll, addEventListener() {}, contains: () => true },
   };
   inputScript.runInNewContext(context);
   const key = (key, code, extra = {}) => {
@@ -37,7 +39,7 @@ function page(chords, { shown = true, marked = false } = {}) {
     for (const fn of listeners) fn(e);
     return e.prevented === true;
   };
-  return { clicks, key };
+  return { clicks, key, buttons };
 }
 
 test('a non-Latin key matches the chord its physical key names', () => {
@@ -66,6 +68,62 @@ test('the fallback keeps the chord\'s modifiers and refuses keys it cannot name'
 // LLP 1116.000 D4: a Back control the bar stands for is not shown, and its chord still presses it; a button that is
 // not shown otherwise takes none.
 test('a Back control the bar stands for keeps its chord', () => {
-  const hidden = page(['Meta+['], { shown: false }), marked = page(['Meta+['], { shown: false, marked: true });
+  const hidden = page(['Meta+['], { shown: false }), marked = page(['Meta+['], { shown: false, marked: '' });
   expect([hidden.key('[', 'BracketLeft'), hidden.clicks, marked.key('[', 'BracketLeft'), marked.clicks]).toEqual([false, [], true, ['Meta+[']]);
+});
+
+// A split's first detail has no Back (LLP 1116.004 D1): its control takes no chord, which a shown button with it keeps.
+test('a suppressed Back control leaves its chord to a shown button', () => {
+  const p = page([['Meta+[', { shown: false, marked: 'suppressed', name: 'back' }], 'Meta+[']);
+  expect([p.key('[', 'BracketLeft'), p.clicks]).toEqual([true, ['Meta+[']]);
+  const alone = page([['Meta+[', { shown: false, marked: 'suppressed', name: 'back' }]]);
+  expect([alone.key('[', 'BracketLeft'), alone.clicks]).toEqual([false, []]);
+});
+
+test('the Wasm prop writer resolves a portable list when setting and updating it', () => {
+  const source = hostFixtureFile(new URL('./wasm/views.js', import.meta.url), 'utf8');
+  const write = new Script(glueDeclarations(source, ['applyProps']) + '\napplyProps');
+  const element = { setAttribute(k, v) { this[k] = v; }, removeAttribute(k) { delete this[k]; } };
+  const key = 'aria-keyshortcuts';
+  for (const [nav, primary] of [[{ platform: 'iPad' }, 'Meta'], [{ userAgentData: { platform: 'Linux' } }, 'Control']]) {
+    const apply = write.runInNewContext({ host: { inputReady: true }, HTMLIFrameElement: class {}, HTMLImageElement: class {}, HTMLMediaElement: class {},
+      syncMedia() {}, syncMarkup() {}, resolveShortcuts: chords => resolveShortcuts(chords, nav) });
+    apply(element, { [key]: 'Escape\u0085Mod+O' });
+    expect(element[key]).toBe('Escape ' + primary + '+O');
+    apply(element, { [key]: 'Control+Mod\uFEFFMod+P' });
+    expect(element[key]).toBe(primary + '+P');
+    apply(element, { [key]: 'Escape Mod+Hyper+K Mod+𐐀' });
+    expect(element[key]).toBe('Escape');
+    apply(element, { [key]: 'Control+Mod' });
+    expect(element[key]).toBeUndefined();
+  }
+});
+
+test('named keys, functions and modifier order use the reader’s notation', () => {
+  for (const [chord, apple, windows] of [
+    ['Meta+Shift+Alt+Control+ArrowUp', '⌃⌥⇧⌘↑', 'Windows logo key+Ctrl+Alt+Shift+Up arrow'],
+    ['Mod+ß', '⌘ß', 'Ctrl+ß'], ['Mod+Insert', '⌘Insert', 'Ctrl+Insert'], ['Mod+𐐀', '', ''],
+    ['Mod+Enter', '⌘↩', 'Ctrl+Enter'], ['Space', 'Space', 'Spacebar'], ['Escape', '⎋', 'Esc'],
+    ['Mod++', '⌘+', 'Ctrl+Plus sign'], ['F35', 'F35', 'F35'], ['F36', '', ''],
+    ['Mod+Meta+O', '', ''], ['Mod+Control+O', '', ''], ['Hyper+O', '', ''], ['Mod+O Mod+P', '', ''],
+  ]) {
+    expect(formatShortcut(chord, { platform: 'MacIntel' })).toBe(apple);
+    expect(formatShortcut(chord, { platform: 'Win32' })).toBe(windows);
+    expect(formatShortcut(chord, {})).toBe('');
+  }
+});
+
+test('an open modal dialog blocks background shortcuts even when focus is outside it, and hidden aria-modal is ignored', () => {
+  const modal = { exactOpened: 1, matches: s => s === 'dialog:modal', contains: el => el === inside };
+  const coveredSheet = { getClientRects: () => [{}], visibility: 'visible', contains: el => el === behind };
+  const p = page([['Control+D', { name: 'behind' }], ['Control+S', { name: 'inside' }]], { modals: [modal], ariaModals: [coveredSheet] });
+  const [behind, inside] = p.buttons;
+  expect(p.key('d', 'KeyD', { metaKey: false, ctrlKey: true })).toBe(false);
+  expect(p.key('s', 'KeyS', { metaKey: false, ctrlKey: true })).toBe(true);
+  expect(p.clicks).toEqual(['inside']);
+
+  const hiddenSheet = { getClientRects: () => [{}], visibility: 'hidden', contains: () => false };
+  const visible = page([['Control+D', { name: 'page' }]], { ariaModals: [hiddenSheet] });
+  expect(visible.key('d', 'KeyD', { metaKey: false, ctrlKey: true })).toBe(true);
+  expect(visible.clicks).toEqual(['page']);
 });

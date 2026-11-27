@@ -1,5 +1,6 @@
 //! Raspberry Pi camera probe: one explicitly enabled stream, latest frame only.
 //! This is not the cross-platform @exact/camera implementation.
+use super::{Bitmap, Report};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -149,6 +150,56 @@ impl Drop for Camera {
             session.stop.store(true, Ordering::Relaxed);
             let _ = session.thread.join();
         }
+    }
+}
+
+impl super::Images {
+    pub(super) fn sync_camera(&mut self) {
+        self.camera
+            .request(self.views.values().any(|v| v.source == SOURCE && v.visible));
+    }
+
+    pub(super) fn poll_camera(&mut self) -> Vec<Report> {
+        let output = self.camera.poll(&self.backend);
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        let mut reports = Vec::new();
+        match output {
+            Ok(pixels) => {
+                let natural = (pixels.width(), pixels.height());
+                let bytes = pixels.data().len() as u64;
+                let Ok(reservation) = self.backend.session.reserve_allocation(bytes) else {
+                    return reports;
+                };
+                let Ok(charge) = reservation.commit(bytes) else {
+                    return reports;
+                };
+                let bitmap = Arc::new(Bitmap::decoded(pixels, natural, charge));
+                for (id, view) in &mut self.views {
+                    if view.source == SOURCE && view.visible {
+                        self.bitmaps.insert(*id, bitmap.clone());
+                        view.displayed_source = view.source.clone();
+                        self.load_events.extend(view.settle(*id, None));
+                        reports.push((*id, Some((natural.0 as f32, natural.1 as f32))));
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Camera: {error}");
+                for (id, view) in &mut self.views {
+                    if view.source == SOURCE {
+                        self.bitmaps.remove(id);
+                        // A stream can fail after its first successful image load.
+                        view.settled = false;
+                        self.load_events
+                            .extend(view.settle(*id, Some(error.clone())));
+                        reports.push((*id, None));
+                    }
+                }
+            }
+        }
+        reports
     }
 }
 

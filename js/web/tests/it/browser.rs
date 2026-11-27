@@ -222,7 +222,7 @@ const startupStub=()=>{
       exact_compat:()=>out({inputs:{app:'test.startup'}}),exact_logic:()=>out(rustOnly?null:{appId:'test.startup',grants:''}),
       ...(rustOnly?{}:{exact_module_artifact:()=>0}),
       exact_plan:()=>out([]),exact_plan_fonts:()=>out([]),exact_boot:()=>out(batch),exact_boot_plan:()=>out(batch),
-      exact_agent:()=>out({nodes:[]}),
+      exact_set_screen_reader:()=>{},exact_agent:()=>out({nodes:[]}),
       exact_data_ready:()=>{startup.activations++;startup.activated=true;startup.painted=!!document.getElementById('exact-root').dataset.frameCallbackMs;return out({ops:[
         {op:'props',id:7,set:{disabled:'true'},clear:[]},
         {op:'props',id:8,set:{},clear:['disabled']}
@@ -347,8 +347,9 @@ try {
     const answer=(source,args=[])=>call({op:'answer',id:module.id,source,args,store:[['token','old']],grants:['token']});
     const results=[];
     for(const name of ['alias','random','constructor','intl'])results.push(await checkpoint(answer(name)));
-    // Each refused with its way out (Math.random's names crypto.getRandomValues since 24bf4fc341).
-    if(!results.every(r=>r.kind==='Unavailable'&&r.message?.includes('is unavailable in data sources')&&/pass (time or )?a (random )?seed/.test(r.message)))throw new Error(JSON.stringify(results));
+    // Virtualized clock and Math.random() succeed and report clock/entropy taint (LLP 1195.000 D2).
+    if(!results.every(r=>r.tag===0))throw new Error(JSON.stringify(results));
+    if(!results[0].clockRead||!results[1].entropy||!results[2].clockRead||!results[3].clockRead)throw new Error('missing taint flags: '+JSON.stringify(results));
     if((await checkpoint(answer('explicit',[0]))).value!==1970)throw new Error('explicit date arithmetic changed');
     const written=await checkpoint(answer('write'));
     if(written.value!=='old'||written.reads[0]!=='token'||written.writes[0][1]!=='next')throw new Error('store seam changed');
@@ -406,17 +407,29 @@ try {
         if (!init.value?.includes('during module initialization')) throw new Error(`${placement}: host read during initialization`);
       } finally { realm.dispose(); }
     }
-    const forms=['now','new','call','call-with-arg','random','alias-now','alias-random','alias-date','prototype-constructor','computed-now','computed-random','bound-now','bound-new','reflect','intl-format','intl-format-undefined','intl-parts','intl-parts-undefined','intl-format-alias','intl-format-alias-undefined','intl-parts-alias','intl-parts-alias-undefined','intl-format-getter','intl-format-computed','intl-parts-prototype'];
-    for(const form of forms){
+    const virtualForms=['now','new','call','call-with-arg','random','alias-now','alias-random','alias-date','prototype-constructor','computed-now','computed-random','bound-now','bound-new','reflect','intl-format','intl-format-undefined','intl-parts','intl-parts-undefined','intl-format-alias','intl-format-alias-undefined','intl-parts-alias','intl-parts-alias-undefined','intl-format-getter','intl-format-computed','intl-parts-prototype'];
+    for(const form of virtualForms){
       const initial=await invoke(inputs,'atInit',[form]);
       const direct=await invoke(inputs,'ambient',[form]);
       const pending=await invoke(inputs,'ambientLater',[form]);
       if(pending.request?.url!=='https://fixture.exact.test/value')throw new Error('missing ambient request');
       const resumed=await invoke(inputs,'ambientLater',[form],[],[],response());
-      if(!initial.value?.includes('as an argument')||direct.tag!==2||direct.message!==initial.value||resumed.tag!==2||resumed.message!==initial.value)throw new Error(`guard parity ${form}: ${JSON.stringify({initial,direct,resumed})}`);
+      if(!initial.value?.startsWith('UNGUARDED: ')||direct.tag!==0||resumed.tag!==0)throw new Error(`virtualized parity ${form}: ${JSON.stringify({initial,direct,resumed})}`);
     }
-    let initRefused=false;try{await prepare(await payload(fixtures['ambient-init'],inputsIdentity),inputsIdentity);}catch{initRefused=true;}
-    if(!initRefused)throw new Error('uncaught init did not refuse');
+    for(const form of ['interval','computed-interval','frame']){
+      const initial=await invoke(inputs,'atInit',[form]);
+      const direct=await invoke(inputs,'ambient',[form]);
+      const pending=await invoke(inputs,'ambientLater',[form]);
+      if(pending.request?.url!=='https://fixture.exact.test/value')throw new Error('missing ambient request');
+      const resumed=await invoke(inputs,'ambientLater',[form],[],[],response());
+      if(!initial.value?.includes('as an argument')||direct.tag!==2||direct.message!==initial.value||resumed.tag!==2||resumed.message!==initial.value)throw new Error(`timer guard parity ${form}: ${JSON.stringify({initial,direct,resumed})}`);
+    }
+    // Module-level Date.now() loads cleanly and latches moduleClock taint (LLP 1195.000 D2.5).
+    const ambientInit=await prepare(await payload(fixtures['ambient-init'],inputsIdentity),inputsIdentity);
+    try {
+      const check=await invoke(ambientInit,'explicit',[0,7]);
+      if(check.tag!==0||!check.moduleClock)throw new Error(`expected moduleClock taint: ${JSON.stringify(check)}`);
+    } finally { ambientInit.dispose(); }
     for(const [ms,year] of [[0,'1970'],[1709210096789,'2024'],[-1,'1969']])if((await invoke(inputs,'intl',[ms])).value!==Array(4).fill(year).join('/'))throw new Error('Intl explicit parity');
     if((await invoke(inputs,'utc')).value!=='2024-02-29T12:34:56.789Z/12/1709210096789/true')throw new Error('UTC parity');
     const argumentsList=[[0,7],[1000,8]];
@@ -602,7 +615,7 @@ try {
     const wrote=await run(turn.continuation);
     if(wrote.value!=='committed'||wrote.reads[0]!=='token'||wrote.writes[0][1]!=='next')throw new Error(`worker turn read the answer-time store: ${JSON.stringify(wrote)}`);
     const guarded=await checkpoint(call({op:'answer',id:placed.id,source:'alias',args:[],store:[],grants:[]}));
-    if(!guarded.message?.includes('pass time or a random seed'))throw new Error('worker realm lost the ambient guards');
+    if(guarded.tag!==0||!guarded.clockRead)throw new Error('worker realm lost the virtual clock: '+JSON.stringify(guarded));
     const discarded=call({op:'answer',id:placed.id,source:'write',args:[],store:[],grants:['token']});
     call({op:'discard',id:placed.id,token:discarded.continuation});
     let gone=false;try{await run(discarded.continuation);}catch{gone=true;}
@@ -699,26 +712,32 @@ try {
       // A picked file's entry is the browser's own File (LLP 1069.002 D5).
       await files.putBlob('app:/data/picked.jpg',new File([photo],'picked.jpg',{type:'image/jpeg'}));
       files.close();
-      const sent=[], fetchBefore=globalThis.fetch;
-      globalThis.fetch=async(url,init)=>{
-        sent.push({url:String(url),body:init.body,headers:init.headers});
-        return Object.defineProperty(new Response('stored'),'url',{value:String(url)});
+      const sent=[], fetchBefore=globalThis.fetch, RequestBefore=globalThis.Request;
+      // Fetch exposes a stream on the constructed request. Keep the input to check that the host passed a Blob.
+      globalThis.Request=class extends RequestBefore {
+        constructor(input,init){super(input,init);this.sourceInit=init;}
+      };
+      globalThis.fetch=async request=>{
+        sent.push(request);
+        return Object.defineProperty(new Response('stored'),'url',{value:request.url});
       };
       try {
         const host={grantSet:storageIdentity.grantSet,controllers:new Set(),bodyFile:(path,grants)=>requestBody(storageIdentity.appId,grants,path)};
         const op=(path,headers=[])=>({op:'request',ticket:1,method:'POST',url:'https://example.test/upload',headers,body:'',bodyFrom:path,cache:'default',scope:null});
         const typed=await runRequest(op('app:/data/photo.jpg',[['content-type','image/jpeg']]),host);
         const picked=await runRequest(op('app:/data/picked.jpg'),host);
-        if(typed.kind!==0||picked.kind!==0||sent.length!==2)throw new Error(`exactBodyFrom on the page: ${typed.kind} ${picked.kind} ${sent.length}`);
+        for(const reply of [typed,picked])if(reply.kind!==0)throw new Error(`exactBodyFrom on the page: kind ${reply.kind}: ${new TextDecoder().decode(reply.body)}`);
+        if(sent.length!==2)throw new Error(`exactBodyFrom on the page: ${sent.length} fetches`);
         for(const reply of [typed,picked])if(reply.status!==200||new TextDecoder().decode(reply.body)!=='stored')throw new Error('exactBodyFrom: the upload reply changed');
         // The file's bytes as a Blob with no type, so the browser adds no Content-Type; the author's headers as they were.
-        for(const one of sent)if(!(one.body instanceof Blob)||one.body.type!==''||await hash(await one.body.arrayBuffer())!==await hash(photo))throw new Error('exactBodyFrom: the body is not the file as an untyped Blob');
-        if(JSON.stringify(sent[0].headers)!=='[["content-type","image/jpeg"]]'||sent[1].headers.length)throw new Error('exactBodyFrom: the headers changed');
+        for(const one of sent)if(!(one.sourceInit.body instanceof Blob)||one.sourceInit.body.type!==''||await hash(await one.arrayBuffer())!==await hash(photo))throw new Error('exactBodyFrom: the body is not the file as an untyped Blob');
+        if(JSON.stringify(sent[0].sourceInit.headers)!=='[["content-type","image/jpeg"]]'||sent[1].sourceInit.headers.length)throw new Error('exactBodyFrom: the author headers changed before fetch');
+        if(JSON.stringify([...sent[0].headers])!=='[["content-type","image/jpeg"]]'||[...sent[1].headers].length)throw new Error('exactBodyFrom: the headers changed');
         const refusal=async path=>{const r=await runRequest(op(path),host);return r.kind+' '+new TextDecoder().decode(r.body);};
         const denied=await refusal('app:/tmp/photo.jpg'), missing=await refusal('app:/data/absent.jpg');
         if(!denied.startsWith('2 exactBodyFrom app:/tmp/photo.jpg: denied: fs.read')||!missing.startsWith('2 exactBodyFrom app:/data/absent.jpg: no such file')||sent.length!==2)
           throw new Error(`exactBodyFrom's refusals on the page: ${denied} / ${missing}`);
-      } finally {globalThis.fetch=fetchBefore;}
+      } finally {globalThis.fetch=fetchBefore;globalThis.Request=RequestBefore;}
     }
     onWorker.dispose();
     const workerCount=workersCreated;
@@ -993,7 +1012,7 @@ try {
       if(canonical(actual)!==canonical(test.expected))throw new Error(`Caltrain parity ${test.source}: ${JSON.stringify({actual,expected:test.expected})}`);
     }
     train.dispose();
-    return {ecdsa:globalThis.ecdsaResult,guards:forms.length,caltrain:fixtures.oracle.length,store:true,isolated:true,refusals:true,async:true,storage:true,sqliteReload:{coldMs,warmMs}};
+    return {ecdsa:globalThis.ecdsaResult,guards:virtualForms.length,caltrain:fixtures.oracle.length,store:true,isolated:true,refusals:true,async:true,storage:true,sqliteReload:{coldMs,warmMs}};
   };
   // Its busy-storage steps each wait out a lock's 10 s bound (storage-fs.js `lockPaths`, since 837ecf4360): past CDP's 15 s.
   const result=await cdp.send('Runtime.evaluate',{expression:`(${probe.toString()})(${JSON.stringify(fixtures)})`,returnByValue:true,awaitPromise:true},sessionId,240000);

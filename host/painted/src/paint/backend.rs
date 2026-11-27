@@ -139,6 +139,11 @@ pub trait Backend {
     fn present_statistics(&self) -> Option<exact_ink::device::d3d11::PresentStatistics> {
         None
     }
+    /// The hardware device a hidden window keeps (`D3d11::keep_hidden`).
+    #[cfg(windows)]
+    fn keep_hidden_device(&self) -> Option<exact_ink::device::d3d11::Hidden> {
+        None
+    }
     /// Attach the carrier's owned window when the device can present directly.
     #[cfg(windows)]
     fn attach_window(
@@ -165,6 +170,10 @@ pub trait Backend {
     /// A new frame of this size in points at this scale, cleared to the
     /// page's colour ([`Backend::page`]; white until one is told).
     fn begin(&mut self, width: f32, height: f32, scale: f32);
+    /// The raster backing's origin and size in device pixels after `begin`.
+    fn raster_extent(&self) -> Option<crate::placement::RasterExtent> {
+        None
+    }
     /// Release idle renderer storage, keeping the visible frame unless hidden.
     fn trim(&mut self, _hidden: bool) {}
     /// Storage from a presented frame after its last reader releases it.
@@ -332,6 +341,10 @@ pub trait Backend {
         _direct: bool,
     ) {
     }
+    /// An element alive and shown nowhere: a video in a hidden `portal`
+    /// mover (LLP 1013.002 D5), whose player a reader that hosts players
+    /// keeps, or a module view that paints nothing (`Painter::unpainted`).
+    fn held(&mut self, _id: ViewId, _kind: NativeKind, _props: &str) {}
     /// An audio player whose element has no visible controls to place.
     fn boxless_audio(&mut self, id: ViewId, props: &str) {
         self.native(
@@ -404,6 +417,12 @@ pub trait Backend {
     fn rows(&self) -> bool {
         false
     }
+    /// Whether what this backend draws is replayed on a display's pixels,
+    /// box by box: the painter then draws each box on whole pixels
+    /// (`Painter::drawn`).
+    fn pixel_grid(&self) -> bool {
+        false
+    }
     /// Whether this geometry walk can read existing row metadata without
     /// recording, drawing or freeing rows on the backend.
     fn geometry_rows(&self) -> bool {
@@ -461,6 +480,11 @@ pub trait Backend {
     fn row_draw_through(&mut self, _id: u32, _ts: Transform, _bounds: Rect4) {}
     /// Kept row `id` is not drawn again.
     fn row_free(&mut self, _id: u32) {}
+    /// Whether this backend can open a scroller's row group right now (not
+    /// inside a row, layer, shared element or slot recording).
+    fn can_group(&self) -> bool {
+        true
+    }
     /// The rows of scroller `id`, painted at its `scroll` offset, follow
     /// until [`Backend::group_end`].
     fn group_begin(&mut self, _id: ViewId, _scroll: (f32, f32)) {}
@@ -495,7 +519,7 @@ pub trait Backend {
         _ts: Transform,
         _pivot: (f32, f32),
         _reference: (f32, f32),
-        _base: [f32; 7],
+        _base: [f32; 8],
     ) -> bool {
         false
     }
@@ -517,27 +541,6 @@ pub trait Backend {
 }
 
 impl super::Painter {
-    pub(crate) fn recycle_frame(&mut self, pixels: Arc<Pixmap>) {
-        if let Ok(pixels) = Arc::try_unwrap(pixels) {
-            self.backend.recycle_frame(pixels);
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn recycle_window_layers(
-        &mut self,
-        below: Pixmap,
-        above: Arc<Pixmap>,
-        rows: (u32, u32),
-    ) {
-        // Damage snapshots contain only the overlay after a split, not a
-        // complete CPU picture. A window repaint rebuilds both layers.
-        self.damage.pixels = None;
-        self.damage.next.clear();
-        self.backend
-            .recycle_window_layers(below, Arc::try_unwrap(above).ok(), Some(rows));
-    }
-
     #[cfg(target_os = "macos")]
     pub(crate) fn attach_apple_layer(
         &mut self,
@@ -579,6 +582,10 @@ impl super::Painter {
     #[cfg(windows)]
     pub(crate) fn present_statistics(&self) -> Option<exact_ink::device::d3d11::PresentStatistics> {
         self.backend.present_statistics()
+    }
+    #[cfg(windows)]
+    pub(crate) fn keep_hidden_device(&self) -> Option<exact_ink::device::d3d11::Hidden> {
+        self.backend.keep_hidden_device()
     }
     #[cfg(windows)]
     pub(crate) fn attach_window(

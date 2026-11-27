@@ -44,6 +44,7 @@ pub use host_kinds::{HistorySwipe, ScrollDrag};
 mod pointer;
 pub use pointer::{AtomEvent, DropEvent, MouseEvent, PointerEvent, WheelEvent};
 mod intersect;
+mod mounted_reorder;
 mod reorder;
 mod reorder_codec;
 mod reorder_group;
@@ -64,6 +65,7 @@ mod forma;
 mod root_font;
 mod shown;
 mod sounds;
+mod surface_colors;
 mod theme;
 pub use event::{
     ActionBinding, ActionBindingError, ActionBindingRefusal, ControlValue, Event, KeyModifiers,
@@ -87,8 +89,8 @@ mod source;
 mod tabs;
 pub use source::{
     Announce, BackgroundState, DataError, DataSource, DataSourceWrapper, InFlight, Interrupt,
-    Native, NativeCall, NativeHandler, Overlaid, PreloadWake, Report, Reporter, ResourceChange,
-    SnapshotModule, Target, Write, BACKGROUND,
+    Native, NativeCall, NativeHandler, Overlaid, PreloadWake, QueuedSendReplacer, Report, Reporter,
+    ResourceChange, SnapshotModule, Target, Write, BACKGROUND,
 };
 mod delivery;
 mod links;
@@ -150,7 +152,7 @@ mod apply;
 mod live_time;
 pub mod midi;
 mod modules;
-pub use modules::AppState;
+pub use modules::{check_arrival_field, check_source_substitute, AppState};
 mod calls;
 pub use calls::CallHow;
 mod module_seam;
@@ -162,7 +164,7 @@ mod provenance;
 mod seams;
 pub use audio_seam::{Audio, LinkedAudio, NoAudio};
 pub use list_seam::Lists;
-pub(crate) use processes::refusal as process_refusal;
+pub(crate) use processes::held as process_held;
 pub use provenance::CallOrigin;
 pub use seams::{ModuleLinks, PresenceSecrets, TextAxes, Tools};
 mod wakes;
@@ -180,7 +182,6 @@ mod transport_tests;
 mod uploads;
 mod viewport;
 mod writes;
-
 use crate::instance::{Ids, InstanceError, InstanceStep, SurfaceUpdate, Tree, Update};
 use crate::request::{Answer, Dispatch, Outcome, Request, RequestClass, RequestOut};
 use crate::store::{Store, StoreWrite};
@@ -193,16 +194,7 @@ pub use router::{launch_matches, routing, RouterChange, Routing};
 pub use split::{press_writes_router, RouteInspector, StackSplit};
 pub use uploads::{UploadEnd, UploadMark};
 
-/// A host-facing effect an action asked for; executed after commit, in order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Command {
-    /// The capability name.
-    pub name: String,
-    /// Its arguments.
-    pub args: Vec<Value>,
-    /// The node whose input ran the action, when a host event did: where a command that shows system UI anchors it (LLP 1069.003 D3). `None` for a timer, an answer, or anything else no input dispatched.
-    pub source: Option<ViewId>,
-}
+pub use crate::commands::Command;
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(Debug))]
@@ -277,7 +269,7 @@ struct PendingReq {
     completion: Option<CompletionReply>,
     module: Option<ModuleInstance>,
     inspection_generation: u64,
-    refusal: Option<(&'static str, bool)>,
+    refusal: Option<(String, bool)>,
     /// The host refused this ordered request before execution (LLP 1041 §8.4).
     /// Earlier source turns may already have executed effects.
     refused: bool,
@@ -303,9 +295,8 @@ struct PendingReq {
     sent: bool,
     /// A stream's: the grant line that admits it (`state.streams`).
     grant: Option<String>,
-    /// A topic its resource watches changed while it was in flight: its
-    /// reply lands, then the resource is asked again (LLP 1016.002 D4).
-    ask_again: bool,
+    /// Changes owed one ask when this answer lands (LLP 1054.000.000 D3).
+    ask_again: resources::AskAgain,
     /// Module work wrote the store while it was in flight, leaving this store
     /// revision: until another write, its answer stands (LLP 1146 §2.3).
     module_again: Option<u64>,
@@ -371,11 +362,9 @@ impl PendingReq {
 
 type FocusPath = Vec<(ViewId, NodesId, Vec<Frame>)>;
 
-/// A send made before the data source was ready: its target, source and
-/// arguments, and the origin and invocation of the commit that made it,
-/// which `data_ready` sends it under (LLP 1133.002 D12), as a queue's
-/// waiting send keeps them (`queue.rs`).
-type Unsent = (Target, String, Vec<Value>, (CallOrigin, u64));
+/// A send made before the data source was ready: its target, source,
+/// arguments and the cause `data_ready` sends it under (LLP 1133.023 D7a).
+type Unsent = (Target, String, Vec<Value>, provenance::Cause);
 /// A send's request this commit hands out once it stands.
 type Later = (Target, String, Vec<Value>, Request);
 
@@ -386,12 +375,15 @@ pub struct Runner<D: DataSource> {
     strings: vm::Strings,
     sites: crate::instance::SiteIndex,
     inspection_digest: std::cell::OnceCell<String>,
-    /// The plan's tab panel sites and whether each needs a navigation controller (`Runner::panels_need_navigation`).
+    /// Panel templates with a route that can request a split.
+    split_panel_sites: std::cell::OnceCell<Vec<NodesId>>,
+    /// The plan's tab panel sites and whether each needs a navigation controller.
     panel_navigation: std::cell::OnceCell<(Vec<NodesId>, Vec<bool>)>,
     /// [`Runner::keeps_midi`], made at the first agent read.
     keeps_midi: std::cell::OnceCell<bool>,
     action_binding_origin: std::rc::Rc<()>,
     detached_focus: Vec<(ViewId, FocusPath)>,
+    floating_videos: std::collections::BTreeMap<ViewId, event::FloatingVideo>,
     data: D,
     bake_warnings: Vec<String>,
     kernel: Kernel,
@@ -441,6 +433,7 @@ pub struct Runner<D: DataSource> {
     /// Refused requests, for `state` (LLP 1070.000 §2.2).
     into_view_refused: std::collections::VecDeque<String>,
     surfaces: Vec<SurfaceUpdate>,
+    surface_colors: surface_colors::Bindings,
     /// Views the next applied batch renews (LLP 1078): rebound list rows.
     renewed: Vec<ViewId>,
     /// Rows the next batch mounts out of their port, and those that showed (LLP 1055 D13).
@@ -485,7 +478,7 @@ pub struct Runner<D: DataSource> {
     pending_mut: Vec<bool>,
     failed_mut: Vec<Option<crate::failure::Failure>>,
     /// Mutations whose answer landed in the commit being made; their `then` actions are armed once it stands (LLP 1016.001).
-    landed: Vec<usize>,
+    landed: Vec<(usize, provenance::Cause)>,
     /// Sends made before the data source was ready, sent at `data_ready`
     /// (LLP 1027 D4): pending meanwhile, one per mutation but a parallel
     /// one, which keeps each.
@@ -608,6 +601,10 @@ pub struct Runner<D: DataSource> {
     geometry: geometry_facts::Facts,
     // @ref LLP 1069.000 D2 — visibility, connectivity, the share sheet.
     platform: crate::page::Platform,
+    // @ref LLP 1094.000 D2 — each node's standing drag refusals, by its url
+    // or its files, each by what was refused, so a refusal is journaled once
+    // while it stands.
+    drag_refused: std::collections::HashMap<(exact_kernel::ViewId, bool), Vec<String>>,
     page: crate::page::Page,
     presented: crate::page::Presented, // `exactPage().presented` (LLP 1069.000 D2)
     window_name: String,               // the page's `name` (LLP 1030.004 D2)
@@ -769,8 +766,8 @@ impl<D: DataSource> Runner<D> {
                 fix: format!(
                     "the plan names {plan:?} and this binary's data source {host:?}. If the plan is this app's own \
                      (baked from its app.json), the data source is wrong: a Rust data crate's `fn app_id` (one copied \
-                     from a sample keeps the sample's) or app.ts's `appId` must say {plan:?}, or remove that \
-                     `fn app_id` to take app.json's. If the plan came from elsewhere (another app's dev server, \
+                     from a sample keeps the sample's) or app.ts's `appId`, its own or one it re-exports from shared \
+                     code, must say {plan:?}, or not be exported, to take app.json's. If the plan came from elsewhere (another app's dev server, \
                      update or link), the plan is the wrong one: change nothing in the app",
                     plan = plan.app_id,
                     host = data.app_id()
@@ -882,13 +879,16 @@ impl<D: DataSource> Runner<D> {
             strings,
             failed_mut: vec![None; plan.mutations.len()],
             audio: audio_seam::AudioState(seams.audio.state(&plan, &data)),
+            page: crate::time::launch_page(&plan),
             plan,
             inspection_digest: std::cell::OnceCell::new(),
+            split_panel_sites: std::cell::OnceCell::new(),
             panel_navigation: std::cell::OnceCell::new(),
             keeps_midi: std::cell::OnceCell::new(),
             action_binding_origin: std::rc::Rc::new(()),
             completion_identity: Default::default(),
             detached_focus: Vec::new(),
+            floating_videos: Default::default(),
             data,
             kernel,
             slots: Vec::new(),
@@ -932,6 +932,7 @@ impl<D: DataSource> Runner<D> {
             intersections: Vec::new(),
             into_view_refused: Default::default(),
             surfaces: Vec::new(),
+            surface_colors: Default::default(),
             renewed: Vec::new(),
             shown: Default::default(),
             reuse: false,
@@ -981,7 +982,8 @@ impl<D: DataSource> Runner<D> {
             churn: Default::default(),
             activities: activities::Activities::default(),
             extensions: module_seam::ModuleState(seams.modules.state()),
-            origins: Default::default(),
+            // Boot is the app's (LLP 1133.023 D7a), until `booted` below.
+            origins: provenance::Origins::booting(),
             processes: Default::default(),
             wakes: Default::default(),
             calls: Default::default(),
@@ -992,13 +994,13 @@ impl<D: DataSource> Runner<D> {
             viewport,
             viewport_geometry,
             geometry: Default::default(),
-            page: Default::default(),
             presented: crate::page::Presented::at_boot(),
             time: crate::time::launch_time(),
             live_times: Default::default(),
             text_axes: seams::TextAxesState(seams.text_axes.state()),
             place: launched_place.clone().unwrap_or_default(),
             platform: crate::page::Platform::at_boot(),
+            drag_refused: Default::default(),
             window_name: crate::time::launch_window_name(),
             host_direction: crate::time::launch_direction(),
             surface_records: Default::default(),
@@ -1036,42 +1038,14 @@ impl<D: DataSource> Runner<D> {
             fragment_warned: Default::default(),
             conformed: Default::default(),
         };
+        runner.seams.modules.launch_substitutes(&mut runner)?;
         runner.record_replacement(carried);
         runner.init_slots(carried, launch)?;
         runner.carry_modes(carried.map_or(&[], |c| &c.modes));
         runner.ask_kept_scheme();
         runner.derives = vec![None; runner.plan.derives.len()];
-        // Resources: carry only the same named source and a value that still fits the declared shape; a carried value can refuse nothing.
-        let carried_resources = (0..runner.plan.resources.len())
-            .map(|i| {
-                let name = runner.plan.str(runner.plan.resources[i].name);
-                let source = runner.plan.str(runner.plan.resources[i].source);
-                carried
-                    .filter(|_| same_logic)
-                    .and_then(|c| {
-                        c.resources
-                            .iter()
-                            .find(|(n, s, _, _)| n == name && s == source)
-                    })
-                    .filter(|(_, _, _, value)| runner.check_shape(i, value).is_ok())
-                    .map(|(_, _, args, value)| ResourceState {
-                        inspection_generation: 0,
-                        args: args.clone(),
-                        value: crate::held::Held::new(value.clone()),
-                        store_revision: runner.store.revision(),
-                        placeholder: false,
-                        kept_seed: false,
-                        from_page: false,
-                        answered_for: None,
-                        asleep: false,
-                        slept: false,
-                        origin: 0,
-                    })
-            })
-            .collect::<Vec<_>>();
-        for (row, state) in runner.resources.iter_mut().zip(carried_resources) {
-            row.state = state;
-        }
+        runner.sync_store_clock();
+        runner.adopt_carried_resources(carried, same_logic);
         // @ref LLP 1016.000 D10 — the uploads asked, carried by resource,
         // source and arguments whatever the data module; a launch starts with none.
         runner.carry_uploads_in(carried.map_or(&[][..], |c| &c.uploads));
@@ -1168,6 +1142,7 @@ impl<D: DataSource> Runner<D> {
         }
         drop(booting);
         runner.roles.install();
+        runner.origins.booted();
         Ok(runner)
     }
 

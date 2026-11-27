@@ -190,6 +190,13 @@ fn unavailable(s: impl Into<String>) -> DataError {
     DataError::Unavailable(s.into())
 }
 impl<D: DataSource> exact_runner::DataSourceWrapper for Storage<D> {
+    fn queued_send_replacer(
+        &mut self,
+        source: Option<&str>,
+    ) -> Option<exact_runner::QueuedSendReplacer> {
+        self.source.queued_send_replacer(source)
+    }
+
     fn prepare_snapshot(
         &mut self,
         module: Option<exact_runner::SnapshotModule<'_>>,
@@ -218,6 +225,10 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Storage<D> {
 
     fn render_web(&mut self) {
         self.source.render_web();
+    }
+
+    fn ambient_taint(&self, source: &str) -> (bool, bool) {
+        self.source.ambient_taint(source)
     }
 
     fn preload(&self) -> Result<bool, DataError> {

@@ -177,14 +177,14 @@ impl<D: DataSource> Runner<D> {
         }
         let what = super::lines::fulfilling(ticket, &self.target_name(p.target), &summary);
         let target = p.target;
+        let again = p.ask_again;
         // An answer lands as a commit of its request's origin (LLP 1133.002
         // D12), with every cause the request has (LLP 1133.035 D16 item 6).
-        let (origin, id) = (self.ticket_origin(ticket), self.ticket_id(ticket));
-        let causes = self.ticket_causes(ticket);
-        let result = self.as_invocation_caused(origin, id, causes, |r| r.fulfill_inner(p, outcome));
+        let cause = self.ticket_cause(ticket);
+        let result = self.as_cause(cause, |r| r.fulfill_inner(p, outcome));
         self.conclude(checkpoint, &result, was_poisoned);
         // Its `then` is armed under the same origin, invocation and causes.
-        self.as_invocation_caused(origin, id, causes, |r| r.arm_then(result.is_ok()));
+        self.as_cause(cause, |r| r.arm_then(result.is_ok()));
         self.arm_next(result.is_ok());
         self.log_outcome(&what, &result, was_poisoned);
         if let (Some(handles), Err(_)) = (handles, &result) {
@@ -212,7 +212,8 @@ impl<D: DataSource> Runner<D> {
                 );
             }
         }
-        result.map(Some)
+        self.as_cause(cause, |r| r.after_kept_read(target, ticket, again, result))
+            .map(Some)
     }
 
     /// One message of the open stream at `pos` (LLP 1016.000 D1): parsed
@@ -251,9 +252,8 @@ impl<D: DataSource> Runner<D> {
         // D12), with every cause its request has (LLP 1133.035 D16 item 6),
         // as a one-shot's reply does: a stream a tool asked answers as the
         // tool's, frame after frame.
-        let (origin, id) = (self.ticket_origin(ticket), self.ticket_id(ticket));
-        let causes = self.ticket_causes(ticket);
-        let result = self.as_invocation_caused(origin, id, causes, |r| r.fulfill_inner(p, outcome));
+        let cause = self.ticket_cause(ticket);
+        let result = self.as_cause(cause, |r| r.fulfill_inner(p, outcome));
         // What the mapper staged answering this frame (LLP 1016.000 D7):
         // addressed for the commit, or left staged by a frame that failed.
         // The commit's answers may have sent too (its amendment of
@@ -263,7 +263,7 @@ impl<D: DataSource> Runner<D> {
         let replied = left || self.sockets[before..].iter().any(mapper);
         self.conclude(checkpoint, &result, was_poisoned);
         crate::stream_timing::committed(result.is_ok());
-        self.as_invocation_caused(origin, id, causes, |r| r.arm_then(result.is_ok()));
+        self.as_cause(cause, |r| r.arm_then(result.is_ok()));
         self.arm_next(result.is_ok());
         self.log_outcome(&what, &result, was_poisoned);
         // Or by one whose answer reopened the stream, which sends none.
@@ -313,9 +313,9 @@ impl<D: DataSource> Runner<D> {
             }
             (_, outcome) => outcome,
         };
-        self.store.set_clock_ms(self.now_ms);
-        let (reads_before, revision_before) = (self.store.reads(), self.store.revision());
-        let draws_before = self.store.entropy_draws();
+        self.sync_store_clock();
+        let obs_before = self.store.observations();
+        let revision_before = self.store.revision();
         let parsed = if Self::activity_send(&p.source) {
             Self::activity_reply(&self.plan, ty, outcome).map(Some)
         } else if self.plan.module_named(&p.source).is_some() {
@@ -359,9 +359,12 @@ impl<D: DataSource> Runner<D> {
         if let Target::Resource(i) = p.target {
             // A read in a later turn (after an `await`) makes a store reader
             // as one in the first does (LLP 1146 §2.3).
-            if self.store.reads() > reads_before {
-                let contents = self.note_reads(i, reads_before, draws_before);
-                self.module_work.reply_reader = Some((i, contents));
+            if self.store.reads() > obs_before.0 || self.store.clock_reads() > obs_before.2 {
+                let store_read = self.store.reads() > obs_before.0;
+                let contents = self.note_reads(i, obs_before);
+                if store_read {
+                    self.module_work.reply_reader = Some((i, contents));
+                }
             }
             for topic in self.store.take_topics() {
                 if !self.resources[i].watching.contains(&topic) {
@@ -503,8 +506,13 @@ impl<D: DataSource> Runner<D> {
                     let end = super::UploadEnd::Answered(value.clone());
                     self.upload_over(p.ticket, p.sent || !failed_end, end);
                 }
-                if p.ask_again {
-                    self.log(super::lines::asked_again(p.ticket, &name));
+                if p.ask_again.context {
+                    self.resources[i].landing_read = true;
+                }
+                if p.ask_again.refresh {
+                    if !p.ask_again.context {
+                        self.log(super::lines::asked_again(p.ticket, &name, false));
+                    }
                     self.force_refresh(i);
                 }
                 self.resources[i].state = Some(ResourceState {
@@ -531,7 +539,7 @@ impl<D: DataSource> Runner<D> {
                     self.failed_mut[m] = None;
                     self.land_send(m, slot, Value::some(value));
                 }
-                self.landed.push(m);
+                self.landed.push((m, self.cause()));
                 // The reply landed: what the mutation changed is asked again
                 // in this commit (LLP 1054.000.000 D1); its write shows until
                 // that answer lands.
@@ -578,7 +586,9 @@ impl<D: DataSource> Runner<D> {
             .iter_mut()
             .filter(|n| n.target == previous.target)
         {
-            next.ask_again |= previous.ask_again;
+            next.ask_again.refresh |= previous.ask_again.refresh;
+            next.ask_again.context |=
+                previous.ask_again.context && next.stream.is_none() && !next.upload;
             next.module_again = next.module_again.or(previous.module_again);
             next.origin = previous.origin;
             next.inspection_generation = previous.inspection_generation;

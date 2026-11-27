@@ -5,7 +5,10 @@
 //! kernel lays the route out inside what is left, as it lays a page out
 //! inside `env(safe-area-inset-*)`: the covered edges add to the box's
 //! padding. A box that a native bar replaces outright (a header whose
-//! heading the bar shows) is covered whole and laid out as `display: none`.
+//! heading the bar shows) is covered whole and laid out as `display: none`;
+//! one whose place the bar keeps in the page (a root tablist with a row
+//! between it and the panels, LLP 1083.000 D4) is laid out as an empty box
+//! as tall as the bar's room (`Room`).
 //! Authored rows never change, and a host that reports nothing (the web,
 //! Linux, the agent's presentation) lays out exactly as authored.
 //!
@@ -44,6 +47,16 @@ pub enum HostCover {
     Edges([f32; 4]),
     /// Replaced by a native control: the box takes no space.
     Whole,
+    /// Replaced by a native bar that shows some nodes inside the box in
+    /// views of its own (LLP 1141.004 D2): the box takes no space, as under
+    /// `Whole`, but a block the host gives a node inside it is laid out and
+    /// shown. A block the kernel implies (a popover's) waits, as under
+    /// `Whole`.
+    Bar,
+    /// Replaced by a native bar that keeps the box's place in the page: the
+    /// box is this many points tall, with no padding or border, and what it
+    /// holds takes no space and hides, as under `Whole`.
+    Room(f32),
     /// A scroller the platform insets by these points at its top and bottom
     /// edges: subtracted from its content box's height for layout, never
     /// moving the content, and left out of its published extent.
@@ -53,6 +66,19 @@ pub enum HostCover {
     Gutter([f32; 2]),
     /// Space the native table leaves above and below this row, outside its cell.
     RowSpacing([f32; 2]),
+}
+
+impl HostCover {
+    /// Whether the box takes no space: replaced by a native control or bar.
+    pub fn replaces(self) -> bool {
+        matches!(self, HostCover::Whole | HostCover::Bar)
+    }
+
+    /// Whether what the box holds takes no space and hides: replaced whole,
+    /// by a bar, or by one that keeps the box's room.
+    pub fn hides_content(self) -> bool {
+        matches!(self, HostCover::Whole | HostCover::Bar | HostCover::Room(_))
+    }
 }
 
 impl Kernel {
@@ -77,6 +103,7 @@ impl Kernel {
         let edges: &[f32] = match &cover {
             Some(HostCover::Edges(e)) => e,
             Some(HostCover::Inset(e) | HostCover::Gutter(e) | HostCover::RowSpacing(e)) => e,
+            Some(HostCover::Room(height)) => std::slice::from_ref(height),
             _ => &[],
         };
         if !edges.iter().all(|e| e.is_finite() && *e >= 0.0) {
@@ -95,7 +122,7 @@ impl Kernel {
         // A scroller the platform insets at the bottom edge, or stops
         // insetting, changes what the covered box it ends pads there
         // (`scroller_insets_bottom`), however deep.
-        let whole = |c: Option<HostCover>| c == Some(HostCover::Whole);
+        let whole = |c: Option<HostCover>| c.is_some_and(HostCover::replaces);
         let bottom = |c: Option<HostCover>| matches!(c, Some(HostCover::Inset([_, b])) if b > 0.0);
         // A box replaced or given back also leaves the chain or joins it.
         // So does a box that comes to be covered, or stops: the walk stops
@@ -110,8 +137,13 @@ impl Kernel {
                 || edges(before) != edges(cover)))
         .then(|| covering(&self.arena, slot))
         .flatten();
-        // And a block under it is hidden or shown with it (`block::apply`).
-        let blocks: Vec<u32> = if whole(before) != whole(cover) {
+        // And a block under it is hidden or shown with it (`block::apply`),
+        // which a bar's cover and a whole one decide apart.
+        let room = |c: Option<HostCover>| matches!(c, Some(HostCover::Room(_)));
+        let blocks: Vec<u32> = if whole(before) != whole(cover)
+            || (before == Some(HostCover::Bar)) != (cover == Some(HostCover::Bar))
+            || room(before) != room(cover)
+        {
             let arena = &self.arena;
             (arena.blocks.roots())
                 .filter(|b| *b != slot && arena.is_ancestor(slot, *b))
@@ -119,7 +151,17 @@ impl Kernel {
         } else {
             Vec::new()
         };
-        for slot in std::iter::once(slot).chain(chain).chain(blocks) {
+        // And its children take no space under a room, or take it back
+        let children: Vec<u32> = if room(before) != room(cover) {
+            self.arena.children(slot).to_vec()
+        } else {
+            Vec::new()
+        };
+        for slot in std::iter::once(slot)
+            .chain(chain)
+            .chain(blocks)
+            .chain(children)
+        {
             if let (Some(node), Some(layout)) = (self.arena.taffy(slot), self.layout.as_deref_mut())
             {
                 layout.restyle(&self.arena, slot, node);
@@ -208,8 +250,22 @@ pub(crate) fn apply(arena: &NodeArena, slot: u32, s: &mut taffy::style::Style) {
     // A popover is the host's to lift, out of flow, open or closed (`style::top_layer`).
     crate::style::top_layer::apply(arena, slot, s);
     let style = arena.effective_style(slot);
+    if arena
+        .parent(slot)
+        .and_then(|p| arena.cover(p))
+        .is_some_and(|c| matches!(c, HostCover::Room(_)))
+    {
+        s.display = taffy::style::Display::None;
+    }
     match arena.cover(slot) {
-        Some(HostCover::Whole) => s.display = taffy::style::Display::None,
+        Some(HostCover::Whole | HostCover::Bar) => s.display = taffy::style::Display::None,
+        Some(HostCover::Room(height)) => {
+            let height = taffy::style::Dimension::length(height);
+            (s.size.height, s.min_size.height, s.max_size.height) = (height, height, height);
+            s.padding = taffy::geometry::Rect::zero();
+            s.border = taffy::geometry::Rect::zero();
+            s.aspect_ratio = None;
+        }
         Some(HostCover::Edges(_)) => {
             let cleared = applied_padding(arena, slot);
             let [top, right, bottom, left] = added_padding(arena, slot);
@@ -289,7 +345,7 @@ fn scroller_insets_bottom(arena: &NodeArena, slot: u32) -> bool {
             s.display != crate::Display::None
                 // A popover is out of flow, open or closed (`style::top_layer`).
                 && crate::style::top_layer::layout_position(arena, c) != crate::PositionType::Absolute
-                && arena.cover(c) != Some(HostCover::Whole)
+                && !arena.cover(c).is_some_and(HostCover::replaces)
         };
         let Some(&last) = arena.children(at).iter().rev().find(flowing) else {
             return false;
@@ -506,6 +562,32 @@ fn lay_gutter(s: &mut taffy::style::Style, [right, bottom]: [f32; 2]) {
 /// A box's children changed: a covered box's bottom padding follows the
 /// scroller at its bottom edge (`scroller_insets_bottom`), so its engine
 /// style is derived again.
+/// Whether `slot` is a box a bar keeps the room of (`HostCover::Room`).
+pub(crate) fn is_room(arena: &NodeArena, slot: u32) -> bool {
+    matches!(arena.cover(slot), Some(HostCover::Room(_)))
+}
+
+/// The children of `new`, about to be `slot`'s, that come into a box a bar keeps the room of or
+/// leave one: their engine style changes with their parent (`apply`).
+pub(crate) fn room_moves(arena: &NodeArena, slot: u32, new: &[u32]) -> Vec<u32> {
+    let room = |p: Option<u32>| p.is_some_and(|p| is_room(arena, p));
+    let into = room(Some(slot));
+    new.iter()
+        .copied()
+        .filter(|&n| arena.parent(n) != Some(slot) && (into || room(arena.parent(n))))
+        .collect()
+}
+
+/// Lays `slots` out again, each taking no space under a room or taking its space back.
+pub(crate) fn restyle(arena: &NodeArena, layout: &mut dyn LayoutMirror, slots: &[u32]) {
+    for &slot in slots {
+        if let Some(node) = arena.taffy(slot) {
+            layout.restyle(arena, slot, node);
+            layout.mark_dirty(node);
+        }
+    }
+}
+
 pub(crate) fn children_changed(
     arena: &NodeArena,
     layout: &mut dyn LayoutMirror,

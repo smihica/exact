@@ -19,7 +19,7 @@ const GENERIC_STACKS: u16 = 8;
 
 /// Each text style's rows in each column, as a start: its weight and its
 /// leading (a ratio, or `normal`).
-static STARTS: LazyLock<Vec<[StyleProps; 4]>> = LazyLock::new(|| {
+static STARTS: LazyLock<Vec<[StyleProps; 5]>> = LazyLock::new(|| {
     crate::TEXT_STYLES
         .iter()
         .map(|style| {
@@ -259,6 +259,15 @@ impl NodeArena {
 
     /// [`crate::NodeRef::says`].
     pub(crate) fn says(&self, slot: u32, id: StyleId) -> bool {
+        // A platform text style the author wrote (`font="-exact-..."` or
+        // `font-size="-exact-..."`) owns its weight and leading (LLP 1115.000 D12.2).
+        if start_rows().has(id)
+            && self
+                .text_style_source(slot, id)
+                .is_some_and(|source| self.style(source).written.has(StyleId::FontSize))
+        {
+            return true;
+        }
         let mut current = Some(slot);
         while let Some(s) = current {
             let own = self.style(s);
@@ -275,11 +284,15 @@ impl NodeArena {
 
     /// Whether a symbol image here would draw in its author's `color`
     /// ([`crate::NodeRef::symbol_color_said`]) but for its source: the colour
-    /// is said, and the node is no native button's face.
+    /// is said, or is the label colour a readout the bar hosts gives what it
+    /// leaves unsaid (LLP 1141.004 D3), and the node is no native button's face.
     pub(crate) fn ink_said(&self, slot: u32) -> bool {
+        let bar = self.bar_text.start.as_deref().is_some_and(|start| {
+            std::ptr::eq(self.computed_source(slot, StyleId::TextColor), start)
+        });
         self.parents[slot as usize]
             .is_none_or(|p| self.node_type(p) != crate::generated::NodeType::Control)
-            && self.says(slot, StyleId::TextColor)
+            && (bar || self.says(slot, StyleId::TextColor))
     }
 }
 

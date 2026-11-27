@@ -5,7 +5,7 @@
 //! v1 animates the four CSS properties a compositor applies without relayout:
 //! the individual transform properties `translate`, `scale`, `rotate`, and
 //! `opacity`. Names, units, identity values, and interpolation are CSS's:
-//! `translate` is two lengths in points, `scale` one number, `rotate` an angle
+//! `translate` is two lengths in points, `scale` two factors, `rotate` an angle
 //! in degrees with an optional axis, and `opacity` a number. Rotation
 //! keyframes interpolate through [`crate::rotation`]; the others interpolate
 //! componentwise (CSS Transitions §4, "animation type: by computed value"). The
@@ -43,7 +43,8 @@
 //! named by `transition` (never `@keyframes` yet), so it is outside
 //! [`Property::ALL`]; a `transition` row carries it by its own code.
 //! `filter` is the same (LLP 1003.002): its slot holds a progress, and the
-//! two lists at its ends are [`crate::filter::FilterValue`]s.
+//! two lists at its ends are [`crate::filter::FilterValue`]s. So is a box's
+//! `clip-path` (LLP 1003.003), whose ends are [`crate::clip::ClipValue`]s.
 
 /// One animatable property.
 #[repr(u8)]
@@ -51,7 +52,7 @@
 pub enum Property {
     /// `translate: <x> <y>`, in points.
     Translate = 0,
-    /// `scale: <n>`, uniform; one is the natural size.
+    /// `scale: <x> <y>`; one on each axis is the natural size.
     Scale = 1,
     /// `rotate`: degrees in x, its optional axis in y/z/w.
     Rotate = 2,
@@ -117,16 +118,21 @@ pub enum Property {
     /// transition's progress from one list to the next; the lists are
     /// [`crate::filter::FilterValue`]s the engine keeps beside it.
     Filter = 29,
+    /// CSS `clip-path` on a box, a `path()` (LLP 1003.003). Its slot's value
+    /// is a running transition's progress from one clip to the next; the
+    /// clips are [`crate::clip::ClipValue`]s the engine keeps beside it.
+    ClipPath = 30,
 }
 
 impl Property {
     /// The property numbered `slot` (its discriminant): every property,
-    /// [`Property::Layout`], [`Property::D`] and [`Property::Filter`] included.
+    /// [`Property::Layout`] and the transition-only lists included.
     pub(crate) fn from_slot(slot: u32) -> Property {
         match slot {
             27 => Property::Layout,
             28 => Property::D,
             29 => Property::Filter,
+            30 => Property::ClipPath,
             slot => Property::ALL[slot as usize],
         }
     }
@@ -167,13 +173,14 @@ impl Property {
     pub const COUNT: usize = 27;
 
     /// How many properties the engine has slots for: the wire's, then
-    /// [`Property::Layout`], [`Property::D`] and [`Property::Filter`].
-    pub const SLOTS: usize = Property::COUNT + 3;
+    /// [`Property::Layout`], then [`Property::TRANSITION_ONLY`].
+    pub const SLOTS: usize = Property::COUNT + 4;
 
     /// The properties `transition` names that no keyframe carries, so
-    /// outside [`Property::ALL`]: a path's `d` and `filter`, each a list
-    /// the engine moves as a progress (LLP 1055.000 D15, LLP 1003.002).
-    pub const TRANSITION_ONLY: [Property; 2] = [Property::D, Property::Filter];
+    /// outside [`Property::ALL`]: a path's `d`, `filter` and a box's
+    /// `clip-path`, each a list the engine moves as a progress (LLP 1055.000
+    /// D15, LLP 1003.002, LLP 1003.003).
+    pub const TRANSITION_ONLY: [Property; 3] = [Property::D, Property::Filter, Property::ClipPath];
 
     /// The paint properties: repainted, never laid out. A native host's
     /// paint pass owns them (LLP 1062 D2): CSS's box colours and
@@ -227,6 +234,7 @@ impl Property {
             Property::Layout => "layout",
             Property::D => "d",
             Property::Filter => "filter",
+            Property::ClipPath => "clip-path",
         }
     }
 
@@ -300,11 +308,12 @@ impl Property {
     /// How many components the value carries: four for `translate` (its x
     /// and y lengths, then its x and y percentages of the box, which CSS
     /// interpolates componentwise as a `calc()`), three for `box-shadow`'s
-    /// geometry and for a variation axis, four for rotation, colour and
+    /// geometry and for a variation axis, two for scale, four for rotation, colour and
     /// `layout`'s box, else one.
     pub fn components(self) -> usize {
         match self {
             Property::Translate | Property::Rotate => 4,
+            Property::Scale => 2,
             Property::BoxShadow | Property::FontVariationSettings => 3,
             Property::Layout => 4,
             p if p.is_color() => 4,
@@ -318,7 +327,8 @@ impl Property {
     pub fn identity(self) -> Option<Value> {
         match self {
             Property::Translate => Some(Value::ZERO),
-            Property::Scale | Property::Opacity => Some(Value::scalar(1.0)),
+            Property::Scale => Some(Value::new(1.0, 1.0)),
+            Property::Opacity => Some(Value::scalar(1.0)),
             Property::Rotate
             | Property::StrokeDashoffset
             | Property::R
@@ -538,4 +548,22 @@ impl core::ops::Add for Value {
     fn add(self, other: Value) -> Value {
         self.zip(other, |a, b| a + b)
     }
+}
+
+/// CSS scale factors, x then y. One factor applies to both axes.
+pub fn scale(text: &str) -> Option<Value> {
+    if text.trim().eq_ignore_ascii_case("none") {
+        return Some(Value::new(1.0, 1.0));
+    }
+    let factor = |text: &str| {
+        let (n, divisor) = text.strip_suffix('%').map_or((text, 1.0), |n| (n, 100.0));
+        exact_num::parse_f64(n)
+            .ok()
+            .map(|n| n / divisor)
+            .filter(|n| n.is_finite())
+    };
+    let mut parts = text.split_ascii_whitespace();
+    let x = factor(parts.next()?)?;
+    let y = parts.next().map_or(Some(x), factor)?;
+    parts.next().is_none().then_some(Value::new(x, y))
 }

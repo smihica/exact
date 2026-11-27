@@ -41,6 +41,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.Base64
+import dev.exact.canvas.Cause
 import dev.exact.canvas.ExactExtension
 import dev.exact.canvas.ExtensionContext
 import org.json.JSONArray
@@ -92,7 +93,9 @@ class NfcModule(context: ExtensionContext) : ExactExtension(context) {
         .put("state", "granted")
         .put("readerUI", "app")
 
-    override fun later(name: String, args: JSONObject, reply: (JSONObject) -> Unit) {
+    override fun later(name: String, args: JSONObject, reply: (JSONObject) -> Unit) = later(name, args, null, Cause.none, reply)
+
+    override fun later(name: String, args: JSONObject, preferred: Any?, cause: Cause, reply: (JSONObject) -> Unit) {
         when (name) {
             "nfcStatus" -> reply(status())
             "scan", "write", "makeReadOnly" -> {
@@ -103,7 +106,7 @@ class NfcModule(context: ExtensionContext) : ExactExtension(context) {
                     try { message(records) } catch (e: IllegalArgumentException) { return reply(error("TypeError", e.message)) }
                 }
                 if (name == "scan" && !adapter.isEnabled) return reply(error("NotReadableError", "radio-off"))
-                Registry.claim(Claim(name, this, context.request, args, settings(name, args), reply))
+                Registry.claim(Claim(name, this, cause.request, args, settings(name, args), reply))
             }
             "abortScan" -> { Registry.end(this, setOf("scan"), ended("stopped")); reply(JSONObject()) }
             "abortWrite" -> { Registry.end(this, setOf("write", "makeReadOnly"), error("AbortError")); reply(JSONObject()) }
@@ -420,8 +423,10 @@ internal object Records {
                 val status = data.firstOrNull()?.toInt() ?: 0
                 val n = status and 0x3f
                 encoding = if (status and 0x80 == 0) "utf-8" else "utf-16be"
-                lang = String(data, 1, minOf(n, data.size - 1))
-                data = data.copyOfRange(minOf(1 + n, data.size), data.size)
+                // A tag's payload can be shorter than its status byte says, or empty.
+                val end = minOf(1 + n, data.size)
+                lang = String(data.copyOfRange(minOf(1, end), end))
+                data = data.copyOfRange(end, data.size)
                 text = String(data, if (encoding == "utf-8") Charsets.UTF_8 else Charsets.UTF_16BE)
             }
             "smart-poster" -> {

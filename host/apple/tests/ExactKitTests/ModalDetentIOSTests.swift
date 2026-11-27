@@ -22,33 +22,36 @@ final class ModalDetentIOSTests: XCTestCase {
     }
 
     private final class Context: NSObject, UISheetPresentationControllerDetentResolutionContext {
-        let containerTraitCollection = UITraitCollection()
+        let containerTraitCollection: UITraitCollection
         let maximumDetentValue: CGFloat
-        init(_ maximum: CGFloat) { maximumDetentValue = maximum }
+        init(_ maximum: CGFloat, verticalSizeClass: UIUserInterfaceSizeClass = .regular) {
+            maximumDetentValue = maximum
+            containerTraitCollection = UITraitCollection(verticalSizeClass: verticalSizeClass)
+        }
     }
 
     func testTheWordsBecomeDetentsInOrder() {
-        let detents = ModalHost.detents("300 500 large nonsense") { 120 }
+        let detents = SheetDetents.detents("300 500 large nonsense") { 120 }
         XCTAssertEqual(detents.map(\.identifier.rawValue), ["authored-0", "authored-1", UISheetPresentationController.Detent.Identifier.large.rawValue])
         XCTAssertEqual(detents[0].resolvedValue(in: Context(700)), 300)
-        XCTAssertEqual(ModalHost.detents("fit-content large") { 120 }.map(\.identifier.rawValue), ["fit-content-0", UISheetPresentationController.Detent.Identifier.large.rawValue])
-        XCTAssertTrue(ModalHost.detents(nil) { nil }.isEmpty)
+        XCTAssertEqual(SheetDetents.detents("fit-content large") { 120 }.map(\.identifier.rawValue), ["fit-content-0", UISheetPresentationController.Detent.Identifier.large.rawValue])
+        XCTAssertTrue(SheetDetents.detents(nil) { nil }.isEmpty)
     }
 
     /// LLP 1075.003 §9.13: a percentage is that share of UIKit's maximum
     /// detent value, as RN's `sheetAllowedDetents: [0.45]` is.
     func testAPercentageIsAShareOfTheMaximum() {
         let large = UISheetPresentationController.Detent.Identifier.large.rawValue
-        let detents = ModalHost.detents("45% 70%") { nil }
+        let detents = SheetDetents.detents("45% 70%") { nil }
         XCTAssertEqual(detents.map(\.identifier.rawValue), ["authored-0", "authored-1"])
         XCTAssertEqual(detents[0].resolvedValue(in: Context(700)), 315)
         XCTAssertEqual(detents[0].resolvedValue(in: Context(600)), 270, "read at each resolution, as the maximum changes")
         XCTAssertEqual(detents[1].resolvedValue(in: Context(700)), 490)
         // All of the maximum is `large` itself (Grok's review): one rest, not
         // two at one height, and the status bar's covering sheet (LLP 1105 D2).
-        XCTAssertEqual(ModalHost.detents("100%") { nil }.map(\.identifier.rawValue), [large])
+        XCTAssertEqual(SheetDetents.detents("100%") { nil }.map(\.identifier.rawValue), [large])
         var refused: [Substring] = []
-        XCTAssertEqual(ModalHost.detents("45% 100% large", refused: { word, _ in refused.append(word) }) { nil }.map(\.identifier.rawValue), ["authored-0", large])
+        XCTAssertEqual(SheetDetents.detents("45% 100% large", refused: { word, _ in refused.append(word) }) { nil }.map(\.identifier.rawValue), ["authored-0", large])
         XCTAssertEqual(refused, ["large"])
     }
 
@@ -57,12 +60,12 @@ final class ModalDetentIOSTests: XCTestCase {
     /// so "900 large" on a phone is `large` alone, not two rests at one
     /// height; on a taller screen it is 900 then `large`.
     func testAPointHeightNeverTiesTheDetentAfterIt() {
-        let followed = ModalHost.detents("900 large") { nil }[0]
+        let followed = SheetDetents.detents("900 large") { nil }[0]
         XCTAssertNil(followed.resolvedValue(in: Context(800)))
         XCTAssertNil(followed.resolvedValue(in: Context(900)))
         XCTAssertEqual(followed.resolvedValue(in: Context(1000)), 900)
-        XCTAssertEqual(ModalHost.detents("300 900") { nil }[0].resolvedValue(in: Context(800)), 300)
-        XCTAssertEqual(ModalHost.detents("900") { nil }[0].resolvedValue(in: Context(800)), 800, "alone, it stops at the maximum")
+        XCTAssertEqual(SheetDetents.detents("300 900") { nil }[0].resolvedValue(in: Context(800)), 300)
+        XCTAssertEqual(SheetDetents.detents("900") { nil }[0].resolvedValue(in: Context(800)), 800, "alone, it stops at the maximum")
     }
 
     /// A bound value can carry what the compiler refuses in a literal; the
@@ -70,14 +73,14 @@ final class ModalDetentIOSTests: XCTestCase {
     /// line names the value, the route and what the sheet uses.
     func testWordsThatNameNoDetentAreRefusedAloud() {
         var refused: [Substring] = []
-        let detents = ModalHost.detents("0 -4 NaN nan inf 0% 150% x% 300 large", refused: { word, reason in
+        let detents = SheetDetents.detents("0 -4 NaN nan inf 0% 150% x% 300 large", refused: { word, reason in
             XCTAssertEqual(reason, .unknown)
             refused.append(word)
         }) { nil }
         XCTAssertEqual(refused, ["0", "-4", "NaN", "nan", "inf", "0%", "150%", "x%"])
         XCTAssertEqual(detents.count, 2)
         XCTAssertEqual(
-            ModalHost.refusal(detent: "-12", words: [("-12", .unknown)], route: "3", kept: false),
+            SheetDetents.refusal(detent: "-12", words: [("-12", .unknown)], owner: "route \"3\"", kept: false),
             "navigationDetent \"-12\" on route \"3\": \"-12\" is not large, medium, fit-content, a positive point height or a percentage above 0% and at most 100%; the sheet uses the platform's large detent")
     }
 
@@ -86,30 +89,30 @@ final class ModalDetentIOSTests: XCTestCase {
     /// (300, 270), so what a bound value keeps is one kind, ascending, with
     /// `large` last, which is in order on any screen; the rest is journaled.
     func testWhatIsKeptAscendsOnEveryScreen() {
-        var refused: [(Substring, ModalHost.DetentRefusal)] = []
-        let refuse = { (word: Substring, reason: ModalHost.DetentRefusal) in refused.append((word, reason)) }
+        var refused: [(Substring, SheetDetents.DetentRefusal)] = []
+        let refuse = { (word: Substring, reason: SheetDetents.DetentRefusal) in refused.append((word, reason)) }
         let large = UISheetPresentationController.Detent.Identifier.large.rawValue
-        let kept = ModalHost.detents("300 45% large", refused: refuse) { nil }
+        let kept = SheetDetents.detents("300 45% large", refused: refuse) { nil }
         XCTAssertEqual(kept.map(\.identifier.rawValue), ["authored-0", large])
         for value in ["medium 300", "500 300", "60% medium", "fit-content 300", "large medium", "large large"] {
             refused = []
-            XCTAssertEqual(ModalHost.detents(value, refused: refuse) { 120 }.count, 1, value)
+            XCTAssertEqual(SheetDetents.detents(value, refused: refuse) { 120 }.count, 1, value)
             XCTAssertEqual(refused.map { "\($0.0)" }, [String(value.split(separator: " ")[1])], value)
             XCTAssertTrue(refused.allSatisfy { $0.1 == .order }, value)
         }
-        let shares = ModalHost.detents("30% medium 80% large") { nil }
+        let shares = SheetDetents.detents("30% medium 80% large") { nil }
         for maximum: CGFloat in [500, 600, 800] {
             let custom = [shares[0], shares[2]].compactMap { $0.resolvedValue(in: Context(maximum)) }
             XCTAssertEqual(custom, custom.sorted(), "at \(maximum)")
         }
         XCTAssertTrue(
-            ModalHost.refusal(detent: "300 45%", words: [("45%", .order)], route: "3", kept: true)
+            SheetDetents.refusal(detent: "300 45%", words: [("45%", .order)], owner: "route \"3\"", kept: true)
                 .hasSuffix("\"45%\" is not taller than the detent before it on every screen (UIKit takes them shortest to tallest; a point height, a share of the maximum and the content's height do not mix, and large goes last); the sheet uses its other detents"))
     }
 
     func testFitContentIsTheContentHeightWithinTheMaximum() {
         var content: CGFloat? = 180.4
-        let detent = ModalHost.detents("fit-content") { content }[0]
+        let detent = SheetDetents.detents("fit-content") { content }[0]
         XCTAssertEqual(detent.resolvedValue(in: Context(700)), 181, "rounded up to a whole point")
         content = 900
         XCTAssertEqual(detent.resolvedValue(in: Context(700)), 700, "clamped to the sheet's maximum")
@@ -121,6 +124,115 @@ final class ModalDetentIOSTests: XCTestCase {
         XCTAssertEqual(detent.resolvedValue(in: Context(700)), 700)
         content = 0
         XCTAssertEqual(detent.resolvedValue(in: Context(700)), 700)
+    }
+
+    /// LLP 1075.003 §9.11 (amended 2026-11-27, expo/exact#2023): a terminal
+    /// `fit-content` acts as a content-height ceiling for preceding stops.
+    func testTerminalFitContentCeilingResolvesAndOmitsStops() {
+        var content: CGFloat? = 220
+        let detents = SheetDetents.detents("medium fit-content") { content }
+        XCTAssertEqual(detents.map(\.identifier.rawValue), ["authored-0", "fit-content-1"])
+        let ctx = Context(800)
+        // Short content (<= medium): medium omits itself (nil), fit-content settles at 220.
+        XCTAssertNil(detents[0].resolvedValue(in: ctx))
+        XCTAssertEqual(detents[1].resolvedValue(in: ctx), 220)
+        // Medium-tall content (between medium and max): both active, ceiling at 520.
+        content = 520
+        XCTAssertEqual(detents[0].resolvedValue(in: ctx), 400)
+        XCTAssertEqual(detents[1].resolvedValue(in: ctx), 520)
+        // Overflowing content (> max): both active, ceiling clamps to max on its custom id.
+        content = 1000
+        XCTAssertEqual(detents[0].resolvedValue(in: ctx), 400)
+        XCTAssertEqual(detents[1].resolvedValue(in: ctx), 800)
+        XCTAssertNotEqual(detents[1].identifier, .large)
+
+        // Compact vertical size class (landscape phone) omits `medium`, while `50%` stays active.
+        let compact = Context(360, verticalSizeClass: .compact)
+        content = 300
+        XCTAssertNil(detents[0].resolvedValue(in: compact), "medium is inactive in compact height")
+        XCTAssertEqual(detents[1].resolvedValue(in: compact), 300)
+        let pct = SheetDetents.detents("50% fit-content") { content }
+        XCTAssertEqual(pct[0].resolvedValue(in: compact), 180)
+        XCTAssertEqual(pct[1].resolvedValue(in: compact), 300)
+
+        // Unrounded 0.5-point cutoff: 300.4 pt content omits 300, even though fit-content rounds up to 301.
+        content = 300.4
+        let fractional = SheetDetents.detents("300 fit-content") { content }
+        XCTAssertNil(fractional[0].resolvedValue(in: ctx), "300 >= 300.4 - 0.5 omits 300 before rounding")
+        XCTAssertEqual(fractional[1].resolvedValue(in: ctx), 301)
+
+        // Multi-stop prefix and point prefix.
+        content = 360
+        let shares = SheetDetents.detents("25% 50% fit-content") { content }
+        XCTAssertEqual(shares[0].resolvedValue(in: ctx), 200)
+        XCTAssertNil(shares[1].resolvedValue(in: ctx), "50% (400) >= 360 - 0.5 is omitted")
+        XCTAssertEqual(shares[2].resolvedValue(in: ctx), 360)
+
+        // Bound invalid shapes with terminal fit-content refuse out-of-order words.
+        for (value, dropped) in [
+            ("medium fit-content large", ["large"]),
+            ("large fit-content", ["fit-content"]),
+            ("100% fit-content", ["fit-content"]),
+            ("fit-content fit-content", ["fit-content"]),
+        ] as [(String, [Substring])] {
+            var refused: [Substring] = []
+            _ = SheetDetents.detents(value, refused: { word, reason in
+                XCTAssertEqual(reason, .order, value)
+                refused.append(word)
+            }) { 300 }
+            XCTAssertEqual(refused, dropped, value)
+        }
+    }
+
+    @MainActor func testTerminalFitContentSyncsGrabberUndimmedAndClampsSelection() throws {
+        let controller = UIViewController()
+        let sheet = try XCTUnwrap(controller.sheetPresentationController)
+        let presenter = Presenter()
+        let node = NodeView(id: 1, kind: "column", presenter: presenter)
+        node.props["navigationDetent"] = "medium fit-content"
+        node.props["navigationInitialDetent"] = "medium"
+        node.fitContentHeight = 220
+
+        // Short content: medium omitted -> single active detent, no grabber, selection + undimmed clamp to fit-content.
+        SheetDetents.select(on: sheet, node: node, owner: "route \"a\"", maximum: 800)
+        SheetDetents.syncTerminalContent(
+            on: sheet, node: node, owner: "route \"a\"",
+            maximum: 800, grabber: "auto", scrollExpands: nil, undimmed: "medium"
+        )
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .init("fit-content-1"))
+        XCTAssertEqual(sheet.largestUndimmedDetentIdentifier, .init("fit-content-1"))
+        XCTAssertFalse(sheet.prefersGrabberVisible)
+        XCTAssertFalse(sheet.prefersScrollingExpandsWhenScrolledToEdge)
+
+        // Growing past medium restores 2 active stops, keeps fit-content selected, and honors explicit scrollExpands=false.
+        node.fitContentHeight = 560
+        SheetDetents.syncTerminalContent(
+            on: sheet, node: node, owner: "route \"a\"",
+            maximum: 800, grabber: "auto", scrollExpands: "false", undimmed: "medium"
+        )
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .init("fit-content-1"))
+        XCTAssertEqual(sheet.largestUndimmedDetentIdentifier, .init("authored-0"))
+        XCTAssertTrue(sheet.prefersGrabberVisible)
+        XCTAssertFalse(sheet.prefersScrollingExpandsWhenScrolledToEdge)
+
+        // A user drag to fit-content is preserved across subsequent content changes even when navigationSelectedDetent is set (LLP 1123 D7).
+        node.props["navigationSelectedDetent"] = "medium"
+        node.fitContentHeight = 620
+        SheetDetents.syncTerminalContent(
+            on: sheet, node: node, owner: "route \"a\"",
+            maximum: 800, grabber: "auto", scrollExpands: nil, undimmed: "medium"
+        )
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .init("fit-content-1"))
+
+        // Resting at medium and shrinking below medium clamps selection back to fit-content.
+        sheet.selectedDetentIdentifier = .init("authored-0")
+        node.fitContentHeight = 200
+        SheetDetents.syncTerminalContent(
+            on: sheet, node: node, owner: "route \"a\"",
+            maximum: 800, grabber: "auto", scrollExpands: nil, undimmed: "medium"
+        )
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .init("fit-content-1"))
+        XCTAssertFalse(sheet.prefersGrabberVisible)
     }
 
     private func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
@@ -381,6 +493,176 @@ final class ModalDetentIOSTests: XCTestCase {
         session.presenter.modalHost.updatePermissions()
         XCTAssertEqual(controller.selectedDetentIdentifier, .large)
         XCTAssertTrue(session.agent(#"{"op":"logs","since":0}"#).contains(#"navigationInitialDetent \"medum\""#), "journaled when the sheet is made")
+    }
+
+    /// LLP 1123 D7: the detent a route holds its sheet at moves the sheet as it changes and again over new
+    /// detents, while an unrelated update leaves the height the person dragged it to; let go, the sheet returns to
+    /// the one it opens at. Its edge attachment and scroll expansion are UIKit's properties while it says them, and
+    /// UIKit's defaults once it stops; its sizing is the presentation style it is made with.
+    func testASheetRouteHoldsItsSelectedDetentAndSaysItsSheetsChoices() throws {
+        let session = try fixture("detent-selected")
+        try tap(session, "menu")
+        until("the menu is presented as a sheet") { sheet()?.sheetPresentationController != nil }
+        let presented = try XCTUnwrap(sheet())
+        let controller = try XCTUnwrap(presented.sheetPresentationController)
+        let unsaid = UIViewController()
+        unsaid.modalPresentationStyle = .automatic
+        XCTAssertEqual(presented.modalPresentationStyle, unsaid.modalPresentationStyle, "unsaid, the platform's sheet")
+        let route = try node(session, "route-menu")
+        func update(_ props: [String: String?]) {
+            for (name, value) in props { route.props[name] = value }
+            session.presenter.modalHost.updatePermissions()
+        }
+        update(["navigationDetent": "medium large", "navigationSelectedDetent": "large"])
+        XCTAssertEqual(controller.selectedDetentIdentifier, .large)
+        controller.selectedDetentIdentifier = .medium
+        update(["navigationGrabber": "visible"])
+        XCTAssertEqual(controller.selectedDetentIdentifier, .medium, "an unrelated update leaves the height the person dragged it to")
+        update(["navigationSelectedDetent": "medium"])
+        update(["navigationSelectedDetent": "large"])
+        XCTAssertEqual(controller.selectedDetentIdentifier, .large, "a new value moves it")
+        update(["navigationDetent": "300 large"])
+        XCTAssertEqual(controller.selectedDetentIdentifier, .large, "held over new detents")
+        update(["navigationSelectedDetent": "45%"])
+        XCTAssertEqual(controller.selectedDetentIdentifier, .large, "a word that names none of its detents leaves it")
+        XCTAssertTrue(session.agent(#"{"op":"logs","since":0}"#).contains(#"navigationSelectedDetent \"45%\" on route"#))
+        update(["navigationSelectedDetent": nil])
+        XCTAssertEqual(controller.selectedDetentIdentifier, .init("authored-0"), "let go: where it opens, its first")
+        XCTAssertFalse(controller.prefersEdgeAttachedInCompactHeight)
+        XCTAssertTrue(controller.prefersScrollingExpandsWhenScrolledToEdge, "unsaid over two detents: the platform's")
+        XCTAssertFalse(controller.widthFollowsPreferredContentSizeWhenEdgeAttached)
+        update(["navigationEdgeAttachedInCompactHeight": "true", "navigationWidthFollowsPreferredContentSize": "true", "navigationScrollExpands": "false"])
+        XCTAssertTrue(controller.prefersEdgeAttachedInCompactHeight)
+        XCTAssertTrue(controller.widthFollowsPreferredContentSizeWhenEdgeAttached)
+        XCTAssertFalse(controller.prefersScrollingExpandsWhenScrolledToEdge)
+        update(["navigationEdgeAttachedInCompactHeight": nil, "navigationWidthFollowsPreferredContentSize": nil, "navigationScrollExpands": nil])
+        XCTAssertFalse(controller.prefersEdgeAttachedInCompactHeight, "UIKit's default once it stops")
+        XCTAssertFalse(controller.widthFollowsPreferredContentSizeWhenEdgeAttached)
+        XCTAssertTrue(controller.prefersScrollingExpandsWhenScrolledToEdge)
+        // UIKit reads a style back as it resolves it (`automatic` as a form sheet on iOS 18 and later, a page sheet
+        // before), so the sheet is made as a plain controller given the same style is
+        for (sizing, style) in [("form", UIModalPresentationStyle.formSheet), ("automatic", .automatic), ("page", .pageSheet), (nil, .automatic)] {
+            XCTAssertEqual(ModalController.sheetStyle(sizing), style, sizing ?? "unsaid")
+            route.props["navigationSizing"] = sizing
+            let made = ModalController(host: session.presenter.modalHost, route: route, kind: "modal", detent: nil, grabber: nil)
+            let plain = UIViewController()
+            plain.modalPresentationStyle = style
+            XCTAssertEqual(made.modalPresentationStyle, plain.modalPresentationStyle, sizing ?? "unsaid")
+            XCTAssertNotNil(made.sheetPresentationController, "\(sizing ?? "unsaid"): a sheet to configure")
+            // Each sizing's sheet takes its route's detents, as any sheet does
+            made.updateSheet(detent: "medium large", cornerRadius: nil, grabber: nil)
+            XCTAssertEqual(made.sheetPresentationController?.detents.count, 2, "\(sizing ?? "unsaid"): its detents")
+        }
+    }
+
+    /// LLP 1123 D7: a sheet resting at or below its undimmed detent dims nothing and is no modal dialog: the screen
+    /// under it takes a person's touch, its views are live to reads, and the sheet begins no modal boundary. Above
+    /// it, or with no undimmed detent, the sheet is modal again.
+    func testASheetAtOrBelowItsUndimmedDetentLeavesTheScreenUnderItLive() throws {
+        guard ProcessInfo.processInfo.environment["EXACT_TOUCH_PORT"] != nil else {
+            throw missing("touch", "a person's touch reaches the screen under an undimmed sheet")
+        }
+        let touch = try TouchRunner(self)
+        defer { touch.connection.cancel() }
+        let session = try fixture("detent-undimmed")
+        let window = try XCTUnwrap(self.window), modals = session.presenter.modalHost
+        try tap(session, "menu")
+        until("the menu is presented as a sheet") { self.sheet()?.sheetPresentationController != nil && self.sheet()?.view.window != nil }
+        let presented = try XCTUnwrap(sheet()), controller = try XCTUnwrap(presented.sheetPresentationController)
+        let route = try node(session, "route-menu"), bump = try node(session, "bump")
+        func update(_ props: [String: String?]) {
+            for (name, value) in props { route.props[name] = value }
+            modals.updatePermissions()
+        }
+        func count() -> Double? {
+            let reply = try? JSONSerialization.jsonObject(with: Data(session.agent(#"{"op":"state"}"#).utf8)) as? [String: Any]
+            return (reply?["slots"] as? [String: Any])?["count"] as? Double
+        }
+        // A short detent, so the sheet leaves Bump uncovered on any screen: 40 points clear of Bump's bottom
+        let short = UISheetPresentationController.Detent.Identifier("authored-0")
+        let bumpBottom = bump.convert(bump.bounds, to: window).maxY
+        let height = Int(window.bounds.height - window.safeAreaInsets.bottom - bumpBottom - 40)
+        XCTAssertGreaterThan(height, 80, "room for a short sheet under Bump")
+        update(["navigationDetent": "\(height) large", "navigationSelectedDetent": "\(height)", "navigationUndimmedDetent": "\(height)"])
+        XCTAssertEqual(controller.largestUndimmedDetentIdentifier, short)
+        until("the sheet rests at its short detent") { controller.selectedDetentIdentifier == short && presented.transitionCoordinator == nil }
+        XCTAssertFalse(modals.inertBehind(bump), "the screen under it is live")
+        XCTAssertNil(session.presenter.openTopLayer.1, "the sheet begins no modal boundary")
+        XCTAssertNil(modals.topNavigation)
+        // Bump takes touches where every view from it to the window does
+        let takesTouches = { sequence(first: bump as UIView, next: \.superview).allSatisfy(\.isUserInteractionEnabled) }
+        XCTAssertTrue(takesTouches())
+        let center = bump.convert(CGPoint(x: bump.bounds.midX, y: bump.bounds.midY), to: window)
+        XCTAssertLessThan(center.y, presented.view.convert(presented.view.bounds, to: window).minY, "Bump lies above the sheet")
+        let before = try XCTUnwrap(count())
+        waitFor("the window receives touches") { Agent.frontRefusal(window) == nil }
+        XCTAssertEqual(try touch.ask(TouchRunner.aim(center, in: window).merging(["op": "tap"]) { _, new in new })["done"] as? Bool, true)
+        until("a person's tap presses Bump under the sheet") { count() == before + 1 }
+        // A person's drag takes it above its undimmed detent, and it is modal again
+        let top = presented.view.convert(presented.view.bounds, to: window).minY
+        var drag = try TouchRunner.aim(CGPoint(x: window.bounds.midX, y: top + 10), in: window)
+        let end = try TouchRunner.aim(CGPoint(x: window.bounds.midX, y: 120), in: window)
+        drag.merge(["op": "drag", "to": end["point"]!, "screenTo": end["screen"]!, "velocity": 900, "press": 0.05, "hold": 0.1]) { _, new in new }
+        XCTAssertEqual(try touch.ask(drag)["done"] as? Bool, true)
+        until("the person's drag takes the sheet to large") { controller.selectedDetentIdentifier == .large && presented.transitionCoordinator == nil }
+        XCTAssertTrue(modals.inertBehind(bump), "above its undimmed detent the sheet is modal")
+        XCTAssertFalse(takesTouches(), "the screen under it takes no touch")
+        XCTAssertNotNil(session.presenter.openTopLayer.1)
+        update(["navigationSelectedDetent": "large", "navigationUndimmedDetent": nil])
+        XCTAssertNil(controller.largestUndimmedDetentIdentifier)
+        XCTAssertTrue(modals.inertBehind(bump), "with no undimmed detent every height is modal")
+    }
+
+    func testADialogUsesItsAuthoredDetentsAndKeepsTheSelectionWhenItsGrabberChanges() throws {
+        guard hostedWindowScene() != nil else {
+            throw missing("scene", "UIKit presents and dismisses the dialog in its window")
+        }
+        let session = try fixture("dialog-detents", planKey: "EXACT_DIALOG_SHEET_READS_PLAN")
+        let p = session.presenter
+        p.dialogCommand("showModal", "resizable")
+        until("dialog presented") { self.sheet() != nil && !p.menus.inTransition }
+        let presented = try XCTUnwrap(sheet()), sheet = try XCTUnwrap(presented.sheetPresentationController)
+        let dialog = try XCTUnwrap(p.views.values.first { $0.props["id"] == "resizable" })
+        let footer = try node(session, "dialog-footer")
+        let bottom = { footer.convert(footer.bounds, to: presented.view).maxY }
+        let port = { presented.view.safeAreaLayoutGuide.layoutFrame.maxY }
+        until("the footer reaches the large sheet's safe area") { abs(bottom() - port()) < 1 }
+        let large = port()
+        XCTAssertEqual(sheet.detents.map(\.identifier), [.medium, .large])
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .large)
+        XCTAssertFalse(sheet.prefersGrabberVisible)
+        XCTAssertEqual(presented.view.backgroundColor, .systemBackground, "at its large detent the sheet's ground is the system background")
+        sheet.animateChanges { sheet.selectedDetentIdentifier = .medium }
+        until("the footer follows the sheet to medium") { port() < large - 100 && abs(bottom() - port()) < 1 }
+        // UIKit tells the delegate only of a detent a person dragged to.
+        sheet.delegate?.sheetPresentationControllerDidChangeSelectedDetentIdentifier?(sheet)
+        // In regular width the ground stays the system background, as the route's does.
+        let below: UIColor = presented.traitCollection.horizontalSizeClass == .regular ? .systemBackground : .clear
+        XCTAssertEqual(presented.view.backgroundColor, below, "below it a compact sheet's ground is left to UIKit's glass (LLP 1141.001 D3)")
+        dialog.props["navigationGrabber"] = "visible"
+        p.menus.sync()
+        XCTAssertTrue(sheet.prefersGrabberVisible)
+        XCTAssertEqual(sheet.selectedDetentIdentifier, .medium)
+        p.dialogCommand("close", "resizable")
+        until("dialog closed") { self.sheet() == nil && !p.menus.inTransition }
+    }
+
+    func testADialogsFitContentDetentFollowsItsOwnContents() throws {
+        guard hostedWindowScene() != nil else { throw missing("scene", "UIKit resolves the dialog's resting heights") }
+        let session = try fixture("fitted-dialog", planKey: "EXACT_DIALOG_SHEET_READS_PLAN"), p = session.presenter
+        p.dialogCommand("showModal", "fitted-rests")
+        until("fitted dialog presented") { self.sheet() != nil && !p.menus.inTransition }
+        let sheet = try XCTUnwrap(sheet()?.sheetPresentationController)
+        let fitted = try XCTUnwrap(sheet.detents.first)
+        XCTAssertEqual(sheet.selectedDetentIdentifier, fitted.identifier)
+        let below: UIColor = self.sheet()?.traitCollection.horizontalSizeClass == .regular ? .systemBackground : .clear
+        XCTAssertEqual(self.sheet()?.view.backgroundColor, below, "a compact sheet that opens below its large detent opens on UIKit's glass")
+        XCTAssertEqual(sheet.largestUndimmedDetentIdentifier, .large, "the authored backdrop replaces UIKit's dimming at every height")
+        until("initial content height") { fitted.resolvedValue(in: Context(800)) == 100 }
+        try tap(session, "grow-fitted")
+        until("the content detent grows with its contents") { fitted.resolvedValue(in: Context(800)) == 300 }
+        p.dialogCommand("close", "fitted-rests")
+        until("fitted dialog closed") { self.sheet() == nil && !p.menus.inTransition }
     }
 
     /// Mounted, its route in its block (LLP 1123 D2), the sheet still

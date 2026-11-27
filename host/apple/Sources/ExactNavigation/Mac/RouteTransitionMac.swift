@@ -50,21 +50,22 @@ final class RouteTransitions {
         if let kept {
             let pop = before.count == after.count + 1 && before.starts(with: after)
             if pop { exiting = kept.id }
-            play(pop ? kept.exit : nil, on: presenter.leaving[kept.id]?.view) { [weak self] _ in
+            play(pop ? kept.exit : nil, on: presenter.leaving[kept.id]?.view) { [weak self] alone in
                 if self?.exiting == kept.id { self?.exiting = nil }
                 _ = self?.presenter.endExit(kept.id)
+                if alone { self?.presenter.navigationHost.resync() }
             }
         }
         let route = stack.indices.contains(at) ? stack[at] : nil
         if !presenter.navigation.crossFading, after.count == before.count + 1, after.starts(with: before), at > 0, let route,
-           let part = presenter.session?.runtime.routePart(route.id, exit: false, size: route.bounds.size), part.plays {
+           let part = presenter.session?.routePart(route, exit: false, size: route.bounds.size), part.plays {
             held = (stack[at - 1].id, route.id)
             play(part, on: route) { [weak self] alone in
                 self?.held = nil
                 if alone { self?.presenter.navigationHost.resync() }
             }
         }
-        top = route.map { ($0.id, at > 0 ? presenter.session?.runtime.routePart($0.id, exit: true, size: $0.bounds.size) : nil) }
+        top = route.map { ($0.id, at > 0 ? presenter.session?.routePart($0, exit: true, size: $0.bounds.size) : nil) }
     }
 
     private func play(_ part: RoutePart?, on view: NSView?, end: @escaping (Bool) -> Void) {
@@ -81,6 +82,25 @@ final class RouteTransitions {
         }
         layer.add(part.animation(about: CGPoint(x: view.bounds.midX, y: view.bounds.midY)), forKey: Self.key)
         CATransaction.commit()
+    }
+
+    /// Cancel any playing or pending route transition and release any kept exiting view.
+    func reset() {
+        generation &+= 1
+        if let playing {
+            self.playing = nil
+            playing.view.layer?.removeAnimation(forKey: Self.key)
+        }
+        if let id = exiting {
+            exiting = nil
+            _ = presenter.endExit(id)
+        }
+        if let kept = leaving {
+            leaving = nil
+            _ = presenter.endExit(kept.id)
+        }
+        held = nil
+        top = nil
     }
 
     /// End the playing part at its end (D6).

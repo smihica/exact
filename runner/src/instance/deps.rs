@@ -37,6 +37,23 @@ impl Bits {
     pub(crate) fn get(&self, i: usize) -> bool {
         self.0.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
     }
+    fn set_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(word_index, mut word)| {
+                std::iter::from_fn(move || {
+                    if word == 0 {
+                        return None;
+                    }
+                    let index = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    Some(word_index * 64 + index)
+                })
+            })
+    }
+
     pub(crate) fn union(&mut self, other: &Bits) {
         self.grow(
             other
@@ -268,6 +285,8 @@ pub struct Deps {
     pub(crate) derives: Vec<Reads>,
     /// Each resource's arguments together.
     pub(crate) resource_args: Vec<Reads>,
+    /// Whether any body above reads the clock.
+    pub(crate) reads_clock: bool,
 }
 
 /// One input a settlement body reads, decoded from [`Reads::bits`].
@@ -384,7 +403,19 @@ impl Deps {
                     reads
                 })
                 .collect(),
+            reads_clock: false,
         };
+        deps.reads_clock = [
+            &deps.bindings,
+            &deps.surface_args,
+            &deps.subjects,
+            &deps.keys,
+        ]
+        .into_iter()
+        .flat_map(|table| &table.reads)
+        .chain(&deps.derives)
+        .chain(&deps.resource_args)
+        .any(|reads| reads.bits.get(layout.clock()));
         // Post-order over the site tree without recursing to the plan's depth;
         // the sites' reads are tabled once every one is known.
         let mut nodes = vec![Reads::default(); plan.nodes.len()];
@@ -465,20 +496,24 @@ impl Deps {
     /// The inputs `reads` names, in bit order.
     pub(crate) fn inputs<'a>(&self, reads: &'a Reads) -> impl Iterator<Item = Input> + 'a {
         let l = self.layout.expect("built from a plan");
-        (0..l.width()).filter(|i| reads.bits.get(*i)).map(move |i| {
-            let (d, r, m) = (l.derive(0), l.resource(0), l.pending_resource(0));
-            let (pm, clock) = (l.pending_mutation(0), l.clock());
-            let failed = l.failed_resource(0);
-            match i {
-                _ if i < d => Input::Slot(i),
-                _ if i < r => Input::Derive(i - d),
-                _ if i < m => Input::Resource(i - r),
-                _ if i < pm => Input::PendingResource(i - m),
-                _ if i < failed => Input::PendingMutation(i - pm),
-                _ if i < clock => Input::FailedResource(i - failed),
-                _ => Input::Clock,
-            }
-        })
+        reads
+            .bits
+            .set_indices()
+            .take_while(move |i| *i < l.width())
+            .map(move |i| {
+                let (d, r, m) = (l.derive(0), l.resource(0), l.pending_resource(0));
+                let (pm, clock) = (l.pending_mutation(0), l.clock());
+                let failed = l.failed_resource(0);
+                match i {
+                    _ if i < d => Input::Slot(i),
+                    _ if i < r => Input::Derive(i - d),
+                    _ if i < m => Input::Resource(i - r),
+                    _ if i < pm => Input::PendingResource(i - m),
+                    _ if i < failed => Input::PendingMutation(i - pm),
+                    _ if i < clock => Input::FailedResource(i - failed),
+                    _ => Input::Clock,
+                }
+            })
     }
 
     /// Mark resource `i`'s value, flags and failure changed in `bits`.
@@ -764,6 +799,38 @@ impl RowWrites {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inputs_decode_sparse_bits_in_layout_order() {
+        let deps = Deps {
+            layout: Some(Layout {
+                slots: 65,
+                derives: 64,
+                resources: 3,
+                mutations: 2,
+            }),
+            ..Default::default()
+        };
+        let mut reads = Reads::default();
+        assert_eq!(deps.inputs(&reads).next(), None);
+        for bit in [191, 140, 128, 63, 137, 129, 64, 135, 65, 132] {
+            reads.bits.set(bit);
+        }
+        assert_eq!(
+            deps.inputs(&reads).collect::<Vec<_>>(),
+            [
+                Input::Slot(63),
+                Input::Slot(64),
+                Input::Derive(0),
+                Input::Derive(63),
+                Input::Resource(0),
+                Input::PendingResource(0),
+                Input::PendingMutation(0),
+                Input::FailedResource(0),
+                Input::Clock,
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]

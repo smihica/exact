@@ -22,13 +22,7 @@ final class AgentBarPointerIOSTests: XCTestCase {
         super.tearDown()
     }
 
-    private func until(_ ready: () -> Bool) {
-        let deadline = Date(timeIntervalSinceNow: 5)
-        while !ready(), Date() < deadline {
-            RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.02))
-        }
-        XCTAssertTrue(ready(), "navigation reached its observable ready state")
-    }
+    private func until(_ ready: () -> Bool) { waitFor("navigation reaches its observable ready state", ready) }
 
     private func fixture(_ key: String = "EXACT_FIXTURE_PLAN") throws -> ExactSession {
         let plan = try Data(contentsOf: URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment[key])))
@@ -136,14 +130,30 @@ final class AgentBarPointerIOSTests: XCTestCase {
             XCTAssertEqual(presses, [], "\(e.name), \(why)")
         }
 
-        // More items than fit: UIKit shows the first and lists the rest under its overflow button
+        // More items than fit: UIKit shows the first and lists the rest under its overflow button. It lays the bar out
+        // again some frames after a push: start once no item's answer has changed for a while
         bar.layoutIfNeeded()
+        var answers: [String] = [], since = Date()
+        until {
+            let now = ((try? entries()) ?? []).map { aim($0.node)["error"] as? String ?? "" }
+            if now != answers { (answers, since) = (now, Date()) }
+            return Date().timeIntervalSince(since) > 0.5 && navigationItem.overflowPresentationSource != nil && !agent.nativeInFlight()
+        }
         var placed: [String] = [], overflowed: [String] = []
         for e in try entries() {
             if aim(e.node)["error"] == nil { placed.append(e.name); try assertPlaced(e) } else { overflowed.append(e.name); assertRefused(e, overflowed: true, "crowded") }
         }
         XCTAssertTrue(placed.contains("item-add") && placed.contains("Plain"), "the bar shows its first items: \(placed)")
         XCTAssertTrue(overflowed.contains("item-31") && overflowed.contains("Spare"), "the bar has no room for its last: \(overflowed)")
+
+        let omitted = try entry("item-31").node
+        let reply = agent.layout(["id": Int(omitted.id)])
+        let detail = try XCTUnwrap(reply["node"] as? [String: Any])
+        let space = try XCTUnwrap(detail["space"] as? [String: Any])
+        XCTAssertEqual((space["viewport"] as? [String: Double])?["w"], 0)
+        let row = (reply["nodes"] as? [[String: Any]])?.first { $0["id"] as? Int == Int(omitted.id) }
+        XCTAssertEqual(row?["w"] as? Double, 0)
+        XCTAssertEqual((detail["visible"] as? [String: Any])?["hidden"] as? Bool, true, "More is not the item's box")
 
         // Every item fits
         p.onPress = appPress
@@ -185,7 +195,10 @@ final class AgentBarPointerIOSTests: XCTestCase {
             return controls.map { $0.convert($0.bounds, to: bar) }.min { $0.minX < $1.minX } ?? .zero
         }
         XCTAssertNotNil(bar.backItem, "the pushed route's bar shows Back")
-        for name in ["item-31", "Spare"] { try assertRefused(name, reporting: back, "reporting Back's frame") }
+        // A vertical bar holds Back, outside this one
+        if !bar.traitCollection.placesVerticalBar {
+            for name in ["item-31", "Spare"] { try assertRefused(name, reporting: back, "reporting Back's frame") }
+        }
         let numbered = try entry("item-31").item
         try assertRefused("Spare", reporting: { numbered.frame(in: bar) ?? .zero }, "reporting another item's frame")
 
@@ -193,17 +206,29 @@ final class AgentBarPointerIOSTests: XCTestCase {
         let spare = try entry("Spare"), other = UIControl(frame: try XCTUnwrap(spare.item.frame(in: bar)))
         other.accessibilityIdentifier = "BackButton"
         bar.addSubview(other)
-        assertRefused(spare, overflowed: false, "under a control with another name")
+        XCTAssertTrue((aim(spare.node)["error"] as? String)?.contains("covers its middle") == true)
+        presses = []
+        XCTAssertNotNil(agent.tap(["id": Int(spare.node.id)])["error"])
+        XCTAssertTrue(presses.isEmpty)
         other.removeFromSuperview()
 
         for e in try entries() { try assertPlaced(e) }
     }
 
-    private func assertVisibleSegmentPoint(_ session: ExactSession, _ testId: String) throws {
+    private func assertVisibleSegmentPoint(_ session: ExactSession, _ testId: String, inBar: Bool = true) throws {
         let p = session.presenter, tab = try node(session, testId), agent = Agent(session: session)
-        until { p.navigationHost.barSegment(tab) != nil && !agent.nativeInFlight() }
-        let shown = try XCTUnwrap(p.navigationHost.barSegment(tab))
-        let point = shown.control.convert(CGPoint(x: shown.segment.midX, y: shown.segment.midY), to: nil)
+        func control() -> UISegmentedControl? {
+            let drawn = inBar ? p.navigationHost.barSegment(tab) : p.segments.drawn(tab)
+            return drawn?.control as? UISegmentedControl
+        }
+        until { control()?.window != nil && !agent.nativeInFlight() }
+        XCTAssertEqual(p.navigationHost.barSegment(tab) != nil, inBar)
+        let segments = try XCTUnwrap(control())
+        let index = try XCTUnwrap((0..<segments.numberOfSegments).first { segments.titleForSegment(at: $0) == tab.accessibleName })
+        let views = segments.segmentViews
+        XCTAssertEqual(views.count, segments.numberOfSegments)
+        let view = try XCTUnwrap(views.indices.contains(index) ? views[index] : nil)
+        let point = view.convert(CGPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
         let expected = p.client(point)
         var samples: [PointerSample] = []
         p.onPointer = { _, _, sample in samples.append(sample) }
@@ -228,44 +253,39 @@ final class AgentBarPointerIOSTests: XCTestCase {
         guard UIApplication.shared.connectedScenes.first is UIWindowScene else { throw missing("scene", "search and subtitle segments are placed by a scene's bar") }
         let session = try fixture("EXACT_SEARCH_SCOPE_PLAN")
         try node(session, "app").handlers.formUnion(["pointerdown", "pointerup"])
-        try assertVisibleSegmentPoint(session, "filter-mine")
+        let inBar = UIDevice.current.userInterfaceIdiom == .phone
+        try assertVisibleSegmentPoint(session, "filter-mine", inBar: inBar)
         session.presenter.press(try node(session, "pick-plain").id)
-        try assertVisibleSegmentPoint(session, "filter-done")
+        try assertVisibleSegmentPoint(session, "filter-done", inBar: inBar)
     }
 
-    func testABarReadoutBubblesPointersWithoutPressing() throws {
+    /// LLP 1141.004 D3: a hosted item is the element's own view in the bar, so
+    /// the agent's tap lands on it where the bar shows it, its pointer events
+    /// bubble to its logical ancestors, and nothing presses it.
+    func testAHostedItemBubblesPointersWithoutPressing() throws {
         let session = try fixture(), p = session.presenter, agent = Agent(session: session)
         p.press(try node(session, "open-plain").id)
         until { (p.navigationHost.primaryNavigation?.topViewController as? RouteController)?.node.props["testId"] == "route-plain" && !p.navigationHost.inTransition }
         try node(session, "navigation").handlers.formUnion(["pointerdown", "pointerup"])
         let readout = try node(session, "readout-plain")
         let route = try XCTUnwrap(p.navigationHost.primaryNavigation?.topViewController as? RouteController)
+        let item = try XCTUnwrap(route.navigationItem.rightBarButtonItems?.first { ($0.customView as? HostedItemView)?.node === readout }, "the readout is a hosted item")
         var events: [String] = [], presses: [UInt32] = []
         p.onPointer = { _, kind, sample in
             events.append(kind == .down ? "down" : "up")
-            guard let visible = route.readouts[readout.id]?.customView else { return XCTFail("the readout has a native view") }
-            let expected = p.client(visible.convert(CGPoint(x: visible.bounds.midX, y: visible.bounds.midY), to: nil))
+            let expected = p.client(readout.convert(CGPoint(x: readout.bounds.midX, y: readout.bounds.midY), to: nil))
             XCTAssertEqual(sample.clientX, Double(expected.x), accuracy: 0.5)
             XCTAssertEqual(sample.clientY, Double(expected.y), accuracy: 0.5)
         }
         p.onPress = { presses.append($0) }
-        for testId in ["readout-plain", "readout-text"] {
-            events = []
-            let readout = try node(session, testId)
-            let reply = agent.tap(["id": Int(readout.id)])
-            XCTAssertNil(reply["error"], "\(reply)")
-            XCTAssertEqual(reply["native"] as? String, "bar-readout")
-            XCTAssertEqual(events, ["down", "up"], testId)
-            XCTAssertTrue(presses.isEmpty, "a readout has no press action")
-        }
-        var checked = false
-        let refused = p.navigationHost.activateChrome(readout, before: { _ in checked = true; return false })
-        XCTAssertTrue(checked)
-        XCTAssertNotNil(refused?["error"], "a refused pointer delivery is not acknowledged as a tap")
-        // A readout the bar does not show has no place for a pointer
-        let item = try XCTUnwrap(route.readouts[readout.id])
+        events = []
+        let reply = agent.tap(["id": Int(readout.id)])
+        XCTAssertNil(reply["error"], "\(reply)")
+        XCTAssertEqual(events, ["down", "up"])
+        XCTAssertTrue(presses.isEmpty, "a readout has no press action")
+        // A hosted item the bar does not show has no place for a pointer
         item.isHidden = true
-        until { item.customView?.window == nil }
+        until { readout.window == nil }
         events = []
         XCTAssertNotNil(agent.tap(["id": Int(readout.id)])["error"], "the bar shows no view for the readout")
         XCTAssertEqual(events, [])

@@ -54,10 +54,25 @@ extension Presenter {
         return v.textArea ?? v.field ?? v.nativeValueControl ?? v
     }
 
+    /// Plain text insertion doesn't read the key-view loop. If AppKit
+    /// interprets a text key as a command, the editor prepares it there.
+    /// Return the editor when preparation is deferred to it.
+    func prepareKeyViewLoop(for event: NSEvent, in window: NSWindow?) -> NSTextView? {
+        guard event.type == .keyDown else { return nil }
+        let editor = window?.firstResponder as? NSTextView
+        let owner = (editor as? TextArea)?.owner ?? (editor as? FieldEditor)?.owner
+        if owner?.presenter === self, editor?.hasMarkedText() == false,
+           event.modifierFlags.isDisjoint(with: [.command, .control, .option, .shift, .function]),
+           let characters = event.characters, !characters.isEmpty,
+           characters.unicodeScalars.allSatisfy({ $0.properties.generalCategory != .control && $0.properties.generalCategory != .privateUse }) {
+            return editor
+        }
+        flushKeyViewLoop()
+        return nil
+    }
+
     /// Rebuild the key-view loop if a batch left it stale, or the Keyboard
-    /// Navigation setting changed since it was built: called for each key
-    /// event before AppKit reads `nextKeyView` (the view's monitor, and the
-    /// agent's `type`, which sends to the window directly).
+    /// Navigation setting changed since it was built.
     func flushKeyViewLoop() {
         guard keyViewLoopStale || keyViewLoopMode != KeyboardNavigation.on else { return }
         keyViewLoopStale = false
@@ -89,8 +104,9 @@ extension Presenter {
     /// pane's view, and stands where it was written (LLP 1115.002 D4); a
     /// popover painted in the page follows its invoker.
     private func inTabOrder(_ tops: [NodeView], _ visit: (NodeView) -> Void) {
+        var seen = Set<ObjectIdentifier>()
         func walk(_ v: NodeView) {
-            if v.inert || v.isHidden { return }
+            guard !v.inert, !v.isHidden, seen.insert(ObjectIdentifier(v)).inserted else { return }
             visit(v)
             let own = v.childNodes
             for child in tables.feeds[v.id]?.mounted ?? navigation.stackSplit.authored(own, in: v.container) { walk(child) }

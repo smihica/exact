@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 mod build_advice;
+pub mod controls;
 pub use build_advice::{
     compile_path_advised, information, resource_clock_warnings, surface_findings, warning_rank,
     web_only, web_only_line, web_only_said, Advised,
@@ -64,13 +65,14 @@ mod surface;
 use surface::fact_shape;
 mod symbols;
 pub use contract_analyze::SuggestionCheck;
-pub use properties::resolve_test_states_path;
 pub use properties::{
     check_properties, check_properties_path, check_suggestions_path, properties, property_program,
-    resolve_properties_path, tests,
+    resolve_properties_path, tests, tests_with_defaults,
 };
+pub use properties::{check_test_substitutes, resolve_test_states_path};
 mod tests_json;
 pub use tests_json::{authored_json, tests_json};
+pub mod forma_gen;
 pub mod forma_levels;
 pub mod forma_params;
 /// `uses` (LLP 1121 stage 4, commit 6): where the app reads a token.
@@ -81,6 +83,7 @@ mod typescript;
 pub mod watch;
 pub mod watch_sync;
 pub use contract_lower::vocab::collection_edge_refusal;
+use contract_lower::SourceOutput;
 pub use contract_types::strings::Strings;
 /// The data seam, re-exported for an app's build script: the bake asks the
 /// crate its grants for the compatibility id (`Caltrain.grants()`).
@@ -91,7 +94,8 @@ pub use logic::{
     rust_entry_naming, web_linked, web_rust_mode,
 };
 pub use manifest::{Activity, Choices, Configuration, Manifest, Parameter, RustData, Widget};
-pub use map::{plan_digest, SourceMap};
+pub use manifest::{Control, ControlAction};
+pub use map::{compile_for_comparison, plan_digest, ComparisonInput, SourceMap};
 pub use module_rust::{build_module_rust, module_rust, module_rust_path};
 pub use preload::preload_expression;
 pub use resolve::Origin;
@@ -103,7 +107,9 @@ pub use sources::{
 pub use symbols::{
     editor_elements_json, editor_symbols_json, symbols_json, ElementFilters, PartialSymbols,
 };
-pub use typescript::{design_exports, typescript, typescript_exporting, typescript_sources};
+pub use typescript::{
+    design_exports, typescript, typescript_entry_answer, typescript_exporting, typescript_sources,
+};
 /// The app's strings tables (LLP 1060 D1), `None` for an app without a
 /// `strings` directory, every refusal in one message: the bake reads grant
 /// purposes from them (LLP 1069.008 D1).
@@ -323,10 +329,11 @@ fn vars(file: &mut contract_syntax::File) -> Result<Vec<CompileError>, CompileEr
         .map(CompileError::warning)
         .collect())
 }
-/// Compile one source text to a validated plan. A text has no path, so a
-/// `use … from "./file.contract"` in it cannot be resolved: compile a file
-/// that uses others with [`compile_path`].
+/// Compile standalone text to a validated plan. Use [`compile_path`] for relative imports.
 pub fn compile(src: &str) -> Result<Plan, CompileError> {
+    compile_text(src, SourceOutput::Places)
+}
+fn compile_text(src: &str, output: SourceOutput) -> Result<Plan, CompileError> {
     let mut file = contract_syntax::parse(src)?;
     contract_syntax::resolve_clock_timelines(&mut file)?;
     params(&mut file)?;
@@ -345,7 +352,13 @@ pub fn compile(src: &str) -> Result<Plan, CompileError> {
             related: Box::new([]),
         });
     }
-    compile_file(file, None)
+    // Media alone: a text has no app, so no `file_handlers` (LLP 1069.002 D1).
+    picker::check(&file, None)
+        .and(orientationlock::check(&file, None))
+        .map_err(first)?;
+    compile_file_output(&file, None, None, output, contract_lower::Profile::Web)
+        .map(|(plan, _)| plan)
+        .map_err(first)
 }
 /// [`compile`], with the warnings beside its result (LLP 1116 D6): every
 /// one the text earns once it type-checks, whether it then compiled or not.
@@ -423,7 +436,7 @@ fn read_source(path: &Path) -> Result<String, CompileError> {
 /// resolution. Unlike [`compile_path`], this never re-reads the root file;
 /// callers that watch a file can compile the exact snapshot they observed.
 pub fn compile_path_source(path: &Path, src: &str) -> Result<Plan, CompileError> {
-    compile_path_output(path, src, false)
+    compile_path_source_all(path, src, false)
         .map(|(plan, _)| plan)
         .map_err(first)
 }
@@ -441,7 +454,7 @@ pub fn compile_path_all(
     mapped: bool,
 ) -> Result<(Plan, Option<SourceMap>), Vec<CompileError>> {
     let src = read_source(path).map_err(|e| vec![e])?;
-    compile_path_output(path, &src, mapped)
+    compile_path_source_all(path, &src, mapped)
 }
 
 /// [`compile_path_all`] over the exact observed root source snapshot, as
@@ -452,7 +465,7 @@ pub fn compile_path_source_all(
     src: &str,
     mapped: bool,
 ) -> Result<(Plan, Option<SourceMap>), Vec<CompileError>> {
-    compile_path_output(path, src, mapped)
+    compile_path_checked(path, src, mapped, true, contract_lower::Profile::Web)
 }
 
 fn first(mut all: Vec<CompileError>) -> CompileError {
@@ -465,7 +478,7 @@ pub fn compile_path_source_mapped(
     path: &Path,
     src: &str,
 ) -> Result<(Plan, SourceMap), CompileError> {
-    compile_path_output(path, src, true)
+    compile_path_source_all(path, src, true)
         .map(|(plan, map)| (plan, map.expect("map requested")))
         .map_err(first)
 }
@@ -480,6 +493,15 @@ pub fn source_graph(path: &Path) -> SourceGraph {
 /// [`source_graph`]'s Contract half ([`sources::GraphBase`]), which reads no design file, or its refusal (the root
 /// unreadable) as the whole graph: the design server's walk keeps it across a design-only edit.
 pub fn source_graph_base(path: &Path) -> Result<GraphBase, SourceGraph> {
+    graph_base_for(path, None)
+}
+
+/// The inputs to a web frame built in its owning app.
+pub fn frame_source_graph(path: &Path, frame: &Path) -> SourceGraph {
+    graph_base_for(path, Some(frame)).map_or_else(|refused| refused, |base| base.tail())
+}
+
+fn graph_base_for(path: &Path, frame: Option<&Path>) -> Result<GraphBase, SourceGraph> {
     // The server's planned text of the root, where it has one (stage 8 D).
     let refused = |message: String| SourceGraph {
         sources: Vec::new(),
@@ -504,7 +526,7 @@ pub fn source_graph_base(path: &Path) -> Result<GraphBase, SourceGraph> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     match source_root.canonicalize() {
-        Ok(app_root) => Ok(sources::graph_base(path, &src, &app_root)),
+        Ok(app_root) => Ok(sources::graph_base(path, &src, &app_root, frame)),
         Err(e) => Err(refused(format!("{}: {e}", source_root.display()))),
     }
 }
@@ -799,7 +821,7 @@ pub type Warned = (
 /// [`contract_lower::MAX_WARNINGS`], whether lowering then succeeded or
 /// refused. A file the type checker refuses has none.
 pub fn compile_path_all_warned(path: &Path, mapped: bool) -> Warned {
-    compile_path_all_warned_with(path, mapped, false)
+    compile_path_all_warned_with(path, mapped, false, None)
 }
 
 /// [`compile_path_all`], surface arguments checked, with the warnings beside
@@ -807,10 +829,20 @@ pub fn compile_path_all_warned(path: &Path, mapped: bool) -> Warned {
 /// web's, a bake) prints, so they reach whoever ran it and not only
 /// `contract build` (LLP 1116.004 D7).
 pub fn compile_path_all_with_warnings(path: &Path, mapped: bool) -> Warned {
-    compile_path_all_warned_with(path, mapped, true)
+    compile_path_all_warned_with(path, mapped, true, None)
 }
 
-fn compile_path_all_warned_with(path: &Path, mapped: bool, surfaces: bool) -> Warned {
+/// Compile the frame's component tree with the declarations and data of the app at `path`.
+pub fn compile_frame_with_warnings(path: &Path, frame: &Path, mapped: bool) -> Warned {
+    compile_path_all_warned_with(path, mapped, true, Some(frame))
+}
+
+fn compile_path_all_warned_with(
+    path: &Path,
+    mapped: bool,
+    surfaces: bool,
+    frame: Option<&Path>,
+) -> Warned {
     let mut warned = Vec::new();
     let result = read_source(path).map_err(|e| vec![e]).and_then(|src| {
         compile_path_warned(
@@ -820,6 +852,8 @@ fn compile_path_all_warned_with(path: &Path, mapped: bool, surfaces: bool) -> Wa
             surfaces,
             contract_lower::Profile::Web,
             Some(&mut warned),
+            frame,
+            None,
         )
     });
     warned.sort_by_key(warning_rank);
@@ -843,39 +877,37 @@ pub(crate) fn app_root(path: &Path) -> Result<PathBuf, Vec<CompileError>> {
     })
 }
 
-fn compile_path_output(
-    path: &Path,
-    src: &str,
-    mapped: bool,
-) -> Result<(Plan, Option<SourceMap>), Vec<CompileError>> {
-    compile_path_checked(path, src, mapped, true, contract_lower::Profile::Web)
-}
-
 fn compile_path_checked(
     path: &Path,
     src: &str,
-    mapped: bool,
+    mapped: impl Into<SourceOutput>,
     surfaces: bool,
     profile: contract_lower::Profile,
 ) -> Result<(Plan, Option<SourceMap>), Vec<CompileError>> {
-    compile_path_warned(path, src, mapped, surfaces, profile, None)
+    compile_path_warned(path, src, mapped, surfaces, profile, None, None, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_path_warned(
     path: &Path,
     src: &str,
-    mapped: bool,
+    mapped: impl Into<SourceOutput>,
     surfaces: bool,
     profile: contract_lower::Profile,
     warned: Option<&mut Vec<CompileError>>,
+    frame: Option<&Path>,
+    swift: Option<&mut Option<String>>,
 ) -> Result<(Plan, Option<SourceMap>), Vec<CompileError>> {
     let app_root = app_root(path)?;
     // A file's syntax refusals do not stop the passes after it: they check
     // what parsed, and the refusals lead what they report (`Refused::join`).
     let mut refused = sources::Refused::default();
-    let loaded = sources::load_partial(path, src, &app_root, &mut refused);
+    let loaded = sources::load_partial_with(path, src, &app_root, &mut refused, None, frame);
     let mut own = Vec::new();
     let compiled = loaded.and_then(|(file, sources)| {
+        if let Some(output) = swift {
+            *output = forma_gen::swift_names(&file);
+        }
         let warned = warned
             .is_some()
             .then_some((contract_lower::MAX_WARNINGS, &mut own));
@@ -897,13 +929,13 @@ fn compile_loaded(
     app_root: &Path,
     file: File,
     sources: sources::Sources,
-    mapped: bool,
+    mapped: impl Into<SourceOutput>,
     surfaces: bool,
     profile: contract_lower::Profile,
     warned: Option<(usize, &mut Vec<CompileError>)>,
 ) -> Result<(Plan, Option<SourceMap>), Vec<CompileError>> {
     let app_root = app_root.to_path_buf();
-    let views = native::check(&file, &app_root).map_err(|all| {
+    let views = native::check(&file, &app_root, profile).map_err(|all| {
         all.into_iter()
             .map(|e| sources.resolve(e))
             .collect::<Vec<_>>()
@@ -997,16 +1029,6 @@ fn compile_loaded(
     Ok((plan, sites.map(|sites| SourceMap::new(sites, sources))))
 }
 
-fn compile_file(file: File, asset_root: Option<&Path>) -> Result<Plan, CompileError> {
-    // Media alone: a text has no app, so no `file_handlers` (LLP 1069.002 D1).
-    picker::check(&file, None)
-        .and(orientationlock::check(&file, None))
-        .map_err(first)?;
-    compile_file_output(&file, asset_root, None, false, contract_lower::Profile::Web)
-        .map(|(plan, _)| plan)
-        .map_err(first)
-}
-
 impl From<CompileError> for Vec<CompileError> {
     fn from(e: CompileError) -> Self {
         vec![e]
@@ -1017,7 +1039,7 @@ fn compile_file_output(
     file: &File,
     asset_root: Option<&Path>,
     strings: Option<std::sync::Arc<contract_types::strings::Strings>>,
-    mapped: bool,
+    mapped: impl Into<SourceOutput>,
     profile: contract_lower::Profile,
 ) -> Result<(Plan, Option<contract_lower::Sites>), Vec<CompileError>> {
     compile_file_warned(file, asset_root, strings, mapped, profile, None)
@@ -1032,7 +1054,7 @@ fn compile_file_warned(
     file: &File,
     asset_root: Option<&Path>,
     strings: Option<std::sync::Arc<contract_types::strings::Strings>>,
-    mapped: bool,
+    mapped: impl Into<SourceOutput>,
     profile: contract_lower::Profile,
     warned: Option<(&contract_lower::WarningSelection, &mut Vec<CompileError>)>,
 ) -> Result<(Plan, Option<contract_lower::Sites>), Vec<CompileError>> {
@@ -1047,6 +1069,8 @@ fn compile_file_warned(
             .map(|e| hint(e.into()))
             .collect()
     }
+    let output = mapped.into();
+    let mapped = output == SourceOutput::Mapped;
     let hint = |error| symbols::authored_action_hint(file, error);
     // Lowering needs what types and analysis establish; when either refuses,
     // what it would find without them (tags, attribute names, literal values)
@@ -1094,7 +1118,7 @@ fn compile_file_warned(
             &checked,
             &analysis,
             asset_root,
-            mapped,
+            output,
             profile,
             warned
                 .as_ref()
@@ -1104,7 +1128,7 @@ fn compile_file_warned(
         .and_then(|built| {
             // A component nothing uses is not lowered; its literal values
             // are checked as the lint checks them (LLP 1156.005 D3).
-            let unused = contract_lower::lint_unused(file);
+            let unused = contract_lower::lint_unused(file, &checked.types.shapes);
             if !unused.is_empty() {
                 return Err(each(unused, |e| e));
             }
@@ -1162,7 +1186,7 @@ pub fn bake_with_warnings<D: DataSource>(
     }
     let mut b = PlanBuilder::from_plan(plan);
     let pending: Vec<String> = runner.pending().into_iter().map(|(n, _)| n).collect();
-    let dated = runner.resources_reading_clock();
+    let dated = runner.resources_tainted_for_bake();
     // A resource over a list compiles nothing: its elements are the
     // launch's to ask (LLP 1017.000 P4c), and they follow the plan's rows.
     for i in 0..runner.declared_resources().len() {
@@ -1329,7 +1353,7 @@ fn first_frame<D: DataSource>(
 /// nothing bounding it (it grows, and never scrolls — 0102, 0103), and a
 /// pressable with zero area (nothing can press it — valet 0003). A pressable
 /// holding an image or a canvas is exempt: their size is the host's.
-/// A pressable hidden by `display: none` on itself or an ancestor is skipped.
+/// A pressable under `display: none` or in a closed `dialog` has no box and is skipped.
 ///
 /// Unanswered (`answered` false, [`check`]), a verdict that could rest on a
 /// placeholder is not given: an empty list's `scroll`, or a button whose
@@ -1466,7 +1490,7 @@ fn has_zero_dimension(node: exact_kernel::NodeRef<'_>) -> bool {
 fn hidden(kernel: &Kernel, node: exact_kernel::NodeRef<'_>) -> bool {
     let mut at = Some(node);
     while let Some(n) = at {
-        if matches!(n.style.display, exact_kernel::Display::None) {
+        if matches!(n.style.display, exact_kernel::Display::None) || kernel.is_closed_dialog(n.id) {
             return true;
         }
         at = n.parent.and_then(|p| kernel.node(p));

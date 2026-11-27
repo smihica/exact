@@ -4,9 +4,11 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { OFFLINE_MISSING, withHostDeployment } from './filesystem.mjs';
 import { BUILD_SCRIPT_FAILED_LINE, buildScriptFailed, throwContractErrors } from './contract-diagnosis.mjs';
-import { basename, delimiter, dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
+import { basename, delimiter, dirname, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
+import { resolveAppleLLVM, writtenPath } from './paths.mjs';
+export { writtenPath } from './paths.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -48,11 +50,23 @@ export const WEB_STD = ['-Zbuild-std=std,panic_abort', '-Zbuild-std-features=opt
 // deprecates names, like `fetch_update`, before stable has their successors.
 export const WEB_RUSTFLAGS = ['-Zunstable-options', '-Cpanic=immediate-abort', '-Zlocation-detail=none', '-Adeprecated'];
 export const WEB_SIZE = [...WEB_STD, ...WEB_RUSTFLAGS].join(' ');
+/** Refuses a WEB_STD build run in `cwd` whose Cargo configuration names a lockfile. Cargo resolves std's own
+ * workspace against a configured `resolver.lockfile-path` as well, not against std's Cargo.lock, so each of std's
+ * dependencies that lockfile does not pin resolves afresh to its newest release, which need not compile as std's
+ * (hashbrown 0.17.2 does not on WEB_TOOLCHAIN). The key takes one path for every workspace, so nothing gives std its
+ * own while the author's is set. */
+export function refuseStdLockfile(env, cwd, what) {
+  const config = spawnSync('cargo', ['-Z', 'unstable-options', 'config', 'get', 'resolver.lockfile-path', '--color=never'], { cwd, env: { ...env, RUSTUP_TOOLCHAIN: WEB_TOOLCHAIN }, encoding: 'utf8' });
+  if (config.status === 0) throw new Error(`${what}: Cargo's configuration names a lockfile (${config.stdout.trim()}), and a -Zbuild-std build resolves std's dependencies against it instead of std's own Cargo.lock, so they move to releases std need not compile with. Unset CARGO_RESOLVER_LOCKFILE_PATH, or remove resolver.lockfile-path from the Cargo configuration that sets it.`);
+  if (!config.stderr?.trimEnd().endsWith('error: config value `resolver.lockfile-path` is not set')) throw new Error(`${what}: Cargo's configuration did not read: ${config.stderr || config.error?.message || `exit ${config.status}`}`);
+}
 /** The environment for a web build, refusing a machine without the toolchain
  * or its std sources (Cargo builds offline, so std's dependencies too). A
  * build that links wasm on a Mac also needs llvm-tools: this nightly's
- * `rust-lld` loads `libLLVM.dylib` from `rustlib/<host>/lib/`. */
-export function webToolchainEnv(env, { linksWasm = false } = {}) {
+ * `rust-lld` loads `libLLVM.dylib` from `rustlib/<host>/lib/`. `recheck`
+ * probes std's sources despite a marker, which outlives them when Cargo's
+ * cache is cleaned or std's lock changes under the same sysroot path. */
+export function webToolchainEnv(env, { linksWasm = false, recheck = false } = {}) {
   const printed = spawnSync('rustc', ['--print', 'sysroot', '--print', 'host-tuple'], { env: { ...env, RUSTUP_TOOLCHAIN: WEB_TOOLCHAIN }, encoding: 'utf8' });
   const [sysroot, host = ''] = printed.status === 0 ? printed.stdout.trim().split('\n') : [];
   const needs = ['lib/rustlib/src/rust/library/Cargo.lock', ...(linksWasm && host.endsWith('-apple-darwin') ? [`lib/rustlib/${host}/lib/libLLVM.dylib`] : [])];
@@ -66,7 +80,7 @@ export function webToolchainEnv(env, { linksWasm = false } = {}) {
   const home = (process.platform === 'win32' ? env.USERPROFILE : env.HOME) || homedir();
   const cargoHome = resolve(env.CARGO_HOME || resolve(home, '.cargo'));
   const marker = resolve(cargoHome, '.exact', 'web-std', createHash('sha256').update(library).digest('hex'));
-  if (!existsSync(marker)) {
+  if (recheck || !existsSync(marker)) {
     const offline = spawnSync('cargo', ['metadata', '--offline', '--locked', '--format-version', '1', '--manifest-path', resolve(library, 'Cargo.toml')], { env: cargoEnvironment({ ...env, RUSTUP_TOOLCHAIN: WEB_TOOLCHAIN }), encoding: 'utf8', maxBuffer: 1 << 26 });
     let ready = offline.status === 0;
     if (!ready) {
@@ -439,14 +453,6 @@ export function cargoBuildEnv(cwd, env) {
   return result;
 }
 
-/** `path` made absolute as written, a `..` kept: a relative one joins the working directory, a Windows drive's own
- * for `D:staging`, and a root (a drive, a UNC share) stays whole. */
-export function writtenPath(path) {
-  if (isAbsolute(path)) return path;
-  const { root } = parse(path);
-  return resolve(root || '.') + sep + path.slice(root.length);
-}
-
 /** `path` as the system reaches it, or null when a part of it cannot be read. Windows collapses a `..` before it
  * opens a path, as `path.resolve` does; POSIX follows each link before a later `..`, which `path.resolve`, and Bun's
  * `realpathSync.native`, collapse first, so there a path with `..` is followed part by part, split at `/` alone. Bun
@@ -478,12 +484,17 @@ export function targetRustflags(target, flags, { cwd = process.cwd(), env = proc
 
 /** Make Apple's deployment environment part of every target unit's Cargo hash. Add to each existing flags source
  * so Cargo keeps choosing and merging flags itself; introducing a target table would hide `build.rustflags`. */
-export function appleCargo(command, arguments_, options = {}) {
-  const targets = arguments_.filter((value, index) => arguments_[index - 1] === '--target' || value.startsWith('--target='));
+export function appleCargo(command, arguments_, options = {}, platform = process.platform) {
+  const separator = arguments_.indexOf('--'), at = separator < 0 ? arguments_.length : separator;
+  const cargoArgs = arguments_.slice(0, at);
+  const targets = cargoArgs.flatMap((arg, index) => arg === '--target' && index + 1 < at ? [cargoArgs[index + 1]]
+    : arg.startsWith('--target=') ? [arg.slice('--target='.length)] : []);
   const apple = command === 'cargo' && (targets.some(value => value.includes('-apple-')) ||
-    !targets.length && process.platform === 'darwin' && ['build', 'rustc', 'check', 'test', 'clippy'].includes(arguments_[0]));
+    !targets.length && platform === 'darwin' && ['build', 'rustc', 'check', 'test', 'clippy'].includes(cargoArgs[0]));
   if (!apple) return [command, arguments_, options];
   const environment = { ...(options.env ?? process.env) };
+  // The diagnostics relay starts in the workspace, and Cargo runs build scripts in their packages.
+  if (platform === 'linux') resolveAppleLLVM(environment);
   // LIBSQLITE3_FLAGS is global to a Cargo invocation. Recompute it for each
   // destination, including a nested Mac bake after an iOS compile.
   const sqliteFlags = ['-DSQLITE_ENABLE_LOCKING_STYLE=0', '-Dfstatfs=exact_sqlite_fstatfs'];
@@ -536,8 +547,7 @@ export function appleCargo(command, arguments_, options = {}) {
     else if (Array.isArray(flags) && flags.every(value => typeof value === 'string')) set(key, [flag]);
     else throw new Error(`Cannot track Apple deployment targets because Cargo ${key} is not a string or string array. Fix its configuration before building.`);
   }
-  const separator = arguments_.indexOf('--'), at = separator < 0 ? arguments_.length : separator;
-  return [command, [...arguments_.slice(0, at), ...configurationArgs, ...arguments_.slice(at)], { ...options, env: environment }];
+  return [command, [...cargoArgs, ...configurationArgs, ...arguments_.slice(at)], { ...options, env: environment }];
 }
 
 /** The link argument that aligns an Android library's LOAD segments to 16 KB, which a device with 16 KB pages needs

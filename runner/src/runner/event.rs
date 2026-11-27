@@ -8,6 +8,8 @@ use std::rc::Rc;
 mod focus;
 pub(super) mod frame_navigation;
 mod keyboard;
+mod picture_in_picture;
+pub(super) use picture_in_picture::FloatingVideo;
 mod view_event;
 pub use keyboard::KeyboardEvent;
 pub(in crate::runner) use view_event::absent_is_none;
@@ -315,9 +317,10 @@ pub enum Event {
     /// A touch or primary button went down on the view (DOM's
     /// `pointerdown`), before any gesture is recognized (LLP 1005 §3).
     Pointerdown(super::PointerEvent),
-    /// That touch or button came up, or the platform cancelled it (DOM's
-    /// `pointerup`; a `pointercancel` is delivered as one).
+    /// That touch or button came up (DOM's `pointerup`).
     Pointerup(super::PointerEvent),
+    /// The held contact was cancelled.
+    Pointercancel(super::PointerEvent),
     /// The pointer moved over the view, or while held after going down on
     /// it: at most one a frame (LLP 1056 §3 stage 3, as built).
     Pointermove(super::PointerEvent),
@@ -325,6 +328,9 @@ pub enum Event {
     Swiperight,
     /// Its mirror, a left swipe (Charlie, 2026-11-10).
     Swipeleft,
+    /// The platform's discrete swipe in the node's `swipe-flick` direction (LLP
+    /// 1057.001 §8).
+    Swipe,
     /// A pull past the top of a scroll container asked for fresh content
     /// (UIKit's `UIRefreshControl`); the app answers through `refreshing`.
     Refresh,
@@ -349,6 +355,10 @@ pub enum Event {
     /// where it measures one (UIKit), `exact_motion::VelocityTracker`'s
     /// elsewhere; a cancelled contact releases at (0, 0) (LLP 1057 §10.6).
     PanRelease(f64, f64),
+    /// Cumulative touch scale and focal point in viewport coordinates.
+    Pinch(f64, f64, f64),
+    /// The final two-contact sample, with scale 1 on cancellation.
+    PinchRelease(f64, f64, f64),
     /// A standard media event. Numeric payloads are seconds.
     Media(EventKind, String),
     /// DOM's `copy`, `cut` or `paste` at the focused view (spreadsheet F4,
@@ -592,6 +602,7 @@ impl Event {
             Event::Key(k) | Event::Keycapture(k) | Event::Keyup(k) => Some(k.value()),
             Event::Pointerdown(p)
             | Event::Pointerup(p)
+            | Event::Pointercancel(p)
             | Event::Pointermove(p)
             | Event::ContextmenuAt(p) => Some(p.value()),
             // A menu asked for with no point (a keyboard's menu key): the
@@ -703,8 +714,23 @@ impl Event {
         (vx.is_finite() && vy.is_finite()).then_some(Self::PanRelease(vx, vy))
     }
 
-    fn invalid_payload(&self) -> Option<&'static str> {
+    pub(super) fn invalid_payload(&self) -> Option<&'static str> {
         match *self {
+            Self::Media(kind @ (EventKind::Play | EventKind::Pause), ref how)
+                if !matches!(how.as_str(), "" | "remote") =>
+            {
+                Some(kind.name())
+            }
+            Self::Pinch(scale, x, y)
+                if !(scale.is_finite() && scale > 0. && pixel(x) && pixel(y)) =>
+            {
+                Some("pinch")
+            }
+            Self::PinchRelease(scale, x, y)
+                if !(scale.is_finite() && scale > 0. && pixel(x) && pixel(y)) =>
+            {
+                Some("pinchrelease")
+            }
             Self::Pan(x, y) if !pixel(x) || !pixel(y) => Some("pan"),
             Self::PanRelease(vx, vy) if !vx.is_finite() || !vy.is_finite() => Some("panrelease"),
             Self::HeightRelease { height, velocity } if !valid_height_release(height, velocity) => {
@@ -762,39 +788,9 @@ impl Event {
         );
         valid_height_release(height, velocity).then_some(Self::HeightRelease { height, velocity })
     }
-
-    /// Decode the scroll event: `left,top,scrollWidth,scrollHeight,
-    /// clientWidth,clientHeight`, finite CSS pixels, the extents not negative,
-    /// then a zoomable container's zoom, above 0; a scroller that does not
-    /// zoom leaves it out.
-    pub fn scroll_payload(payload: &str) -> Option<Self> {
-        let (payload, zoom) = match payload.matches(',').count() {
-            6 => {
-                let (rest, zoom) = payload.rsplit_once(',')?;
-                (rest, exact_num::parse_f64(zoom).ok()?)
-            }
-            _ => (payload, 1.0),
-        };
-        let [left, top, width, height, client_width, client_height] = tuple::<6>(payload)?;
-        ([left, top].iter().all(|v| v.is_finite())
-            && [width, height, client_width, client_height]
-                .iter()
-                .all(|v| v.is_finite() && *v >= 0.0)
-            && zoom.is_finite()
-            && zoom > 0.0)
-            .then_some(Self::Scroll(ScrollEvent {
-                left,
-                top,
-                width,
-                height,
-                client_width,
-                client_height,
-                zoom,
-            }))
-    }
 }
 
-fn tuple<const N: usize>(payload: &str) -> Option<[f64; N]> {
+pub(super) fn tuple<const N: usize>(payload: &str) -> Option<[f64; N]> {
     let mut parts = payload.split(',');
     let mut values = [0.0; N];
     for value in &mut values {
@@ -1011,17 +1007,50 @@ impl<D: DataSource> Runner<D> {
     /// Deliver a host event to `view`: find its handler, evaluate the curried
     /// arguments in the instance's scope now, run the action, update.
     pub fn dispatch(&mut self, view: ViewId, event: Event) -> Result<CommitReceipt, RunnerError> {
-        // A world's message runs as the origin its mark carries (`world_origin.rs`).
-        if let Event::Message(text) = &event {
-            if let Some((origin, text)) = super::world_origin::unmark(text) {
-                let event = Event::Message(text.to_owned());
-                return self.as_origin(origin, |r| r.arrived(|r| r.dispatch_event(view, event)));
-            }
+        // A world's message carries the origins posted into it
+        // (`world_origin.rs`), which only lower what it runs as. A tool's or
+        // a press's work keeps D4a's command rules (LLP 1133.023 D7a); the
+        // mark cannot tell a press from another action.
+        let mut marked = None;
+        let event = match event {
+            Event::Message(text) => match super::world_origin::unmark(&text) {
+                Some((causes, rest)) => {
+                    marked = Some(super::provenance::Cause::marked(causes));
+                    Event::Message(rest.to_owned())
+                }
+                None => Event::Message(text),
+            },
+            event => event,
+        };
+        // A remote Play or Pause the host carried out for the element (LLP
+        // 1133.023 D7a; no host reports one yet). A `play` or `pause`
+        // carries nothing else (`invalid_payload`).
+        if matches!(&event, Event::Media(EventKind::Play | EventKind::Pause, how) if how == "remote")
+        {
+            let cause = super::provenance::Cause::remote_control();
+            return self.as_cause(cause, |r| r.arrived(|r| r.dispatch_event(view, event)));
         }
-        self.arrived(|r| {
-            r.note_input(&event);
-            r.dispatch_event(view, event)
-        })
+        // The person's act in the app's own UI is an `app` cause. What the
+        // host observes of the page and a package view's message are the
+        // person's while the page shows (`as_shown`).
+        let package = matches!(event, Event::Message(_))
+            && (self.kernel.node(view)).is_some_and(|n| {
+                n.props
+                    .str(exact_kernel::PropId::NativeViewModuleName)
+                    .is_some()
+            });
+        let shown = !(observed(&event) || package) || !self.page.hidden;
+        let dispatched = |r: &mut Self| match marked {
+            Some(marked) => {
+                let cause = r.join_causes(r.cause(), marked);
+                r.as_cause(cause, |r| r.arrived(|r| r.dispatch_event(view, event)))
+            }
+            None => r.arrived(|r| {
+                r.note_input(&event);
+                r.dispatch_event(view, event)
+            }),
+        };
+        self.as_shown(shown, dispatched)
     }
 
     fn dispatch_event(&mut self, view: ViewId, event: Event) -> Result<CommitReceipt, RunnerError> {
@@ -1065,13 +1094,17 @@ impl<D: DataSource> Runner<D> {
             Event::Dblclick => "dblclick",
             Event::Pointerdown(_) => "pointerdown",
             Event::Pointerup(_) => "pointerup",
+            Event::Pointercancel(_) => "pointercancel",
             Event::Pointermove(_) => "pointermove",
             Event::Swiperight => "swiperight",
             Event::Swipeleft => "swipeleft",
+            Event::Swipe => "swipe",
             Event::Refresh => "refresh",
             Event::Scroll(_) => "scroll",
             Event::Resize(_) => "resize",
             Event::Intersect { .. } => "intersect",
+            Event::Pinch(..) => "pinch",
+            Event::PinchRelease(..) => "pinchrelease",
             Event::Pan(_, _) => "pan",
             Event::PanRelease(_, _) => "panrelease",
             Event::Media(kind, _) | Event::Clipboard(kind, ..) => kind.name(),
@@ -1123,18 +1156,14 @@ impl<D: DataSource> Runner<D> {
             return Err(RunnerError::InvalidEvent { event });
         }
         let (node, frames) = self
-            .find(view)
-            .or_else(|| {
-                matches!(event, Event::Focusout { .. })
-                    .then(|| self.take_detached_focus(view))
-                    .flatten()
-            })
+            .event_target(view, &event)
             .ok_or(RunnerError::UnknownView(view))?;
         // Events without a listener do nothing: a picker's `cancel` (LLP
         // 1069.010 D3), a dialog's `close` (LLP 1021), a scroll's end or drag, a swipe.
         if matches!(
             event,
-            Event::Cancel
+            Event::Media(EventKind::Enterpictureinpicture, _)
+                | Event::Cancel
                 | Event::Close
                 | Event::Scrollend
                 | Event::Scrolldragstart
@@ -1142,6 +1171,7 @@ impl<D: DataSource> Runner<D> {
                 | Event::Historyswipe(_)
         ) {
             let kind = match event {
+                Event::Media(kind, _) => kind,
                 Event::Close => EventKind::Close,
                 Event::Scrollend => EventKind::Scrollend,
                 Event::Scrolldragstart => EventKind::Scrolldragstart,
@@ -1269,9 +1299,11 @@ impl<D: DataSource> Runner<D> {
             Event::Dblclick => (EventKind::Dblclick, None, "dblclick"),
             Event::Pointerdown(_) => (EventKind::Pointerdown, None, "pointerdown"),
             Event::Pointerup(_) => (EventKind::Pointerup, None, "pointerup"),
+            Event::Pointercancel(_) => (EventKind::Pointercancel, None, "pointercancel"),
             Event::Pointermove(_) => (EventKind::Pointermove, None, "pointermove"),
             Event::Swiperight => (EventKind::Swiperight, None, "swiperight"),
             Event::Swipeleft => (EventKind::Swipeleft, None, "swipeleft"),
+            Event::Swipe => (EventKind::Swipe, None, "swipe"),
             Event::Refresh => (EventKind::Refresh, None, "refresh"),
             Event::Scroll(_) => (EventKind::Scroll, None, "scroll"),
             Event::Resize(_) => (EventKind::Resize, None, "resize"),
@@ -1291,6 +1323,8 @@ impl<D: DataSource> Runner<D> {
             ),
             Event::Clipboard(kind, ..) => (*kind, None, kind.name()),
             Event::SelectionChange { .. } => (EventKind::Selectionchange, None, "selectionchange"),
+            Event::Pinch(..) => (EventKind::Pinch, None, "pinch"),
+            Event::PinchRelease(..) => (EventKind::Pinchrelease, None, "pinchrelease"),
             Event::Pan(_, _) => (EventKind::Pan, None, "pan"),
             Event::PanRelease(_, _) => (EventKind::Panrelease, None, "panrelease"),
             Event::HeightRelease { .. } => (EventKind::Heightrelease, None, "heightrelease"),
@@ -1371,6 +1405,8 @@ impl<D: DataSource> Runner<D> {
             }
             _ => event.record(),
         };
+        let composing =
+            matches!(&event, Event::Input(ControlValue::Edit(_, _, edit)) if edit.is_composing);
         match event {
             Event::ReorderDrop { item, before } => {
                 args.push(Value::str(&item));
@@ -1385,6 +1421,9 @@ impl<D: DataSource> Runner<D> {
             | Event::Pan(left, top)
             | Event::PanRelease(left, top) => {
                 args.extend([Value::Number(left), Value::Number(top)])
+            }
+            Event::Pinch(s, x, y) | Event::PinchRelease(s, x, y) => {
+                args.extend([s, x, y].map(Value::Number))
             }
             Event::HeightRelease { height, velocity } => {
                 args.extend([Value::Number(height), Value::Number(velocity)]);
@@ -1415,6 +1454,9 @@ impl<D: DataSource> Runner<D> {
             }
         }
         super::lines::ran(what, self.plan.str(self.plan.action(handler.action).name));
+        if kind == EventKind::Input && self.plan.action(handler.action).writes.len != 0 {
+            return self.run_input(view, node, &handler, args, &frames, composing);
+        }
         self.traced_action("handler", handler.action, args, &frames)
     }
 }
@@ -1423,3 +1465,22 @@ impl<D: DataSource> Runner<D> {
 mod retained_binding_tests;
 
 mod projection;
+
+/// Whether `event` is the host's observation of the page rather than the
+/// person's act: a load, a resize, an intersection, a media element's
+/// progress, a frame's navigation, a geometry's report or a MIDI message.
+fn observed(event: &Event) -> bool {
+    match event {
+        // A media session's action is the person's, on the platform's controls.
+        Event::Media(kind, _) => !super::media_session::ACTIONS.contains(kind),
+        Event::Load
+        | Event::Resize(..)
+        | Event::Intersect { .. }
+        | Event::Beforeunload
+        | Event::MidiMessage(..)
+        | Event::FrameNavigation(..)
+        | Event::FrameRecord(..)
+        | Event::TransformGeometry { .. } => true,
+        _ => false,
+    }
+}

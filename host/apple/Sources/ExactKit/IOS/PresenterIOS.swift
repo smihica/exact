@@ -72,6 +72,7 @@ package final class Presenter {
     /// made modal, which a cleared prop drops from the index (`syncModal`).
     var announcedModal: (id: UInt32, incarnation: UInt64)?
     static var postScreenChanged: (Any?) -> Void = { UIAccessibility.post(notification: .screenChanged, argument: $0) }
+    static var postAnnouncement: (NSAttributedString) -> Void = { UIAccessibility.post(notification: .announcement, argument: $0) }
     let modalViews = NSHashTable<NodeView>.weakObjects()
     weak package var session: ExactSession?
     /// The document: the roots live here, content-sized like a page.
@@ -86,7 +87,7 @@ package final class Presenter {
     package var leaving: [UInt32: Leaving] = [:]
     /// The shared elements in flight (LLP 1013.000, `FlightLink`).
     package lazy var flightHost: any FlightHosting = FlightLink.make?(self) ?? NoFlights()
-    private(set) package var chrome = ChromeIndex()
+    internal(set) package var chrome = ChromeIndex()
     package var listRowDependencies: ListRowDependencies?
     #if DEBUG
     var listRowDependencyBuilds = 0
@@ -99,12 +100,15 @@ package final class Presenter {
         AriaCarriers.note(view, of: self)
         reorders.updateGesture(view)
         view.updateRefresh()
+        #if os(iOS)
+        view.updateDiscreteSwipe()
+        #endif
         view.relook()
     }
     package func carrying(_ key: String) -> [NodeView] { chrome.ids(key).sorted().compactMap { views[$0] } }
     package func takeChangedNames() -> Set<String> { chrome.takeChangedNames() }
     var scrollers: Set<UInt32> = []
-    var pendingScrolls: Set<UInt32> = []
+    var pendingScrolls: Set<UInt32> = []; package var scrollAskCount: UInt64 = 0 // every ask of a scroller to move (`NodeView.lastScrollAsk`)
     /// The batch's suppression triggers for scroll anchoring (`ScrollAnchoring.swift`).
     var anchorChanges = ScrollAnchoring.Changes()
     var materialNodes: Set<UInt32> = []
@@ -130,12 +134,15 @@ package final class Presenter {
     package lazy var stickies: any StickyHosting = StickyLink.make?(self) ?? NoStickies()
     let tableGrid = TableGrid()
     lazy var pool = NodePool(self)
-    /// Heavy leaves held mid-fling (LLP 1068 §5.1).
-    /// The heavy leaves' hold, when a product that makes heavy leaves is linked.
+    /// Heavy leaves held mid-fling (LLP 1068 §5.1). The heavy leaves' hold, when a product that makes heavy leaves is linked.
     package lazy var leaves: HeavyLeafHolding? = LeavesLink.make?(self)
     /// The list whose row is creating node `id` now, for the hold.
     package func listCreating(_ id: UInt32) -> NodeView? { pool.list(creating: id) }
     package lazy var flats = FlatLeaves(self)
+    /// Whether `id` is drawn, as a view or as a flat leaf.
+    package func draws(_ id: UInt32) -> Bool { views[id] != nil || flats.isFlat(id) }
+    /// Whether a container tells the kernel that `id` is uncovered.
+    package func uncovers(_ id: UInt32) -> Bool { draws(id) && !menus.ownsCover(id) }
     /// The native swipe rows (LLP 1008 §9), a grouped list's included.
     package lazy var swipeActions: any SwipeActionsHosting = SwipeActionsLink.make?(self) ?? NoSwipeActions()
     package lazy var rowCells: any RowCellsHosting = SwipeActionsLink.makeRowCells?(self) ?? NoRowCells()
@@ -151,6 +158,8 @@ package final class Presenter {
     #if os(iOS)
     /// The drag sources (LLP 1094.000 D4), when the module is linked.
     package lazy var dragOut: DragOutSources? = DragOutLink.installed?.sources(self)
+    /// The drop target (LLP 1094.001 D4), when the module is linked.
+    package lazy var dragIn: DragInTarget? = DragInLink.installed?.target(self)
     #endif
     /// A `dialog` that is not a confirmation, as UIKit's sheet (`DialogLink`).
     lazy package var dialogs: any DialogHosting = DialogLink.make?(self) ?? NoDialogs(self)
@@ -164,6 +173,7 @@ package final class Presenter {
     package lazy var fieldSelections = FieldSelections(self)
     /// Nodes marked `hatch="word"` (LLP 1075.003.000).
     package internal(set) lazy var elements: any ElementHatching = NativeModuleLink.makeElements?(self) ?? NoElementHatches()
+    let deferredPresses = DeferredPresses()
     lazy package var navigation: any NavigationHosting = NavigationLink.make?(self) ?? NoNavigation(self)
     /// Each navigation root's tabs, as the last batch to say them gave them (`takeRootTabs`).
     package var rootTabs: [UInt32: RootTabs] = [:]
@@ -200,6 +210,10 @@ package final class Presenter {
     /// what a canvas painted through its surface captures every frame for
     /// (LLP 1014 D4 d), and what the keyboard reveals.
     weak package var editing: NodeView?
+    #if os(iOS)
+    /// The focus a batch carries across a move (CarriedFocusIOS.swift).
+    var carriedFocus: CarriedFocus?
+    #endif
     /// The first root's `viewportFit` prop (`"cover"` or nothing), as of the
     /// last batch; `onViewportFit` fires when it changes.
     private(set) package var viewportFit: String?
@@ -212,6 +226,11 @@ package final class Presenter {
     package var keyboardPolicy: String { interactiveWidget ?? "resizes-content" }
     /// The keyboard guide's top in window coordinates for this session's current layout.
     package var keyboardTop: CGFloat?
+    /// A reveal of the focused editor an interactive keyboard drag held (`keyboardDragEnded`).
+    var revealOwed = false
+    /// The first root, as of the last batch.
+    private(set) weak var documentRoot: NodeView?
+    private var aspectFitWord: String? // the first root's `-exact-safe-area-aspect-fit` as last read (LLP 1123 D16)
     /// The safe-area insets the kernel was given (LLP 1008 §9): the
     /// screen's under `viewport-fit=cover`, zero when the viewport is the
     /// safe area itself. Reported to the agent as `env`.
@@ -227,13 +246,11 @@ package final class Presenter {
     /// Whether `UIHingeInteraction` has reported once (a hinge or none):
     /// before that, a 27.1 device's fold is unknown (LLP 1078 D7).
     var hingeReported = false
-    /// The keyboard's overlap with the viewport before avoidance,
-    /// derived by `ExactView.fit`.
+    /// The keyboard's overlap with the viewport before avoidance, derived by `ExactView.fit`.
     package var keyboardInset: CGFloat = 0
     /// The keyboard's own contribution to the viewport's shared insets.
     private let keyboardViewportInset = KeyboardInset()
-    /// What scrollers took below their content to show a field above pinned
-    /// content, while the keyboard is up (`PinnedRoom`).
+    /// What scrollers took below their content to show a field above pinned content, while the keyboard is up (`PinnedRoom`).
     let pinnedRoom = PinnedRoom()
     /// A native prompt outside the session's mounts, associated by its creator.
     package weak var keyboardPrompt: UITextField?
@@ -281,6 +298,9 @@ package final class Presenter {
         collections.rescued = { [unowned self] in paintVisibleText() }
         textRasters.slotFreed = { [unowned self] in scrollPump.textSlotFreed() }
         viewport.keyboardDismissMode = .interactive
+        #if os(iOS)
+        KeyboardDrag.watch(viewport) { [weak self] in self?.documentRoot }
+        #endif
         viewport.contentInsetAdjustmentBehavior = .never
         viewport.backgroundColor = .platformBackground(in: root)
     }
@@ -307,11 +327,6 @@ package final class Presenter {
     }
     #endif
 
-    var interactiveKeyboardDrag: Bool {
-        let drags = { (sv: UIScrollView) in sv.keyboardDismissMode == .interactive && (sv.isTracking || sv.isDragging) }
-        return drags(viewport) || scrollers.contains { views[$0]?.scrollView.map(drags) ?? false }
-            || navigation.primaryRouteSurfaces.contains { $0.contentViewport.map(drags) ?? false }
-    }
 
     /// Reconcile through UIKit layout in the keyboard's animation, after batches finish.
     /// Deferred work captures timing only and reads current ownership and geometry.
@@ -360,6 +375,7 @@ package final class Presenter {
     /// A restart: every view goes.
     func reset() {
         resetting = true; defer { resetting = false }
+        if let v = viewport as? Viewport { v.authoredBars = [:]; v.edgeBars.values.forEach { $0.value.map(ControlBars.detach) }; v.edgeBars = [:]; v.scrollportBars = []; v.childLists = [:] }
         listRowDependencies = nil
         resetFragments()
         MainActor.assumeIsolated { HeldState.retire(self) } // before its views leave the map (HeldState.swift)
@@ -368,9 +384,8 @@ package final class Presenter {
         releaseOrientationLock()
         focusEvents.reset(); TipLink.installed?.withdraw(owner: self)
         // Every hatched node ends first, its view and platform object there.
-        elements.reset()
-        flightHost.reset()
-        canvasKey = nil
+        elements.reset(); deferredPresses.reset()
+        flightHost.reset(); canvasKey = nil
         session?.transformInputHold?.cancel()
         reorders.abandon()
         session?.rasters?.reset()
@@ -385,6 +400,7 @@ package final class Presenter {
         menus.reset()
         #if os(iOS)
         dragOut?.reset()
+        dragIn?.reset()
         #endif
         swipeActions.reset(); rowCells.reset()
         pool.reset()
@@ -403,8 +419,8 @@ package final class Presenter {
         root.subviews.forEach { $0.removeFromSuperview() }
         chrome = ChromeIndex()
         AriaCarriers.forget(presenter: self)
-        views.removeAll()
-        inlineOwners.removeAll()
+        views.removeAll(); inlineOwners.removeAll()
+        stickies.reset(); tableGrid.reset(); svg?.reset(); boxAnimations.reset(); canvas2d.reset()
         scrollers.removeAll(); pendingScrolls.removeAll(); materialNodes.removeAll(); contextNodes.removeAll()
         hoveredInline = nil
         scrollPump.reset()
@@ -500,9 +516,15 @@ package final class Presenter {
         guard let scope else { return false }
         var listed: [NodeView] = [], start: Int? // where a focused member of a painted group that is no stop stands among them
         func walk(_ view: UIView) {
-            if view.isHidden || (view as? NodeView)?.props["inert"] == "true" { return }
-            if let node = view as? NodeView, views[node.id] === node, Self.tabbable(node),
-               !fields || node.field != nil || node.textArea != nil { listed.append(node) } else if view.isFirstResponder, (view as? NodeView)?.paintedGroup != nil { start = listed.count }
+            let node = view as? NodeView
+            if view.isHidden {
+                if !fields, let grip = node, grip.tabOrder >= 0,
+                   grip.projectedReorderResponder()?.canBecomeFirstResponder == true { listed.append(grip) }
+                return
+            }
+            if node?.props["inert"] == "true" { return }
+            if let node, views[node.id] === node, Self.tabbable(node),
+               !fields || node.field != nil || node.textArea != nil { listed.append(node) } else if view.isFirstResponder, node?.paintedGroup != nil { start = listed.count }
             (navigation.lifted?.focusChildren(of: view) ?? view.subviews).forEach(walk)
         }
         walk(scope)
@@ -512,12 +534,12 @@ package final class Presenter {
             return pa != pb ? pa < pb : a.offset < b.offset
         }.map(\.element)
         guard !order.isEmpty else { return false }
-        let focused = order.firstIndex { $0.isFirstResponder || $0.field?.isFirstResponder == true || $0.textArea?.isFirstResponder == true }
+        let focused = order.firstIndex { $0.isFirstResponder || $0.projectedReorderResponder()?.isFirstResponder == true || $0.field?.isFirstResponder == true || $0.textArea?.isFirstResponder == true }
         if fields, focused.map({ backward ? $0 == 0 : $0 == order.count - 1 }) ?? true { return false }
         let next = focused.map { (backward ? $0 - 1 + order.count : $0 + 1) % order.count } ?? (backward ? order.count - 1 : 0)
         // From a focused member of a painted group that is no stop (`tabindex=-1`, LLP 1166.000 D1), the stop after or before its place.
         let target = focused == nil ? start.map { backward ? ($0 > 0 ? listed[$0 - 1] : order[order.count - 1]) : ($0 < listed.count ? listed[$0] : order[0]) } ?? order[next] : order[next]
-        let responder: UIView = target.headerField ?? target.textArea ?? target.field ?? target
+        let responder: UIView = target.headerField ?? target.textArea ?? target.field ?? target.projectedReorderResponder() ?? target
         chooseFocus(target)
         let became = responder.becomeFirstResponder()
         if became, responder === target { target.showFocusRing(true) }
@@ -574,7 +596,8 @@ package final class Presenter {
         defer { authoredFocus = false }
         focusAsked = target
         let name = target.props["id"] ?? "#\(target.id)"
-        let shown: UIView = target.headerField ?? target
+        let projectedGrip = target.projectedReorderResponder()
+        let shown: UIView = target.headerField ?? projectedGrip ?? target
         // UIKit may not announce its next transition until after the outgoing
         // sheet starts dismissing. The selected route's editor already exists,
         // but cannot receive focus until its controller mounts it in a window.
@@ -596,12 +619,12 @@ package final class Presenter {
         // Require this session's window. Inert comes from the author or a
         // presentation that owns interaction (LLP 1123 D2).
         if let reason = NavigationRules.focusRefusal(mounted: shown.window != nil, disabled: target.formDisabled,
-                                                     zeroSize: !Self.sized(target),
+                                                     zeroSize: projectedGrip?.bounds.isEmpty ?? !Self.sized(target),
                                                      hiddenAncestor: hidden, inertAncestor: target.inert) {
             session?.log("focus \"\(name)\" refused: \(reason)")
             return
         }
-        let responder: UIView = target.headerField ?? textEditor ?? target
+        let responder: UIView = target.headerField ?? textEditor ?? projectedGrip ?? target
         if selectText, textEditor == nil {
             session?.log("selectText \"\(name)\" refused: not a text editor")
             return
@@ -718,10 +741,13 @@ package final class Presenter {
     func typed(_ id: UInt32, _ value: String, input: Bool) {
         send(id) { [self] in
             edited = id
-            if input { onInput?(id, value) }
+            if input { fieldSelections.input(id, value) }
         }
     }
     package func commitEdit(_ id: UInt32, _ value: String, change: Bool) {
+        #if os(iOS)
+        if carriesFocus(id) { carriedFocus?.commit = (value, change); return }
+        #endif
         guard edited == id, !menus.preservesFocus(id) else { return }
         edited = nil
         var value = value
@@ -759,7 +785,7 @@ package final class Presenter {
     var regionMeasures = PositionArea.MeasureCache()
     /// Paragraphs whose text or style the batch invalidated (`paintChangedText`).
     var changedText: Set<UInt32> = []
-    private func send(_ id: UInt32, _ f: @escaping () -> Void) {
+    func send(_ id: UInt32, _ f: @escaping () -> Void) {
         guard textHost(id) != nil else { return }
         if applying { waiting.append((id, f)) } else { navigation.finishBootOwner(); f() }
     }
@@ -776,7 +802,13 @@ package final class Presenter {
         }
     }
     package func key(_ id: UInt32, _ press: KeyPress) { send(id) { [self] in onKey?(id, press) } }
-    func clipboard(_ id: UInt32, _ kind: UInt32, _ text: String) { send(id) { [self] in onClipboard?(id, kind, text) } }
+    /// An event of `kind` with its line at node `id`: a clipboard's, a popover's toggle, a drag's (LLP 1094.001 D1).
+    /// False when no node `id` is there to hear it.
+    @discardableResult package func clipboard(_ id: UInt32, _ kind: UInt32, _ text: String) -> Bool {
+        guard textHost(id) != nil else { return false }
+        send(id) { [self] in onClipboard?(id, kind, text) }
+        return true
+    }
     package func contextmenu(_ id: UInt32) { send(id) { [self] in onContextmenu?(id) } }
     /// A `contextmenu` with its point (studio diary R22): kind 10 and its line.
     func contextmenu(_ id: UInt32, line: String) { send(id) { [self] in onClipboard?(id, 10, line) } }
@@ -841,7 +873,7 @@ package final class Presenter {
     /// and makes its correction without the presenter's whole finalization
     /// pass, unless work waits on a batch (a focus, a callback, a scroll).
     private func applySnapshots(_ batch: Batch) -> Bool {
-        guard !applying, !pageGeometryOwed, batch.error == nil, !batch.controls, batch.rootTabs == nil, !batch.ops.isEmpty, batch.ops.allSatisfy({ $0.op == .collections }),
+        guard !applying, !pageGeometryOwed, batch.error == nil, !batch.controls, batch.rootTabs == nil, !batch.splitChanged, !batch.ops.isEmpty, batch.ops.allSatisfy({ $0.op == .collections }),
               waiting.isEmpty, pendingScrolls.isEmpty, pendingFocus == nil else { return false }
         collections.beginBatch(batch)
         collections.endBatch()
@@ -903,7 +935,12 @@ package final class Presenter {
             }
         }
         svg?.seek(clock: session?.clock); boxAnimations.seek(clock: session?.clock)
+        // A clock's move can put on or take off a background colour's animation, which the colour strip cannot follow (LLP 1123 D13)
+        if !NodeView.extensionMirrors { NodeView.extensionsLookAgain() }
         let outermost = !applying
+        #if os(iOS)
+        if outermost { carryFocus(batch) }
+        #endif
         applying = true
         // Hatched nodes this batch destroys end first, so a reusable hatch has
         // undone its additions before the pool looks at their rows; inside
@@ -940,6 +977,9 @@ package final class Presenter {
                 textSelection.batchEnded()
                 #endif
                 if moved { session?.natives.refreshWorldGeometry() }
+                #if os(iOS)
+                landFocus()
+                #endif
                 flushPendingFocus(); elementScrolls.flush()
                 #if os(iOS)
                 session?.view?.syncKeyboardFocus()
@@ -948,7 +988,7 @@ package final class Presenter {
         }
         var beganGeometry = false, touchedIDs: [UInt32] = [], reshapedIDs: [UInt32] = [], restyledIDs: [UInt32] = []
         // Read once: an animation UIKit has open around the batch is open around each of its ops
-        let animating = UIView.inheritedAnimationDuration > 0
+        let animating = Presenter.animationMayBeOpen
         if outermost { placedAnew.removeAll(keepingCapacity: true) } // a flat leaf promoted between batches
         let anewFrom = placedAnew.count
         if batch.controls { controls.facesChanged() }
@@ -1036,6 +1076,7 @@ package final class Presenter {
             case .animations:
                 if flats.isFlat(id) { flats.promote(id) }
                 boxAnimations.animations(id, op.payload, layer: views[id]?.layer, clock: session?.clock)
+                views[id]?.applyExtension() // looks at an extension again, which a background colour's animation holds off before iOS 26 (LLP 1123 D13)
             case .command:
                 let name = op.payload["name"] as? String ?? ""
                 if name == "preventDefault" { defaultPrevented = true; break }
@@ -1077,6 +1118,7 @@ package final class Presenter {
                 views[id]?.applyColumns(op.payload)
             case .table: tableGrid.apply(id, op.payload)
             case .destroy:
+                if let v = viewport as? Viewport { v.authoredBars[id] = nil; v.scrollportBars.remove(id); v.childLists[id] = nil }
                 listRowDependencies?.rows.removeValue(forKey: id)
                 listRowDependencies?.rowOwners.removeValue(forKey: id)
                 views[id]?.holdGone()
@@ -1116,7 +1158,7 @@ package final class Presenter {
                 switch op.property {
                 case "translate": v.translatePx = CGPoint(x: x, y: CGFloat(op.y)); v.translatePercent = CGPoint(x: CGFloat(op.w), y: CGFloat(op.h)); v.applyTransform()
                 case "layout": v.layoutOffset = CGPoint(x: x, y: CGFloat(op.y)); v.layoutResize = CGSize(width: CGFloat(op.w), height: CGFloat(op.h)); v.applyTransform(); v.applySurface()
-                case "scale": v.scale = x; v.applyTransform()
+                case "scale": v.scale = CGPoint(x: x, y: CGFloat(op.y)); v.applyTransform()
                 case "rotate": v.rotate = x; v.rotationAxis = [op.y, op.w, op.h]; v.applyTransform()
                 case "opacity": v.presentOpacity(x)
                 case "flight": flightHost.present(id, x)
@@ -1174,7 +1216,8 @@ package final class Presenter {
             pageGeometryOwed = false
             fitDocument(); reachPageEdges(); paintCanvas()
         }
-        let first = root.subviews.first as? NodeView
+        documentRoot = root.subviews.first as? NodeView
+        let first = documentRoot
         let widget = first?.props["interactiveWidget"]
         if widget != interactiveWidget {
             interactiveWidget = widget
@@ -1182,6 +1225,8 @@ package final class Presenter {
         }
         let fit = first?.props["viewportFit"]
         if fit != viewportFit { viewportFit = fit; onViewportFit?() }
+        // A new aspect fit lays the session's view out again, which claims the window's guide at it (`AspectFitIOS`)
+        if first?.style["safe_area_aspect_fit"]?.string != aspectFitWord { aspectFitWord = first?.style["safe_area_aspect_fit"]?.string; session?.view?.setNeedsLayout() }
         session?.canvases.cancelMovedControls()
         PaintOrder.flush()
         let changed = touchedAndAbove(touchedIDs + geometryApplied)
@@ -1211,9 +1256,10 @@ package final class Presenter {
         focusGuides.sync()
         #endif
         attachRegionPopovers()
-        ApplyProfile.time("pass.menus") { menus.sync() }
+        ApplyProfile.time("pass.menus") { menus.sync(); menus.updateKeptMenu() }
         #if os(iOS)
         ApplyProfile.time("pass.dragOut") { dragOut?.sync() }
+        ApplyProfile.time("pass.dragIn") { dragIn?.sync() }
         #endif
         glassGroups.reconcile()
         positionContexts()
@@ -1276,12 +1322,13 @@ package final class Presenter {
     /// `parent`'s children, in order: its views as subviews of its container,
     /// then its flat leaves' layers among them (LLP 1068 §6.1).
     func placeChildren(_ parent: NodeView, _ ids: [UInt32]) {
-        let ids = regionPopoverChildren(ids, of: parent)
+        // The whole list is what a replay places again, a scroller's bars on its scrollport among it
+        let all = regionPopoverChildren(ids, of: parent), ids = ScrollportBars.place(parent, all, in: self)
         #if os(iOS)
-        if #available(iOS 27.1, *) { arrangements.record(parent, children: ids) }
+        if #available(iOS 27.1, *) { arrangements.record(parent, children: all) }
         #endif
         // Make any views required by this holder before assembling its list.
-        for id in flats.place(parent, ids) { flats.promote(id) }
+        for id in flats.place(parent, all) { flats.promote(id) }
         let container = parent.container
         // A row a grouped list carries stays in its cell (`GroupedLists.placing`).
         let want = groupedLists.map { $0.placing(container, ids.compactMap { views[$0] }) } ?? ids.compactMap { views[$0] }
@@ -1306,24 +1353,25 @@ package final class Presenter {
         let contained = NodeView.keepingGhosts(want.filter { !heldByArrangement($0) && !navigation.ownsContainment(of: $0, under: parent) && !menus.lifted($0) && !flightHost.isFlying($0) && navigation.lifted?.holds($0, under: parent) != true }, in: container)
         // Keep paragraph coverage below authored children when UIKit owns its view
         let text = parent.specs?.rasterView
-        let offset = text?.superview === container ? 1 : 0
-        if offset != 0, let text, container.subviews.first !== text {
+        if let text, text.superview === container, container.subviews.first !== text {
             container.sendSubviewToBack(text)
             parent.insertBoxSublayer(text.layer)
         }
         current = container.subviews
+        let offset = current.firstIndex(where: { $0 === text }).map { $0 + 1 } ?? 0
         for (rank, child) in contained.enumerated() {
             let i = rank + offset
             if i < current.count && current[i] === child { continue }
-            // One already here is past `i` (those before it are in place):
-            // moved as UIKit moves it, without asking for every subview again
-            // (a pooled row comes back from past the rows, each a move).
+            // A pooled row already here comes forward from past the rows in place.
             let wasHere = child.superview === container
             let was = wasHere && i < current.count ? current[i...].firstIndex { $0 === child } : nil
-            container.insertSubview(child, at: i)
             if wasHere {
+                container.insertSubview(child, at: i)
                 if let was { current.remove(at: was); current.insert(child, at: i) } else { current = container.subviews }
-            } else { current.insert(child, at: i); regrid(child) }
+            } else {
+                child.movingRoute(into: container) { container.insertSubview(child, at: i) }
+                current.insert(child, at: i); regrid(child)
+            }
         }
         flats.mounted(parent.id)
         if parent === navigation.container { navigation.placeOwner() }
@@ -1381,7 +1429,7 @@ package final class Presenter {
     private(set) var title: String?
     var onTitle: ((String?) -> Void)?
     #if os(iOS)
-    lazy var textSelection: any TextSelecting = TextSelectionLink.make?(self) ?? NoTextSelection() // `user-select: text` (LLP 1115.000 D11.6)
+    package lazy var textSelection: any TextSelecting = TextSelectionLink.make?(self) ?? NoTextSelection() // `user-select: text` (LLP 1115.000 D11.6)
     /// The status bar's resolved style (LLP 1105), the controllers' `preferredStatusBarUpdateAnimation`, and who is told of a change.
     package var statusBar = StatusBarChoice(), statusBarUpdateAnimation = UIStatusBarAnimation.none
     var onStatusBar: ((StatusBarChoice) -> Void)?
@@ -1400,7 +1448,7 @@ package final class Presenter {
         // The root's colour, resolved and compared only when what it is made
         // of changes: every batch asked UIKit for a colour it then compared.
         let first = root.subviews.first as? NodeView
-        let key = CanvasKey(root: first.map(ObjectIdentifier.init), channels: first?.channels("background_color"))
+        let key = CanvasKey(root: first.map(ObjectIdentifier.init), channels: first?.textChannels("background_color"))
         guard key != canvasKey else { return }
         canvasKey = key
         // A root without a background shows the platform's (LLP 1115 D2).

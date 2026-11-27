@@ -54,29 +54,55 @@ pub fn launch_location(args: impl IntoIterator<Item = String>, compat: &str) -> 
     launch_argument(args).map_or_else(|| "/".into(), |href| incoming_location(&href, compat))
 }
 
-/// A URL from outside the app as its location (LLP 1038 D8): at the
-/// template's `%s` of the `protocol_handlers` entry for its scheme, else its
-/// ordinary location. Only the Android reader registers handlers and names
-/// them here (`EXACT_PROTOCOL_HANDLERS`, from the APK's
-/// `dev.exact.protocol_handlers`), as an Apple bundle's
-/// `ExactProtocolHandlers`; a command-line URL on Linux or Windows has none.
+/// A URL from outside the app as its location (LLP 1038 D8), or the root
+/// when it is outside this app's web mount, link origins and registered schemes.
 pub fn incoming_location(href: &str, compat: &str) -> String {
-    incoming_location_at(href, web_mount(compat).as_ref())
+    incoming_location_at(href, &IncomingLinks::from_compat(compat)).unwrap_or_else(|| "/".into())
 }
 
-pub(crate) fn incoming_location_at(href: &str, mount: Option<&serde_json::Value>) -> String {
+/// The Android reader exports its registered templates as `EXACT_PROTOCOL_HANDLERS`
+/// before the first URL is read, at launch or while the app runs.
+pub(crate) fn incoming_location_at(href: &str, links: &IncomingLinks) -> Option<String> {
     static HANDLERS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
     let handlers = HANDLERS.get_or_init(|| {
         protocol_handlers(std::env::var("EXACT_PROTOCOL_HANDLERS").ok().as_deref())
     });
-    location_through(href, handlers, mount)
+    location_through(href, handlers, links)
 }
 
-pub(crate) fn web_mount(compat: &str) -> Option<serde_json::Value> {
-    serde_json::from_str::<serde_json::Value>(compat)
-        .ok()?
-        .pointer("/inputs/webMount")
-        .cloned()
+#[derive(Clone, Default)]
+pub(crate) struct IncomingLinks {
+    mount: Option<serde_json::Value>,
+    schemes: Vec<String>,
+    origins: Vec<String>,
+}
+
+impl IncomingLinks {
+    pub(crate) fn from_compat(compat: &str) -> Self {
+        let inputs = serde_json::from_str::<serde_json::Value>(compat)
+            .ok()
+            .and_then(|value| value.get("inputs").cloned())
+            .unwrap_or_default();
+        Self {
+            mount: inputs.get("webMount").cloned(),
+            origins: inputs
+                .pointer("/links/origins")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            schemes: inputs
+                .pointer("/capabilities/urlSchemes")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
 }
 
 /// The `[{"protocol", "url"}]` entries the reader registered; none when
@@ -100,13 +126,38 @@ fn protocol_handlers(json: Option<&str>) -> Vec<(String, String)> {
 fn location_through(
     href: &str,
     handlers: &[(String, String)],
-    mount: Option<&serde_json::Value>,
-) -> String {
-    let local = mount.and_then(|mount| {
+    links: &IncomingLinks,
+) -> Option<String> {
+    if let Some(location) = handlers.iter().find_map(|(protocol, template)| {
+        exact_route::protocol_location_of(href, protocol, template)
+    }) {
+        return Some(location);
+    }
+    let url = url::Url::parse(href).ok();
+    if url.as_ref().is_some_and(|url| {
+        links
+            .schemes
+            .iter()
+            .any(|scheme| url.scheme().eq_ignore_ascii_case(scheme))
+    }) {
+        return Some(exact_route::location_of(href));
+    }
+    if links.mount.is_none() || url.is_none() {
+        return Some(exact_route::location_of(href));
+    }
+    links.mount.as_ref().and_then(|mount| {
         let mut url = url::Url::parse(href).ok()?;
         let origin = url::Url::parse(mount.get("origin")?.as_str()?).ok()?;
-        if !matches!(url.scheme(), "http" | "https") || url.origin() != origin.origin() {
+        if !matches!(url.scheme(), "http" | "https") {
             return None;
+        }
+        if url.origin() != origin.origin() {
+            return links
+                .origins
+                .iter()
+                .filter_map(|origin| url::Url::parse(origin).ok())
+                .any(|origin| url.origin() == origin.origin())
+                .then(|| exact_route::location_of(href));
         }
         let base = mount.get("base")?.as_str()?;
         let path = if url.path() == base.trim_end_matches('/') {
@@ -115,14 +166,8 @@ fn location_through(
             format!("/{}", url.path().strip_prefix(base)?)
         };
         url.set_path(&path);
-        Some(url.to_string())
-    });
-    handlers
-        .iter()
-        .find_map(|(protocol, template)| {
-            exact_route::protocol_location_of(href, protocol, template)
-        })
-        .unwrap_or_else(|| exact_route::location_of(local.as_deref().unwrap_or(href)))
+        Some(exact_route::location_of(url.as_str()))
+    })
 }
 
 /// The first non-flag argument, as it was given, or `None`. The `hidden`
@@ -201,6 +246,9 @@ pub struct Config {
     pub services: Services,
     /// Viewport preferences the carrier read before boot (LLP 1039 D10).
     pub preferences: Option<exact_runner::Preferences>,
+    /// What `exactPage()` says from the first settlement of the plan a boot
+    /// runs, where the carrier knows it ([`exact_runner::time::Launch::page`]).
+    pub page: Option<exact_runner::time::PageFacts>,
     /// Explicit consumer registration before the first layout; ordinary default
     /// is None. This trial never guesses bindings from test IDs.
     pub content_region: Option<crate::content_region::ContentRegionRegistration>,
@@ -351,34 +399,13 @@ impl Config {
     /// Read the environment; `baked` is the plan compiled into the binary
     /// and `compat` its `compat.json` (LLP 1030 D3a).
     pub fn from_env(baked: &[u8], compat: &str) -> Config {
-        Self::from_bake::<true>(baked, compat)
+        Self::from_bake::<true>(baked, compat, Services::default())
     }
 
-    /// A shell that knows its baked trust can omit the unsigned plan loaders
-    /// from a production executable. Development shells also check the receipt.
-    pub fn from_bake<const DEVELOPMENT: bool>(baked: &[u8], compat: &str) -> Config {
-        Self::from_bake_with_executor::<DEVELOPMENT>(
-            baked,
-            compat,
-            crate::executor::Executor::start,
-        )
-    }
-
-    /// Load a baked shell with the data executor selected by its build.
-    pub fn from_bake_with_executor<const DEVELOPMENT: bool>(
-        baked: &[u8],
-        compat: &str,
-        start: crate::executor::Start,
-    ) -> Config {
-        Self::from_bake_with_services::<DEVELOPMENT>(
-            baked,
-            compat,
-            Services::with_image_downloads(start),
-        )
-    }
-
-    /// Boot with the data executor and image loader selected by the bake.
-    pub fn from_bake_with_services<const DEVELOPMENT: bool>(
+    /// Boot with the data executor and image loader selected by the bake. A
+    /// shell that knows its baked trust can omit the unsigned plan loaders
+    /// from a production executable; development shells also check the receipt.
+    pub fn from_bake<const DEVELOPMENT: bool>(
         baked: &[u8],
         compat: &str,
         services: Services,
@@ -479,6 +506,7 @@ impl Config {
         Config {
             services,
             preferences: None,
+            page: None,
             content_region: None,
             // An argument, else `EXACT_LAUNCH_URL`: the Android reader's launching intent's data has no
             // command line to arrive by (LLP 1133.023 D15 item 3).
@@ -721,8 +749,28 @@ pub(crate) fn boot_presenter_with_painter<D: DataSource + Default>(
     if let Some((location, _)) = &cold_share {
         config.launch = location.clone();
     }
+    // @ref LLP 1069.000 D2, D6 — this host has no share sheet and no
+    // document picker; under the agent the drive's substitute answers
+    // each, files and pictures in a share too, as on every host.
+    let page = if std::env::var("EXACT_AGENT").as_deref() == Ok("1") {
+        let host = config.page.clone();
+        Some(exact_runner::time::PageFacts::new(move |plan| {
+            exact_runner::Page {
+                can_share: true,
+                can_share_files: true,
+                can_share_pictures: true,
+                can_open_files: true,
+                ..host
+                    .as_ref()
+                    .map_or_else(Default::default, |host| host.facts(plan))
+            }
+        }))
+    } else {
+        config.page.clone()
+    };
     let launch_facts = exact_runner::time::Launch {
         preferences: config.preferences,
+        page,
         time: Some(exact_runner::time::WallTime {
             epoch_at_zero,
             utc_offset,
@@ -752,21 +800,6 @@ pub(crate) fn boot_presenter_with_painter<D: DataSource + Default>(
         // (above); under the agent, the drive's epoch (D3).
         if let Some(e) = booted.0.set_time(epoch_at_zero, utc_offset) {
             eprintln!("exact: {e}");
-        }
-        // @ref LLP 1069.000 D2, D6 — this host has no share sheet and no
-        // document picker; under the agent the drive's substitute answers
-        // each, files and pictures in a share too, as on every host.
-        if std::env::var("EXACT_AGENT").as_deref() == Ok("1") {
-            let page = exact_runner::Page {
-                can_share: true,
-                can_share_files: true,
-                can_share_pictures: true,
-                can_open_files: true,
-                ..Default::default()
-            };
-            if let Some(e) = booted.0.set_page(page) {
-                eprintln!("exact: {e}");
-            }
         }
         booted.0.set_development(dev_url.clone(), dev_identity);
         booted.0.said_at_boot(dev_said.clone());
@@ -1181,10 +1214,13 @@ mod scale_tests {
         std::fs::write(&path, b"local").unwrap();
         std::env::set_var("EXACT_PLAN", &path);
         let development = r#"{"embedded":{"trust":"development"}}"#;
-        let baked = super::Config::from_bake::<false>(b"baked", development);
-        let editable = super::Config::from_bake::<true>(b"baked", development);
-        let production =
-            super::Config::from_bake::<true>(b"baked", r#"{"embedded":{"trust":"production"}}"#);
+        let baked = super::Config::from_bake::<false>(b"baked", development, Default::default());
+        let editable = super::Config::from_bake::<true>(b"baked", development, Default::default());
+        let production = super::Config::from_bake::<true>(
+            b"baked",
+            r#"{"embedded":{"trust":"production"}}"#,
+            Default::default(),
+        );
         std::fs::remove_file(path).unwrap();
         assert_eq!(baked.plan.as_ref(), b"baked");
         assert_eq!(editable.plan.as_ref(), b"local");
@@ -1320,18 +1356,53 @@ mod tests {
             ("web+notes://n/1", "/n/web%2Bnotes%3A%2F%2Fn%2F1"),
             // An App Link and an unregistered scheme keep their ordinary location.
             ("https://links.example/ficha/7", "/ficha/7"),
+            ("notes:///links?from=cold#part", "/links?from=cold#part"),
+            ("notes://links?from=warm", "/links?from=warm"),
             ("other://post/42", "/post/42"),
             ("/urgencies", "/urgencies"),
         ] {
-            assert_eq!(location_through(href, &handlers, None), expected, "{href}");
+            assert_eq!(
+                location_through(href, &handlers, &IncomingLinks::default()).as_deref(),
+                Some(expected),
+                "{href}"
+            );
+        }
+        let links = IncomingLinks::from_compat(
+            r#"{"inputs":{"webMount":{"origin":"https://site.invalid","base":"/app/"},"capabilities":{"urlSchemes":["notes"]},"links":{"origins":["https://site.invalid","https://share.example"]}}}"#,
+        );
+        for (href, expected) in [
+            (
+                "sscontrol://unknown/7",
+                Some("/open?u=sscontrol%3A%2F%2Funknown%2F7"),
+            ),
+            ("notes:///unknown/7?q=1#part", Some("/unknown/7?q=1#part")),
+            (
+                "https://site.invalid/app/unknown?q=1#part",
+                Some("/unknown?q=1#part"),
+            ),
+            ("https://site.invalid/app", Some("/")),
+            ("https://share.example/post/42", Some("/post/42")),
+            ("http://share.example/post/42", None),
+            ("https://share.example:444/post/42", None),
+            ("/unknown?q=1#part", Some("/unknown?q=1#part")),
+            ("https://other.invalid/app/unknown", None),
+            ("https://site.invalid/application/unknown", None),
+            ("https://site.invalid:444/app/unknown", None),
+            ("other://unknown", None),
+        ] {
+            assert_eq!(
+                location_through(href, &handlers, &links).as_deref(),
+                expected,
+                "{href}"
+            );
         }
         for json in [None, Some(""), Some("{}"), Some(r#"[{"protocol":"x"}]"#)] {
             assert!(protocol_handlers(json).is_empty(), "{json:?}");
         }
         // No reader named any: every host's ordinary conversion.
         assert_eq!(
-            location_through("sscontrol://ficha/7", &[], None),
-            "/ficha/7"
+            location_through("sscontrol://ficha/7", &[], &IncomingLinks::default()).as_deref(),
+            Some("/ficha/7")
         );
     }
 

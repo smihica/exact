@@ -99,9 +99,10 @@ when slower drags were close to 60 fps. When a row left the visible set and
 lost its pin, Ink retired its bitmap texture. Showing the same decoded photo
 again uploaded its pixels and regenerated its mip chain.
 
-The opt-in bitmap cache keeps the uploaded texture while the decoded bitmap
-has another owner. When making room it evicts textures in the order they
-became idle.
+In this experiment the opt-in bitmap cache kept the uploaded texture while the
+decoded bitmap had another owner. It evicted textures in the order they became
+idle. The [November 27 integration](kiosk-upstream.md#blurred-shadows-on-upstream-main-2026-11-27)
+uses upstream's default-on cache.
 The size and count limits apply to idle entries per painter. Visible textures,
 retained rows, driver alignment and storage awaiting GPU completion have
 separate costs. A first encounter with a photo still pays for upload and mips.

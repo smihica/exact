@@ -8,23 +8,201 @@
 //        machine, so no app's first build compiles them.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 // Also for its PATH: the pinned binaryen (and Cargo) as every web build has
 // them, so a prebuild optimizes and keeps what an app's build would.
-import { awaitBuildOutput, WEB_STD, WEB_SIZE, WEB_TOOLCHAIN, injectedProfiles, resolveApp, wasmRemapFlags, webToolchainEnv } from '../../scripts/app.mjs';
+import { awaitBuildOutput, cargoCheckout, refuseStdLockfile, WEB_STD, WEB_SIZE, WEB_TOOLCHAIN, shaderRoots, shaderPreludeFiles, injectedProfiles, resolveApp, wasmRemapFlags, webToolchainEnv } from '../../scripts/app.mjs';
 import { rustDataOf, undeclaredDataCrate } from '../../scripts/app-shells.mjs';
 import { appCrates, linkedCrate } from '../../scripts/cargo-check.mjs';
-import { SETUP_FETCHES, withHostDeployment } from '../../scripts/filesystem.mjs';
-import { replaceBuild } from '../web/serve.mjs';
+import { SETUP_FETCHES, filesystemRead, withHostDeployment } from '../../scripts/filesystem.mjs';
+import { withoutBase } from './route-pattern.js';
+import { buildTreeFile, planRows, replaceBuild, webContentType } from '../web/serve.mjs';
+import { builtSettings } from '../../js/bake/src/__exact_env.mjs';
+import { webPackageBindingChanged } from '../../js/bake/src/package-config.mjs';
 import { proofInputs } from '../../game/inputs.mjs';
 import { keptProducts } from '../../scripts/kept.mjs';
-import { RustMissing, fromSet, fromSets, fetchedTool, launch, rustMissing, freshCompiler } from '../../scripts/tools.mjs';
-import { EXE } from '../../scripts/paths.mjs';
+import { RustMissing, compilerFrom, fromSet, fromSets, fetchedTool, launch, rustMissing, freshCompiler } from '../../scripts/tools.mjs';
+import { EXE, slashRelative, within } from '../../scripts/paths.mjs';
+// Most tables use only ECMAScript at import time. Detect a host read even under
+// `typeof` or a caught exception, so an answer for the build VM never qualifies a browser-only branch.
+async function scriptModuleTags(dist, base, factoryTags) {
+  const vm = await import('node:vm');
+  const options = { strings: false, wasm: false };
+  const properties = vm.runInNewContext('Object.getOwnPropertyDescriptors(globalThis)', {}, { contextCodeGeneration: options });
+  delete properties.globalThis;
+  let hostRead = false;
+  const context = vm.createContext(new Proxy(Object.defineProperties(Object.create(null), properties), {
+    get(target, key) {
+      if (typeof key === 'string' && !Object.hasOwn(target, key)) {
+        hostRead = true;
+        throw new ReferenceError(key);
+      }
+      return Reflect.get(target, key);
+    },
+  }), { codeGeneration: options });
+  const origin = 'https://exact.invalid', modules = new Map();
+  function load(url) {
+    if (modules.has(url.href)) return modules.get(url.href);
+    const path = url.origin === origin && withoutBase(url.pathname, base);
+    const file = path && buildTreeFile(dist, path);
+    if (!file) throw new Error(url.href);
+    const module = new vm.SourceTextModule(readFileSync(file.path, 'utf8'), {
+      context, identifier: url.href, initializeImportMeta(meta) { meta.url = url.href; },
+    });
+    modules.set(url.href, module);
+    return module;
+  }
+  let timer;
+  try {
+    const module = load(new URL(base + 'modules/index.js', origin));
+    await module.link((specifier, parent) => {
+      if (!/^(?:\.{1,2}\/|\/)/.test(specifier)) throw new Error(specifier);
+      return load(new URL(specifier, parent.identifier));
+    });
+    await Promise.race([module.evaluate({ timeout: 2000 }), new Promise((_, reject) => { timer = setTimeout(reject, 2000); })]);
+    const tags = factoryTags(module.namespace);
+    return hostRead ? null : tags;
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+
+/** The `Bun.WebView` backend used to read a DOM-dependent module roster.
+ * Off macOS, pass `--no-sandbox` (and `--disable-dev-shm-usage` on Linux) so
+ * Chromium starts on CI runners, containers and root build environments. */
+export function webModuleBackend(chrome, platform = process.platform) {
+  if (platform === 'darwin') return 'webkit';
+  if (chrome.unavailable) throw new Error(chrome.unavailable);
+  return {
+    type: 'chrome',
+    path: chrome.executable,
+    argv: ['--no-sandbox', ...(platform === 'linux' ? ['--disable-dev-shm-usage'] : [])],
+  };
+}
+
+/** Read the table in the staged page when its initialization needs a browser. */
+export async function webModuleTags(dist, base, required, release, { platform = process.platform } = {}) {
+  const entry = resolve(dist, 'modules/index.js');
+  if (!existsSync(entry)) return [];
+  let view, server, timer;
+  try {
+    const { factoryTags } = await import('../../scripts/launch-modules.mjs');
+    const tags = await scriptModuleTags(dist, base, factoryTags);
+    if (tags) return tags;
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      const url = new URL(request.url);
+      const path = url.origin === server.url.origin && withoutBase(url.pathname, base);
+      const file = path && buildTreeFile(dist, path, request.headers.get('Accept') ?? '');
+      if (!file) return new Response(null, { status: 404 });
+      return new Response(Bun.file(file.path), { headers: {
+        'Content-Type': webContentType(file.route),
+        'Content-Security-Policy': "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'",
+      } });
+    } });
+    let chrome = null;
+    if (platform !== 'darwin') {
+      const { chromium } = await import('../../scripts/agent-launch.mjs');
+      chrome = chromium();
+    }
+    const backend = webModuleBackend(chrome, platform);
+    view = new Bun.WebView({ backend });
+    const read = async () => {
+      await view.navigate(new URL(base, server.url).href);
+      return view.evaluate(`(async () => (${factoryTags})(await import(new URL('./modules/index.js', document.baseURI))))()`);
+    };
+    return await Promise.race([read(), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('module initialization timed out')), 15000);
+    })]);
+  } catch (cause) {
+    const message = `web: cannot read the factory roster for ${required.join(', ')}: ${cause.message}`;
+    if (release) throw new Error(message, { cause });
+    console.warn(`warning: ${message}`);
+    return null;
+  } finally { clearTimeout(timer); view?.close(); server?.stop(true); }
+}
+
+/** The development URL for frames/<name>.contract. */
+export const frameURL = name => '/__dev/frames/' + encodeURIComponent(name).replaceAll("'", '%27');
+
+export const frameFixturePath = frame => frame.slice(0, -'.contract'.length) + '.fixture.mts';
+
+/** Files whose bytes enter a frame's output, and public URLs the browser reads itself. */
+export async function recordFrameAssets(gen, appDir, manifest, rustModule, gpuCrates) {
+  const graph = resolve(gen, 'dev-sources.json'), inputs = JSON.parse(readFileSync(graph));
+  const plan = readFileSync(resolve(gen, 'app.plan'));
+  const baked = [
+    ...planRows(plan, 'sounds', ['src']).map(row => row.src),
+    ...planRows(plan, 'faces', ['source']).map(row => row.source),
+    ...planRows(plan, 'profiles', ['src']).map(row => row.src),
+  ];
+  for (const icons of [manifest, ...(manifest.alternate_icons ?? [])]) {
+    for (const entry of [...(icons.icons ?? []), ...(icons.color_scheme_dark?.icons ?? [])]) baked.push(entry.src);
+  }
+  inputs.baked = baked.filter(Boolean).map(name => resolve(appDir, name));
+  const depFiles = rustModule ? [moduleDepInfo.get(rustModule).depInfo] : [];
+  if (gpuCrates.length) {
+    const app = resolveApp(appDir);
+    for (const crate of gpuCrates) depFiles.push(resolve(app.target, 'wasm32-unknown-unknown/web', crate.replaceAll('-', '_') + '.d'));
+    for (const dir of shaderRoots(app)) if (existsSync(dir)) inputs.baked.push(...readdirSync(dir).map(name => resolve(dir, name)));
+    inputs.baked.push(...shaderPreludeFiles(app));
+  }
+  for (const dep of depFiles) inputs.baked.push(...compilerPaths(readFileSync(dep, 'utf8'), appDir).filter(path => within(appDir, path) && !within(gen, path)));
+  const output = dirname(gen), publicName = path => slashRelative(appDir, path);
+  const settings = builtSettings(output).sourceInputs?.reads ?? [];
+  // Keep the URL and the plan from one publication when the compiler also consumed the public file.
+  const names = [...new Set([...inputs.sources, ...inputs.baked, ...settings.filter(r => r.kind === 'file').map(r => r.path)].map(publicName))];
+  inputs.captured = [];
+  for (const path of names.filter(name => /^(assets|deck)\//.test(name))) {
+    if (!statSync(resolve(appDir, path), { throwIfNoEntry: false })?.isFile()) continue;
+    const bytes = await filesystemRead({ op: 'get', root: appDir, path });
+    if (bytes === null) throw new Error(path + ' disappeared while building the frame');
+    mkdirSync(dirname(resolve(output, path)), { recursive: true });
+    writeFileSync(resolve(output, path), Buffer.from(bytes, 'base64'));
+    inputs.captured.push(path);
+  }
+  inputs.publicAssets = [];
+  for (const value of planRows(plan)) {
+    if (!/^(?:\.\/|\/)?(?:assets|deck)\//.test(value)) continue;
+    try {
+      const path = decodeURIComponent(new URL(value, 'http://localhost/').pathname).slice(1);
+      if (/^(assets|deck)\//.test(path)) inputs.publicAssets.push(path);
+    } catch { /* the browser cannot request this path */ }
+  }
+  writeFileSync(graph, JSON.stringify(inputs));
+}
+
+/** Only the selected frame's fixture enters its TypeScript capture. */
+export function frameFixture(app, frame) {
+  if (!frame) return null;
+  const path = frameFixturePath(frame), stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat) return null;
+  const root = realpathSync(app), physical = realpathSync(path);
+  if (!stat.isFile() || !within(root, physical)) throw new Error(`${path}: a frame fixture must be a regular file inside the app`);
+  return slashRelative(root, physical);
+}
+
+/** The preview's dispatcher accepts the app's TypeScript sources and calls introduced by the frame.
+ * The app retains its grants, hooks and original handler for every unanswered call. */
+export function frameAnswer(file, types) {
+  return `import * as app from './app';
+${types}
+import fixture from ${JSON.stringify('./' + file)};
+import type { SourceMap as AppSources, TypeScriptSources } from './app.contract.d.ts';
+export * from './app';
+type Providers = { [S in TypeScriptSource]?: (args: Args<S>, store: Store, storage: Storage, native?: NativeModule | null) => Result<S> | Promise<Result<S>> };
+type Allowed = keyof TypeScriptSources | Exclude<TypeScriptSource, keyof AppSources>;
+const checked: Providers & Partial<TypeScriptSources> = fixture satisfies Record<Exclude<keyof typeof fixture, Allowed>, never>;
+const overrides: Providers = checked;
+const live: TypeScriptAnswer = app.answer;
+export const answer: TypeScriptAnswer = (source, args, store, storage, native) => {
+  const provide = Object.hasOwn(overrides, source) ? overrides[source] : undefined;
+  return provide ? provide(args, store, storage, native) : live(source, args, store, storage, native);
+};`;
+}
+
 export { EXE };
-import { buildScriptDir, crateDir, depInfoOf, fresh as cargoFresh, refreshCargoRustBindings } from '../../scripts/cargo-dep-info.mjs';
+import { buildScriptDir, compilerPaths, crateDir, depInfoOf, fresh as cargoFresh, refreshCargoRustBindings } from '../../scripts/cargo-dep-info.mjs';
 export { buildScriptDir, crateDir, depInfoOf, freshCompiler };
 export const fresh = (product, dep, also = []) => cargoFresh(product, dep, also);
 import { BINARYEN_DOWNLOAD } from '../web/stages.mjs';
@@ -89,6 +267,13 @@ const WASM_FLAGS = () => (wasmFlags ??= [...WEB_STD, ...wasmRemapFlags(null, WEB
 // cannot link is refused with its install command (scripts/cargo-check.mjs).
 let linkChecked = false;
 const LINK_FLAGS = () => { if (!linkChecked) { webToolchainEnv(process.env, { linksWasm: true }); linkChecked = true; } return WASM_FLAGS(); };
+// Each directory a WEB_STD build runs Cargo in, under each lockfile variable, once Cargo's configuration there names
+// no lockfile (`refuseStdLockfile`).
+const stdChecked = new Set();
+const checkStd = (cwd, what) => {
+  const key = `${cwd}\0${process.env.CARGO_RESOLVER_LOCKFILE_PATH ?? ''}`;
+  if (!stdChecked.has(key)) { refuseStdLockfile(process.env, cwd, what); stdChecked.add(key); }
+};
 // What those flags say apart from this checkout's path, for a kept module's group.
 const WASM_FLAGS_KEY = () => WASM_FLAGS().map(f => f.replaceAll(root, '.'));
 // Under this checkout's own target/ (AGENTS.md: never another checkout's):
@@ -116,7 +301,7 @@ const held = new Map();
 // fails, `input` copied there unoptimized and said so, as host/web/build.mjs
 // does: a missing tool is named, never left for a later ENOENT to report.
 const unoptimized = new Set();
-const OPT = ['-Oz', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext', '--enable-mutable-globals'];
+const OPT = ['-Oz', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', '--enable-sign-ext', '--enable-mutable-globals', '--enable-simd'];
 function optimized(opt, input, output, label) {
   if (opt.status === 0) return output;
   // Not optimized: a leaf is not kept for other checkouts (`buildLeaf`).
@@ -153,9 +338,23 @@ function replace(path, write) {
   try { written = write(temp); } catch (error) { clean(); throw error; }
   return written instanceof Promise ? written.then(land, (error) => { clean(); throw error; }) : land(written);
 }
-const cargoWasmArgs = (manifest) => [`+${WEB}`, 'build', '--release', '--target', 'wasm32-unknown-unknown', '--manifest-path', manifest, ...LINK_FLAGS()];
-function cargoWasm(manifest, args) {
-  return spawnSync('cargo', [...cargoWasmArgs(manifest), ...args], { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: TARGET, EXACT_RUST_BINDINGS: '1' } });
+const cargoWasmArgs = (manifest, profile = ['--release']) => [`+${WEB}`, 'build', ...profile, '--target', 'wasm32-unknown-unknown', '--manifest-path', manifest, ...LINK_FLAGS()];
+function cargoWasm(manifest, args, profile) {
+  return spawnSync('cargo', [...cargoWasmArgs(manifest, profile), ...args], { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: TARGET, EXACT_RUST_BINDINGS: '1' } });
+}
+// The dev loop's app module: the profile a build ships (`inherits`) without whole-module LTO, in parallel units and
+// incremental, so an edit recompiles the data crate and relinks. It is given on Cargo's command line, so no manifest,
+// and no other build's arguments or cache keys, carry it. The page takes it without `wasm-opt`, marked so that no
+// production build ships it (`moduleGrants`).
+export const DEV_PROFILE = 'web-dev';
+const devProfile = inherits => [['inherits', inherits], ['opt-level', 1], ['lto', false], ['codegen-units', 16], ['incremental', true]]
+  .flatMap(([key, value]) => ['--config', `profile.${DEV_PROFILE}.${key}=${JSON.stringify(value)}`]).concat('--profile', DEV_PROFILE);
+const DEV_MARK = 'exact.dev-module';
+/** A custom section named DEV_MARK (WebAssembly core spec 5.5.3), appended to a module. */
+function devMarked(bytes) {
+  const leb = n => { const out = []; do { out.push((n & 0x7f) | (n > 0x7f ? 0x80 : 0)); n >>>= 7; } while (n); return out; };
+  const name = [...new TextEncoder().encode(DEV_MARK)], body = [...leb(name.length), ...name];
+  return Buffer.concat([bytes, Buffer.from([0, ...leb(body.length), ...body])]);
 }
 /** The dep-info and generated wrapper of each module, by its staged path. */
 const moduleDepInfo = new Map();
@@ -187,14 +386,6 @@ function lockFrom(crate) {
 
 const LOCKFILE_KEY = 'resolver.lockfile-path';
 
-// Let Cargo apply configuration includes and environment overrides.
-function usesDefaultLock(env) {
-  const result = spawnSync('cargo', [`+${WEB}`, '-Z', 'unstable-options', 'config', 'get', LOCKFILE_KEY, '--color=never'], { env, encoding: 'utf8' });
-  if (result.status === 0) return false;
-  if (result.stderr?.trimEnd().endsWith(`error: config value \`${LOCKFILE_KEY}\` is not set`)) return true;
-  throw new Error(`module Cargo config: ${result.stderr || result.error?.message}`);
-}
-
 // Cargo prunes unused pins. Start each resolution with Exact's full lockfile
 // and preserve the build lockfile's mtime when the result is identical.
 function resolveDevLock(lock, readMetadata) {
@@ -217,9 +408,7 @@ export function moduleMetadata(manifest, env, dev = false) {
     if (result.status !== 0) throw new Error(`module metadata: ${result.stderr || result.error?.message}`);
     return JSON.parse(result.stdout);
   };
-  const locked = dev && usesDefaultLock(env);
-  const metadata = locked ? resolveDevLock(resolve(dirname(manifest), 'Cargo.lock'), readMetadata) : readMetadata();
-  return { metadata, locked };
+  return { metadata: dev ? resolveDevLock(resolve(dirname(manifest), 'Cargo.lock'), readMetadata) : readMetadata(), locked: dev };
 }
 
 /** A built `app.js` past this is an order of magnitude over what the apps here build, and near what a host refuses
@@ -238,21 +427,21 @@ export const dirKey = (dir) => createHash('sha256').update(realpathSync(dir)).di
 // backslashes (`C:\Users`) are not read as escapes.
 const tomlString = (path) => JSON.stringify(path);
 
-// The workspace's `[patch.crates-io]` table, its vendor paths made absolute for a crate outside the workspace.
-const workspacePatch = (ws) => ws.slice(ws.indexOf('[patch.crates-io]')).split('\n[')[0]
-  .replace(/path = "(vendor[^"]*)"/g, (_, path) => `path = ${tomlString(resolve(root, path))}`);
+// The workspace's `[patch.crates-io]` table, its vendor paths made absolute, under `checkout`, for a crate outside the workspace.
+const workspacePatch = (ws, checkout = root) => ws.slice(ws.indexOf('[patch.crates-io]')).split('\n[')[0]
+  .replace(/path = "(vendor[^"]*)"/g, (_, path) => `path = ${tomlString(resolve(checkout, path))}`);
 
-/** Cargo's module at `wasm`, optimized to `<out>/app.module.wasm`. */
+/** Cargo's module at `wasm`, optimized to `<out>/app.module.wasm`, or for the dev loop (`dev`) as Cargo linked it. */
 function module(manifest, name, out, label, writeInputs, dev = false) {
-  const wasm = resolve(TARGET, 'wasm32-unknown-unknown/release', `${name}.wasm`), done = resolve(out, 'app.module.wasm');
+  const wasm = resolve(TARGET, 'wasm32-unknown-unknown', dev ? DEV_PROFILE : 'release', `${name}.wasm`), done = resolve(out, 'app.module.wasm');
   mkdirSync(out, { recursive: true });
   const crate = dirname(manifest);
   const release = awaitBuildOutput({ id: label, dir: crate }, resolve(TARGET, '.claims', `${name}.lock`));
   try {
     writeInputs?.();
-    prepareModule(wasm, done, { manifest, targetDir: TARGET, profile: 'release', dev }, locked => {
+    prepareModule(wasm, done, { manifest, targetDir: TARGET, profile: dev ? DEV_PROFILE : 'release', wrapper: dev && !!writeInputs, dev }, locked => {
       const args = locked ? ['--locked'] : [];
-      if (cargoWasm(manifest, args).status !== 0) throw new Error(`${label} did not build`);
+      if (cargoWasm(manifest, args, dev ? devProfile('release') : undefined).status !== 0) throw new Error(`${label} did not build`);
     });
     moduleDepInfo.set(done, { depInfo: wasm.replace(/\.wasm$/, '.d'), wrapper: writeInputs ? realpathSync(crate) : undefined });
     return done;
@@ -261,12 +450,15 @@ function module(manifest, name, out, label, writeInputs, dev = false) {
 
 // A dev build's staging directory is replaced each time. Keep the optimized
 // module beside Cargo's artifact so a new stage need not optimize it again.
-function prepareModule(wasm, done, { manifest, targetDir, profile, dev }, build) {
+// `wrapper`: a dev wrapper, whose lock `moduleMetadata` resolves; `dev`: the
+// dev loop's module, served as Cargo linked it.
+function prepareModule(wasm, done, { manifest, targetDir, profile, wrapper = false, dev = false }, build) {
   const cached = wasm.replace(/\.wasm$/, '.optimized.wasm'), from = `${cached}.from`;
   const env = { ...process.env, CARGO_TARGET_DIR: targetDir, EXACT_RUST_BINDINGS: '1' };
-  const { metadata, locked } = moduleMetadata(manifest, env, dev);
+  const { metadata, locked } = moduleMetadata(manifest, env, wrapper);
   refreshCargoRustBindings(targetDir, 'wasm32-unknown-unknown', profile, metadata.packages, env, metadata.build_directory);
   build(locked);
+  if (dev) return void replace(done, temp => writeFileSync(temp, devMarked(readFileSync(wasm))));
   // Cargo may restore an older artifact when features change back.
   const id = createHash('sha256').update(readFileSync(wasm)).update(JSON.stringify([WASM_OPT(), OPT])).digest('hex');
   if (!existsSync(cached) || !existsSync(from) || readFileSync(from, 'utf8') !== id) {
@@ -277,30 +469,32 @@ function prepareModule(wasm, done, { manifest, targetDir, profile, dev }, build)
 }
 
 export function buildModule(app, out, draw = false, dir = resolve(root, 'apps', app), { dev = false } = {}) {
+  checkStd(process.cwd(), app);
   const key = dirKey(dir);
   out ??= resolve(MODULES, `${app}-${key}`);
   const manifest = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8'));
-  if (manifest.rust?.module?.package) return ownModule(app, out, dir);
+  if (manifest.rust?.module?.package) return ownModule(app, out, dir, dev);
   // The source app.json's rust.data names (LLP 1153.003 D2), exported from a crate of its own whose one dependency is
   // the data crate.
   const data = rustDataOf(manifest);
-  if (!data) return ownModule(app, out, dir);
-  // Canvas 2D draws only for a plan that has a 2D surface (logic/abi/src/draw.rs).
-  const lib = `exact_logic_abi::export!(${data.ty}, ${data.source});\n${draw ? `exact_logic_abi::export_draw!(${data.ty});\n` : ''}`;
+  if (!data) return ownModule(app, out, dir, dev);
+  // Canvas 2D draws only for a plan that has a 2D surface (logic/abi/src/draw.rs). Beside app.ts, the module carries
+  // the sources Rust answers (logic/abi/src/sources.rs).
+  const lib = `exact_logic_abi::export!(${data.ty}, ${data.source});\n${draw ? `exact_logic_abi::export_draw!(${data.ty});\n` : ''}${existsSync(resolve(dir, 'app.ts')) ? `exact_logic_abi::export_sources!(${data.lib}::RUST_SOURCES);\n` : ''}`;
   const resolved = resolveApp(dir);
   // An app whose host crates exact2 generates has the module as a member of that workspace (`.exact/shells/module`),
   // built --locked against the app's resolution, so a data crate's dependencies resolve once.
   if (resolved.generated) {
     const workspace = resolved.rust(), crate = resolve(workspace, 'module');
     const manifestPath = resolve(crate, 'Cargo.toml'), name = Bun.TOML.parse(readFileSync(manifestPath, 'utf8')).package.name;
-    const wasm = resolve(resolved.target, 'wasm32-unknown-unknown/web', `${name.replaceAll('-', '_')}.wasm`), done = resolve(out, 'app.module.wasm');
+    const wasm = resolve(resolved.target, 'wasm32-unknown-unknown', dev ? DEV_PROFILE : 'web', `${name.replaceAll('-', '_')}.wasm`), done = resolve(out, 'app.module.wasm');
     mkdirSync(out, { recursive: true });
     moduleDepInfo.set(done, { depInfo: wasm.replace(/\.wasm$/, '.d') });
     const release = awaitBuildOutput(resolved, resolve(resolved.target, '.claims', `${name}.lock`));
     try {
       keep(resolve(crate, 'src/lib.rs'), lib);
-      prepareModule(wasm, done, { manifest: manifestPath, targetDir: resolved.target, profile: 'web' }, () => {
-        const args = [`+${WEB}`, 'build', '--locked', '--offline', '--profile', 'web', '--target', 'wasm32-unknown-unknown', '--manifest-path', manifestPath, ...injectedProfiles({ manifest }, workspace), ...LINK_FLAGS()];
+      prepareModule(wasm, done, { manifest: manifestPath, targetDir: resolved.target, profile: dev ? DEV_PROFILE : 'web', dev }, () => {
+        const args = [`+${WEB}`, 'build', '--locked', '--offline', ...dev ? devProfile('web') : ['--profile', 'web'], '--target', 'wasm32-unknown-unknown', '--manifest-path', manifestPath, ...injectedProfiles({ manifest }, workspace), ...LINK_FLAGS()];
         if (spawnSync('cargo', args, { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: resolved.target, EXACT_RUST_BINDINGS: '1' } }).status !== 0) throw new Error(`${app}: the module did not build; if Cargo says above that it could not download a crate offline, ${SETUP_FETCHES}`);
       });
       return done;
@@ -315,9 +509,11 @@ export function buildModule(app, out, draw = false, dir = resolve(root, 'apps', 
   // own package name keeps Cargo from reusing a stage-local wrapper's artifact.
   const crate = dev ? resolve(MODULES, 'wrappers', packageName) : resolve(out, 'crate');
   mkdirSync(resolve(crate, 'src'), { recursive: true });
+  // The data crate's workspace was authored, so the wrapper names the checkout as it does (scripts/paths.mjs).
+  const checkout = cargoCheckout(resolved.dir, false);
   const writeInputs = () => {
     const ws = readFileSync(resolve(root, 'Cargo.toml'), 'utf8');
-    const patch = workspacePatch(ws);
+    const patch = workspacePatch(ws, checkout);
     keep(resolve(crate, 'Cargo.toml'), `[package]
 name = "${packageName}"
 version = "0.1.0"
@@ -327,7 +523,7 @@ publish = false
 crate-type = ["cdylib"]
 [dependencies]
 ${data.krate} = { path = ${tomlString(dataCrate)} }
-exact-logic-abi = { path = ${tomlString(resolve(root, 'logic/abi'))} }
+exact-logic-abi = { path = ${tomlString(resolve(checkout, 'logic/abi'))} }
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -368,32 +564,54 @@ export function undeclaredRustData(app, dir, manifest) {
 
 /** The app's explicit logic module (`rust.module.package`, LLP 1029.000):
  * its crate already exports the ABI, built as the generated one is. */
-function ownModule(app, out, dir) {
+function ownModule(app, out, dir, dev) {
   const pkg = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')).rust?.module?.package;
   if (!pkg) throw new Error(`${app}: its web build bakes with no Rust data source, and app.json names no rust.module.package`);
   const manifest = readdirSync(dir).map(d => resolve(dir, d, 'Cargo.toml')).find(f => existsSync(f) && new RegExp(`^name\\s*=\\s*"${pkg}"`, 'm').test(readFileSync(f, 'utf8')));
   if (!manifest) throw new Error(`${app}: no crate in ${dir} is ${pkg}`);
-  return module(manifest, pkg.replaceAll('-', '_'), out, `${app}: ${pkg}`);
+  return module(manifest, pkg.replaceAll('-', '_'), out, `${app}: ${pkg}`, undefined, dev);
 }
 
-/** A logic module's grants (the seam's first call, `meta`): what its storage
- * requests may name, which decides whether the page ships the storage
- * adapters. */
-export async function moduleGrants(path) {
-  const { instance } = await WebAssembly.instantiate(readFileSync(path), {}), e = instance.exports;
-  const abi = e.exact_logic_abi();
+/** A logic module's `meta`, the seam's first call: the app id its data names and its grants, or null if it fails. */
+function moduleMeta(instance, path) {
+  const e = instance.exports, abi = e.exact_logic_abi();
   if (abi !== 12) throw new Error(`${path}: Rust module ABI ${abi} is not 12; rebuild it with this checkout`);
   const session = e.exact_logic_create(), request = new Uint8Array(5), p = e.exact_logic_alloc(request.length);
   new DataView(request.buffer).setUint32(0, abi, true);
   new Uint8Array(e.memory.buffer, p, request.length).set(request);
-  if (e.exact_logic_call(session, p, request.length) !== 0) return '';
+  if (e.exact_logic_call(session, p, request.length) !== 0) return null;
   const out = new Uint8Array(e.memory.buffer, e.exact_logic_output(session), e.exact_logic_output_len(session)).slice(), d = new DataView(out.buffer);
+  // The reply's header: the ABI, then the kind of reply, 0 for `meta` (logic/abi/src/lib.rs `dispatch`).
+  if (out.length < 5 || d.getUint32(0, true) !== abi || out[4] !== 0) return null;
   let at = 5;
-  const str = () => { const n = d.getUint32(at, true), t = new TextDecoder().decode(out.subarray(at + 4, at + 4 + n)); at += 4 + n; return t; };
-  str();
-  return str();
+  // The id exactly as Rust wrote it, a leading U+FEFF included, since the composition compares it byte for byte.
+  const str = (ignoreBOM = false) => { const n = d.getUint32(at, true), t = new TextDecoder('utf-8', { ignoreBOM }).decode(out.subarray(at + 4, at + 4 + n)); at += 4 + n; return t; };
+  return { appId: str(true), grants: str() };
 }
 
+/** A logic module's grants: what its storage requests may name, which decides whether the page ships the storage
+ * adapters. A `production` build refuses a dev loop's module. */
+export async function moduleGrants(path, { production = false } = {}) {
+  const { module, instance } = await WebAssembly.instantiate(readFileSync(path), {});
+  if (production && WebAssembly.Module.customSections(module, DEV_MARK).length) throw new Error(`this production build was given a dev loop's Rust module (built at ${DEV_PROFILE}, not optimized): give --data or --plan a build made without --dev`);
+  return moduleMeta(instance, path)?.grants ?? '';
+}
+
+/** The sources a module beside app.ts answers, as its `exact_logic_abi::export_sources!` carries them, or null for a
+ * module that carries none. The module is refused what a native host's composition refuses (`exact_data::Mixed::new`
+ * over `Placed::named`): a source named twice or empty, and data whose app id is neither empty nor app.ts's, which is
+ * `manifest.app.id` (the selected variant's) as the page runs it. */
+export async function moduleSources(path, manifest) {
+  const { module, instance } = await WebAssembly.instantiate(readFileSync(path), {});
+  const [section] = WebAssembly.Module.customSections(module, 'exact.rust_sources');
+  if (!section) return null;
+  const names = JSON.parse(new TextDecoder().decode(section)), bad = names.find((name, i) => !name || names.indexOf(name) !== i);
+  if (bad !== undefined) throw new Error(`RUST_SOURCES names ${bad ? `\`${bad}\` twice` : 'an empty source'}: name each source once`);
+  const meta = moduleMeta(instance, path), id = manifest.app.id;
+  if (!meta) throw new Error('its Rust module did not answer `meta`, the seam\'s first call');
+  if (meta.appId && meta.appId !== id) throw new Error(`its Rust data's app_id is ${JSON.stringify(meta.appId)}, but app.ts's is ${JSON.stringify(id)}${manifest.variant ? ` (variant ${manifest.variant.name})` : ''}: the two halves of a mixed app declare one identity, so return the same id or an empty one`);
+  return names;
+}
 
 /** Markdown pieces (LLP 1045 D3) as a loaded capability for the runtime:
  * the web host's own `exact_web_capabilities::markdown::pieces`, exported
@@ -458,6 +676,7 @@ export async function buildFlow({ out = resolve(MODULES, 'flow'), keepFresh = fa
   const leaf = own ? null : taken('textflow.wasm', at);
   if (leaf?.path) { replace(wasm, (temp) => cpSync(leaf.path, temp)); held.set('textflow.wasm', leaf.kept); return wasm; }
   const started = Date.now();
+  checkStd(root, 'textflow.wasm');
   const r = await run('cargo', [`+${WEB}`, 'build', '--profile', 'web', '--target', 'wasm32-unknown-unknown', '-p', 'exact-textflow', '--bin', 'textflow-web', ...LINK_FLAGS()],
     { cwd: root, env: { ...process.env, CARGO_TARGET_DIR: target } });
   if (r.status !== 0) throw new Error('textflow.wasm did not build');
@@ -556,6 +775,7 @@ ${patch}`;
   const leaf = own ? null : taken(`${name}.wasm`, at);
   if (leaf?.path) { replace(wasm, (temp) => cpSync(leaf.path, temp)); held.set(`${name}.wasm`, leaf.kept); return wasm; }
   const started = Date.now();
+  checkStd(process.cwd(), `${name}.wasm`);
   const r = await run('cargo', cargoWasmArgs(resolve(crate, 'Cargo.toml')), { env: { ...process.env, CARGO_TARGET_DIR: target } });
   if (r.status !== 0) throw new Error(`${name}.wasm did not build`);
   const optimizedLeaf = await replace(wasm, async (temp) => !unoptimized.has(await optimizeAsync(product, temp, `${name}.wasm`)));
@@ -590,38 +810,26 @@ export function withInspectHooks(file, text) {
 export const withRuntimeStamp = (text, files) => text.replace('"exact-runtime-unstamped"', JSON.stringify(createHash('sha256').update(files.map(f => `${f.path}\0${f.text}`).join('\0')).digest('hex').slice(0, 24)));
 export const withoutDev = (text) => text.replace(/^[ \t]*\/\/ dev-only \{.*\n[\s\S]*?^[ \t]*\/\/ dev-only \}.*\n/gm, '');
 
-/** The plan-to-JavaScript compiler (`exact-web-js`) to `launch`, in LLP 1174
- * D5's order: its binary when nothing it was built from changed, a tool set's
- * built on this machine, one kept for the machine, a fetched set's where one
- * may run, or `cargo run`, whose binary `done()` keeps. Throws `RustMissing`
- * where only Cargo could answer and Rust is missing. */
 const COMPILER = resolve(TARGET_DIR, `debug/exact-web-js${EXE}`);
 const compilerKept = () => kept({ crate: 'exact-web-js', product: COMPILER, depInfo: depInfoOf(COMPILER), group: ['debug'], buildDirs: [resolve(TARGET_DIR, 'debug/build')], stamp: resolve(MODULES, 'kept', 'exact-web-js.json') });
-export function webCompiler() {
-  // The optimised compiler (`host-dev`) the JS dev loop built for its design
-  // reader: a copy it makes for one build while that build is done and
-  // fresh (dev.mjs), the same output, about ten times faster on a large app
-  // (the Bluesky clone: 1.2 s, not 11.8).
-  const fast = process.env.EXACT_WEB_COMPILER;
-  if (fast && freshCompiler(fast)) return launch(fast);
-  if (freshCompiler(COMPILER)) return launch(COMPILER);
-  const built = fromSet('exact-web-js', 'built');
-  if (built) return launch(built.path);
-  const missing = rustMissing(), at = compilerKept();
-  const taken = missing ? null : at.find();
-  if (taken) return launch(taken);
-  const fetched = fetchedTool('exact-web-js');
-  if (fetched) return launch(fetched.path);
-  if (missing) throw new RustMissing('exact-web-js');
-  const started = Date.now();
-  return launch('cargo', ['run', '-q', '-p', 'exact-web-js', '--'], () => at.keep(started));
+export function webCompilerFrom(env = process.env, { rehash = false } = {}) {
+  // The dev loop can lend a fresh copy of its optimized design reader to this build.
+  const fast = env.EXACT_WEB_COMPILER;
+  if (fast && freshCompiler(fast)) return { path: fast, set: null };
+  return compilerFrom('exact-web-js', COMPILER, env, { rehash, kept: () => rustMissing(env) ? null : compilerKept().find() });
 }
-/** The tool set `webCompiler` takes the compiler from, when it would take it from one (null when this checkout's
- * own build is fresh, or no set matches): the web build then reads the set's record in place of Cargo's (LLP 1174 D5). */
+
+/** Launch the compiler selected by LLP 1174 D5, or build it with Cargo when none answers. */
+export function webCompiler(options) {
+  const selected = webCompilerFrom(process.env, options);
+  if (selected) return launch(selected.path);
+  if (rustMissing()) throw new RustMissing('exact-web-js');
+  const started = Date.now();
+  return launch('cargo', ['run', '-q', '-p', 'exact-web-js', '--'], () => compilerKept().keep(started));
+}
+/** The selected compiler's tool set supplies the web build's Cargo metadata (LLP 1174 D5). */
 export function compilerSet() {
-  const fast = process.env.EXACT_WEB_COMPILER;
-  if ((fast && freshCompiler(fast)) || freshCompiler(COMPILER)) return null;
-  return fromSets('exact-web-js')?.set ?? null;
+  return webCompilerFrom()?.set ?? null;
 }
 
 /** Everything an app's web build shares, compiled where it is not yet and
@@ -758,6 +966,10 @@ export function takeWarmGame(app, dist, env = process.env) {
     stage = mkdtempSync(resolve(app.target, 'proof-web-copy-'));
     cpSync(resolve(receipt.directory, 'dist'), stage, {recursive:true});
     if (JSON.stringify(warmFiles(stage)) !== JSON.stringify(receipt.files)) return false;
+    // The game proof's source inventory excludes installed packages. Verify what the bundler read and what it bound.
+    const markerPath = resolve(stage, '.exact-build.json');
+    const marker = existsSync(markerPath) ? JSON.parse(readFileSync(markerPath, 'utf8')) : {};
+    if (webPackageBindingChanged(app.dir, marker.packageViews)) return false;
     // Driver staleness paths are local to the captured source tree. Relocate only
     // after the complete portable input identity and copied products agree.
     // The caller refreshes the driver's path-based marker after this copy.

@@ -545,11 +545,13 @@ try {
   assert.throws(()=>captureAppleProduct(build,source,captured),/changed before Apple capture/);
   assert.deepEqual(readFileSync(captured),bytes);
   const binary = resolve(placed,'ExactMac'), compat = 'a'.repeat(32);
+  const header = Buffer.alloc(32); header.writeUInt32LE(0xfeedfacf);
+  const writeBinary = text => writeFileSync(binary, Buffer.concat([header, Buffer.from(text)]));
   const embedded = id => JSON.stringify({id:compat,inputs:{abi:{c:4},app:id}});
-  writeFileSync(binary, embedded(a.id)); assertAppleIdentity(a,binary,compat);
-  writeFileSync(binary, embedded('org.foreign.app') + a.id);
+  writeBinary(embedded(a.id)); assertAppleIdentity(a,binary,compat);
+  writeBinary(embedded('org.foreign.app') + a.id);
   assert.throws(()=>assertAppleIdentity(a,binary), /embedded app identity/);
-  writeFileSync(binary, a.id); assert.throws(()=>assertAppleIdentity(a,binary), /missing/);
+  writeBinary(a.id); assert.throws(()=>assertAppleIdentity(a,binary), /missing/);
 } finally { rmSync(run,{recursive:true,force:true}); }
 "#])
         .output()
@@ -768,7 +770,7 @@ fn a_reloaded_plan_resolves_line_height_kinds_against_the_new_receiving_font() {
             .node(view(&host, "child"))
             .unwrap()
             .text_style()
-            .line_height,
+            .used_line_height(),
         Some(30.0)
     );
     let carry = host.carry();
@@ -795,7 +797,7 @@ fn a_reloaded_plan_resolves_line_height_kinds_against_the_new_receiving_font() {
                 .node(view(&reloaded, "child"))
                 .unwrap()
                 .text_style()
-                .line_height,
+                .used_line_height(),
             expected
         );
     }

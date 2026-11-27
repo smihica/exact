@@ -24,6 +24,8 @@ package protocol NavigationHosting: AnyObject {
     func groundChanged()
     /// Whether a node that left keeps its view for its route's exit.
     func keepsForExit(_ id: UInt32) -> Bool
+    /// Whether navigation holds per-node bookkeeping (`refused`, `shown`, `keptSheets`) for `id`.
+    func tracks(_ id: UInt32) -> Bool
     /// A batch inside `startViewTransition()`'s cross-fade: its routes play no entrance or exit of their own.
     var crossFading: Bool { get set }
 
@@ -58,6 +60,11 @@ package protocol NavigationHosting: AnyObject {
     func makeRouteChrome() -> (any SheetChrome)?
     func adoptRouteSheet(_ entry: DialogHost.Entry, _ sheet: DialogSheet)
     func releaseRouteSheet(_ entry: DialogHost.Entry)
+    /// What a `dialog`'s sheet shows of its header in the same rows
+    /// (LLP 1141.004 D6); nil where the header stays in the dialog.
+    func dialogSheetHeader(_ dialog: NodeView) -> (any SheetHeading)?
+    /// After a batch: a dialog's sheet's rows show its header as it now is.
+    func syncDialogSheet(_ entry: DialogHost.Entry)
 
     #if EXACT_AGENT
     /// `state.navigation.sheet` for a modal route painted in the window; nil with none.
@@ -90,11 +97,10 @@ package protocol StackSplitting: AnyObject {
     var listDivider: (view: NSSplitView, index: Int)? { get }
     var hasInspector: Bool { get }
     var emphasizedRow: NodeView? { get }
-    /// The press of the row the list is pressing: a route it brings is that row's detail.
-    var pressing: UInt32? { get set }
     /// The list whose row pushes the detail.
     var table: UInt32? { get }
-    func pressesPaintedRow(_ node: NodeView) -> Bool
+    /// The split's painted list, where `node` is what a click on one of its rows presses.
+    func paintedRowList(_ node: NodeView) -> UInt32?
     func authored(_ mounted: [NodeView], in home: NSView) -> [NodeView]
     func deselected(_ list: UInt32)
     func holds(_ route: NodeView) -> Bool
@@ -235,6 +241,7 @@ package final class NoNavigation: NavigationHosting {
     package func reset() { oneLocationAsked = nil }
     package func groundChanged() {}
     package func keepsForExit(_ id: UInt32) -> Bool { false }
+    package func tracks(_ id: UInt32) -> Bool { false }
 
     package var selection: (root: UInt32, stack: [UInt32], at: Int)? { nil }
     package var barRoute: Bool { false }
@@ -264,6 +271,8 @@ package final class NoNavigation: NavigationHosting {
     package func makeRouteChrome() -> (any SheetChrome)? { nil }
     package func adoptRouteSheet(_ entry: DialogHost.Entry, _ sheet: DialogSheet) {}
     package func releaseRouteSheet(_ entry: DialogHost.Entry) {}
+    package func dialogSheetHeader(_ dialog: NodeView) -> (any SheetHeading)? { nil }
+    package func syncDialogSheet(_ entry: DialogHost.Entry) {}
 
     #if EXACT_AGENT
     package var paintedModalObservation: [String: Any]? { nil }
@@ -288,9 +297,8 @@ package final class NoSplit: StackSplitting {
     package var listDivider: (view: NSSplitView, index: Int)? { nil }
     package var hasInspector: Bool { false }
     package var emphasizedRow: NodeView? { nil }
-    package var pressing: UInt32?
     package var table: UInt32? { nil }
-    package func pressesPaintedRow(_ node: NodeView) -> Bool { false }
+    package func paintedRowList(_ node: NodeView) -> UInt32? { nil }
     package func authored(_ mounted: [NodeView], in home: NSView) -> [NodeView] { mounted }
     package func deselected(_ list: UInt32) {}
     package func holds(_ route: NodeView) -> Bool { false }

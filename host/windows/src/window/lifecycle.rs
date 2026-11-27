@@ -18,24 +18,42 @@ use crate::instance::{Activation, Claim, Handed, Instance};
 /// DWM composes a cloaked window without putting it on the desktop. Winit's
 /// visible flag stays clear until the frame is ready because setting it can
 /// activate the window and take keyboard input away from the current app.
+/// How long after a show is asked for its first present waits for the
+/// pictures its draws asked for. On the NucBox (Ryzen AI Max+ 395) a
+/// 3440 × 1440 PNG reads and decodes on a raster worker in 15 ms, and a
+/// freeze overlay's two 2560 × 1440 JPEG stills land 45 to 60 ms after the
+/// show begins; a capture's own PNG pixels take no decode. 100 ms covers those
+/// with room, and is about what the overlay of expo/exact#1315 took to reveal
+/// before its decodes left the presentation thread (93 ms): no reveal waits
+/// longer, and a picture still loading then lands in a later frame.
+pub(super) const REVEAL_PICTURES: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub(super) struct PendingShow {
+    /// When the show was asked for: its pictures' wait counts from here.
+    pub(super) began: std::time::Instant,
     window: Rc<Window>,
     hwnd: windows_sys::Win32::Foundation::HWND,
 }
 
 impl PendingShow {
+    /// `minimum` is the client's least size in CSS pixels.
     #[allow(unsafe_code)]
-    fn begin(window: &Rc<Window>) -> Option<Self> {
+    fn begin(window: &Rc<Window>, minimum: (f32, f32)) -> Option<Self> {
         use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
         let RawWindowHandle::Win32(handle) = window.window_handle().ok()?.as_raw() else {
             return None;
         };
         let pending = Self {
+            began: std::time::Instant::now(),
             window: window.clone(),
             hwnd: handle.hwnd.get() as _,
         };
+        let shown = crate::placement::shown_now(pending.hwnd as isize, minimum);
         pending.cloak(true).ok()?;
         unsafe { ShowWindow(pending.hwnd, SW_SHOWNOACTIVATE) };
+        if let Some(shown) = shown {
+            crate::placement::take_dpi(pending.hwnd as isize, shown);
+        }
         Some(pending)
     }
 
@@ -186,12 +204,70 @@ impl<D: DataSource + Default + 'static> App<D> {
                 return;
             }
         }
-        // The window is going: its hatch, then the app's, ends.
-        if let Some(p) = &mut self.presenter {
-            p.end_hatches();
-            p.end_packages();
-        }
+        self.end();
         events.exit();
+    }
+
+    /// The app ends in order (LLP 1097 D10, LLP 1146 D2), as the headless
+    /// host's exit does: the window goes at once, then the storage an answer
+    /// started and a request with effects in flight land, five seconds at
+    /// most (a second for an agent's quit), and its hatches and packages end.
+    /// It ends once, and the loop serves it no more (`ended`).
+    pub(super) fn end(&mut self) {
+        let Some(window) = self.begin_end() else {
+            return;
+        };
+        if let Some(window) = window {
+            window.set_visible(false);
+        }
+        self.finish_end();
+    }
+
+    /// Marks the app ended once and returns its window so callers invoked from
+    /// a `WndProc` subclass can drop their `RefCell` borrow before hiding it.
+    pub(super) fn begin_end(&mut self) -> Option<Option<Rc<Window>>> {
+        if std::mem::replace(&mut self.ended, true) {
+            return None;
+        }
+        Some(self.window.clone())
+    }
+
+    /// Drains background storage and in-flight effects after `begin_end`.
+    pub(super) fn finish_end(&mut self) {
+        let bound = self.exit_bound();
+        if let Some(p) = &mut self.presenter {
+            exact_painted::teardown::finish(p, bound);
+        }
+    }
+
+    /// How long the end waits for work in flight: a second for an agent's quit.
+    pub(super) fn exit_bound(&self) -> Duration {
+        if self.config.agent {
+            exact_painted::teardown::AGENT_EXIT_BOUND
+        } else {
+            exact_painted::teardown::EXIT_BOUND
+        }
+    }
+
+    /// Windows asks before ending the session (`WM_QUERYENDSESSION`).
+    /// `beforeunload` answers as it does for a window close; a handler that
+    /// keeps the window posts `Focus` so the loop brings it forward and draws
+    /// its question after the message returns without re-entering `WndProc`
+    /// while the app is borrowed.
+    pub(super) fn keeps_session(&mut self) -> bool {
+        if self.ended {
+            return false;
+        }
+        let Some(p) = self.presenter.as_mut() else {
+            return false;
+        };
+        p.advance(self.started.elapsed().as_secs_f64() * 1000.);
+        let now = p.host().now();
+        if p.before_unload(now) {
+            return false;
+        }
+        let _ = self.proxy.send_event(crate::accessibility::Event::Focus);
+        true
     }
 
     /// The window hidden by the person's close, the session running on.
@@ -231,7 +307,7 @@ impl<D: DataSource + Default + 'static> App<D> {
                 p.prepare_window_show();
             }
             self.hidden = false;
-            self.pending_show = PendingShow::begin(&window);
+            self.pending_show = PendingShow::begin(&window, self.min_size);
             if self.pending_show.is_none() {
                 window.set_visible(true);
             }

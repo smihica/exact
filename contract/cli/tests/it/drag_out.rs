@@ -4,6 +4,7 @@
 //! prop left with nothing and journaling each refusal as the prop is
 //! written (D2).
 
+use crate::source::{boxed, Source};
 use exact_kernel::{Kernel, PropId};
 use exact_plan::Value;
 use exact_runner::page::Platform;
@@ -21,33 +22,41 @@ impl DataSource for Grants {
     }
 }
 
-fn boot(platform: Platform, grants: &'static str) -> Runner<Grants> {
+fn boot(platform: Platform, grants: &'static str) -> Runner<Source> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/drag-out.contract");
     boot_source(&std::fs::read_to_string(path).unwrap(), platform, grants)
 }
 
-fn boot_source(src: &str, platform: Platform, grants: &'static str) -> Runner<Grants> {
+fn boot_source(src: &str, platform: Platform, grants: &'static str) -> Runner<Source> {
+    boot_on(src, platform, grants, Kernel::with_monospace())
+}
+
+/// A runner with no kernel, as a render on the server boots one (`host/render`).
+fn boot_detached(platform: Platform, grants: &'static str) -> Runner<Source> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/drag-out.contract");
+    boot_on(
+        &std::fs::read_to_string(path).unwrap(),
+        platform,
+        grants,
+        Kernel::detached(),
+    )
+}
+
+fn boot_on(src: &str, platform: Platform, grants: &'static str, kernel: Kernel) -> Runner<Source> {
     let plan = contract::compile(src).unwrap();
-    let plan = contract::bake(plan, Grants(grants)).unwrap();
+    let plan = contract::bake(plan, boxed(Grants(grants))).unwrap();
     platform.boot(|| {
-        Runner::boot(
-            plan,
-            Grants(grants),
-            Kernel::with_monospace(),
-            Default::default(),
-            "/",
-        )
-        .unwrap()
+        Runner::boot(plan, boxed(Grants(grants)), kernel, Default::default(), "/").unwrap()
     })
 }
 
-fn view(r: &Runner<Grants>, test_id: &str) -> u32 {
+fn view(r: &Runner<Source>, test_id: &str) -> u32 {
     let key = r.kernel().find_by_test_id(test_id)[0];
     r.kernel().node_by_key(key).unwrap().id
 }
 
 /// `(draggable, text, url, files)` of a node, as the host reads them.
-fn drag(r: &Runner<Grants>, test_id: &str) -> (Option<bool>, String, String, String) {
+fn drag(r: &Runner<Source>, test_id: &str) -> (Option<bool>, String, String, String) {
     let key = r.kernel().find_by_test_id(test_id)[0];
     let props = r.kernel().node_by_key(key).unwrap().props;
     let text = |p| props.str(p).unwrap_or_default().to_string();
@@ -60,14 +69,14 @@ fn drag(r: &Runner<Grants>, test_id: &str) -> (Option<bool>, String, String, Str
 }
 
 /// The prop a node holds, or none where the runner cleared it.
-fn held(r: &Runner<Grants>, test_id: &str, prop: PropId) -> Option<String> {
+fn held(r: &Runner<Source>, test_id: &str, prop: PropId) -> Option<String> {
     let key = r.kernel().find_by_test_id(test_id)[0];
     let props = r.kernel().node_by_key(key).unwrap().props;
     props.str(prop).map(str::to_string)
 }
 
 /// The journal's drag refusals, without their clock stamps.
-fn refusals(r: &Runner<Grants>) -> Vec<String> {
+fn refusals(r: &Runner<Source>) -> Vec<String> {
     r.journal()
         .filter_map(|l| l.find("drag: refused").map(|at| l[at..].to_string()))
         .collect()
@@ -80,6 +89,11 @@ fn each_argument_binds_its_prop_and_a_bound_draggable_follows_state() {
     assert_eq!(
         card,
         (Some(true), "".into(), "".into(), "assets/1016.jpg".into())
+    );
+    assert_eq!(
+        held(&r, "card-1016", PropId::DataTransferNames).as_deref(),
+        Some("Mount Fuji.jpg"),
+        "named by the card's title, the photo's suffix added (D14)"
     );
     let row = (
         "Mount Fuji".to_string(),
@@ -126,6 +140,17 @@ fn the_runner_admits_files_by_the_grants_and_the_host_reach_and_journals_a_refus
         refusals(&web),
         ["drag: refused: app:/data/export.pdf: an app:/ file cannot be dragged on the web"]
     );
+    // A render with no kernel builds no prop op, so nothing journals the refusal, and its document carries what a commit admits.
+    let mut detached = boot_detached(Platform::Web, "fs.read app:/data\n");
+    let doc = detached.document_tree().unwrap();
+    let export = doc
+        .nodes()
+        .iter()
+        .find(|n| n.props.str(PropId::TestId) == Some("export"))
+        .unwrap();
+    assert_eq!(export.props.str(PropId::DataTransferFiles), None);
+    assert_eq!(export.props.str(PropId::DataTransferText), Some("Export"));
+    assert!(refusals(&detached).is_empty());
     // A host with no drag admits what the rule admits, so `tree` shows the declaration.
     let linux = boot(Platform::Linux, "fs.read app:/data\n");
     assert_eq!(drag(&linux, "export").3, "app:/data/export.pdf");
@@ -136,9 +161,12 @@ fn bound_entries_and_urls_are_refused_by_the_same_rules() {
     // A template of literals is a constant the compiler folds, admitted as a bound value is.
     let src = "component A\n  state files = [\"assets/a.jpg\", \"img/x.jpg\", \"app:/data/../x.pdf\"]\n  state link = \"/card/1\"\n  view\n    column\n      column draggable=true dataTransfer=DataTransfer(files=files, url=link) testId=\"odd\"\n        text \"a\"\n      column draggable=true dataTransfer=DataTransfer(url=`https://${\"example.com\"}/a b`) testId=\"folded\"\n        text \"b\"\n";
     let mut r = boot_source(src, Platform::Ios, "fs.read app:/data\n");
-    // A render with no kernel folds the same admitted URL into its document.
-    let folded = view(&r, "folded");
+    // A render with no kernel folds the same admitted files and URL into its document.
+    let (odd, folded) = (view(&r, "odd"), view(&r, "folded"));
     let doc = r.document_tree().unwrap();
+    let odd = &doc.node(odd).unwrap().props;
+    assert_eq!(odd.str(PropId::DataTransferFiles), Some("assets/a.jpg"));
+    assert_eq!(odd.str(PropId::DataTransferUrl), None);
     assert_eq!(
         doc.node(folded).unwrap().props.str(PropId::DataTransferUrl),
         None
@@ -283,4 +311,63 @@ fn expect_drag_reads_each_form_and_names_them_when_it_cannot() {
         "test \"drag\"\n  expect drag \"card\" missing \"text/plain\" == \"a\"\n"
     )
     .is_err());
+}
+
+#[test]
+fn scroll_into_view_commits_admit_drag_data_on_action_and_materialized_rows() {
+    let src = r#"component App
+  state badUrl = "https://example.com/ok"
+  state badFiles = ["assets/ok.jpg"]
+  state items = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+  action poisonAndSeek
+    badUrl = "javascript:alert(1)"
+    badFiles = ["Info.plist", "app:/secret/key.txt"]
+    scrollIntoView("feed", 30, block="start")
+  view
+    column height=400 width=300
+      column draggable=true dataTransfer=DataTransfer(url=badUrl, files=badFiles) testId="outside"
+        text "outside"
+      list id="feed" virtualized=true height=200 width=300 estimated-item-height=50 testId="feed"
+        for i in items key=i
+          column height=50 draggable=true dataTransfer=DataTransfer(url=(i >= 30 ? "file:///etc/passwd" : "https://example.com/ok"), files=(i >= 30 ? ["Info.plist", "assets/ok.jpg"] : ["assets/ok.jpg"])) testId=`row-${i}`
+            text `${i}`
+"#;
+    let mut r = boot_source(src, Platform::Macos, "");
+    assert_eq!(
+        held(&r, "outside", PropId::DataTransferUrl).as_deref(),
+        Some("https://example.com/ok")
+    );
+    r.act("poisonAndSeek", vec![]).unwrap();
+    assert_eq!(held(&r, "outside", PropId::DataTransferUrl), None);
+    assert_eq!(held(&r, "outside", PropId::DataTransferFiles), None);
+    assert_eq!(held(&r, "row-30", PropId::DataTransferUrl), None);
+    assert_eq!(
+        held(&r, "row-30", PropId::DataTransferFiles).as_deref(),
+        Some("assets/ok.jpg")
+    );
+    let logged = refusals(&r);
+    assert!(
+        logged.iter().any(|l| l.contains("Info.plist")),
+        "{logged:?}"
+    );
+    assert!(
+        logged.iter().any(|l| l.contains("app:/secret/key.txt")),
+        "{logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|l| l.contains("not an absolute http: or https: URL")),
+        "{logged:?}"
+    );
+
+    // Direct scroll_into_view_at materializing row 35 also admits drag props.
+    let feed = view(&r, "feed");
+    r.scroll_into_view_at(feed, "35", "start", "nearest")
+        .unwrap();
+    assert_eq!(held(&r, "row-35", PropId::DataTransferUrl), None);
+    assert_eq!(
+        held(&r, "row-35", PropId::DataTransferFiles).as_deref(),
+        Some("assets/ok.jpg")
+    );
 }

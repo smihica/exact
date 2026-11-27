@@ -7,7 +7,8 @@
 //   both at once is ignored from Android 11, where the second opens the app's location settings page). A denied first
 //   step fails `PERMISSION_DENIED` without the second.
 // - Twenty a fence app (D11), `android.limit` up to Play services' 100; a radius under 100 m is raised with a journal
-//   line. A fence added while inside raises `geofenceenter` (`INITIAL_TRIGGER_ENTER`); a re-arm adds none.
+//   line. A fence added while inside raises `geofenceenter` (`INITIAL_TRIGGER_ENTER`, or `INITIAL_TRIGGER_DWELL` for
+//   a dwell fence); a re-arm adds none.
 // - A crossing reaches `GeofenceReceiver` (Receivers.kt), which writes it to the store and asks for a region wake. A
 //   live session's module delivers it at once; with none (it boots no session yet, §9 item 6) the store keeps it,
 //   and the module delivers it when a later launch makes it (D14 step 3), with its original time.
@@ -26,6 +27,7 @@ import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofenceStatusCodes
 import com.google.android.gms.location.GeofencingRequest
 import com.google.android.gms.location.LocationServices
+import dev.exact.canvas.Cause
 import dev.exact.canvas.ExactExtension
 import dev.exact.canvas.ExactRegions
 import dev.exact.canvas.ExtensionContext
@@ -59,11 +61,19 @@ class GeofencingModule(context: ExtensionContext) : ExactExtension(context) {
                 .build()
         }
 
+        /**
+         * Play services' request for [regions]: [initial] raises an entry for a fence the device is already inside. Each
+         * initial trigger applies only to fences listening for its transition, so a dwell fence needs `DWELL`.
+         */
+        internal fun request(regions: List<JSONObject>, initial: Boolean): GeofencingRequest {
+            val trigger = if (initial) GeofencingRequest.INITIAL_TRIGGER_ENTER or GeofencingRequest.INITIAL_TRIGGER_DWELL else 0
+            return GeofencingRequest.Builder().setInitialTrigger(trigger).addGeofences(regions.map(::fence)).build()
+        }
+
         /** Add [regions] to Play services: [initial] raises an entry for a fence the device is already inside. */
         internal fun arm(app: Context, regions: List<JSONObject>, initial: Boolean, done: (Exception?) -> Unit) {
             if (regions.isEmpty() || app.checkSelfPermission(FINE) != PackageManager.PERMISSION_GRANTED) return done(null)
-            val request = GeofencingRequest.Builder().setInitialTrigger(if (initial) GeofencingRequest.INITIAL_TRIGGER_ENTER else 0)
-                .addGeofences(regions.map(::fence)).build()
+            val request = request(regions, initial)
             try {
                 LocationServices.getGeofencingClient(app).addGeofences(request, pendingIntent(app))
                     .addOnSuccessListener { done(null) }.addOnFailureListener { done(it) }
@@ -91,11 +101,13 @@ class GeofencingModule(context: ExtensionContext) : ExactExtension(context) {
         }
     }
 
-    override fun later(name: String, args: JSONObject, reply: (JSONObject) -> Unit) {
+    override fun later(name: String, args: JSONObject, reply: (JSONObject) -> Unit) = later(name, args, null, Cause.none, reply)
+
+    override fun later(name: String, args: JSONObject, preferred: Any?, cause: Cause, reply: (JSONObject) -> Unit) {
         when (name) {
             "geofencingStatus" -> reply(status())
             "geofences" -> reply(JSONObject().put("exact:answer", store.answer()))
-            "addGeofence" -> allowed(reply) { add(args, reply) }
+            "addGeofence" -> allowed(cause, reply) { add(args, reply) }
             "removeGeofence" -> remove(args.optString("name"), reply)
             else -> reply(error("NotSupportedError"))
         }
@@ -135,15 +147,15 @@ class GeofencingModule(context: ExtensionContext) : ExactExtension(context) {
     }
 
     /** [then] once both decisions allow it: fine and coarse, then background location alone (D13). */
-    private fun allowed(reply: (JSONObject) -> Unit, then: () -> Unit) {
+    private fun allowed(cause: Cause, reply: (JSONObject) -> Unit, then: () -> Unit) {
         if (!playServices()) return reply(error("NotSupportedError"))
         val state = status().getString("state")
         when {
             state == "granted" -> then()
             state == "denied" -> reply(error("PERMISSION_DENIED"))
-            else -> fine {
+            else -> fine(cause) {
                 if (!has(FINE)) return@fine reply(error("PERMISSION_DENIED"))
-                background {
+                background(cause) {
                     context.changed("geofencing.geofencingStatus")
                     if (Build.VERSION.SDK_INT < 29 || has(BACKGROUND)) then() else reply(error("PERMISSION_DENIED"))
                 }
@@ -151,9 +163,9 @@ class GeofencingModule(context: ExtensionContext) : ExactExtension(context) {
         }
     }
 
-    private fun fine(done: () -> Unit) {
+    private fun fine(cause: Cause, done: () -> Unit) {
         if (has(FINE)) return done()
-        context.requestPermissions(arrayOf(FINE, COARSE)) { answered ->
+        context.requestPermissions(cause, arrayOf(FINE, COARSE)) { answered ->
             val a = context.activity
             if (FINE in answered && !has(FINE) && a != null && !a.shouldShowRequestPermissionRationale(FINE)) {
                 app.getSharedPreferences("exact.permissions", Context.MODE_PRIVATE).edit().putBoolean(FINE, true).apply()
@@ -164,9 +176,9 @@ class GeofencingModule(context: ExtensionContext) : ExactExtension(context) {
 
     /** From Android 11 the platform opens the app's location settings page rather than a dialog; the request settles
      * when the activity resumes and the permission is read again. */
-    private fun background(done: () -> Unit) {
+    private fun background(cause: Cause, done: () -> Unit) {
         if (Build.VERSION.SDK_INT < 29 || has(BACKGROUND)) return done()
-        context.askPermission(BACKGROUND, done)
+        context.askPermission(cause, BACKGROUND, done)
     }
 
     // Fences (D10, D11)

@@ -32,8 +32,12 @@ extension Runtime {
             decodeBatch: { Batch.decode($0, resolver: $1) },
             prepareBatch: { runtime, batch in
                 batch.prepare()
+                batch.takeBeneath(runtime)
                 #if os(macOS)
                 batch.takeControls(runtime)
+                #endif
+                #if os(iOS) || os(macOS)
+                batch.takeSplit(runtime)
                 #endif
             }, symbolMeasure: SymbolMeasure.measure,
             prewarmIslands: SvgLink.prewarm))
@@ -148,42 +152,57 @@ extension Runtime {
             return RoleKeys(json: Data(bytes: exact_out(rt), count: Int(len)))
         }
     }
+    private func encodeCovers(_ covers: [(UInt32, HostCover?)]) -> Data {
+        var bytes = Data(capacity: covers.count * 24)
+        for (view, cover) in covers {
+            let (kind, edges): (UInt32, [CGFloat]) = switch cover {
+            case .none: (0, [0, 0, 0, 0])
+            case .edges(let e)?: (1, [e.top, e.right, e.bottom, e.left])
+            case .whole?: (2, [0, 0, 0, 0])
+            case .bar?: (26, [0, 0, 0, 0])
+            case .room(let height)?: (30, [height, 0, 0, 0])
+            case .inset(let top, let bottom)?: (3, [top, 0, bottom, 0])
+            case .gutter(let right, let bottom)?: (12, [0, right, bottom, 0])
+            case .rowSpacing(let top, let bottom)?: (25, [top, 0, bottom, 0])
+            }
+            for word in [view, kind] + edges.map({ Float($0).bitPattern }) {
+                withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
+            }
+        }
+        return bytes
+    }
     /// What native containers cover of boxes (LLP 1075.003 §3.5), under one
     /// layout: `edges` add to a box's padding; `whole` lays it out as
-    /// `display: none`; nil clears.
+    /// `display: none`, and `bar` too but for the blocks given inside it;
+    /// nil clears.
     package func covers(_ covers: [(UInt32, HostCover?)]) -> Batch {
-        return on(layout: true) {
-            var bytes = Data(capacity: covers.count * 24)
-            for (view, cover) in covers {
-                let (kind, edges): (UInt32, [CGFloat]) = switch cover {
-                case .none: (0, [0, 0, 0, 0])
-                case .edges(let e)?: (1, [e.top, e.right, e.bottom, e.left])
-                case .whole?: (2, [0, 0, 0, 0])
-                case .inset(let top, let bottom)?: (3, [top, 0, bottom, 0])
-                case .gutter(let right, let bottom)?: (12, [0, right, bottom, 0])
-                case .rowSpacing(let top, let bottom)?: (25, [top, 0, bottom, 0])
-                }
-                for word in [view, kind] + edges.map({ Float($0).bitPattern }) {
-                    withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
-                }
+        let bytes = encodeCovers(covers)
+        return on(layout: true) { read(exact_host_covers(rt, write(bytes))) }
+    }
+    package func coversAsync(_ covers: [(UInt32, HostCover?)], done: @escaping (RuntimeCompletion) -> Void) {
+        let bytes = encodeCovers(covers)
+        postWithTopLayer(layout: true, done: done) { [self] in read(exact_host_covers(rt, write(bytes))) }
+    }
+    private func encodeLocalInsets(_ owners: [(UInt32?, [CGFloat]?)]) -> Data {
+        var bytes = Data(capacity: owners.count * 24)
+        for (view, insets) in owners {
+            let kind: UInt32 = (view == nil ? 19 : 17) + (insets == nil ? 1 : 0)
+            for word in [view ?? 0, kind] + (insets ?? [0, 0, 0, 0]).map({ Float($0).bitPattern }) {
+                withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
             }
-            return read(exact_host_covers(rt, write(bytes)))
         }
+        return bytes
     }
     /// Content owners' local insets (LLP 1123 D9), top right bottom left, under
     /// one layout: the owner by its root's view, nil for the session root's;
     /// nil insets take them back.
     func localInsets(_ owners: [(UInt32?, [CGFloat]?)]) -> Batch {
-        return on(layout: true) {
-            var bytes = Data(capacity: owners.count * 24)
-            for (view, insets) in owners {
-                let kind: UInt32 = (view == nil ? 19 : 17) + (insets == nil ? 1 : 0)
-                for word in [view ?? 0, kind] + (insets ?? [0, 0, 0, 0]).map({ Float($0).bitPattern }) {
-                    withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
-                }
-            }
-            return read(exact_host_covers(rt, write(bytes)))
-        }
+        let bytes = encodeLocalInsets(owners)
+        return on(layout: true) { read(exact_host_covers(rt, write(bytes))) }
+    }
+    func localInsetsAsync(_ owners: [(UInt32?, [CGFloat]?)], done: @escaping (RuntimeCompletion) -> Void) {
+        let bytes = encodeLocalInsets(owners)
+        postWithTopLayer(layout: true, done: done) { [self] in read(exact_host_covers(rt, write(bytes))) }
     }
     /// Content owners' updates (LLP 1123 D2), each the owner by its root's view and its
     /// update in the kernel's encoding (`OwnerUpdateIOS.encode`), and targets native code
@@ -259,6 +278,56 @@ extension Runtime {
         }
     }
 }
+
+extension Batch {
+    /// On the owner as the batch is read: where Back goes from the router's
+    /// new top (`ExactSession.locationBeneath`).
+    mutating func takeBeneath(_ runtime: Runtime) {
+        guard let op = ops.last(where: { $0.op == .router }), let top = (op.payload["top"] as? NSNumber)?.uint64Value else { return }
+        let length = exact_location_beneath(runtime.rt, top)
+        beneath = (top, String(decoding: Data(bytes: exact_out(runtime.rt), count: Int(length)), as: UTF8.self))
+    }
+}
+
+#if os(iOS) || os(macOS)
+extension Batch {
+    /// On the owner as the batch is read, with the runtime as it made it: the
+    /// split rule of the stack main last asked about, on every commit (a
+    /// layout-only style change such as `flex-direction` can commit with empty
+    /// ops or alongside unrelated ops such as `.paragraph`). Main keeps the
+    /// last it applied (`NavigationHost.splitRule`, `SplitHost.ask`), so it
+    /// never waits on the owner to learn it (LLP 1072 T2).
+    mutating func takeSplit(_ runtime: Runtime) {
+        guard !unchanged, let asked = runtime.splitAsked else { return }
+        let previous = runtime.splitReadJson
+        let read = runtime.readSplit(asked.view, retained: asked.retained, sequence: sequence)
+        split = read
+        splitChanged = previous?.view == asked.view && previous?.json != read.json
+    }
+}
+
+extension Runtime {
+    /// On the owner: the split rule of the stack whose root route is `view`,
+    /// which each later batch that can change it carries.
+    package func readSplit(_ view: UInt32, retained: UInt32, sequence: UInt64) -> SplitRead {
+        splitAsked = (view, retained)
+        let length = exact_stack_split(rt, view, retained)
+        let json = Data(bytes: exact_out(rt), count: Int(length))
+        splitReadJson = (view, json)
+        return SplitRead(view: view, retained: retained, json: json, sequence: sequence)
+    }
+
+    /// Update the retained list carried by later batches for `view` without
+    /// waiting on the owner, when `splitAsked` still names `(view, previous)`.
+    package func retainSplit(_ view: UInt32, from previous: UInt32, to retained: UInt32) {
+        Owner.shared.post(counted: false) { [self] in
+            if let asked = splitAsked, asked.view == view, asked.retained == previous {
+                splitAsked = (view, retained)
+            }
+        }
+    }
+}
+#endif
 
 #if os(macOS)
 extension Batch {

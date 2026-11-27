@@ -45,7 +45,7 @@ impl Surfaces {
         self.window_owner = None;
     }
 
-    fn window_canvas(&self) -> Option<u32> {
+    pub(super) fn window_canvas(&self) -> Option<u32> {
         if self.canvases.len() != 1 {
             return None;
         }
@@ -119,7 +119,9 @@ impl<D: DataSource> Presenter<D> {
                     );
                 }
                 self.brush.window_canvas = Some(view);
-                let above = self.frame();
+                let above = self
+                    .frame_for(crate::paint::FrameTarget::Window)
+                    .expect("CPU window overlay has pixels");
                 self.brush.window_canvas = None;
                 if let Some(below) = self
                     .brush
@@ -167,6 +169,7 @@ impl<D: DataSource> Presenter<D> {
                     )
                 };
                 if result == 0 {
+                    self.surfaces.drawn_sizes.insert(view, self.viewport());
                     self.surfaces.window_artifact = Some(canvas.artifact.clone());
                     self.surfaces.owe_records([view]);
                     return Ok(None);
@@ -180,7 +183,9 @@ impl<D: DataSource> Presenter<D> {
         if self.surfaces.window_artifact.is_none() {
             return Ok(self.frame_for(crate::paint::FrameTarget::Window));
         }
-        let frame = self.frame();
+        let frame = self
+            .frame_for(crate::paint::FrameTarget::Window)
+            .expect("CPU window frame has pixels");
         if let Some(abi) = self
             .surfaces
             .window_artifact
@@ -260,6 +265,11 @@ impl Startup {
             startup.check_exhausted()?;
         }
         Ok((startup, selected))
+    }
+
+    /// A device already open, with nothing left to prepare.
+    pub(crate) fn opened(force_warp: bool) -> Self {
+        Self::new(force_warp)
     }
 
     fn new(force_warp: bool) -> Self {

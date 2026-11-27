@@ -2,7 +2,8 @@
 //! `fastSeek(id, seconds)` reaches the host every time it runs, even to the
 //! same time twice (the bound `currentTime` seeks only on a changed value),
 //! and `load(id)` loads the source again.
-use exact_runner::{DataError, DataSource, Runner, Value};
+use crate::source::{boxed, NoData};
+use exact_runner::{Runner, Value};
 
 const APP: &str = r#"component App
   state hush = true
@@ -19,18 +20,11 @@ const APP: &str = r#"component App
       audio "https://example.com/episode.mp3" id="player" paused=hush
 "#;
 
-struct NoData;
-impl DataSource for NoData {
-    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
-        Err(DataError::UnknownSource(source.to_string()))
-    }
-}
-
 #[test]
 fn every_seek_and_load_is_its_own_command() {
     let mut r = Runner::boot(
         contract::compile(APP).unwrap(),
-        NoData,
+        boxed(NoData),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -107,4 +101,46 @@ fn a_resolution_is_width_x_height_on_a_video() {
     );
     let error = contract::compile(&audio).unwrap_err().to_string();
     assert!(error.contains("lower-attr-tag"), "{error}");
+}
+
+#[test]
+fn only_a_video_that_may_continue_requires_background_audio() {
+    let plan = |tag: &str, props: &str| {
+        contract::compile(&format!(
+            "component App\n  state policy = \"pauses\"\n  view\n    {tag} \"assets/clip.mp4\" {props}\n"
+        ))
+    };
+    for (props, required) in [
+        ("", false),
+        ("audiovisualBackgroundPlaybackPolicy=\"automatic\"", false),
+        ("audiovisualBackgroundPlaybackPolicy=\"pauses\"", false),
+        (
+            "audiovisualBackgroundPlaybackPolicy=\"continuesIfPossible\"",
+            true,
+        ),
+        ("audiovisualBackgroundPlaybackPolicy=policy", true),
+        (
+            r#"audiovisualBackgroundPlaybackPolicy=(policy == "continuesIfPossible" ? "automatic" : "pauses")"#,
+            false,
+        ),
+        (
+            r#"audiovisualBackgroundPlaybackPolicy=(policy == "pauses" ? policy : "pauses")"#,
+            true,
+        ),
+    ] {
+        let plan = plan("video", props).unwrap();
+        assert_eq!(
+            exact_runner::uses::uses_background_video(&plan),
+            required,
+            "{props}"
+        );
+    }
+    for (tag, value, diagnostic) in [
+        ("audio", "\"pauses\"", "lower-attr-tag"),
+        ("video", "\"continue\"", "lower-attr-value"),
+        ("video", "true", "lower-attr-type"),
+    ] {
+        let error = plan(tag, &format!("audiovisualBackgroundPlaybackPolicy={value}")).unwrap_err();
+        assert!(error.to_string().contains(diagnostic), "{error}");
+    }
 }

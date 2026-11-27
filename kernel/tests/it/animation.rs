@@ -170,6 +170,114 @@ fn an_animation_waits_for_its_row_unless_its_trigger_is_none() {
     assert_eq!(sync.animations[0].1, row, "running, from its start");
 }
 
+/// A row's wait is the row's while it lives: a row destroyed, or a kernel
+/// reset, forgets it, so the same id created again does not start paused.
+#[test]
+fn a_row_created_again_does_not_wait_for_its_former_self() {
+    let row = rows("lit 900ms linear");
+    let ops = |root: bool| {
+        let mut ops = vec![
+            Op::CreateView {
+                id: 2,
+                node_type: NodeType::View,
+            },
+            Op::CreateView {
+                id: 3,
+                node_type: NodeType::View,
+            },
+            Op::SetStyle {
+                id: 3,
+                patch: patch(StyleId::Animation, &row),
+            },
+            Op::SetChildren {
+                id: 2,
+                children: vec![3],
+            },
+        ];
+        if root {
+            ops.insert(
+                0,
+                Op::CreateView {
+                    id: 1,
+                    node_type: NodeType::View,
+                },
+            );
+            ops.push(Op::AttachRoot { id: 1 });
+        }
+        ops.push(Op::SetChildren {
+            id: 1,
+            children: vec![2],
+        });
+        ops
+    };
+    let paused = |k: &Kernel| {
+        let node = k.node(3).unwrap();
+        k.animation_row(&node).0.iter().all(|a| a.paused)
+    };
+    let mut k = Kernel::with_monospace();
+    k.apply(0, 1, &ops(true)).unwrap();
+    assert!(k.await_view(2));
+    k.reset();
+    k.apply(0, 2, &ops(true)).unwrap();
+    assert!(!k.is_awaiting(2), "reset forgets the wait");
+    assert!(!paused(&k));
+
+    assert!(k.await_view(2));
+    k.apply(0, 3, &[Op::DestroyView { id: 2 }]).unwrap();
+    k.apply(0, 4, &ops(false)).unwrap();
+    assert!(!k.is_awaiting(2), "destroying the row forgets the wait");
+    assert!(!paused(&k));
+
+    assert!(k.await_view(2));
+    let mut again = vec![Op::DestroyView { id: 2 }];
+    again.extend(ops(false));
+    k.apply(0, 5, &again).unwrap();
+    assert!(!k.is_awaiting(2), "in the batch that creates it again too");
+    assert!(!paused(&k));
+
+    // A multi-phase commit that creates a row, awaits it before finish, and
+    // destroys another row keeps the newly awaited live row held.
+    k.apply(
+        0,
+        6,
+        &[
+            Op::DestroyView { id: 2 },
+            Op::CreateView {
+                id: 4,
+                node_type: NodeType::View,
+            },
+            Op::SetChildren {
+                id: 1,
+                children: vec![4],
+            },
+        ],
+    )
+    .unwrap();
+    let mut phase = vec![Op::DestroyView { id: 4 }];
+    phase.extend(ops(false));
+    k.begin_document_commit(0, 7, &phase, None).unwrap();
+    assert!(k.await_view(2));
+    k.finish_document_commit().unwrap();
+    assert!(
+        k.is_awaiting(2),
+        "live row awaited during a multi-phase commit stays held"
+    );
+    assert!(paused(&k));
+
+    // A row created, awaited, and destroyed across phases of one commit is
+    // forgotten when the commit finishes.
+    k.apply(0, 8, &[Op::DestroyView { id: 2 }]).unwrap();
+    k.begin_document_commit(0, 9, &ops(false), None).unwrap();
+    assert!(k.await_view(2));
+    k.continue_document_commit(&[Op::DestroyView { id: 2 }])
+        .unwrap();
+    k.finish_document_commit().unwrap();
+    assert!(!k.is_awaiting(2));
+    k.apply(0, 10, &ops(false)).unwrap();
+    assert!(!k.is_awaiting(2));
+    assert!(!paused(&k));
+}
+
 #[test]
 fn delayed_lights_keep_independent_timing_through_patches_and_clears() {
     use exact_kernel::{motion::motion_node, StyleMask};
@@ -307,4 +415,119 @@ fn delayed_lights_keep_independent_timing_through_patches_and_clears() {
         .unwrap();
     k.motion_sync(&receipt).apply(&mut engine).unwrap();
     assert_eq!(sample(&engine, b), 0.25, "rejoins the live clock");
+}
+
+#[test]
+fn per_axis_scale_rows_and_keyframes_round_trip() {
+    use exact_kernel::{StyleCodec, Vec2};
+    use exact_motion::{Property, Value};
+    assert_eq!(StyleId::Scale.codec(), StyleCodec::Vec2);
+    assert_eq!(StyleProps::default().scale, Vec2 { x: 1., y: 1. });
+    for (text, pair) in [
+        ("1 0.5", (1., 0.5)),
+        ("2", (2., 2.)),
+        ("100% -50%", (1., -0.5)),
+        ("0 1", (0., 1.)),
+        ("none", (1., 1.)),
+    ] {
+        let mut style = StyleProps::default();
+        style
+            .set_dynamic(StyleId::Scale, &StyleValue::Text(text.into()))
+            .unwrap();
+        assert_eq!(
+            style.scale,
+            Vec2 {
+                x: pair.0,
+                y: pair.1
+            }
+        );
+        let ops = [Op::SetStyle {
+            id: 1,
+            patch: Box::new(style),
+        }];
+        let bytes = wire::encode(0, 1, &ops);
+        assert_eq!(wire::frame::decode(&bytes).unwrap().ops, ops);
+    }
+    for text in ["1 2 3", "1px", "NaN", "1 inf", "1e40"] {
+        assert!(
+            StyleProps::default()
+                .set_dynamic(StyleId::Scale, &StyleValue::Text(text.into()))
+                .is_err(),
+            "{text}"
+        );
+    }
+    let mut row = Animations::parse("flip 1s linear both").unwrap();
+    let frames = Keyframes::parse("from{scale:1 0.5}to{scale:-2 0}").unwrap();
+    row.resolve(|_| Some(&frames));
+    let decoded = through_the_wire(&row);
+    assert_eq!(decoded, row);
+    assert_eq!(
+        decoded.0[0].keyframes.0[1].values,
+        vec![(Property::Scale, Value::new(-2., 0.))]
+    );
+}
+
+#[test]
+fn scale_presence_follows_row_changes_removal_and_reset() {
+    let mut k = Kernel::with_monospace();
+    k.apply(
+        0,
+        1,
+        &[
+            Op::CreateView {
+                id: 1,
+                node_type: NodeType::View,
+            },
+            Op::CreateView {
+                id: 2,
+                node_type: NodeType::View,
+            },
+            Op::SetChildren {
+                id: 1,
+                children: vec![2],
+            },
+            Op::AttachRoot { id: 1 },
+        ],
+    )
+    .unwrap();
+    let root = k.node(1).unwrap().key;
+    assert!(!k.has_scale());
+    for (batch, value, scaled) in [(2, "1 0.5", true), (3, "none", false), (4, "2", true)] {
+        let mut patch = StyleProps::default();
+        patch
+            .set_dynamic(StyleId::Scale, &StyleValue::Text(value.into()))
+            .unwrap();
+        k.apply(
+            0,
+            batch,
+            &[Op::SetStyle {
+                id: 2,
+                patch: Box::new(patch),
+            }],
+        )
+        .unwrap();
+        assert_eq!(k.has_scale(), scaled);
+        assert_eq!(k.has_scaled_descendant(root), scaled);
+        assert!(!k.has_scaled_descendant(k.node(2).unwrap().key));
+    }
+    k.apply(0, 5, &[Op::DestroyView { id: 2 }]).unwrap();
+    assert!(!k.has_scale());
+    assert!(!k.has_scaled_descendant(root));
+    let mut patch = StyleProps::default();
+    patch
+        .set_dynamic(StyleId::Scale, &StyleValue::Text("2".into()))
+        .unwrap();
+    k.apply(
+        0,
+        6,
+        &[Op::SetStyle {
+            id: 1,
+            patch: Box::new(patch),
+        }],
+    )
+    .unwrap();
+    assert!(k.has_scale());
+    assert!(!k.has_scaled_descendant(root));
+    k.reset();
+    assert!(!k.has_scale());
 }

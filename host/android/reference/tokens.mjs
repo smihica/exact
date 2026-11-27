@@ -17,15 +17,17 @@ const here = dirname(fileURLToPath(new URL(import.meta.url)));
 const root = resolve(here, '../../..');
 const build = join(here, 'build');
 const pinned = readFileSync(join(root, 'host/android/gradle/libs.versions.toml'), 'utf8').match(/^material3 = "([^"]+)"/m)[1];
-const args = process.argv.slice(2);
-const old = args.includes('--diff') ? args[args.indexOf('--diff') + 1] : null;
-
-const now = await read(pinned);
-writeFileSync(join(mkdir(join(build, 'tokens')), `${pinned}.json`), JSON.stringify(now.tokens, null, 1));
-if (old) {
-  diff(await read(old), now, old);
-} else {
-  process.exit(check(now) ? 0 : 1);
+const weights = { Normal: 400, Medium: 500, Bold: 700 };
+if (import.meta.main) {
+  const args = process.argv.slice(2);
+  const old = args.includes('--diff') ? args[args.indexOf('--diff') + 1] : null;
+  const now = await read(pinned);
+  writeFileSync(join(mkdir(join(build, 'tokens')), `${pinned}.json`), JSON.stringify(now.tokens, null, 1));
+  if (old) {
+    diff(await read(old), now, old);
+  } else {
+    process.exit(check(now) ? 0 : 1);
+  }
 }
 
 /** A version's sources: its token objects resolved, and every file's text by its path under `commonMain/…/material3/`. */
@@ -63,11 +65,11 @@ async function fetchJar(version) {
 }
 
 /** Each `object` (and `enum class`) of a generated tokens file: its members' value text, joined across lines. */
-function parseObjects(text) {
+export function parseObjects(text) {
   const out = {};
   for (const m of text.matchAll(/^internal (?:object|enum class) (\w+)\s*\{([\s\S]*?)^\}/gm)) {
     const members = {};
-    const body = m[2];
+    const body = m[2].replace(/\/\/[^\r\n]*/g, '');
     const decls = [...body.matchAll(/^ {4}(?:const )?val (\w+)\s*=\s*/gm)];
     decls.forEach((d, i) => {
       const end = i + 1 < decls.length ? decls[i + 1].index : body.length;
@@ -111,18 +113,33 @@ function value(objects, text, depth) {
   return { expr: text };
 }
 
+export function materialWeight(expression) {
+  const name = expression?.match(/^FontWeight\.(Normal|Medium|Bold)$/)?.[1];
+  return weights[name];
+}
+
 /** Each Material row of the schema against its source. True when all agree. */
-function check({ files, objects }) {
+export function check({ files, objects }) {
   const schema = JSON.parse(readFileSync(join(root, 'kernel/tables/schema.json'), 'utf8'));
   const material = Object.fromEntries(schema.metrics.filter((r) => r.length === 7 && r[6] !== 'unset').map((r) => [r[0], r[6]]));
   const { rows } = JSON.parse(readFileSync(join(here, 'rows.json'), 'utf8'));
   const defaultsFile = join(build, 'oracle/defaults.json');
   const defaults = existsSync(defaultsFile) ? JSON.parse(readFileSync(defaultsFile, 'utf8')) : null;
+  const palette = readFileSync(join(root, 'host/painted/src/presenter/palette.rs'), 'utf8');
   let ok = true;
   for (const name of Object.keys(material)) if (!rows[name]) { console.log(`  ${name}: no source in rows.json`); ok = false; }
   for (const [name, src] of Object.entries(rows)) {
     const want = material[name];
     let got, from;
+    if (src.token && typeof want === 'string') {
+      // A colour: the role the schema names must be the scheme colour the token names (palette.rs's table).
+      const role = palette.match(new RegExp(`\\("${want}", (\\w+), 100\\)`))?.[1];
+      const ref = resolveToken(objects, src.token).ref;
+      const same = ref === `ColorSchemeKeyTokens.${role}`;
+      ok &&= same;
+      console.log(`  ${same ? 'ok' : 'DIFFERS'} ${name}: schema ${want} (${role ?? 'no Material role'}), source ${ref}   ${src.token}`);
+      continue;
+    }
     if (src.token) {
       const v = resolveToken(objects, src.token);
       got = src.corner ? v.corners?.[['topStart', 'topEnd', 'bottomEnd', 'bottomStart'].indexOf(src.corner)] : v.dp ?? v.number;
@@ -146,6 +163,18 @@ function check({ files, objects }) {
     ok &&= same;
     console.log(`  ${same ? 'ok' : 'DIFFERS'} ${name}: schema ${want}, source ${got ?? 'not found'}   ${from}`);
   }
+  // A text style's Material cell names its `TypeScaleTokens` key: its size, line height and weight there.
+  for (const [name, , , , , , , [key, size, line, weight]] of schema.textStyles) {
+    const sp = (part) => resolveToken(objects, `TypeScaleTokens.${key}${part}`).sp;
+    const weightValue = resolveToken(objects, `TypeScaleTokens.${key}Weight`);
+    for (const [part, want, got] of [['Size', size, sp('Size')], ['LineHeight', line, sp('LineHeight')], ['Weight', weight, materialWeight(weightValue.expr)]]) {
+      const same = got === want;
+      ok &&= same;
+      const unexpected = part === 'Weight' ? weightValue.expr ?? weightValue.number ?? JSON.stringify(weightValue) : undefined;
+      const source = got ?? (unexpected === undefined ? 'not found' : `unrecognized ${unexpected}`);
+      console.log(`  ${same ? 'ok' : 'DIFFERS'} ${name} ${part}: schema ${want}, source ${source}   TypeScaleTokens.${key}${part}`);
+    }
+  }
   console.log(ok ? `every Material row is Compose Material 3 ${pinned}'s` : `rows differ from Compose Material 3 ${pinned}`);
   return ok;
 }
@@ -155,7 +184,7 @@ function check({ files, objects }) {
  * constants (`TopAppBarTitleInset = 16.dp - TopAppBarHorizontalPadding`).
  */
 function constant(text, name, depth = 0) {
-  const m = text.match(new RegExp(`^(?:internal |private )?(?:const )?val ${name}\\s*(?::\\s*\\w+\\s*)?=\\s*(.+?)\\s*$`, 'm'));
+  const m = text.match(new RegExp(`^(?:@\\w+ )?(?:internal |private )?(?:const )?val ${name}\\s*(?::\\s*\\w+\\s*)?=\\s*(.+?)\\s*$`, 'm'));
   return m && depth <= 8 ? evaluate(text, m[1], depth) : undefined;
 }
 

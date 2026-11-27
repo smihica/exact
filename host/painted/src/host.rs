@@ -7,6 +7,8 @@
 //! under the viewport, feeds the motion engine the commit (LLP 1003 §4),
 //! seeks the app's clock and keeps node presentation values.
 
+#[path = "activities.rs"]
+mod activities;
 #[path = "host_canvas.rs"]
 mod canvas;
 #[path = "host_replies.rs"]
@@ -65,7 +67,6 @@ mod transform_binding;
 mod value_watch;
 pub use error::{HostError, LET_GO_AFTER};
 pub(crate) use first_frame::PictureMotion;
-
 pub use store_writer::drain as drain_store_writes;
 pub use store_writer::take_warnings as take_store_warnings;
 use system::{physical_memory, store_read};
@@ -99,13 +100,14 @@ impl PlanBytes<'_> {
 /// One runner, one painter.
 pub struct Host<D: DataSource> {
     runner: Runner<D>,
-    pub(crate) web_mount: Option<serde_json::Value>,
+    pub(crate) incoming_links: crate::app::IncomingLinks,
     secret_session: system::SecretSession,
     doc_watch: Option<crate::doc_watch::DocWatch>,
     font_sync: Option<(crate::text::Shared, usize)>,
     pub(crate) engine: Engine,
     keys: BTreeMap<NodeKey, ViewId>,
     presented: BTreeMap<ViewId, Presented>,
+    scaled_presented: std::collections::BTreeSet<ViewId>,
     /// Paint motion's owners and the appearance they resolve by (LLP 1062).
     paint: PaintMotion,
     viewport: (f32, f32),
@@ -115,6 +117,7 @@ pub struct Host<D: DataSource> {
     /// What changed for the painter's kept rows since its last invalidation.
     pub(crate) row_dirty: crate::paint::rows::Dirty,
     pub(crate) scroll_anchors: crate::scroll_anchor::State,
+    pub(crate) snap_changes: crate::snap_changes::State,
     /// The nodes whose `:hover` look holds, the one whose `:focus-visible`
     /// does (LLP 1121 D8), and the state held (LLP 1122 D8; the presenter's,
     /// `presenter/feedback.rs`, `presenter/held.rs`): a new host holds none.
@@ -146,9 +149,15 @@ pub struct Host<D: DataSource> {
     preload_wake: exact_runner::PreloadWake,
     router_op: Option<exact_runner::RouterChange>,
     pub(crate) navigation: crate::navigation::Navigation,
+    pub(crate) safe_area: crate::safe_area::SafeArea,
     presence: presence::Presence,
     pub(crate) flights: flights::Flights,
     presses: BTreeMap<NodeKey, press::Feedback>,
+    /// Each press edge a picture must show takes the next generation, and a
+    /// picture carries the latest when painted (`press::Phase`).
+    press_generation: u64,
+    /// The generation the latest picture painted carries.
+    painted_press_generation: u64,
     /// The 2D canvases' bitmaps (LLP 1056 D7).
     canvas2d: crate::canvas2d::Canvases,
     /// Views commits renewed (LLP 1078) the presenter has yet to reset.
@@ -223,6 +232,25 @@ impl<D: DataSource> Host<D> {
         let plan = Plan::decode(plan_bytes).map_err(HostError::Plan)?;
         Self::boot_decoded(
             plan, data, measurer, width, height, carried, delivery, launch, region, None, None,
+            true,
+        )
+    }
+
+    /// Boot a candidate or validation host without reconciling or pumping the
+    /// live presence vault; committed callers follow with [`Host::install_presence`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn boot_candidate(
+        plan_bytes: &[u8],
+        data: D,
+        measurer: Box<dyn TextMeasurer>,
+        width: f32,
+        height: f32,
+        carried: Option<&Carried>,
+        delivery: Option<exact_runner::Delivery>,
+    ) -> Result<(Host<D>, Option<String>), HostError> {
+        let plan = Plan::decode(plan_bytes).map_err(HostError::Plan)?;
+        Self::boot_decoded(
+            plan, data, measurer, width, height, carried, delivery, "/", None, None, None, false,
         )
     }
 
@@ -241,6 +269,7 @@ impl<D: DataSource> Host<D> {
         region: Option<crate::content_region::ContentRegionRegistration>,
         font_sync: Option<crate::text::Shared>,
         mut boot_images: Option<(&mut crate::image::Images, f32)>,
+        commit_presence: bool,
     ) -> Result<(Host<D>, Option<String>), HostError> {
         // @ref LLP 1075.003.000 §3.3 — whether the plan marks nodes for a hatch.
         let hatched = plan.bindings.iter().any(|b| {
@@ -270,15 +299,14 @@ impl<D: DataSource> Host<D> {
         // An `app:/data` image shows from the first frame, before storage
         // is configured and whether or not anything was picked (D7).
         crate::picker::know_roots(data.app_id());
-        // A named drive's secrets, read before the runner takes the source.
-        // A carried reload keeps its memory store and does not touch the files.
-        let (mut store_snapshot, unread_kept) = store_read(data.app_id(), carried.is_some());
-        // Locked secrets' backend, reconciled before boot (LLP 1133.010 D4).
-        let presence = crate::presence_secrets::backend(data.app_id(), data.grants());
-        presence
-            .iter()
-            .filter(|_| carried.is_none())
-            .for_each(|p| store_snapshot.extend(p.snapshot.clone()));
+        let (app_id, grants) = (data.app_id(), data.grants());
+        // A named drive's secrets; a carried reload keeps memory and skips disk.
+        let (mut store_snapshot, unread_kept) = store_read(app_id, grants, carried.is_some())
+            .map_err(|e| HostError::Layout(format!("{e:?}")))?;
+        // Cold-boot read-only presence occupancy; reconciliation waits for commit (`install_presence`).
+        if carried.is_none() {
+            store_snapshot.extend(crate::presence_secrets::snapshot(app_id, grants));
+        }
         #[cfg(target_os = "macos")]
         let boot_trace = exact_ink::device::apple::Trace::new(c"boot runner through first commit");
         let secret_session =
@@ -309,9 +337,6 @@ impl<D: DataSource> Host<D> {
         #[cfg(any(windows, target_os = "macos"))]
         crate::app::boot_phase(c"runner-ready");
         runner.forget_unread_kept(&unread_kept);
-        if let Some(p) = presence {
-            runner.install_presence(p.backend, p.keystore);
-        }
         if let Some(action) = region.and_then(|r| r.activate) {
             runner.act(action, Vec::new()).map_err(HostError::Runner)?;
         }
@@ -320,13 +345,14 @@ impl<D: DataSource> Host<D> {
         }
         let mut host = Host {
             runner,
-            web_mount: None,
+            incoming_links: Default::default(),
             secret_session,
             doc_watch: None,
             font_sync: font_sync.map(|text| (text, 0)),
             engine: Engine::new(),
             keys: BTreeMap::new(),
             presented: BTreeMap::new(),
+            scaled_presented: Default::default(),
             paint: Default::default(),
             viewport: (width, height),
             now_ms: 0.0,
@@ -334,6 +360,7 @@ impl<D: DataSource> Host<D> {
             flow_damage: Default::default(),
             row_dirty: Default::default(),
             scroll_anchors: Default::default(),
+            snap_changes: Default::default(),
             looks_shown: Default::default(),
             height_bindings: Default::default(),
             transform_bindings: Default::default(),
@@ -354,9 +381,12 @@ impl<D: DataSource> Host<D> {
             preload_wake: Default::default(),
             router_op: None,
             navigation: Default::default(),
+            safe_area: Default::default(),
             presence: Default::default(),
             flights: Default::default(),
             presses: Default::default(),
+            press_generation: 0,
+            painted_press_generation: 0,
             canvas2d: Default::default(),
             renewed: Vec::new(),
             media_mounts: Default::default(),
@@ -380,6 +410,7 @@ impl<D: DataSource> Host<D> {
         for id in host.preorder() {
             if let Some(node) = host.runner.kernel().node(id) {
                 host.keys.insert(node.key, id);
+                host.snap_changes.seed(&node);
                 host.values.field(&node);
                 host.runner.kernel().motion_sync_node(node.key, &mut sync);
             }
@@ -407,6 +438,7 @@ impl<D: DataSource> Host<D> {
             );
         }
         let mut error = crate::traced(c"boot first layout", || host.layout()).err();
+        host.reclaim_timeline_bound();
         host.observe_layout();
         #[cfg(any(windows, target_os = "macos"))]
         crate::app::boot_phase(c"layout-ready");
@@ -425,7 +457,22 @@ impl<D: DataSource> Host<D> {
             error = error.or(host.set_intrinsics(reports));
         }
         host.present();
+        if commit_presence {
+            host.install_presence();
+        }
         Ok((host, error))
+    }
+
+    /// Reconcile or tear down the presence vault and install its backend once
+    /// this host commits (LLP 1133.010 D4).
+    pub(crate) fn install_presence(&mut self) {
+        let (app_id, grants) = {
+            let data = self.runner.data_ref();
+            (data.app_id().to_owned(), data.grants().to_owned())
+        };
+        if let Some(p) = crate::presence_secrets::backend(&app_id, &grants) {
+            self.runner.install_presence(p.backend, p.keystore);
+        }
     }
 
     /// Tell the runner what this binary knows about its delivery (LLP 1030
@@ -434,7 +481,7 @@ impl<D: DataSource> Host<D> {
     /// is answered again in that one commit, which the painter picks up
     /// like any other — the kernel is the display list here.
     pub fn set_delivery_from_compat(&mut self, json: &str) -> Option<String> {
-        self.web_mount = crate::app::web_mount(json);
+        self.incoming_links = crate::app::IncomingLinks::from_compat(json);
         match self.runner.set_delivery_from_compat(json) {
             Ok(None) => None,
             Ok(Some(receipt)) => {
@@ -471,8 +518,7 @@ impl<D: DataSource> Host<D> {
         &self.runner
     }
 
-    /// The runner, mutably: a capability arm holds its device requests there
-    /// (LLP 1069.007 D3).
+    /// The runner, mutably: a capability arm holds its device requests there (LLP 1069.007 D3).
     pub fn runner_mut(&mut self) -> &mut Runner<D> {
         &mut self.runner
     }
@@ -668,12 +714,18 @@ impl<D: DataSource> Host<D> {
 
     /// Whether motion is running (the presenter runs frames).
     pub fn motion(&self) -> bool {
-        !self.engine.quiescent() || self.press_settle().is_some()
+        !self.engine.quiescent()
+            || self.press_settle().is_some()
+            || self.press_releases_next_frame()
     }
 
     /// The roots, in order.
     pub fn roots(&self) -> Vec<ViewId> {
         self.runner.roots()
+    }
+
+    pub(crate) fn scaled_presented(&self) -> &std::collections::BTreeSet<ViewId> {
+        &self.scaled_presented
     }
 
     /// A node's presentation values: the engine's, else the committed style's.
@@ -695,8 +747,9 @@ impl<D: DataSource> Host<D> {
         }
         .or_else(|| self.paint.view_dark(node.key));
         shown.lowered = self.lowered_mask(node.key);
+        (shown.reach, shown.scroll, shown.extension) = self.safe_area.of(node.key);
         // @ref LLP 1061 D7, LLP 1121 D8 — the press and the looks that hold;
-        // the painter shows their colours from the same progress.
+        // the painter samples the background and ink independently.
         let looks = self.looks_shown.on(id);
         press::present(&node, self.press_progress(node.key), looks, &mut shown);
         shown
@@ -817,13 +870,22 @@ impl<D: DataSource> Host<D> {
             .map(|(roots, _)| roots)
     }
 
+    /// This session's own files as a drag reads them: its app's roots as
+    /// storage pinned them, and its grants (LLP 1094.000 D3); `None` before
+    /// its storage opened them.
+    #[cfg(target_os = "linux")]
+    pub fn app_files(&mut self) -> Option<crate::picker::AppFiles> {
+        let roots = self.app_roots()?;
+        crate::picker::AppFiles::of(&roots, &self.grants())
+    }
+
     /// The requests the runner handed out since the last take (LLP 1016 D2).
     pub fn take_requests(&mut self) -> Vec<RequestOut> {
         self.runner.take_requests()
     }
 
     /// Admission failures remain on the runner's current tickets, not a queue.
-    pub fn refuse_request(&mut self, ticket: u64, reason: &'static str, ordered: bool) {
+    pub fn refuse_request(&mut self, ticket: u64, reason: impl Into<String>, ordered: bool) {
         self.runner.refuse_request(ticket, reason, ordered);
     }
 
@@ -969,9 +1031,11 @@ impl<D: DataSource> Host<D> {
     }
 
     pub(crate) fn advanced(&mut self, a: exact_runner::Advanced) -> (Option<String>, bool) {
+        let press = self.press_settle().is_some();
         self.now_ms = a.now_ms.max(self.now_ms);
         let error = a.error.map(|e| format!("{e:?}"));
-        self.commit_effects(&a.receipts, error)
+        let (error, paint) = self.commit_effects(&a.receipts, error);
+        (error, paint || press)
     }
 
     /// An image loaded: its intrinsic size in points (`None` when it failed
@@ -1051,8 +1115,7 @@ impl<D: DataSource> Host<D> {
     /// A symbol picture (`symbol:<role>`) a commit made, renewed or touched
     /// takes the natural size the image sync reports for it (LLP 1011 §3),
     /// before this commit's layout: not in a second layout
-    /// once the sync after the commit reports it (every list row built
-    /// with an icon paid one).
+    /// once the sync after the commit reports it (every list row built with an icon paid one).
     fn size_new_symbols(&mut self, receipts: &[Timed]) {
         let kernel = self.runner.kernel_mut();
         if !kernel.has_type(exact_kernel::NodeType::Image) {
@@ -1159,7 +1222,7 @@ impl<D: DataSource> Host<D> {
     }
 
     /// The device's posture and the viewport segments (LLP 1078 D4), set
-    /// only by the agent here: the kernel's grid and `exactViewport`'s
+    /// by the agent here: the kernel's grid and `exactViewport`'s
     /// three fields together — a relayout when a style reads the segments,
     /// one commit when a resource reads the fields.
     pub fn set_segments(
@@ -1169,33 +1232,13 @@ impl<D: DataSource> Host<D> {
         rows: u32,
         rects: Vec<exact_kernel::Rect>,
     ) -> Option<String> {
-        let (Ok(c), Ok(r)) = (u8::try_from(cols), u8::try_from(rows)) else {
-            return Some(format!("segments: {cols}x{rows} is past the kernel's grid"));
-        };
-        let restyled = match self.runner.kernel_mut().set_segments(c, r, rects) {
-            Ok(changed) => changed,
-            Err(e) => return Some(format!("segments: {e:?}")),
-        };
         let fold = exact_runner::Fold {
             posture,
             cols,
             rows,
         };
-        match self.runner.set_fold(fold) {
-            Ok(Some(receipt)) => {
-                self.presence.unauthored |= restyled;
-                self.commit(
-                    &[Timed {
-                        at_ms: self.now_ms,
-                        receipt,
-                    }],
-                    None,
-                )
-            }
-            Ok(None) if restyled => self.layout_unauthored().err(),
-            Ok(None) => None,
-            Err(e) => Some(format!("segments: {e:?}")),
-        }
+        self.set_window_view(None, None, None, Some((fold, rects)))
+            .err()
     }
 
     /// The display preferences (LLP 1061 D5): re-answer `exactViewport()` in one commit.
@@ -1221,9 +1264,9 @@ impl<D: DataSource> Host<D> {
     }
 
     pub(crate) fn tick_effects(&mut self, now_ms: f64) -> (bool, bool) {
-        let press = self.press_settle().is_some();
+        let mut press = self.press_settle().is_some();
         self.now_ms = now_ms.max(self.now_ms);
-        self.retire_presses();
+        press |= self.retire_presses();
         let seek = self.engine.advance(self.now_ms / 1000.0);
         debug_assert!(seek.is_ok(), "the clock never runs backwards here");
         let changed = match self.layout_motion() {
@@ -1255,6 +1298,7 @@ impl<D: DataSource> Host<D> {
         let mut paint = error.is_some() || self.content_region.is_some();
         for t in receipts {
             let r = &t.receipt;
+            self.snap_changes.commit(self.runner.kernel(), r);
             self.navigation
                 .split
                 .renewed(self.runner.kernel(), &r.renewed);
@@ -1270,6 +1314,7 @@ impl<D: DataSource> Host<D> {
                 self.forget_transform_handle(*key);
                 if let Some(id) = self.keys.remove(key) {
                     self.presented.remove(&id);
+                    self.scaled_presented.remove(&id);
                     self.values.committed(id, None);
                 }
             }
@@ -1289,9 +1334,10 @@ impl<D: DataSource> Host<D> {
             // A renewed node is a new mount (LLP 1078): nothing presented
             // or pressed carries over; the presenter resets the rest.
             for key in &r.renewed {
-                self.presses.remove(key);
+                self.cancel_press(*key);
                 if let Some(id) = self.keys.get(key).copied() {
                     self.presented.remove(&id);
+                    self.scaled_presented.remove(&id);
                     self.renewed.push(id);
                     self.scroll_anchors.renewed(id, *key);
                     self.values.committed(id, None);
@@ -1325,6 +1371,11 @@ impl<D: DataSource> Host<D> {
             self.runner.log(line);
         }
         paint |= self.project_navigation();
+        // A commit that removes, hides or disables a pressed node ends its
+        // press at once (LLP 1061 D7 "Timing" item 5).
+        if !self.presses.is_empty() {
+            paint |= self.retire_presses();
+        }
         self.reconcile_height_bindings();
         self.reconcile_transform_bindings();
         // Motion observes each commit before projected layout: targets are in place
@@ -1368,6 +1419,7 @@ impl<D: DataSource> Host<D> {
             }
         });
         self.observe_layout();
+        paint |= self.reclaim_timeline_bound();
         paint |= layout.as_ref().copied().unwrap_or(true);
         // Consume the final sample even when the seek has made motion quiescent.
         paint |= self.present();

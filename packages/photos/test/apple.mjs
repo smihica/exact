@@ -14,7 +14,8 @@
 // - macOS: only what holds with no library grant, since only a person can
 //   grant one here and the library would be this Mac's: the status, its
 //   Apple words, and managePhotoSelection's refusal. Nothing that reads or
-//   adds is pressed.
+//   adds is pressed. Then, under the agent, the `screenshot` filter over the
+//   agent's library, whose one screenshot is agent-2.
 //
 // The limited picker and the system's prompt are a person's (checklist.md):
 // `simctl privacy` grants full access only, and the agent cannot answer
@@ -22,16 +23,31 @@
 // driven: `simctl addmedia` does not return while the driven app is
 // running, so the change observer is shown by the app's own add.
 //
+// `importer` runs instead the fixture app's photo index against PhotoKit on a simulator (`importer.mjs`).
+//
 // usage: bun packages/photos/test/apple.mjs [ios] [macos] [--sim <udid>] [--fill [<n>]]
+//        bun packages/photos/test/apple.mjs importer --sim <udid>
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { loadedDylibs } from '../../../host/apple/link.mjs';
 import { checker, makeFixture, pkg, root, run, texts, until } from './fixture.mjs';
+import { iosImporter } from './importer.mjs';
+import { photoKitChanges } from './photokit-changes.mjs';
 
 const argv = process.argv.slice(2), sim = argv.includes('--sim') ? argv[argv.indexOf('--sim') + 1] : process.env.EXACT_SIM;
 const hosts = argv.filter((a, i) => ['macos', 'ios'].includes(a) && argv[i - 1] !== '--sim');
 const fill = argv.includes('--fill') ? Number(/^\d+$/.test(argv[argv.indexOf('--fill') + 1] ?? '') ? argv[argv.indexOf('--fill') + 1] : 6) : 0;
+if (argv.includes('importer')) {
+  if (!sim) throw new Error('importer: name a simulator you booted (--sim <udid>); the drive changes its library and its privacy settings');
+  process.env.EXACT_SIM = sim;
+  const { open } = await import(resolve(root, 'scripts/agent.mjs'));
+  const { check, failed } = checker();
+  await iosImporter({ sim, open, check });
+  console.log(failed() ? `${failed()} failed` : 'all passed');
+  process.exit(failed() ? 1 : 0);
+}
 const { app, id, dir } = makeFixture(), name = app.split('/').pop();
 Object.assign(process.env, { EXACT_APP_DIR: app, EXACT: root, HERMES_LEAN_SYS_OFFLINE: '1', EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
 if (sim) process.env.EXACT_SIM = sim;
@@ -94,6 +110,13 @@ for (const host of hosts.length ? hosts : ['ios', 'macos']) {
     } finally {
       await s.close();
     }
+    const ops = ['tap read-shots', 'clock settle', 'tree', 'tap read-shots-2', 'clock settle', 'tree', 'tap read-all', 'clock settle', 'tree'];
+    const r = spawnSync('bun', [resolve(root, 'scripts/agent.mjs'), 'macos', '--json', '--app', name, '--reset-storage', '--permission', 'photos=granted', ...ops], { cwd: root, encoding: 'utf8', maxBuffer: 1 << 26 });
+    const trees = (r.stdout ?? '').split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l)).filter((t) => Array.isArray(t.nodes));
+    const [shots, shots2, all] = await Promise.all(trees.map((t) => texts({ tree: async () => t })));
+    check('macos agent', 'the screenshot filter answers agent-2 alone, marked photoScreenshot', shots?.shots === '1 1 1 true true agent-2', shots?.shots ?? `${r.stdout.slice(-1500)}\n${r.stderr.slice(-1500)}`);
+    check('macos agent', 'and at 2 a page, still one page', shots2?.shots === '1 1 1 true true agent-2', shots2?.shots);
+    check('macos agent', 'unfiltered, all six', all?.all === '1 6 6 true', all?.all);
     continue;
   }
 
@@ -145,6 +168,14 @@ for (const host of hosts.length ? hosts : ['ios', 'macos']) {
         Number(total) >= count && Number(distinct) === Number(total) && Number(pages) === Math.max(1, Math.ceil(Number(total) / size)) && ordered === 'true', all);
       if (fill > 500 && size === 500) check(where, `more than one page of 500 with ${fill} added`, Number(pages) > 1 && Number(total) >= fill, all);
     }
+    // `simctl addmedia` never marks a file a screenshot (LLP 1133.019.000 §2) and the simulator's own screenshot needs
+    // Simulator's window, so the filtered list holds no imported photo, and each photo it holds is marked.
+    const [, total] = (await texts(s)).all.split(' ').map(Number);
+    await s.tap('read-shots');
+    const shots = await until(s, 'shots', (t) => Number(t?.split(' ')[0]) > 0, 60000);
+    const [shotPages, shotCount, shotDistinct, shotsOrdered, marked] = (shots ?? '').split(' ');
+    check(where, 'photoAssets filtered to screenshots leaves out every imported photo', Number(shotPages) >= 1 && Number(shotCount) <= total - fill
+      && Number(shotDistinct) === Number(shotCount) && shotsOrdered === 'true' && marked === 'true', `${shots} of ${total}, ${fill} imported`);
     const shown = Math.min(6, count);
     const pictures = await until(s, 'pictures', (t) => Number(t?.split(' ')[0]) >= shown, 20000);
     check(where, `the first ${shown} pictures load, none fails`, Number(pictures?.split(' ')[0]) >= shown && pictures?.split(' ')[1] === '0', pictures);
@@ -170,6 +201,7 @@ for (const host of hosts.length ? hosts : ['ios', 'macos']) {
   // The container is read with the app closed: `simctl` waits on a driven app.
   const file = copy && containerFile(copy), known = [...fixtures, join(root, 'scripts/fixtures/picker/oriented-gps.jpg')].map(sha);
   check(where, "the copy is the photo's own file, byte for byte", !!file && known.includes(sha(file)), file ?? `no tmp/${copy ?? 'photos/<uuid>.jpg'} in the container`);
+  await photoKitChanges({ sim, id, name, open, check, dir, fixtures });
 
   // Denied: nothing is read, and no picture is asked.
   privacy('revoke', 'photos');
@@ -185,6 +217,9 @@ for (const host of hosts.length ? hosts : ['ios', 'macos']) {
     await s.tap('copy');
     const refused = await until(s, 'copy-error', (e) => !!e);
     check(where, 'a copy fails NotAllowedError, asking nothing', refused === 'NotAllowedError', refused);
+    await s.tap('watch');
+    const unread = await until(s, 'changes-error', (e) => !!e);
+    check(where, 'photoChanges fails NotAllowedError', unread === 'NotAllowedError', unread);
   } finally {
     await s.close();
   }

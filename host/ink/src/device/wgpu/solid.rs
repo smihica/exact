@@ -1,5 +1,5 @@
 //! Draw a large solid interior without running its edge coverage shader.
-use super::*;
+use crate::instance::{Instance, Scissor};
 
 fn interior(i: &Instance, scissor: Scissor) -> Option<Scissor> {
     let [sx, skew_y, skew_x, sy, tx, ty] = i.xform;
@@ -38,7 +38,7 @@ fn interior(i: &Instance, scissor: Scissor) -> Option<Scissor> {
         width: right.saturating_sub(left),
         height: bottom.saturating_sub(top),
     });
-    // Up to four extra draws to shade the rim only pay off for a sizeable fill.
+    // Only split the instanced run to draw the interior and rim for sizeable fills.
     (inner.width >= 32 && inner.height >= 32).then_some(inner)
 }
 
@@ -87,6 +87,9 @@ pub(super) fn draw(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[test]
 fn solid_interiors_match_the_edge_shader_on_the_whole_frame() {
+    use super::{Device, Wgpu};
+    use crate::instance::Bindings;
+
     let mut device = Wgpu::new().unwrap();
     let target = device.create_target(160, 120).unwrap();
     let mut encoder = crate::Encoder::new(160, 120);

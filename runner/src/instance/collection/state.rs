@@ -32,6 +32,9 @@ impl ListState for Collection {
             visit(self.region, row);
         }
     }
+    fn fixed_split(&self) -> Option<usize> {
+        self.fixed.as_ref().map(|f| f.split)
+    }
     fn document_children<'a>(&'a self, plan: &Plan) -> Result<Vec<ListChild<'a>>, InstanceError> {
         Collection::document_children(self, plan)
     }
@@ -46,7 +49,7 @@ pub(in crate::instance) fn create_state(
     node: NodesId,
     view: ViewId,
     frames: &[Frame],
-    children: &mut Vec<Child>,
+    children: &mut Children,
 ) -> Result<Option<Box<dyn ListState>>, InstanceError> {
     Ok(Collection::create(u, node, view, frames, children)?.map(|c| c as Box<dyn ListState>))
 }

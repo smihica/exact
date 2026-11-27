@@ -167,6 +167,7 @@ impl Kernel {
         let next = Env {
             control_text_styles: env.control_text_styles,
             button_fonts: env.button_fonts,
+            bar_item_font: env.bar_item_font,
             screen: env.screen,
             regions: env.regions,
             default_padding: env.default_padding,
@@ -240,17 +241,19 @@ impl Kernel {
             return Ok(false);
         }
         let control_changed = self.arena.env().control_text_styles != env.control_text_styles
-            || self.arena.env().button_fonts != env.button_fonts;
+            || self.arena.env().button_fonts != env.button_fonts
+            || self.arena.env().bar_item_font != env.bar_item_font;
         let viewport_users: Vec<_> = self
             .arena
             .relative
             .all
             .iter()
             .filter(|&slot| {
-                self.arena.style(slot).relative.iter().any(|(_, unit, _)| {
-                    matches!(unit, crate::style::relative::Unit::Viewport(u)
-                        if u.basis(self.arena.env()) != u.basis(&env))
-                })
+                self.arena
+                    .style(slot)
+                    .relative
+                    .iter_specs()
+                    .any(|(_, spec)| spec.reads_viewport_change(self.arena.env(), &env))
             })
             .collect();
         // Host border and cell rules can change plain px lengths too.
@@ -262,7 +265,11 @@ impl Kernel {
         let before: Vec<_> = if control_changed {
             self.arena
                 .iter_live()
-                .filter(|&s| self.arena.is_native_text_control(s) || self.arena.is_native_button(s))
+                .filter(|&s| {
+                    self.arena.is_native_text_control(s)
+                        || self.arena.is_native_button(s)
+                        || self.arena.hosted_readout(s)
+                })
                 .map(|s| {
                     (
                         s,
@@ -317,7 +324,11 @@ impl Kernel {
                 && old_family.as_deref()
                     != self.arena.control_font(slot).map(|f| f.family.as_str());
             if !changed.is_empty() || family_changed {
-                txn::control_env_changed(&mut self.arena, layout, slot);
+                if self.arena.hosted_readout(slot) {
+                    crate::arena::bar_text::bar_type_changed(&mut self.arena, layout, slot);
+                } else {
+                    txn::control_env_changed(&mut self.arena, layout, slot);
+                }
                 controls_dirty = true;
             }
         }

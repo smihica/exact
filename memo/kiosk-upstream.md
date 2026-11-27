@@ -11,6 +11,50 @@ Read [KIOSK.md](../KIOSK.md) for runtime switches, prototype limits and checks.
 This memo maps the changes to their code and assesses what is worth sharing
 upstream. The assessments are the fork's, not acceptance decisions by Exact's maintainers.
 
+## Blurred shadows on upstream main (2026-11-27)
+
+The fork merged [`8dd84a33b`](https://github.com/expo/exact/tree/8dd84a33b). It now uses
+upstream's one-frame-ahead Vulkan presentation, twelve fixed Ink material programs,
+solid interior pass, mip generator, idle photo texture cache, and zoom and border
+early exits. The remaining rendering experiment reuses blurred outer shadows. The
+[maintainer's integration notes](https://github.com/expo/exact/issues/145#issuecomment-7216650250)
+describe the four adopted proposals and the outstanding shadow work.
+
+We built one release app and photo set against three SDKs from that revision.
+The first used stock upstream. The second added [shadow texture reuse and exterior
+bands](https://gist.github.com/smihica/11871690659079b97dee96eb73236f9b) and
+sampled the textures with the general shader. The third added [one fixed program
+for that shadow material](https://gist.github.com/smihica/882948e965dcb2e293cb2bd36a64872a).
+All three binaries embedded the same app plan. On one Pi 4 with Ink/Vulkan, an
+800 × 1280 portrait UI and a 60 Hz panel, we replayed a 16-second wheel scroll
+through warmed photo rows. Frame rate comes from completed DRM page flips.
+GPU time is the V3D render-engine time over the scroll divided by completed frames.
+
+| Shadow rendering | Displayed fps, runs 1 / 2 | GPU ms per displayed frame, runs 1 / 2 |
+| --- | ---: | ---: |
+| Stock upstream, analytic shadows | 20.59 / 20.53 | 48.38 / 48.50 |
+| Shadow patch present, cache and bands disabled | 20.53 / 20.59 | 48.50 / 48.37 |
+| Cache and exterior bands, general shader | 32.11 / 32.07 | 30.83 / 30.83 |
+| Same cache and bands, fixed shadow shader | 59.94 / 59.88 | 12.56 / 12.58 |
+
+The second pass ran in reverse order. With the fixed shader, 1 of 956 frame
+intervals in the first run and 2 of 955 in the second spanned two refreshes.
+Each of the other intervals spanned one refresh. On this list, reusing the
+shadow and specializing its remaining draw each saved about 18 ms per frame.
+The cost of building the first shadow texture falls outside the warm scroll.
+At the same stationary list position, 156 of 1,024,000 pixels differed from
+stock with shadow reuse enabled, by at most 1/255 per channel. The general and
+fixed programs produced the same image at that position.
+
+We also ran the same 16-second scroll once in the integrated interactive
+build, with the fork's Linux touch and camera support enabled. It displayed
+60.00 fps, with 12.54 ms of GPU time per frame. All 956 measured intervals
+spanned one refresh. This run measured the photo list with the camera closed.
+
+The cache remains opt-in in the fork. An upstream version needs a policy for
+fractional-position pixel differences, eviction that respects retained rows,
+release on trim, one combined clip per shadow, and device-loss handling.
+
 ## What to share upstream (2026-11-26)
 
 The code comparison uses [upstream `2685f0a30`](https://github.com/expo/exact/tree/2685f0a30) and
@@ -129,7 +173,11 @@ used a different app scene and additional renderer changes.
 
 ## Fork implementations and earlier assessments
 
-| Change | Current implementation | Value to upstream | Work before general adoption |
+This table describes the fork before the November 27 integration. The
+[November 27 results](#blurred-shadows-on-upstream-main-2026-11-27) identify the
+implementations the fork now takes from upstream.
+
+| Change | Implementation at the time | Value to upstream | Work before general adoption |
 | --- | --- | --- | --- |
 | [Shader specialization](../host/ink/src/device/wgpu/programs.rs) | Upstream compiles eight material programs at startup. The fork adds five material programs and a flat fill for the interior of large solid shapes. | The original eight landed in `b2a7e278c`. The additions are candidates for measurement on other GPUs. | Compare startup, frame times and pixel parity before expanding the fixed set. |
 | [Idle bitmap reuse](../host/painted/src/ink/images.rs) | An opt-in cache keeps textures for still-owned decodes up to 8 MiB or 64 idle entries per painter. | Repeated photos in a virtual list can skip uploading the pixels and rebuilding mips. | Upstream chose immediate retirement in `f4ba5552c`. Compare reuse and memory costs on another host before proposing a default. See the [fast-flick results](frame-pacing.md#fast-flicks-through-photographs). |
@@ -146,7 +194,7 @@ used a different app scene and additional renderer changes.
 | [Touch cursor behavior](../host/linux/src/display/pointer.rs) | Hide the cursor for touch; reveal it on mouse movement. | High, and relatively independent of renderer changes. | Build on the existing [Pointing and touch_only classification](../host/painted/src/presenter/device.rs) to distinguish direct touch from pen/touchpad reports, and handle initial mouse visibility. |
 | [Dialog backdrop fade](../host/painted/src/paint/alert.rs) | Under `KIOSK_DIALOG_FADE=1`, replace the scrim with black at `72% × presented dialog opacity`. | Low for this patch as written; useful as a backdrop styling/animation use case. | Put the application's color, opacity and transition choices at the authoring boundary. The fixed black 72% value exists to match the comparison app. |
 | Virtual-list comparison | An external app combines images, SVG, Japanese text, rounded corners, shadows and append batches using Exact's existing virtual list. | High as a benchmark or sample, not as a new list implementation. | Publish a small self-contained fixture with matching input and capture procedures. The list and virtualization primitives already belong to upstream. |
-| [FPS overlay](../host/painted/src/paint/kiosk.rs) and [timing](../host/linux/src/display/event_loop.rs) | Show submitted-frame rate and log timing for local comparisons. | Useful measurements; low value for the dedicated overlay as written. | Use existing performance tooling where possible. Actual presented FPS comes from DRM page-flip completion events, not this counter. |
+| [FPS overlay](../host/painted/src/paint/kiosk.rs) and [timing](../host/linux/src/display/event_loop.rs) | Count attempts to draw and log timing for local comparisons. A frame may still be discarded. | Useful measurements; low value for the dedicated overlay as written. | Use existing performance tooling where possible. The benchmark measures displayed fps from completed DRM page flips. |
 
 The app owns dialog translation, opacity, duration and easing. The backdrop
 override above is the host-side exception, not the implementation of the app's

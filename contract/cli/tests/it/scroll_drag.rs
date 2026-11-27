@@ -4,6 +4,7 @@
 //! leave; and `swipeleft`, the mirror of `swiperight`
 //! (`issues/closed/20261022-no-swipeleft.md`).
 
+use crate::source::{boxed, Source};
 use exact_kernel::{Kernel, PropId};
 use exact_plan::{EventKind, Plan};
 use exact_runner::{Event, Runner};
@@ -27,23 +28,32 @@ const APP: &str = r#"component App
         text "a"
       scroll scrolldragend=ended testId="bare" height=100
         text "b"
-      box swipeleft=swiped("left") swiperight=swiped("right") testId="row"
+      box swipe=swiped("left") swipe-follow="left" testId="row"
         text "c"
+      box swipe=swiped("right") swipe-follow="right" testId="right-row"
+        text "d"
       column testId="plain"
 "#;
 
-fn boot() -> Runner<()> {
+fn boot() -> Runner<Source> {
     let plan = contract::compile(APP).unwrap_or_else(|e| panic!("{e}"));
     let plan = Plan::decode(&plan.encode()).unwrap();
-    Runner::boot(plan, (), Kernel::with_monospace(), Default::default(), "/").unwrap()
+    Runner::boot(
+        plan,
+        boxed(()),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap()
 }
 
-fn view(r: &Runner<()>, id: &str) -> exact_kernel::ViewId {
+fn view(r: &Runner<Source>, id: &str) -> exact_kernel::ViewId {
     let key = r.kernel().find_by_test_id(id)[0];
     r.kernel().node_by_key(key).unwrap().id
 }
 
-fn seen(r: &Runner<()>) -> String {
+fn seen(r: &Runner<Source>) -> String {
     let id = view(r, "seen");
     r.kernel()
         .node(id)
@@ -97,16 +107,14 @@ fn a_release_record_is_typed() {
 }
 
 #[test]
-fn swipeleft_mirrors_swiperight_with_its_arguments() {
+fn a_left_follow_mirrors_a_right_one_with_its_arguments() {
     let mut r = boot();
-    let row = view(&r, "row");
-    assert_eq!(
-        r.handlers_of(row),
-        vec![EventKind::Swipeleft, EventKind::Swiperight]
-    );
+    let (row, right) = (view(&r, "row"), view(&r, "right-row"));
+    assert_eq!(r.handlers_of(row), vec![EventKind::Swipeleft]);
+    assert_eq!(r.handlers_of(right), vec![EventKind::Swiperight]);
     r.dispatch(row, Event::of_host_kind(61, "").unwrap())
         .unwrap();
-    r.dispatch(row, Event::Swiperight).unwrap();
+    r.dispatch(right, Event::Swiperight).unwrap();
     r.dispatch(row, Event::Swipeleft).unwrap();
     assert_eq!(seen(&r), "left;right;left;");
 }
@@ -116,7 +124,14 @@ fn scroll_snap_compiles_each_axis_strictness_alignment_and_stop() {
     for axis in ["x", "y", "both"] {
         let source = format!("component App\n  view\n    scroll height=100 width=300 scroll-snap-type=\"{axis} mandatory\"\n      view scroll-snap-align=\"center\"\n");
         let plan = contract::compile(&source).unwrap();
-        let r = Runner::boot(plan, (), Kernel::with_monospace(), Default::default(), "/").unwrap();
+        let r = Runner::boot(
+            plan,
+            boxed(()),
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
         let node = r.kernel().node(r.roots()[0]).unwrap();
         assert_eq!(
             node.style.scroll_snap_type.name(),
@@ -135,7 +150,7 @@ fn scroll_snap_compiles_each_axis_strictness_alignment_and_stop() {
     let source = "component App\n  view\n    scroll height=100 width=300 scroll-snap-type=\"x proximity\"\n      view scroll-snap-align=\"start center\" scroll-snap-stop=\"always\"\n";
     let r = Runner::boot(
         contract::compile(source).unwrap(),
-        (),
+        boxed(()),
         Kernel::with_monospace(),
         Default::default(),
         "/",

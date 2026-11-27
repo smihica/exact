@@ -33,7 +33,7 @@ extension NodeView {
     /// can be up to a device pixel smaller or larger (`PixelGridIOS.swift`,
     /// `PixelGridMac.swift`), and its text wraps at layout's width, not the
     /// drawn one.
-    package var layoutBounds: CGRect { CGRect(origin: bounds.origin, size: grid?.layout.size ?? bounds.size) }
+    package var layoutBounds: CGRect { CGRect(origin: laidOutBox.origin, size: grid?.layout.size ?? bounds.size) }
     /// The frame layout sent, where the drawn one is on the pixel grid.
     package var laidOutFrame: CGRect { grid?.layout ?? frame }
 

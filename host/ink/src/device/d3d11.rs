@@ -2,7 +2,7 @@
 //! @ref LLP 1149 D5.2, D6.1, D11.
 use super::check_region;
 use super::texture_ids;
-use super::{Device, Error, Format, Info, Result, Submission, TextureDesc};
+use super::{Device, Error, Format, GpuTime, Info, Result, Submission, TextureDesc};
 use crate::instance::{flags, Bindings, Frame, Instance, Kind, TextureId};
 use std::{
     cell::Cell,
@@ -34,6 +34,7 @@ pub mod startup_watchdog;
 #[cfg(test)]
 mod tests;
 mod text_host;
+mod timing;
 pub use composition::{PresentStatistics, Window};
 
 /// Only free-threaded objects cross to the paint thread. A pending worker stays
@@ -50,6 +51,62 @@ struct Prepared {
     pipeline: setup::Pipeline,
     info: Info,
     software: bool,
+}
+
+/// Uploads at least this large go through a staging texture (`upload_texture`).
+const STAGED_UPLOAD_BYTES: usize = 1 << 20;
+
+/// A hardware device kept, with its immediate context and pipeline state,
+/// while its window is out of view, so the next show opens no device.
+/// Everything drawn with it is released; Microsoft's guidance for an app
+/// leaving view is to keep the device and trim it:
+/// <https://learn.microsoft.com/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgidevice3-trim>.
+/// It stays on the thread that drew with the context.
+pub struct Hidden(Prepared, std::marker::PhantomData<Rc<()>>);
+
+impl Hidden {
+    /// Once the painter that drew with the device is dropped: unbind what the
+    /// context still holds, flush so the driver destroys the released
+    /// resources, and return its temporary allocations.
+    pub fn trim(&self) {
+        // SAFETY: the context is used only on the device's owning thread.
+        unsafe {
+            self.0.context.ClearState();
+            self.0.context.Flush();
+            if let Ok(dxgi) = self.0.device.cast::<IDXGIDevice3>() {
+                dxgi.Trim();
+            }
+        }
+    }
+
+    /// Whether the device can draw again: it was not removed or reset while
+    /// hidden, and no adapter came or went since it was opened
+    /// ([IsCurrent](https://learn.microsoft.com/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgifactory2-iscurrent)).
+    pub fn usable(&self) -> Result<()> {
+        // SAFETY: COM calls on owned references.
+        unsafe {
+            self.0.device.GetDeviceRemovedReason()?;
+            let factory: IDXGIFactory1 = self
+                .0
+                .device
+                .cast::<IDXGIDevice>()?
+                .GetAdapter()?
+                .GetParent()?;
+            if !factory.IsCurrent().as_bool() {
+                return Err(Error::Device("the adapters changed while hidden".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The kept device as a painter's again, or why a new one must be opened.
+    pub fn reopen(self) -> Result<D3d11> {
+        self.usable()?;
+        let mut prepared = self.0;
+        prepared.info.device_ms = 0.;
+        prepared.info.shaders_ms = 0.;
+        D3d11::from_prepared(prepared)
+    }
 }
 
 impl Preparing {
@@ -233,6 +290,9 @@ pub struct D3d11 {
     composition: Option<composition::Composition>,
     presentation_pending: bool,
     retiring_devices: Vec<(Box<D3d11>, composition::Retirement)>,
+    /// The staging texture large uploads are copied from (`upload_texture`).
+    staging: Option<ID3D11Texture2D>,
+    timing: timing::Timing,
 }
 
 impl D3d11 {
@@ -247,6 +307,23 @@ impl D3d11 {
             }
             eprintln!("exact-ink: hardware unavailable; trying WARP: {error}");
             Self::open(true)
+        })
+    }
+
+    /// The device to keep while the window is out of view. Only hardware is
+    /// kept: reopening WARP costs a few milliseconds, and its threads would stay.
+    pub fn keep_hidden(&self) -> Option<Hidden> {
+        (!self.software).then(|| {
+            Hidden(
+                Prepared {
+                    device: self.device.clone(),
+                    context: self.context.clone(),
+                    pipeline: self.pipeline.clone(),
+                    info: self.info.clone(),
+                    software: false,
+                },
+                std::marker::PhantomData,
+            )
         })
     }
 
@@ -306,6 +383,8 @@ impl D3d11 {
             composition: None,
             presentation_pending: false,
             retiring_devices: Vec::new(),
+            staging: None,
+            timing: timing::Timing::default(),
             info,
             software,
         })
@@ -492,18 +571,59 @@ impl Device for D3d11 {
         {
             return Err(Error::Invalid("texture upload length".into()));
         }
-        let region = region(origin, size);
-        // UpdateSubresource snapshots CPU bytes and orders the copy after earlier
-        // draws. No mapped storage is mutated while the GPU reads it.
-        unsafe {
-            self.context.UpdateSubresource(
-                &t.raw,
-                0,
-                Some(&region),
-                data.as_ptr().cast(),
-                size[0] * t.desc.format.channels(),
-                0,
-            );
+        let row = (size[0] * t.desc.format.channels()) as usize;
+        if data.len() >= STAGED_UPLOAD_BYTES {
+            // UpdateSubresource grows the driver's upload heap with what is
+            // uploaded between flushes, and the driver keeps it until the
+            // device is destroyed, Trim notwithstanding: 14.5 MiB after one
+            // 2560 × 1440 upload on a Radeon 8060S. A large region is copied
+            // from a staging texture this device owns and releases instead.
+            let raw = t.raw.clone();
+            // SAFETY: the staging texture covers the region in the target's
+            // format; every copied row lies in its mapped storage, which is
+            // unmapped before the copy that reads it is recorded.
+            unsafe {
+                let (staging, mapped) = self.map_staging(&raw, size)?;
+                for (y, line) in data.chunks_exact(row).enumerate() {
+                    std::ptr::copy_nonoverlapping(
+                        line.as_ptr(),
+                        mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize),
+                        row,
+                    );
+                }
+                self.context.Unmap(&staging, 0);
+                let source = D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: size[0],
+                    bottom: size[1],
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(
+                    &raw,
+                    0,
+                    origin[0],
+                    origin[1],
+                    0,
+                    &staging,
+                    0,
+                    Some(&source),
+                );
+            }
+        } else {
+            // UpdateSubresource snapshots CPU bytes and orders the copy after
+            // earlier draws. No mapped storage is mutated while the GPU reads it.
+            unsafe {
+                self.context.UpdateSubresource(
+                    &t.raw,
+                    0,
+                    Some(&region(origin, size)),
+                    data.as_ptr().cast(),
+                    row as u32,
+                    0,
+                );
+            }
         }
         let s = self.submit()?;
         self.textures.get_mut(&id).unwrap().last = s;
@@ -664,6 +784,7 @@ impl Device for D3d11 {
             self.device
                 .CreateRenderTargetView(&t.raw, None, Some(&mut view))?;
         }
+        self.timing.stamp(&self.device, &self.context)?;
         self.draw(
             frame,
             &view.unwrap(),
@@ -671,6 +792,7 @@ impl Device for D3d11 {
             clear,
             None,
         )?;
+        self.timing.stamp(&self.device, &self.context)?;
         let s = self.submit()?;
         self.buffer.last.set(s);
         self.textures.get_mut(&target).unwrap().last = s;
@@ -734,14 +856,73 @@ impl Device for D3d11 {
         self.completed().map(|_| ())
     }
     fn trim(&mut self) -> Result<()> {
+        self.staging = None;
         self.collect_presented_devices();
         self.wait(self.submitted)?;
         self.buffer = self.create_buffer(192)?;
         Ok(())
     }
+    fn begin_gpu_span(&mut self) -> Result<()> {
+        self.timing.begin(&self.device, &self.context)
+    }
+    fn end_gpu_span(&mut self) -> Result<()> {
+        self.timing.end(&self.context)
+    }
+    fn gpu_times(&mut self) -> Result<Vec<Option<GpuTime>>> {
+        self.timing.times(&self.context)
+    }
 }
 
 impl D3d11 {
+    /// A staging texture in `target`'s format covering `size`, mapped for
+    /// writing: the one kept for large uploads, or, when it is too small or a
+    /// copy from it is still in flight, a new one of the region's size.
+    unsafe fn map_staging(
+        &mut self,
+        target: &ID3D11Texture2D,
+        size: [u32; 2],
+    ) -> Result<(ID3D11Texture2D, D3D11_MAPPED_SUBRESOURCE)> {
+        let mut want = D3D11_TEXTURE2D_DESC::default();
+        target.GetDesc(&mut want);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        if let Some(staging) = self.staging.clone() {
+            let mut have = D3D11_TEXTURE2D_DESC::default();
+            staging.GetDesc(&mut have);
+            if have.Format == want.Format
+                && have.Width >= size[0]
+                && have.Height >= size[1]
+                && self
+                    .context
+                    .Map(
+                        &staging,
+                        0,
+                        D3D11_MAP_WRITE,
+                        D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                        Some(&mut mapped),
+                    )
+                    .is_ok()
+            {
+                return Ok((staging, mapped));
+            }
+        }
+        want.Width = size[0];
+        want.Height = size[1];
+        want.MipLevels = 1;
+        want.ArraySize = 1;
+        want.Usage = D3D11_USAGE_STAGING;
+        want.BindFlags = 0;
+        want.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE.0 as u32;
+        want.MiscFlags = 0;
+        let mut staging = None;
+        self.device
+            .CreateTexture2D(&want, None, Some(&mut staging))?;
+        let staging = staging.unwrap();
+        self.context
+            .Map(&staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))?;
+        self.staging = Some(staging.clone());
+        Ok((staging, mapped))
+    }
+
     fn draw(
         &mut self,
         frame: &Frame,

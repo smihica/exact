@@ -327,6 +327,64 @@ fn a_placed_popover_carries_its_margins() {
     assert_eq!(placed["margin_left"], "auto", "{placed}");
 }
 
+/// LLP 1123 D7: a popover route's authored size in points is its popover's preferred size, so it
+/// crosses though the route holds children, where a sheet route's stays the kernel's.
+#[test]
+fn a_popover_routes_size_crosses_and_a_sheets_does_not() {
+    use exact_kernel::{Kernel, MonospaceMeasurer, Op};
+    let mut kernel = Kernel::new(Box::new(MonospaceMeasurer::default()));
+    let mut style = StyleProps::default();
+    style
+        .set_dynamic(StyleId::Width, &StyleValue::Number(240.0))
+        .unwrap();
+    style
+        .set_dynamic(StyleId::Height, &StyleValue::Number(180.0))
+        .unwrap();
+    // Written by the author, as Contract marks an attribute
+    style.written = style.mask;
+    let create = [
+        Op::CreateView {
+            id: 1,
+            node_type: NodeType::View,
+        },
+        Op::CreateView {
+            id: 2,
+            node_type: NodeType::View,
+        },
+        Op::SetStyle {
+            id: 1,
+            patch: Box::new(style),
+        },
+        Op::SetChildren {
+            id: 1,
+            children: vec![2],
+        },
+        Op::SetProp {
+            id: 1,
+            prop: PropId::NavigationPresentation,
+            value: "modal".into(),
+        },
+    ];
+    kernel.apply(0, 1, &create).unwrap();
+    let json = |kernel: &Kernel| -> serde_json::Value {
+        serde_json::from_str(&style_json_for(&kernel.node(1).unwrap(), &Env::default()).0).unwrap()
+    };
+    let sheet = json(&kernel);
+    assert!(sheet.get("width").is_none(), "{sheet}");
+    let popover = [Op::SetProp {
+        id: 1,
+        prop: PropId::NavigationPresentation,
+        value: "popover".into(),
+    }];
+    kernel.apply(0, 2, &popover).unwrap();
+    let popover = json(&kernel);
+    assert_eq!(
+        (popover["width"].clone(), popover["height"].clone()),
+        (240.into(), 180.into()),
+        "{popover}"
+    );
+}
+
 struct NoData;
 impl DataSource for NoData {
     fn query(
@@ -432,6 +490,54 @@ fn basic_clips_cross_as_relative_geometry() {
             "shape": "polygon", "values": [4,0,0,25,0,100,0,0,0,0,0,100], "rule":"evenodd"
         })
     );
+}
+
+#[test]
+fn an_edge_effect_form_crosses_only_while_it_is_set() {
+    // @ref LLP 1123 D14 — each form crosses only while the kernel holds it set, so one the author
+    // clears with `unset` leaves its aspect to the retired `-exact-scroll-edge-effect` until
+    // activation (§"What it replaces"); a written `automatic` or `none` is set, and crosses as no edge
+    let source = "component App\n  view\n    column\n      column testId=\"both\" height=100 overflow-y=\"scroll\" -exact-scroll-edge-effect-style=\"top soft, bottom hard\" -exact-scroll-edge-effect-hidden=\"left start\"\n      column testId=\"written\" height=100 overflow-y=\"scroll\" -exact-scroll-edge-effect-style=\"top automatic\" -exact-scroll-edge-effect-hidden=\"none\"\n      column testId=\"cleared\" height=100 overflow-y=\"scroll\" -exact-scroll-edge-effect=\"none\" -exact-scroll-edge-effect-style=\"unset\" -exact-scroll-edge-effect-hidden=\"unset\"\n";
+    let plan = contract::compile(source).unwrap().encode();
+    let (host, boot) = crate::Host::boot(
+        &plan,
+        NoData,
+        Box::new(exact_kernel::MonospaceMeasurer::default()),
+        400.,
+        800.,
+    )
+    .unwrap();
+    let batch: serde_json::Value = serde_json::from_str(&boot).unwrap();
+    let kernel = host.runner().kernel();
+    let style = |test_id: &str| {
+        let id = kernel
+            .node_by_key(kernel.find_by_test_id(test_id)[0])
+            .unwrap()
+            .id;
+        batch["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["op"] == "create" && op["id"] == id)
+            .map(|op| op["style"].clone())
+            .unwrap_or_else(|| panic!("{test_id} is created: {boot}"))
+    };
+    let rows = |s: &serde_json::Value| {
+        [
+            "scroll_edge_effect_soft",
+            "scroll_edge_effect_hard",
+            "scroll_edge_effect_hidden",
+        ]
+        .map(|row| s.get(row).and_then(serde_json::Value::as_u64))
+    };
+    // The edges' bits: top 1, right 2, bottom 4, left 8, start 16, end 32
+    let both = style("both");
+    assert_eq!(rows(&both), [Some(1), Some(4), Some(8 | 16)], "{both}");
+    let written = style("written");
+    assert_eq!(rows(&written), [Some(0), Some(0), Some(0)], "{written}");
+    let cleared = style("cleared");
+    assert_eq!(rows(&cleared), [None, None, None], "{cleared}");
+    assert_eq!(cleared["scroll_edge_effect"], "none", "{cleared}");
 }
 
 #[test]

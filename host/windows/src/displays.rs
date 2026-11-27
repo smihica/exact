@@ -12,7 +12,8 @@
 //!   the same machine.
 //! - `clientRect`, `clientX` and `clientY` are not in that space. A window
 //!   has one scale, its DPI's, so each is a physical position less the
-//!   client area's origin, over the window's scale.
+//!   client area's origin, over the window's scale. A hidden window's client
+//!   area and scale are those it will have once shown (`crate::placement`).
 //! - `currentScreen` is `MonitorFromWindow`'s nearest monitor, which holds
 //!   the largest part of the window; the pointer's is `MonitorFromPoint`'s.
 //! - While a session reads the displays, a subclass of the window hears
@@ -29,7 +30,22 @@ use exact_painted::desktop::{Pointer, Screen, Screens};
 #[cfg(windows)]
 mod os;
 #[cfg(windows)]
-pub(crate) use os::{capture_snapshot, install};
+pub(crate) use os::{capture_snapshot, install, orientation};
+
+#[cfg(any(windows, test))]
+pub(super) fn screen_orientation(
+    width: u32,
+    height: u32,
+    turns: u32,
+) -> exact_runner::ScreenOrientation {
+    let natural_portrait = if turns % 2 == 0 {
+        height >= width
+    } else {
+        width >= height
+    };
+    // DMDO measures the panel counterclockwise. The content turns the other way.
+    exact_runner::ScreenOrientation::rotated(natural_portrait, ((4 - turns) % 4) as u8)
+}
 
 /// One monitor as Windows reports it to a per-monitor-aware process.
 #[derive(Clone, Debug, Default, PartialEq)]

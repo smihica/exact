@@ -8,21 +8,34 @@
 //! **A header-shaped route** (LLP 1035.001 D9) is one whose first child is a
 //! `header` holding exactly one heading. The heading is the bar's title, at
 //! its level; the header's buttons are the bar's items, those before the
-//! heading leading and those after it trailing, and so is a readout (an
-//! element whose role is `status`, which nothing presses: a "● Clock" the
-//! bar shows as written, LLP 1075.003 §9.15); its `input type="search"`
+//! heading leading and those after it trailing; its `input type="search"`
 //! is the bar's search field and its `tablist` the title's segments. A
 //! pressable around the heading is the title itself, tapped. The stack's
 //! Back control is the platform's own Back where the platform has one for
 //! that route, and an item like the others where it has not.
 //!
+//! **A readout** (an element whose role is `status`, a "● Clock", LLP
+//! 1075.003 §9.15) is an item too, placed as a button is, which nothing
+//! presses as a whole and which a host shows as written, in views of its
+//! own (LLP 1141.004 D1). What a box around the heading holds besides the
+//! bar's parts is the title's (iOS's subtitle and avatar). Any other
+//! element is no item: the compiler refuses one in the header of an app
+//! that ships iOS, and one it cannot see stays out of the bar. A host that
+//! shows only buttons leaves the readouts out.
+//!
 //! **A header with no heading** is the bar too, with no title, when the bar
 //! places everything it shows: buttons, readouts, a search field, a
 //! tablist, and plain boxes around them or empty between them (issue #364).
-//! A text, an image or anything else in it is the page's, so such a header
-//! stays as written rather than lose it. With no heading to stand between
-//! them, its items trail, as SwiftUI's `ToolbarItemPlacement.automatic`
-//! places an action in a bar, except the stack's Back control, which leads.
+//! Any other element keeps such a header in the page as written rather
+//! than give its place to a bar with no title. With no heading to
+//! stand between them, its items trail, as SwiftUI's
+//! `ToolbarItemPlacement.automatic` places an action in a bar, except the
+//! stack's Back control, which leads.
+//!
+//! **A dialog's header** is read by the same rule, with the `dialog` in the
+//! route's place: a host that presents the dialog as the platform's sheet
+//! makes the sheet's bar of it (LLP 1141.004 D6). Its closing button
+//! (`command="close"`) is an item, as a button that opens a dialog is.
 //!
 //! **Two trees.** The rule is written once, over [`Tree`]: a node's facts
 //! ([`fact`]) and its children. A host that reads the kernel's tree calls
@@ -43,6 +56,7 @@ use crate::id::ViewId;
 use crate::kernel::{Kernel, NodeRef};
 use crate::props::PropValue;
 
+mod subtitle;
 mod symbols;
 
 // Paint predicates are broader than the projection rules below.
@@ -79,11 +93,12 @@ pub mod fact {
     pub const TABLIST: u32 = 1 << 2;
     /// It hears `press`.
     pub const PRESS: u32 = 1 << 3;
-    /// A button whose invocation opens what it names (`Invocation::opens`):
+    /// A button whose invocation opens what it names (`Invocation::opens`),
     /// a popover (the item's menu, or a popover shown from it) or a modal
-    /// dialog. It is an item with no `press` of its own, as HTML's
-    /// `commandfor` button is a button.
-    pub const OPENS: u32 = 1 << 4;
+    /// dialog, or closes a dialog (`command="close"`, a dialog's Cancel). It
+    /// is an item with no `press` of its own, as HTML's `commandfor` button
+    /// is a button. One that only hides a popover is none.
+    pub const COMMANDS: u32 = 1 << 4;
     /// Its `id` is the one the navigation root names as the stack's Back
     /// control (`navigationBack`).
     pub const BACK: u32 = 1 << 5;
@@ -97,8 +112,8 @@ pub mod fact {
     /// header that says so keeps its authored bar. Only a written one: a
     /// row the compiler implied is no opt-out.
     pub const AUTHORED: u32 = 1 << 9;
-    /// Its role is `status`: a readout the bar shows as an item that is
-    /// not pressed (LLP 1075.003 §9.15).
+    /// Its role is `status`: a readout, one hosted item whatever it holds
+    /// (LLP 1075.003 §9.15, LLP 1141.004 D1).
     pub const STATUS: u32 = 1 << 10;
     /// A `popover` or a `dialog`: the top layer's when open, as on the web,
     /// so neither it nor what it holds is the bar's (a menu written in the
@@ -108,6 +123,15 @@ pub mod fact {
     /// dimmed, whether or not anything would press it (a "● Clock" written
     /// as one); never the title's tap.
     pub const DISABLED: u32 = 1 << 12;
+    /// A button, native or bare, pressed or not: an item when it presses,
+    /// opens, has an `href` to follow or is disabled, and otherwise none,
+    /// never hosted (LLP 1141.004 D1), so a button whose press comes and
+    /// goes is an item or nothing.
+    pub const BUTTON: u32 = 1 << 19;
+    /// An `href` that is not empty (`PropList::link`): a link a tap follows.
+    /// `role="link"` alone, or an `href` cleared to nothing, follows nothing
+    /// (LLP 1115 §3).
+    pub const HREF: u32 = 1 << 20;
     /// A site's `nav`, including one inside a menu.
     pub const NAV: u32 = 1 << 13;
     /// An `href` or `role="link"`.
@@ -122,10 +146,10 @@ pub mod fact {
 
     /// A node's facts, from its own facts and three that a tree supplies:
     /// whether it hears `press` (the runner's), whether it is a button whose
-    /// invocation opens what it names (`Invocation::opens`, which resolves
-    /// the name it gives), and the `id` the navigation root names as its
-    /// Back control.
-    pub fn of(node: &crate::NodeFacts<'_>, press: bool, opens: bool, back: Option<&str>) -> u32 {
+    /// invocation is an item's ([`COMMANDS`], `Invocation::of` resolving the
+    /// name it gives), and the `id` the navigation root names as its Back
+    /// control.
+    pub fn of(node: &crate::NodeFacts<'_>, press: bool, commands: bool, back: Option<&str>) -> u32 {
         let props = node.props;
         let role = props.str(PropId::AccessibilityRole);
         let heading = node.node_type == NodeType::Text && role == Some("heading");
@@ -146,13 +170,14 @@ pub mod fact {
                 props.str(PropId::Href).is_some() || role == Some("link"),
                 LINK,
             ),
+            (props.link().is_some(), HREF),
             (
                 props.str(PropId::Popover).is_some()
                     || props.str(PropId::SemanticTag) == Some("dialog"),
                 LAYER,
             ),
             (press, PRESS),
-            (opens, OPENS),
+            (commands, COMMANDS),
             (back.is_some() && props.str(PropId::Id) == back, BACK),
             (props.str(PropId::SemanticTag) == Some("header"), HEADER),
             (node.style.display == Display::None, HIDDEN),
@@ -170,6 +195,12 @@ pub mod fact {
                     && role == Some("button")
                     && props.bool(PropId::Disabled) == Some(true),
                 DISABLED,
+            ),
+            (
+                node.node_type == NodeType::Pressable
+                    || (node.node_type == NodeType::Control
+                        && props.str(PropId::Type) == Some("button")),
+                BUTTON,
             ),
         ]
         .into_iter()
@@ -217,14 +248,14 @@ pub struct HeaderShape<N> {
     /// The heading's level: 1 is the screen's own title (UIKit's large
     /// title), any other an inline one; 0 with no heading.
     pub level: u32,
-    /// The items before the heading, in order: its buttons and readouts
-    /// (`role="status"`).
+    /// The items before the heading, in order: its buttons and its
+    /// readouts (`role="status"`).
     pub leading: Vec<N>,
     /// The items after it, in order.
     pub trailing: Vec<N>,
     /// Every button of the header, the stack's Back control among them
     /// (which is in neither list where the platform's own Back stands for
-    /// it). A readout is not one: nothing presses it.
+    /// it). A readout is not one: nothing presses it as a whole.
     pub items: Vec<N>,
     /// Its `input type="search"`, the first.
     pub search: Option<N>,
@@ -276,21 +307,49 @@ impl Bar {
 /// that is `display: none`, which the web does not show.
 const UNSHOWN: u32 = fact::LAYER | fact::HIDDEN;
 
-/// Whether any node under `node` is a heading, leaving out what `walk`
-/// leaves out: a button wrapping a popover's heading is an item, not the
-/// title's tap.
-fn holds_heading<T: Tree>(tree: &T, node: T::Node) -> bool {
+/// Whether any node under `node` has one of `facts`, leaving out what
+/// `walk` leaves out: a button wrapping a popover's heading is an item, not
+/// the title's tap.
+fn holds<T: Tree>(tree: &T, node: T::Node, facts: u32) -> bool {
     tree.children(node).into_iter().any(|child| {
-        let facts = tree.facts(child);
-        facts & UNSHOWN == 0 && (facts & fact::HEADING != 0 || holds_heading(tree, child))
+        let own = tree.facts(child);
+        own & UNSHOWN == 0 && (own & facts != 0 || holds(tree, child, facts))
     })
 }
 
+fn holds_heading<T: Tree>(tree: &T, node: T::Node) -> bool {
+    holds(tree, node, fact::HEADING)
+}
+
+/// A box that shows nothing but boxes like it (a spacer, a box of spacers): no
+/// item. A host that draws a childless box as a layer, with no node of its
+/// own, reads the same.
+fn empty<T: Tree>(tree: &T, node: T::Node, facts: u32) -> bool {
+    facts & fact::BOX != 0
+        && tree.children(node).into_iter().all(|c| {
+            let facts = tree.facts(c);
+            facts & UNSHOWN != 0 || empty(tree, c, facts)
+        })
+}
+
+/// What the bar decides itself, so that a node holding one is walked: the
+/// heading, a search field, a tablist, a button (pressed or not, so a box
+/// around one is walked for it) and a readout.
+const PARTS: u32 = fact::HEADING
+    | fact::SEARCH
+    | fact::TABLIST
+    | fact::PRESS
+    | fact::COMMANDS
+    | fact::DISABLED
+    | fact::BUTTON
+    | fact::STATUS;
+
 struct Walk<N> {
     headings: Vec<N>,
-    /// A shown node the bar has no place for, outside its items: a text, an
-    /// image, a control. With a heading it is hidden with the header; with
-    /// none, the header is not the bar.
+    /// A shown node no button, readout, search field or tablist stands for:
+    /// an element the bar has no object for, a second search field or
+    /// tablist, a button that presses nothing. With no heading, the header
+    /// is not the bar.
     unplaced: bool,
     leading: Vec<N>,
     trailing: Vec<N>,
@@ -309,7 +368,9 @@ impl<N: Copy + PartialEq> Walk<N> {
         }
     }
 
-    fn walk<T: Tree<Node = N>>(&mut self, tree: &T, node: N, back_is_platforms: bool) {
+    /// `title`: `node` holds the heading, so what it holds besides the bar's
+    /// parts is the title's (iOS's subtitle and avatar).
+    fn walk<T: Tree<Node = N>>(&mut self, tree: &T, node: N, back_is_platforms: bool, title: bool) {
         for child in tree.children(node) {
             let facts = tree.facts(child);
             if facts & UNSHOWN != 0 {
@@ -327,14 +388,16 @@ impl<N: Copy + PartialEq> Walk<N> {
                 // bar items. One tablist, as one search field.
                 self.unplaced |= self.segments.is_some();
                 self.segments.get_or_insert(child);
-            } else if facts & (fact::PRESS | fact::OPENS) != 0
+            } else if facts & (fact::PRESS | fact::COMMANDS) != 0
+                // A link with nothing pressing it follows its `href` (LLP 1141.004 D1).
+                || (facts & fact::HREF != 0 && facts & fact::BUTTON != 0 && !holds_heading(tree, child))
                 // A disabled button around the heading is walked for it, as a box is.
                 || (facts & fact::DISABLED != 0 && !holds_heading(tree, child))
             {
                 // A pressable heading's group is the title, tapped.
                 if self.tap.is_none() && facts & fact::PRESS != 0 && holds_heading(tree, child) {
                     self.tap = Some(child);
-                    self.walk(tree, child, back_is_platforms);
+                    self.walk(tree, child, back_is_platforms, true);
                     continue;
                 }
                 self.items.push(child);
@@ -343,12 +406,18 @@ impl<N: Copy + PartialEq> Walk<N> {
                 }
                 self.place(child);
             } else if facts & fact::STATUS != 0 && !holds_heading(tree, child) {
-                // A readout: an item, placed as a button is, that nothing
-                // presses. What it holds is its face.
+                // A readout: an item, placed as a button is, whatever it holds.
                 self.place(child);
+            } else if holds(tree, child, PARTS) {
+                self.unplaced |= facts & fact::BOX == 0;
+                let title = title || holds_heading(tree, child);
+                self.walk(tree, child, back_is_platforms, title);
+            } else if !title && facts & fact::BUTTON == 0 && !empty(tree, child, facts) {
+                // An element the bar has no object for (a spinner, a
+                // picture, a second text) is no item: out of the bar.
+                self.unplaced = true;
             } else {
                 self.unplaced |= facts & fact::BOX == 0;
-                self.walk(tree, child, back_is_platforms);
             }
         }
     }
@@ -378,9 +447,9 @@ pub fn header_shape<T: Tree>(
         segments: None,
         tap: None,
     };
-    walk.walk(tree, header, back_is_platforms);
+    walk.walk(tree, header, back_is_platforms, false);
     let (heading, level) = match walk.headings[..] {
-        [heading] => match tree.facts(heading) >> fact::LEVEL {
+        [heading] => match (tree.facts(heading) >> fact::LEVEL) & 0b111 {
             level @ 1..=6 => (Some(heading), level),
             _ => (Some(heading), 2),
         },
@@ -543,8 +612,9 @@ impl Tree for Live<'_> {
         let Some(node) = self.kernel.node(id) else {
             return 0;
         };
-        let opens = crate::Invocation::of(self.kernel, &node).is_some_and(|i| i.opens());
-        fact::of(&node.facts(), (self.pressed)(id), opens, self.back)
+        let commands = crate::Invocation::of(self.kernel, &node)
+            .is_some_and(|i| i.opens() || i.action == crate::invocation::Action::Close);
+        fact::of(&node.facts(), (self.pressed)(id), commands, self.back)
     }
     fn children(&self, id: ViewId) -> Vec<ViewId> {
         self.kernel
@@ -582,6 +652,9 @@ pub struct RootTabs {
     /// The tablist names an accessory that no element outside the routes
     /// carries: none is mounted, or the name is wrong.
     pub accessory_missing: bool,
+    /// The rows the author wrote between the panels and the tablist that a
+    /// native tab bar's room moves above the bar (LLP 1083.000 D4).
+    pub rows_above: Vec<ViewId>,
 }
 
 impl RootTabs {
@@ -700,6 +773,73 @@ impl crate::arena::NodeArena {
     }
 }
 
+impl crate::arena::NodeArena {
+    /// The rows the author wrote between the root's `panels` and its tablist
+    /// `list` that a native tab bar's room moves above the bar (LLP 1083.000
+    /// D4): `list`, holding no panel, is in flow in a flex column whose child
+    /// holding the panels is in flow and grows, so a room in the list moves
+    /// the rows up by its height, and each row is a displayed node in flow, not the
+    /// bar's `accessory`, after that child and before the list in the order
+    /// the column lays them out, or after the panels inside that child, where
+    /// each level down to the panels is a flex column whose child holding
+    /// them grows, so its rows end where it does. The rule reads the authored
+    /// tree, not a layout the room changes.
+    pub(crate) fn rows_above_tablist(
+        &self,
+        list: u32,
+        panels: &[u32],
+        accessory: Option<u32>,
+    ) -> Vec<u32> {
+        let column = |slot| {
+            let style = self.style(slot);
+            style.display == Display::Flex && style.flex_direction == FlexDirection::Column
+        };
+        let in_flow = |slot| {
+            self.style(slot).display != Display::None
+                && matches!(
+                    crate::style::top_layer::layout_position(self, slot),
+                    PositionType::Static | PositionType::Relative
+                )
+        };
+        let holds = |slot: u32| {
+            panels
+                .iter()
+                .any(|&p| p == slot || self.is_ancestor(slot, p))
+        };
+        let row = |slot: u32| Some(slot) != accessory && !holds(slot) && in_flow(slot);
+        // A flex column's children in the order its layout takes them, a stable sort by `order`
+        let laid = |slot: u32| {
+            let mut children = self.children(slot).to_vec();
+            children.sort_by_key(|&child| self.style(child).order);
+            children
+        };
+        let mut rows = Vec::new();
+        let Some(parent) = self
+            .parent(list)
+            .filter(|&p| column(p) && in_flow(list) && !holds(list))
+        else {
+            return rows;
+        };
+        let mut level = laid(parent);
+        let Some(mut end) = level.iter().position(|&c| c == list) else {
+            return rows;
+        };
+        while let Some(at) = level[..end].iter().rposition(|&c| holds(c)) {
+            let holder = level[at];
+            if self.style(holder).flex_grow <= 0.0 || !in_flow(holder) {
+                break;
+            }
+            rows.extend(level[at + 1..end].iter().copied().filter(|&c| row(c)));
+            if panels.contains(&holder) || !column(holder) {
+                break;
+            }
+            level = laid(holder);
+            end = level.len();
+        }
+        rows
+    }
+}
+
 /// Whether a `rel` value holds `token`: HTML's set of space-separated
 /// tokens, compared ASCII case-insensitively.
 pub fn rel_has(rel: &str, token: &str) -> bool {
@@ -786,6 +926,133 @@ impl Kernel {
     pub fn bar_text(&self, view: ViewId) -> Option<String> {
         crate::grouped::text_of(&self.node(view)?)
     }
+
+    /// A header button's constrained badge face (LLP 1075.003 §9.6, #1945):
+    /// a button whose one displayed child is a filled box holding a picture,
+    /// a symbol or a text. Matches Apple's `BadgeFace` rule so the same header
+    /// markup projects across hosts.
+    pub fn header_badge(&self, button: ViewId) -> Option<HeaderBadge> {
+        let btn = self.node(button)?;
+        let mut visible_children = btn.children().into_iter().filter(|&id| {
+            self.node(id)
+                .is_some_and(|n| n.style.display != Display::None)
+        });
+        let box_node = visible_children.next()?;
+        if visible_children.next().is_some() {
+            return None;
+        }
+        let bx = self.node(box_node)?;
+        if bx.node_type != NodeType::View
+            || bx.computed_row(StyleId::Visibility, |s| s.visibility) != crate::Visibility::Visible
+        {
+            return None;
+        }
+        let bg = bx.style.background_color?;
+        if bg.resolve(false).a() == 0 && bg.resolve(true).a() == 0 {
+            return None;
+        }
+        let mut picture = None;
+        let mut symbol = None;
+        let mut text = String::new();
+        let mut ink_node = None;
+        fn walk(
+            kernel: &Kernel,
+            id: ViewId,
+            picture: &mut Option<ViewId>,
+            symbol: &mut Option<String>,
+            text: &mut String,
+            ink_node: &mut Option<ViewId>,
+        ) {
+            let Some(parent) = kernel.node(id) else {
+                return;
+            };
+            for child_id in parent.children() {
+                let Some(child) = kernel.node(child_id) else {
+                    continue;
+                };
+                if child.style.display == Display::None {
+                    continue;
+                }
+                match child.node_type {
+                    NodeType::Image => {
+                        if child.computed_row(StyleId::Visibility, |s| s.visibility)
+                            != crate::Visibility::Visible
+                        {
+                            continue;
+                        }
+                        if let Some(src) = child
+                            .props
+                            .str(PropId::ImageSource)
+                            .filter(|s| !s.is_empty())
+                        {
+                            if let Some(role) = src.strip_prefix("symbol:") {
+                                if symbol.is_none() {
+                                    *symbol = Some(role.to_string());
+                                }
+                                if ink_node.is_none() {
+                                    *ink_node = Some(child_id);
+                                }
+                            } else if picture.is_none() {
+                                *picture = Some(child_id);
+                            }
+                        }
+                    }
+                    NodeType::Text => {
+                        if child.computed_row(StyleId::Visibility, |s| s.visibility)
+                            != crate::Visibility::Visible
+                        {
+                            continue;
+                        }
+                        if text.is_empty() {
+                            if let Some(words) = kernel.bar_text(child_id) {
+                                if !words.is_empty() {
+                                    *text = words;
+                                    if ink_node.is_none() {
+                                        *ink_node = Some(child_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => walk(kernel, child_id, picture, symbol, text, ink_node),
+                }
+            }
+        }
+        walk(
+            self,
+            box_node,
+            &mut picture,
+            &mut symbol,
+            &mut text,
+            &mut ink_node,
+        );
+        if picture.is_none() && symbol.is_none() && text.is_empty() {
+            return None;
+        }
+        Some(HeaderBadge {
+            box_node,
+            picture,
+            symbol,
+            text,
+            ink_node,
+        })
+    }
+}
+
+/// A header button's constrained badge face (a filled box holding a picture,
+/// a symbol or a text), returned by [`Kernel::header_badge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderBadge {
+    /// The single displayed filled box inside the button.
+    pub box_node: ViewId,
+    /// First non-symbol `image` descendant with an `imageSource`, if any.
+    pub picture: Option<ViewId>,
+    /// First `symbol:` image descendant's role (without `symbol:`), if any.
+    pub symbol: Option<String>,
+    /// First non-empty text descendant's collapsed text, if any.
+    pub text: String,
+    /// The text or symbol node whose `color` supplies fallback ink, if any.
+    pub ink_node: Option<ViewId>,
 }
 
 impl crate::arena::NodeArena {
@@ -850,7 +1117,12 @@ impl crate::arena::NodeArena {
             let sidebar_footer = footer.filter(|_| self.allows_sidebar(root, list, footer));
             let (accessory, accessory_refused, accessory_missing) =
                 self.tab_accessory(root, list, sidebar_footer, &panels, &named);
+            let rows_above = self.rows_above_tablist(list, &panels, accessory);
             Some(RootTabs {
+                rows_above: rows_above
+                    .into_iter()
+                    .map(|slot| self.local_id(slot))
+                    .collect(),
                 footer: footer.map(|slot| self.local_id(slot)),
                 tablist: self.local_id(list),
                 tabs,

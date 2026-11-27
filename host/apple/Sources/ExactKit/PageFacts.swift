@@ -134,6 +134,9 @@ package enum PageFacts {
     nonisolated(unsafe) private static var showWatch: [ObjectIdentifier: NSKeyValueObservation] = [:]
     /// Orders `window` out for a close that keeps its page, and tells the
     /// page it can no longer be seen.
+    /// Whether `window` is put away by its close (`hideForClose`) and not shown since.
+    package static func hiddenForClose(_ window: NSWindow) -> Bool { closeHid.contains(window) }
+
     package static func hideForClose(_ window: NSWindow) {
         closeHid.add(window)
         window.orderOut(nil)
@@ -249,7 +252,7 @@ package enum PageFacts {
         #endif
     }
 
-    /// `document.hasFocus()` for a session in `window` (#114): the window the
+    /// `document.hasFocus()` for a session in `window`: the window the
     /// system's keyboard focus is in. macOS: the app is active and the window
     /// is its key window, so another app in front, another of its windows, or
     /// a sheet over it (an open panel, as a browser's file chooser blurs its
@@ -357,7 +360,7 @@ package enum PageFacts {
     static package func observe(_ changed: @escaping () -> Void) -> [NSObjectProtocol] {
         #if os(macOS)
         // Visibility: hiding, occlusion, and a minimize or restore, which
-        // need not change the occlusion. Focus (#114): any window's key change
+        // need not change the occlusion. Focus: any window's key change
         // or the app's activation; each session reads its own window, and the
         // same facts again commit nothing.
         let workspace = [NSApplication.didHideNotification, NSApplication.didUnhideNotification,
@@ -369,7 +372,7 @@ package enum PageFacts {
         // A prewarmed launch (iOS starts the process in the background ahead
         // of a tap, often after an update) never posts willEnterForeground:
         // becoming active is the only word that the app can be seen. Focus
-        // (#114) follows the scene's activation; a "will" precedes the
+        // follows the scene's activation; a "will" precedes the
         // state's update, so each is read again a main-queue turn later.
         let workspace = [UIApplication.didEnterBackgroundNotification, UIApplication.willEnterForegroundNotification,
                          UIApplication.didBecomeActiveNotification, UIApplication.willResignActiveNotification,

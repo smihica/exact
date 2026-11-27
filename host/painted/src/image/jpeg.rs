@@ -405,11 +405,12 @@ pub(super) fn decode<R: Read + Seek>(
 pub(super) fn decode_pixels<R: Read + Seek>(
     input: R,
     plan: &DecodePlan,
+    _variant: u32,
     cancelled: impl Fn() -> bool,
 ) -> Result<super::bitmap::Pixels, Refusal> {
     #[cfg(target_os = "android")]
     #[allow(unsafe_code)]
-    if plan.platform() && super::hardware::enabled() {
+    if _variant == exact_raster::variant::HARDWARE_SRGB8 {
         let bytes = read_all(input, plan, cancelled)?;
         let size = (plan.pixels.width, plan.pixels.height);
         // SAFETY: `filled` hands a buffer of `len` bytes, rows `stride` apart.
@@ -425,8 +426,10 @@ pub(super) fn decode_pixels<R: Read + Seek>(
 #[cfg(windows)]
 #[path = "windows.rs"]
 mod windows;
+#[cfg(all(windows, test))]
+pub(super) use windows::observed;
 #[cfg(windows)]
-pub(super) use windows::decode;
+pub(super) use windows::{decode, Worker};
 
 /// ImageIO decodes and orients the thumbnail on the raster worker.
 #[cfg(target_os = "macos")]

@@ -24,6 +24,39 @@ fn with_reading(dir: &std::path::Path, design: &str) {
 }
 
 #[test]
+fn axis_removal_lists_app_and_package_conditions_with_their_source_lines() {
+    let dir = app("pkg-axis", "forma t\n\naxes\n  size = small | big\n  tone = pale | deep\n\ntheme\n  brand = #abcdef\n    when size=big tone=deep: #012345\n");
+    with_reading(
+        &dir,
+        "forma reading\ntheme\n  reading.card = #123456\n    when tone=deep: #654321\n",
+    );
+    std::fs::write(
+        dir.join("other.forma"),
+        "forma other\naxes\n  tone = deep\ntheme\n  panel = #123456\n    when tone=deep: #654321\n",
+    )
+    .unwrap();
+    let mut server = Serve::start(&dir, &[]);
+    let (reply, _) =
+        server.ask(json!({"method":"propose","ops":[{"op":"remove-axis","name":"tone"},{"op":"remove-axis","name":"tone","file":"other.forma"}]}));
+    let refs = reply["error"]["diagnostics"].as_array().expect("referrers");
+    assert_eq!(refs.len(), 3, "{reply}");
+    for (file, line, owner, condition) in [
+        ("other.forma", 6, "panel", "tone=deep"),
+        ("app.forma", 9, "brand", "size=big tone=deep"),
+        ("reading.forma", 4, "reading.card", "tone=deep"),
+    ] {
+        assert!(
+            refs.iter()
+                .any(|d| d["file"].as_str().unwrap().ends_with(file)
+                    && d["line"] == line
+                    && d["message"].as_str().unwrap().contains(owner)
+                    && d["message"].as_str().unwrap().contains(condition)),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
 fn the_server_reads_an_app_token_that_names_a_package_token() {
     let dir = app("pkg-alias", "forma t\n\ntheme\n  brand = reading.card\n");
     with_reading(&dir, "forma reading\n\ntheme\n  reading.card = #112233\n");
@@ -979,4 +1012,37 @@ fn a_package_linked_from_outside_keeps_its_motion_sites_and_its_defaults() {
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn a_write_reads_only_the_top_of_each_node_modules_above_the_app() {
+    use std::os::unix::fs::PermissionsExt;
+    // A Bun store above the app, a directory deep in a package's sources unlistable: not looked into.
+    let ws = Scratch::new(format!(
+        "exact2-forma-serve-pkg-above-{}",
+        std::process::id()
+    ));
+    let dir = ws.join("demo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("app.contract"),
+        "component App\n  view\n    text \"a\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.forma"),
+        "forma t\n\ntheme\n  brand = #123456\n",
+    )
+    .unwrap();
+    let deep = ws.join("node_modules/.bun/pkg@1.0.0/node_modules/pkg/src/deep");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut s = Serve::start(&dir, &[]);
+    let (hello, _) = s.ask(json!({"method": "hello"}));
+    let (set, _) = s.ask(json!({"method": "transaction", "client": "t", "files": hello["ok"]["files"], "ops": [{"op": "set-token", "name": "brand", "value": "#654321"}]}));
+    std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(set["ok"].is_object(), "{set}");
+    assert!(std::fs::read_to_string(dir.join("app.forma"))
+        .unwrap()
+        .contains("#654321"));
 }

@@ -198,7 +198,7 @@ fn a_text_style_gives_its_weight_and_leading_by_its_precedence_and_column() {
         let node = r.kernel().node_by_key(key).unwrap();
         node.text_runs()
             .iter()
-            .map(|run| (run.style.font_weight, run.style.line_height))
+            .map(|run| (run.style.font_weight, run.style.used_line_height()))
             .collect::<Vec<_>>()
     };
     assert_eq!(runs[0].0, 400, "{runs:?}");
@@ -275,7 +275,12 @@ fn a_text_style_gives_its_weight_and_leading_by_its_precedence_and_column() {
             row(&r, "h-authored", StyleId::FontSize),
             RowValue::Number(19.0)
         );
-        let headline = if column == Column::Mac { 700.0 } else { 600.0 };
+        let headline = match column {
+            Column::Mac => 700.0,
+            // titleMedium's.
+            Column::Material => 500.0,
+            _ => 600.0,
+        };
         assert_eq!(weight(&r, "h5"), headline);
         for id in ["h-font-authored", "h-level-authored"] {
             assert_eq!(

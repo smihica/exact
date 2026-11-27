@@ -78,6 +78,37 @@ fn a_failed_front_wait_returns_both_unconfirmed_receipts() {
     b.send(Err("panel lost".into())).unwrap();
     assert!(matches!(next(&mut queue), Completion::Retry(lost) if lost == ['B', 'C']));
     assert!(queue.observed.is_none());
-    drop(queue);
-    assert!(c.send(Ok(())).is_err());
+
+    // Dropping the queue must wait for the second queued presentation to finish
+    // waiting before releasing the swapchain.
+    let (dropped_tx, dropped_rx) = channel();
+    let teardown = thread::spawn(move || {
+        drop(queue);
+        let _ = dropped_tx.send(());
+    });
+    assert!(
+        dropped_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+        "drop returned while the second presentation was still unwaited"
+    );
+    c.send(Ok(())).unwrap();
+    dropped_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("drop did not finish after the second wait completed");
+    teardown.join().unwrap();
+}
+
+#[test]
+fn poll_delivers_readable_wake_before_reporting_peer_hangup() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    writer.write_all(&[1]).unwrap();
+    drop(writer);
+
+    let fd = reader.as_raw_fd();
+    assert!(poll(&[fd], fd, 5_000).unwrap());
+    let mut byte = [0u8; 1];
+    assert_eq!(reader.read(&mut byte).unwrap(), 1);
+    assert_eq!(byte, [1]);
 }

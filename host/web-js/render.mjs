@@ -15,7 +15,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import vm from 'node:vm';
 import { brotliCompressSync, createBrotliCompress, constants } from 'node:zlib';
-import { createDocument, esc } from './dom.js';
+import { createCSS, createDocument, esc } from './dom.js';
 import { cachingFetch, directives, FRESH } from './http-cache.mjs';
 import { canonical, matchPattern, mountedHref, withBase } from './route-pattern.js';
 import { select, tokens } from './page-style.mjs';
@@ -28,16 +28,6 @@ const requestCredentials = (input, init) => {
   const given = init?.credentials;
   return String(given === undefined ? input instanceof Request ? input.credentials : 'same-origin' : given);
 };
-// Bun's Request discards `credentials` and reports `include`. Keep Fetch's effective value in the render realm.
-class RenderRequest extends Request {
-  constructor(input, init) {
-    super(input, init);
-    const credentials = requestCredentials(input, init);
-    if (!['omit', 'same-origin', 'include'].includes(credentials)) throw new TypeError('credentials must be omit, same-origin or include');
-    Object.defineProperty(this, 'credentials', { value: credentials });
-  }
-  clone() { return new RenderRequest(super.clone(), { credentials: this.credentials }); }
-}
 // Promise reactions and async functions run outside the host's callback wrapper. Their promise's realm owns the
 // rejection; an Error's realm also identifies a callback chained from a host promise, such as a response body read.
 const rejectionOwners = new WeakMap();
@@ -129,6 +119,21 @@ const utcIntl = new vm.Script(`{
     construct: (target, args, derived) => Reflect.construct(target, argsInUTC(args), derived),
   });
 }`);
+// Pin Date.prototype local getters and stringifiers to UTC inside each render realm
+// so render=build never leaks the build machine's timezone (LLP 1195.000 D2.6).
+const utcDate = new vm.Script(`{
+  const p = Date.prototype, gt = p.getTime;
+  const D = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const p2 = n => n < 10 ? '0' + n : String(n), p4 = y => (y < 0 ? '-' : '') + String(Math.abs(y)).padStart(4, '0');
+  const ds = d => Number.isNaN(gt.call(d)) ? 'Invalid Date' : D[p.getUTCDay.call(d)] + ' ' + M[p.getUTCMonth.call(d)] + ' ' + p2(p.getUTCDate.call(d)) + ' ' + p4(p.getUTCFullYear.call(d));
+  const ts = d => Number.isNaN(gt.call(d)) ? 'Invalid Date' : p2(p.getUTCHours.call(d)) + ':' + p2(p.getUTCMinutes.call(d)) + ':' + p2(p.getUTCSeconds.call(d)) + ' GMT+0000 (Coordinated Universal Time)';
+  p.getTimezoneOffset = function getTimezoneOffset() { return Number.isNaN(gt.call(this)) ? NaN : 0; };
+  p.getFullYear = p.getUTCFullYear; p.getMonth = p.getUTCMonth; p.getDate = p.getUTCDate; p.getDay = p.getUTCDay;
+  p.getHours = p.getUTCHours; p.getMinutes = p.getUTCMinutes; p.getSeconds = p.getUTCSeconds; p.getMilliseconds = p.getUTCMilliseconds;
+  p.toDateString = function toDateString() { return ds(this); };
+  p.toTimeString = function toTimeString() { return ts(this); };
+  p.toString = function toString() { return Number.isNaN(gt.call(this)) ? 'Invalid Date' : ds(this) + ' ' + ts(this); };
+}`);
 
 /** An undeclared route's activation (LLP 1048.007 D1), as the render host
  * infers it (`exact_runner::activation`, whose rules the build wrote in
@@ -171,8 +176,12 @@ export function deferredAnswers(hash) {
 export const deferredPath = path => /^\/\.exact\/checkpoint\/([0-9a-f]{32})\.json$/.exec(path)?.[1] ?? null;
 
 /** `read(path)`: a file of the build by its path in it, the bytes (`sitePages` binds it to one generation); `generation`:
- * the generation each composed head names in its base (generations.mjs `withGenerationBase`). */
-export function renderer(dist, { closed = false, read = path => readFileSync(resolve(dist, path)), generation = null } = {}) {
+ * the generation each composed head names in its base (generations.mjs `withGenerationBase`).
+ * The absolute HTTP(S) page URL passed to the returned function is the allow-list for `net.fetch self`.
+ * The embedder validates that URL against its own tenants and never derives it from Host or forwarded headers. */
+export function renderer(dist, { closed = false, buildOrigin, read = path => readFileSync(resolve(dist, path)), generation = null } = {}) {
+  const published = buildOrigin == null ? null : new URL(buildOrigin);
+  if (published && !['http:', 'https:'].includes(published.protocol)) throw new TypeError('build origin must be HTTP(S)');
   const script = new vm.Script(read('.gen/server.js').toString('utf8'), { filename: 'server.js' });
   let shell;
   try { shell = read('shell.html').toString('utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; shell = read('index.html').toString('utf8'); }
@@ -184,7 +193,9 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
   const cache = new Map();
   const files = p => { let v = cache.get(p); if (!v) { v = read(p.replace(/^\.?\//, '')); if (p.endsWith('.wasm')) v = new WebAssembly.Module(v); cache.set(p, v); } return v; };
   // Every render's fetches share one HTTP cache, for as long as each answer's headers allow (http-cache.mjs).
-  const fetched = closed ? () => Promise.reject(new Error('network data is unavailable during Markdown compilation')) : cachingFetch(fetch);
+  const outbound = globalThis.fetch;
+  const fetched = closed ? () => Promise.reject(new Error('network data is unavailable during Markdown compilation'))
+    : cachingFetch((input, init) => outbound(input, { ...init, credentials: 'omit' }));
   const name = unesc(/<title>([^<]*)<\/title>/.exec(shell)?.[1] ?? '');
   // The head's fields a crawler reads after the title and viewport, as page.rs `page_head` writes them.
   const crawled = (out, location) => {
@@ -234,15 +245,17 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
   // and every render still has a realm of its own (LLP 1048.000 D10, as the render host's `make_realm`).
   const realm = () => {
     const document = createDocument(shell);
+    let pageOrigin;
     // The bake's page facts (runner/src/page.rs): visible, online, focused, no share sheet or pickers. The
     // base is the shell's mount, against which the runtime checks that a link navigates (rt.js `navigable`).
     Object.assign(document, { visibilityState: 'visible', hasFocus: () => true, baseURI: `http://render.invalid${base}` });
     const location = { pathname: '/', search: '', href: 'http://render.invalid/', origin: 'http://render.invalid' };
     // What the render read that another render may not read alike: how long its answers stay fresh for any reader
-    // (http-cache.mjs `FRESH`), and whether a source drew a random number (its only other reading the clock and
-    // `Math.random` refuse, ts-fetch.js) — so how long its page may be given again (`keep`), and whether it may be
-    // shared at all (`drew`).
-    const read = { fresh: Infinity, random: false }, prefers = new Set();
+    // (http-cache.mjs `FRESH`), whether a source drew randomness (`random`/`moduleRandom`), and whether a source read
+    // the ambient clock (`clock`/`moduleClock`, LLP 1195.000 D2.4) — so how long its page may be given again (`keep`),
+    // and whether it may be shared or written by render=build at all.
+    const read = { fresh: Infinity, random: false, clock: false, moduleClock: false, moduleRandom: false }, prefers = new Set();
+    let loaded = false;
     const noted = response => { read.fresh = Math.min(read.fresh, response?.[FRESH] ?? 0); return response; };
     // A call the platform refuses drew nothing
     const drew = f => (...args) => { const drawn = f(...args); read.random = true; return drawn; };
@@ -278,16 +291,78 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
       timers.add(id); return id;
     };
     const stopTimer = id => { timers.delete(id); clearTimeout(id); };
-    const fetchOwned = (input, init) => {
-      if (disposed) return Promise.reject(owner.signal.reason);
-      const credentials = requestCredentials(input, init);
-      const url = input instanceof Request ? input.url : String(input);
-      // No visitor exists here. Decide before the HTTP cache or network can answer anonymously (LLP 1048.000 D9).
-      if (credentials === 'include' || (credentials === 'same-origin' && new URL(url).origin === ctx.__exactRenderOrigin))
-        return Promise.reject(Object.assign(new Error('fetch() with credentials'), { renderDeferred: true }));
+    // A path-only render has an origin only when the app configured one. Never send
+    // the synthetic URL used by the router to the network.
+    class PageRequest extends Request {
+      constructor(input, init) {
+        if (!(input instanceof Request) && input !== undefined) {
+          const value = String(input);
+          try { input = new URL(value, document.URL).href; }
+          catch (error) {
+            if (!document.URL && URL.canParse(value, 'https://render.invalid/'))
+              throw Object.assign(new TypeError("relative fetch has no page origin: set app.origin in app.json, pass an absolute HTTP(S) page URL to the renderer, or write an absolute fetch URL"), {kind: 'Refused'});
+            throw error;
+          }
+        }
+        super(input, init);
+        // Bun reports "include" on every Request. Preserve Fetch's effective credentials for anonymous renders.
+        const credentials = requestCredentials(input, init);
+        if (!['omit', 'same-origin', 'include'].includes(credentials)) throw new TypeError('credentials must be omit, same-origin or include');
+        Object.defineProperty(this, 'credentials', { value: credentials });
+      }
+      clone() { return new PageRequest(super.clone(), { credentials: this.credentials }); }
+    }
+    const fetchOwned = async (input, init, admits) => {
+      if (disposed) throw owner.signal.reason;
       const given = init?.signal, signal = given === undefined && input instanceof Request ? input.signal : given;
-      return fetched(input, { ...init, signal: signal ? AbortSignal.any([owner.signal, signal]) : owner.signal })
-        .then(noted, error => { read.fresh = 0; throw error; });
+      const options = { ...init, signal: signal ? AbortSignal.any([owner.signal, signal]) : owner.signal };
+      let request = new PageRequest(input, options), followed = false;
+      const credentials = request.credentials;
+      for (const key of ['host', 'cookie', 'cookie2']) request.headers.delete(key);
+      try {
+        for (let hops = 0; ; hops++) {
+          // A render is anonymous even when it reaches the page's origin through a redirect.
+          if (credentials === 'include' || (credentials === 'same-origin' && [location.origin, ctx.__exactRenderOrigin].includes(new URL(request.url).origin)))
+            throw Object.assign(new Error('fetch() with credentials'), { renderDeferred: true });
+          if (request.redirect !== 'follow') return noted(await fetched(request));
+          const response = await fetched(request.body ? request.clone() : request, { redirect: 'manual' });
+          const to = [301, 302, 303, 307, 308].includes(response.status) ? response.headers.get('location') : null;
+          if (!to) {
+            if (followed) {
+              const mark = r => Object.defineProperties(r, {
+                redirected: {value: true}, url: {value: response.url}, clone: {configurable: true, writable: true, value() { return mark(Response.prototype.clone.call(this)); }}
+              });
+              mark(response);
+              read.fresh = 0;
+            }
+            return noted(response);
+          }
+          response.body?.cancel().catch(() => {});
+          if (hops >= 20) throw new TypeError('fetch exceeded 20 redirects');
+          const from = new URL(request.url), target = new URL(to, from);
+          if (target.username || target.password) throw new TypeError('fetch cannot redirect to a URL with credentials');
+          if (request.mode === 'same-origin' && target.origin !== from.origin)
+            throw Object.assign(new Error(`same-origin fetch redirected to ${target.origin}`), { kind: 'Refused' });
+          if (!(admits ? admits(target.href, true) : target.origin === from.origin)) {
+            if (admits?.(target.href, false))
+              throw Object.assign(new Error("fetch() redirected outside the render server's grants"), { renderDeferred: true, unavailable: 'a network grant held by the reader' });
+            throw Object.assign(new Error(`outside the app's grants (net.fetch): redirected to ${target.origin}`), { kind: 'Refused' });
+          }
+          const headers = new Headers(request.headers);
+          if (target.origin !== from.origin) for (const key of ['authorization', 'proxy-authorization', 'cookie']) headers.delete(key);
+          const get = (response.status === 301 || response.status === 302) && request.method === 'POST' ||
+            response.status === 303 && request.method !== 'GET' && request.method !== 'HEAD';
+          if (get) {
+            for (const key of ['content-encoding', 'content-language', 'content-location', 'content-type', 'content-length']) headers.delete(key);
+            request.body?.cancel().catch(() => {});
+          }
+          request = new PageRequest(target.href, { method: get ? 'GET' : request.method, headers, body: get ? null : request.body,
+            cache: request.cache, mode: request.mode, referrer: request.referrer, referrerPolicy: request.referrerPolicy,
+            integrity: request.integrity, keepalive: request.keepalive, signal: options.signal, credentials });
+          followed = true;
+        }
+      } catch (error) { read.fresh = 0; throw error; }
+      finally { request.body?.cancel().catch(() => {}); }
     };
     // No code from a string, by any route (a function's own `constructor` too): as on Hermes, and as the page under
     // the render server's CSP, which admits no `'unsafe-eval'`. The module's `Function` and `eval` throw Hermes's
@@ -305,7 +380,7 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
       innerWidth: 390, innerHeight: 844,
       matchMedia: media => ({ media, matches: prefers.has(media.replace(/\s+/g, '')), addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }),
       setTimeout: later, clearTimeout: stopTimer, queueMicrotask: fn => queueMicrotask(() => callback(fn)),
-      performance, console, Request: RenderRequest, Response, Headers, URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, AbortSignal,
+      performance, console, Request: PageRequest, Response, Headers, URL, URLSearchParams, TextEncoder, TextDecoder, AbortController, AbortSignal,
       ReadableStream, WritableStream, TransformStream, CountQueuingStrategy, ByteLengthQueuingStrategy, CompressionStream, DecompressionStream,
       fetch: fetchOwned,
       crypto: { subtle: new Proxy(crypto.subtle, { get: (subtle, name) => !operations.has(name) ? Reflect.get(subtle, name) : (...a) => {
@@ -313,20 +388,43 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
         return salted(name, a) ? made.then(result => { read.random = true; return result; }) : made;
       } }), getRandomValues: view => { const filled = crypto.getRandomValues(view); if (filled.byteLength > 0) read.random = true; return filled; },
       randomUUID: drew(() => crypto.randomUUID()) },
-      WebAssembly, atob, btoa, Event: class {}, CustomEvent: class {}, __exactRender: true, __files: files,
+      WebAssembly, atob, btoa, CSS: createCSS(), Event: class {}, CustomEvent: class {}, __exactRender: true, __files: files,
       // A draw a Rust module reports (rust-data.js)
       __exactDrew: () => { read.random = true; },
+      // Ambient clock and Math.random() reads from ts-fetch.js (LLP 1195.000 D2.4):
+      // reads during bundle evaluation latch module-wide taint across the reset below.
+      __exactClock: () => { if (loaded) read.clock = true; else read.moduleClock = true; },
+      __exactAmbientEntropy: () => { if (loaded) read.random = true; else read.moduleRandom = true; },
       ...(closed ? { __exactMarkdown: new Map() } : {}),
       __exactMarkdownBuilt: JSON.parse(builtMarkdown(shell, seen)),
     }, { codeGeneration: { strings: false } });
+    Object.defineProperty(fetchOwned, 'admitsPageOrigin', { value: origin => pageOrigin !== undefined && (origin === undefined || origin === pageOrigin) });
     ctx.globalThis = ctx; ctx.self = ctx;
     if (!process.listeners('unhandledRejection').includes(unhandledRejection)) process.on('unhandledRejection', unhandledRejection);
     for (const prototype of realmPrototypes.runInContext(ctx)) rejectionOwners.set(prototype, failedCallback);
     utcIntl.runInContext(ctx);
+    utcDate.runInContext(ctx);
     try { script.runInContext(ctx); } catch (error) { dispose(); throw error; }
-    // What loading the bundle read is every render's alike.
-    Object.assign(read, { fresh: Infinity, random: false });
-    return { ctx, location, read, prefers, dispose, errors };
+    loaded = true;
+    // Reset per-render observations while preserving module-level ambient taint (LLP 1195.000 D2.4).
+    Object.assign(read, { fresh: Infinity, random: false, clock: false });
+    const at = (path) => {
+      const explicit = URL.canParse(path) ? new URL(path) : null;
+      if (explicit && !['https:', 'http:'].includes(explicit.protocol)) throw new TypeError('render needs a page path or an absolute HTTP(S) URL');
+      pageOrigin = explicit?.origin ?? published?.origin;
+      const trusted = pageOrigin ?? ctx.__exactRenderOrigin;
+      const page = new URL(path, 'http://render.invalid');
+      // Only a complete URL from the embedder supplies an authority. A request target, even
+      // one starting with two slashes, contributes only its path and query.
+      document.URL = trusted ? trusted + page.pathname + page.search : undefined;
+      const url = new URL(document.URL ?? 'http://render.invalid' + page.pathname + page.search);
+      Object.assign(location, { pathname: page.pathname, search: page.search, href: url.href, origin: url.origin });
+      document.baseURI = new URL(base, url.origin).href;
+      return page;
+    };
+    const mount = new URL(base, 'http://render.invalid');
+    at(mount.pathname + mount.search);
+    return { ctx, at, read, prefers, dispose, errors };
   };
   // The next render's realm, made once the last render is done and nothing waits (`render.ahead` false turns it off).
   let ahead = null, making = false;
@@ -337,12 +435,12 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
   };
   /** Begin at the page's boot state; `finish` settles its data and composes the document. */
   async function begin(location, viewport = PAGE, faults) {
-    const url = new URL(location, 'http://render.invalid');
     const made = ahead ?? realm();
     ahead = null;
     const { ctx, read } = made;
     if (faults !== undefined) ctx.__exactLaunchFaults = faults;
-    Object.assign(made.location, { pathname: url.pathname, search: url.search, href: url.href });
+    let url;
+    try { url = made.at(location); } catch (error) { made.dispose(); throw error; }
     Object.assign(made.ctx, { innerWidth: viewport.width, innerHeight: viewport.height });
     made.prefers.clear();
     for (const [on, query] of [[fixedScheme ? fixedScheme === 'dark' : viewport.dark, '(prefers-color-scheme:dark)'], [viewport.reducedMotion, '(prefers-reduced-motion:reduce)'], [viewport.reducedTransparency, '(prefers-reduced-transparency:reduce)']]) if (on) made.prefers.add(query);
@@ -363,7 +461,7 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
         const wake = activate === 'interaction' && out.wake.length ? ` data-wake="${esc(JSON.stringify(out.wake), true)}"` : '';
         const fields = `<title>${esc(out.title ?? name)}</title><meta name="viewport" content="${viewportMeta}">${crawled(out, url.pathname + url.search)}`;
         const revalidate = info.activate !== 'never' && (out.outstanding || out.continuing);
-        const checkpoint = `{"location":${JSON.stringify(url.pathname + url.search)},"time":${JSON.stringify(out.time)},"logic":null,"answers":${out.answers}${out.urls ? `,"urls":${JSON.stringify(out.urls)}` : ''},"pending":${JSON.stringify(out.pending)}${out.open.length ? `,"open":${JSON.stringify(out.open)}` : ''}${out.readers.length ? `,"readers":${JSON.stringify(out.readers)}` : ''}${revalidate ? ',"revalidate":true' : ''}}`;
+        const checkpoint = `{"location":${JSON.stringify(url.pathname + url.search)},"time":${JSON.stringify(out.time)},"logic":null,"answers":${out.answers}${out.urls ? `,"urls":${JSON.stringify(out.urls)}` : ''},"pending":${JSON.stringify(out.pending)}${out.open.length ? `,"open":${JSON.stringify(out.open)}` : ''}${out.readers.length ? `,"readers":${JSON.stringify(out.readers)}` : ''}${out.instances.length ? `,"instances":${JSON.stringify(out.instances)}` : ''}${revalidate ? ',"revalidate":true' : ''}}`;
         const digest = createHash('sha256').update(out.root).digest('hex').slice(0, 16);
         const style = rules ? `<style data-exact-page>${select(rules, tokens(out.root + shell.slice(root)))}</style>\n` : '';
         // A page made per request that waits for the reader names its answers past 1 KB rather than holding them: they
@@ -392,8 +490,9 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
         // random and read no clock or reader's device (the plan's `kept`), from TypeScript sources alone, is the page
         // another render would make until the first of those answers goes stale: it may be given again until then, for
         // at most 60 s (LLP 1048.007 D8).
-        const keep = status === 200 && settled && !out.failed?.length && out.activation?.kept === false && !out.rust && !read.random && read.fresh > 0 && read.fresh < Infinity ? Math.min(read.fresh, 60000) : 0;
-        return { html: markedHead + body(''), rest: marked + body(late), status, settled, failed: out.failed ?? [], refused, render: out.render, location, policy: info.policy, activate, keep, drew: read.random, robots: out.robots, origin: out.origin };
+        const drew = read.random || read.moduleRandom, clocked = read.clock || read.moduleClock;
+        const keep = status === 200 && settled && !out.failed?.length && out.activation?.kept === false && !out.rust && !drew && !clocked && read.fresh > 0 && read.fresh < Infinity ? Math.min(read.fresh, 60000) : 0;
+        return { html: markedHead + body(''), rest: marked + body(late), status, settled, failed: out.failed ?? [], refused, render: out.render, location, policy: info.policy, activate, keep, drew, clocked, robots: out.robots, origin: out.origin };
       } finally { made.dispose(); }
     } };
   }
@@ -415,9 +514,11 @@ export function renderer(dist, { closed = false, read = path => readFileSync(res
     } finally { clearTimeout(timer); made?.dispose(); }
   };
   render.markdown = async () => {
-    const { ctx } = realm();
-    await ctx.__start();
-    return ctx.__markdown();
+    const made = realm();
+    try {
+      await made.ctx.__start();
+      return await made.ctx.__markdown();
+    } finally { made.dispose(); }
   };
   return render;
 }
@@ -472,7 +573,7 @@ export function pageServer(dist, render = renderer(dist), log = console.log) {
     headers['content-encoding'] = 'br';
     return { status, headers, body: brotliCompressSync(html, { params: { [constants.BROTLI_PARAM_QUALITY]: 5 } }) };
   };
-  const shared = page => page.policy === 'cached' && !page.drew;
+  const shared = page => page.policy === 'cached' && !page.drew && !page.clocked;
   return async function page(location, header) {
     // Laid out for the reader's viewport (LLP 1048.006), and kept per viewport.
     const viewport = viewportOf(header), key = `${location} ${JSON.stringify(viewport)}`;
@@ -608,10 +709,11 @@ if (import.meta.main) {
     const { serve } = await import('../web/serve.mjs');
     process.exitCode = await serve([dist, '--port', String(port), '--loopback'], { js: true, sitePages });
   } else {
-    const render = renderer(dist);
+    const buildRoutes = args.includes('--build') ? JSON.parse(readFileSync(resolve(dist, 'routes.json'), 'utf8')) : null;
+    const render = renderer(dist, { buildOrigin: buildRoutes?.origin });
     if (args.includes('--build')) {
       const listed = JSON.parse(readFileSync(resolve(dist, '.gen/pages.json'), 'utf8')), pages = [], docs = [];
-      const routes = JSON.parse(readFileSync(resolve(dist, 'routes.json'), 'utf8')).routes;
+      const { routes } = buildRoutes;
       render.ahead = false;
       // A build reports every refusal in its one run: it lists and renders every page, then fails
       let failed = false;
@@ -635,11 +737,12 @@ if (import.meta.main) {
       let origin = null;
       for (const [i, p] of pages.entries()) {
         const page = await render(withBase(p.location, buildBase(dist)));
-        // Write no page whose render drew randomness, which every reader of a page made at build would share (LLP 1048.000
-        // D7, LLP 1069.005 D2)
-        if (page.drew) {
+        // Write no page whose render drew randomness or read the ambient clock (LLP 1048.000 D7, LLP 1069.005 D2, LLP 1195.000 D2.4)
+        if (page.drew || page.clocked) {
           failed = true;
-          console.error(`${p.location}: route \`${pageRoute(p, routes)?.name}\` is render=build, but its render drew randomness, and a page made at build would give every reader the same random values (LLP 1069.005 D2). Declare the route render=request, rendered for each request, or render=client, rendered in the browser`);
+          const why = page.drew && page.clocked ? 'drew randomness and read the ambient clock'
+            : page.drew ? 'drew randomness' : 'read the ambient clock';
+          console.error(`${p.location}: route \`${pageRoute(p, routes)?.name}\` is render=build, but its render ${why}, and a page made at build would bake a build-time value for every reader (LLP 1195.000 D2.4). Declare the route render=request, rendered for each request, or render=client, rendered in the browser`);
           continue;
         }
         docs.push({ location: canonical(p.location), notfound: p.notfound, status: page.status, robots: page.robots });

@@ -169,7 +169,9 @@ pub(crate) fn name_the_fix(n: &Node, mut e: LowerError) -> LowerError {
 }
 
 /// The props besides ARIA's that any leaf box takes, so a module's too.
-const BOX_PROPS: [&str; 6] = ["testId", "id", "role", "disabled", "inert", "tabindex"];
+const BOX_PROPS: [&str; 7] = [
+    "testId", "id", "role", "disabled", "inert", "tabindex", "portal",
+];
 
 /// The events a native view sends its box (`ExactNativeEvents`; the Apple
 /// host's `NativeViews.kinds`), the only handlers a module tag can fire.
@@ -180,7 +182,7 @@ const MODULE_EVENTS: [&str; 9] = [
 /// The form-control props (LLP 1069.001, LLP 1069.002) a module's box has
 /// no use for. `checked` is refused on every tag but `input` before this
 /// runs (`controls::control`); it is listed so the set reads whole.
-const CONTROL_PROPS: [&str; 20] = [
+pub const CONTROL_PROPS: [&str; 20] = [
     "value",
     "placeholder",
     "autofocus",
@@ -213,31 +215,12 @@ pub fn module_tags(file: &File) -> Vec<(String, Span)> {
 }
 
 pub(crate) fn module_tags_in(nodes: &[Node]) -> Vec<(String, Span)> {
-    fn walk(nodes: &[Node], out: &mut Vec<(String, Span)>) {
-        for n in nodes {
-            match n {
-                Node::Element {
-                    tag,
-                    children,
-                    span,
-                    ..
-                } => {
-                    if is_module_tag(tag) {
-                        out.push((tag.clone(), *span));
-                    }
-                    walk(children, out);
-                }
-                node => {
-                    for list in node.child_lists() {
-                        walk(list, out);
-                    }
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(nodes, &mut out);
-    out
+    Node::walk(nodes)
+        .filter_map(|n| match n {
+            Node::Element { tag, span, .. } if is_module_tag(tag) => Some((tag.clone(), *span)),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Lowerer<'_> {

@@ -230,6 +230,12 @@ impl Tree {
         theme: &ThemeIndex,
         fonts: Rc<RefCell<bridge::RuntimeFonts>>,
     ) -> Result<DocTree, DocTreeError> {
+        if self.portals.is_some() {
+            // The fold writes each node under its declared parent; only the
+            // kernel's render shows a mover under its destination
+            // (@ref LLP 1013.002 D7).
+            return Err(DocTreeError::Unsupported("a portal"));
+        }
         let mut build = Build {
             plan,
             sites,
@@ -456,18 +462,21 @@ impl Build<'_> {
         for (i, b) in row.bindings.iter().enumerate() {
             let binding = plan.binding(b);
             let Some(value) = n.emitted(plan, self.sites, i) else {
+                if n.is_trapped(b) && binding.kind == BindingKind::Style && shared.is_none() {
+                    if let Some(style) = StyleId::from_bit(binding.id as u32) {
+                        patch.clear(exact_kernel::StyleMask::of(style));
+                        if binding.written {
+                            patch.written.set(style);
+                        } else {
+                            patch.written.clear(style);
+                        }
+                    }
+                }
                 continue;
             };
             let value = &value;
             match binding.kind {
                 BindingKind::Prop => match bridge::prop_value(binding.id, value) {
-                    // A drag's URL the commit refuses (`Runner::admit_drag_files`, LLP 1094.000 D1) is none.
-                    Ok((
-                        exact_kernel::PropId::DataTransferUrl,
-                        exact_kernel::PropValue::Str(url),
-                    )) if exact_plan::http_url_refusal(&url).is_some() => {
-                        props.remove(exact_kernel::PropId::DataTransferUrl);
-                    }
                     Ok((prop, value)) => {
                         let value = bridge::icon_source(plan, prop, value);
                         let value = match prop {
@@ -502,10 +511,13 @@ impl Build<'_> {
                 // kernel's `ClearStyle` does (`NodeInst::emit_bindings`).
                 BindingKind::Style if matches!(value, Value::Option(None)) => {}
                 BindingKind::Style if bridge::unsets(binding.id, value) => {
-                    if let (true, Some(style)) =
-                        (binding.written, StyleId::from_bit(binding.id as u32))
-                    {
-                        patch.written.set(style);
+                    if let Some(style) = StyleId::from_bit(binding.id as u32) {
+                        patch.clear(exact_kernel::StyleMask::of(style));
+                        if binding.written {
+                            patch.written.set(style);
+                        } else {
+                            patch.written.clear(style);
+                        }
                     }
                 }
                 BindingKind::Style => {
@@ -521,6 +533,11 @@ impl Build<'_> {
                     } else {
                         bridge::set_binding_style(&mut patch, &binding, family_value, plan)
                     };
+                    if let Ok(style) = styled {
+                        if !binding.written {
+                            patch.written.clear(style);
+                        }
+                    }
                     match styled {
                         Ok(StyleId::Animation) => {
                             self.sites.keyframes.resolve(&mut patch.animation);
@@ -544,10 +561,13 @@ impl Build<'_> {
                         Err(
                             bridge::BridgeError::Style(_) | bridge::BridgeError::StyleKind { .. },
                         ) => {
-                            if let (true, Some(style)) =
-                                (binding.written, StyleId::from_bit(binding.id as u32))
-                            {
-                                patch.written.set(style);
+                            if let Some(style) = StyleId::from_bit(binding.id as u32) {
+                                patch.clear(exact_kernel::StyleMask::of(style));
+                                if binding.written {
+                                    patch.written.set(style);
+                                } else {
+                                    patch.written.clear(style);
+                                }
                             }
                         }
                         Err(e) => return Err(DocTreeError::Refused(format!("{e:?}"))),

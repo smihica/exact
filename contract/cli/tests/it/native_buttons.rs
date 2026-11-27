@@ -3,21 +3,14 @@
 //! symbol `image` children its face, its style from `buttonStyles` — and
 //! everything Contract can see that the platform cannot draw is refused.
 
+use crate::source::{boxed, NoData, Source};
 use exact_kernel::{Kernel, NodeType, PressFace, PropId, PropValue};
-use exact_runner::{DataError, DataSource, Event, Runner, RunnerError, Value};
+use exact_runner::{Event, Runner, RunnerError, Value};
 
-struct NoData;
-
-impl DataSource for NoData {
-    fn query(&mut self, source: &str, _args: &[Value]) -> Result<Value, DataError> {
-        Err(DataError::UnknownSource(source.to_string()))
-    }
-}
-
-fn boot(src: &str) -> Runner<NoData> {
+fn boot(src: &str) -> Runner<Source> {
     Runner::boot(
         contract::compile(src).unwrap_or_else(|e| panic!("{e}")),
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -25,7 +18,7 @@ fn boot(src: &str) -> Runner<NoData> {
     .unwrap()
 }
 
-fn view_of(r: &Runner<NoData>, test_id: &str) -> u32 {
+fn view_of(r: &Runner<Source>, test_id: &str) -> u32 {
     let key = r.kernel().find_by_test_id(test_id)[0];
     r.kernel().node_by_key(key).unwrap().id
 }
@@ -379,10 +372,207 @@ fn its_face_is_a_title_a_symbol_or_both() {
     }
 }
 
+fn item(view: &str, labels: &[&str]) -> String {
+    let uses: String = labels
+        .iter()
+        .map(|l| format!("      Item(label={l}, go=go)\n"))
+        .collect();
+    let view: String = view.lines().map(|line| format!("    {line}\n")).collect();
+    format!(
+        "component App\n  state busy = false\n  action go\n    busy = !busy\n  view\n    column\n{uses}component Item\n  props\n    label: string\n    go: action\n  view\n{view}"
+    )
+}
+
+fn guarded_item(cond: &str, label: &str, labels: &[&str]) -> String {
+    item(
+        &format!(
+            "if {cond}\n  button appearance=\"auto\" press=go aria-label={label}\n    image \"symbol:add\""
+        ),
+        labels,
+    )
+}
+
+fn assert_label_refused(src: &str) {
+    let Err(e) = contract::compile(src) else {
+        panic!("compiled a native button with a blank label\n{src}");
+    };
+    assert_eq!(e.id, "lower-button-content", "{src}\n{e}");
+    assert!(e.message.contains("never empty"), "{e}");
+}
+
+fn assert_unlabelled_warning(src: &str) {
+    let (result, warnings) = contract::compile_warned(src);
+    result.unwrap_or_else(|e| panic!("{e}\n{src}"));
+    assert_eq!(
+        warnings.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+        ["lower-button-unlabelled"],
+        "{src}\n{warnings:?}"
+    )
+}
+
 #[test]
-fn its_box_carries_place_size_opacity_transforms_and_accent_only() {
+fn a_label_its_if_rules_blank_out_of_is_never_empty() {
+    // #1324: `label=""` inlines to `if "" != ""` around `aria-label=""`, a
+    // button that never renders.
+    for labels in [&["\"\"", "\"Add\""][..], &["(busy ? \"Add\" : \"\")"]] {
+        let src = guarded_item("label != \"\"", "label", labels);
+        boot(&src);
+        let (_, warnings) = contract::compile_warned(&src);
+        assert!(warnings.is_empty(), "{labels:?}: {warnings:?}");
+    }
+    boot(&guarded_item("\"\" != label", "label", &["\"\""]));
+    for (cond, label, labels) in [
+        ("label != \"\"", "\"\"", &["\"Add\""][..]),
+        ("label != \"\"", "label", &["\" \""]),
+        (
+            "label != \"\"",
+            "label",
+            &["(busy ? \"\" : (\" \" + \" \"))"],
+        ),
+        ("label == \"\"", "label", &["\"\""]),
+    ] {
+        assert_label_refused(&guarded_item(cond, label, labels));
+    }
+}
+
+#[test]
+fn an_unlabelled_inline_warns_once_in_either_order() {
+    for labels in [["\"\"", "\" \"", "\" \""], ["\" \"", "\" \"", "\"\""]] {
+        let src = guarded_item("label != \"\"", "label", &labels)
+            .replace("appearance=\"auto\"", "appearance=\"none\"");
+        assert_unlabelled_warning(&src);
+    }
+}
+
+#[test]
+fn a_label_guard_does_not_follow_a_shadowed_binding() {
+    for nested in [
+        "for n in [0] key=n\n            Item(n=n, omitted=\"hidden\", go=go)",
+        "match some(0)\n            case some(n)\n              Item(n=n, omitted=\"hidden\", go=go)\n            case none\n              text \"None\"",
+    ] {
+        let src = format!(
+            r#"component App
+  state busy = false
+  action go
+    busy = !busy
+  view
+    column
+      for n in [1] key=n
+        Item(n=n, omitted="", go=go)
+          {nested}
+component Item
+  props
+    n: number
+    omitted: string
+    go: action
+  slot
+  derive label = n == 1 ? "Add" : ""
+  view
+    if label != omitted
+      button appearance="auto" press=go aria-label=label
+        image "symbol:add"
+      children
+"#
+        );
+        assert_label_refused(&src);
+    }
+}
+
+#[test]
+fn a_label_guard_reaches_the_button_name_in_its_children() {
+    for child in [
+        "svg viewBox=\"0 0 10 10\" width=10 height=10 aria-label=label\n      circle cx=5 cy=5 r=4",
+        "image \"symbol:add\" alt=label",
+        "text label",
+    ] {
+        for labels in [["\"\"", "\"Add\""], ["\"Add\"", "\"\""]] {
+            let src = item(
+                &format!("if label != \"\"\n  button appearance=\"none\" press=go\n    {child}"),
+                &labels,
+            );
+            let (result, warnings) = contract::compile_warned(&src);
+            result.unwrap_or_else(|e| panic!("{src}\n{e}"));
+            assert!(warnings.is_empty(), "{src}\n{warnings:?}");
+        }
+    }
+}
+
+#[test]
+fn a_label_guard_follows_a_forwarded_enum_prop() {
+    let src = r#"component App
+  state busy = false
+  action go
+    busy = !busy
+  view
+    column
+      Item(label="", go=go)
+      Item(label="Add", go=go)
+component Item
+  props
+    label: enum<"", "Add">
+    go: action
+  view
+    if label != ""
+      Face(label=label, go=go)
+component Face
+  props
+    label: enum<"", "Add">
+    go: action
+  view
+    button appearance="auto" press=go aria-label=label
+      image "symbol:add"
+"#;
+    let (result, warnings) = contract::compile_warned(src);
+    result.unwrap_or_else(|e| panic!("{e}"));
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let else_arm = src
+        .replace(
+            "      Face(label=label, go=go)",
+            "      text \"Add\"\n    else\n      Face(label=label, go=go)",
+        )
+        .replace("appearance=\"auto\"", "appearance=\"none\"");
+    assert_unlabelled_warning(&else_arm);
+}
+
+#[test]
+fn a_label_guard_does_not_exempt_a_separate_empty_literal() {
+    assert_label_refused(&guarded_item("label != \"\"", "\"\"", &["\"\""]));
+}
+
+#[test]
+fn a_separate_empty_label_warns_under_a_guard() {
+    let src = guarded_item("label != \"\"", "\"\"", &["\"\""])
+        .replace("appearance=\"auto\"", "appearance=\"none\"");
+    assert_unlabelled_warning(&src);
+}
+
+#[test]
+fn a_label_guard_does_not_reach_the_else_arm() {
+    let src = item(
+        "if label != \"\"\n  text \"Add\"\nelse\n  button appearance=\"auto\" press=go aria-label=label\n    image \"symbol:add\"",
+        &["\"\""],
+    );
+    assert_label_refused(&src);
+    assert_unlabelled_warning(&src.replace("appearance=\"auto\"", "appearance=\"none\""));
+}
+
+#[test]
+fn a_label_guard_does_not_reach_the_next_sibling() {
+    let src = item(
+        "if label != \"\"\n  text \"Add\"\nbutton appearance=\"auto\" press=go aria-label=label\n  image \"symbol:add\"",
+        &["\"\""],
+    );
+    assert_label_refused(&src);
+    assert_unlabelled_warning(&src.replace("appearance=\"auto\"", "appearance=\"none\""));
+}
+
+/// LLP 1069.011 D6: the author places and sizes a native button's box, and its layout transition moves it by its
+/// centre (LLP 1063)
+#[test]
+fn its_box_carries_place_size_motion_opacity_transforms_and_accent_only() {
     boot(&app(
-        "button appearance=\"auto\" press=go key=keys width=120 margin-top=8 align-self=\"center\" display=(busy ? \"none\" : \"flex\") opacity=0.5 translate=\"4px 0px\" accent-color=\"#34c759\" transition=\"opacity 200ms\" animation=\"fade 300ms\"\n  text \"Go\"",
+        "button appearance=\"auto\" press=go key=keys width=120 margin-top=8 align-self=\"center\" display=(busy ? \"none\" : \"flex\") opacity=0.5 translate=\"4px 0px\" accent-color=\"#34c759\" transition=\"opacity 200ms\" animation=\"fade 300ms\" -exact-layout-transition=\"-exact-spring(290, 34, 1)\"\n  text \"Go\"",
     ));
     for body in [
         "button appearance=\"auto\" press=go background-color=\"#ff0000\"\n  text \"Go\"",
@@ -415,6 +605,8 @@ fn it_goes_where_a_button_goes_and_admits_dialog_and_popover_invokers() {
         "row toolbarPlacement=\"window\" role=\"toolbar\"\n  button appearance=\"auto\" buttonStyle=\"filled\" toolbarPlacement=\"navigation\" press=go\n    text \"Edit\"",
         "button appearance=\"auto\" press=go aria-keyshortcuts=\"Meta+S\"\n  text \"Save\"",
         "column id=\"menu\" popover=\"auto\" role=\"menu\"\n  button appearance=\"auto\" role=\"menuitem\" press=go\n    image \"symbol:send\"\n    text \"Send\"\n  if busy\n    button appearance=\"auto\" press=go\n      text \"Wait\"",
+        "column popover=\"auto\"\n  column role=\"group\"\n    if busy\n      button appearance=\"auto\" press=go\n        image \"symbol:send\"\n        text \"Send\"\n        text \"Send a copy\"",
+        "column popover=\"auto\"\n  column role=\"group\"\n    button buttonStyle=\"plain\" press=go\n      text \"Send\"",
         "scroll swipeContent=\"body\" swipeTrailing=\"mute\" overflow-x=\"scroll\" width=200 height=40\n  row id=\"body\" width=200 height=40\n    button appearance=\"auto\" press=go\n      text \"Open\"\n  button id=\"mute\" appearance=\"auto\" press=go aria-label=\"Mute\"\n    image \"symbol:send\"",
         "column id=\"confirm\" popover=\"auto\" role=\"alertdialog\"\n  text \"Delete it?\"\n  button appearance=\"auto\" popovertarget=\"confirm\" popovertargetaction=\"hide\" press=go destructive=true\n    text \"Delete\"\n  button appearance=\"auto\" popovertarget=\"confirm\" popovertargetaction=\"hide\"\n    text \"Cancel\"",
         "dialog id=\"ask\" closedby=\"any\"\n  button appearance=\"auto\" commandfor=\"ask\" command=\"close\" press=go\n    text \"Send\"",
@@ -427,6 +619,8 @@ fn it_goes_where_a_button_goes_and_admits_dialog_and_popover_invokers() {
         "button appearance=\"auto\" press=go role=\"dialog\"\n  text \"Go\"",
         "button appearance=\"auto\" press=go type=\"submit\"\n  text \"Go\"",
         "column id=\"menu\" popover=\"auto\"\n  row\n    button appearance=\"auto\" press=go\n      text \"Deep\"",
+        "column popover=\"auto\"\n  column role=\"group\"\n    column role=\"group\"\n      button appearance=\"auto\" press=go\n        text \"Deep\"",
+        "column popover=\"auto\"\n  column role=\"group\"\n    button appearance=\"none\" press=go\n      button appearance=\"auto\" press=go\n        text \"Nested\"",
         // A projection makes one item of a custom button, dropping what it holds.
         "row role=\"toolbar\" toolbarPlacement=\"window\"\n  button press=go\n    button appearance=\"auto\" press=go\n      text \"Inner\"",
     ] {
@@ -436,6 +630,25 @@ fn it_goes_where_a_button_goes_and_admits_dialog_and_popover_invokers() {
             message.contains("custom `button`") || message.contains("`\"button\"`"),
             "{body}: {message}"
         );
+    }
+}
+
+#[test]
+fn a_nested_popover_supplies_its_own_native_rows() {
+    for body in [
+        "column popover=\"auto\"\n  button appearance=\"auto\" press=go\n    text \"Outer\"\ncolumn popover=\"auto\"\n  button appearance=\"auto\" press=go\n    text \"Inner\"",
+        "column popover=\"auto\"\n  column popover=\"auto\"\n    button appearance=\"auto\" press=go\n      text \"Inner\"\n  button appearance=\"auto\" press=go\n    text \"Outer\"",
+        "column popover=\"auto\"\n  column role=\"group\"\n    column popover=\"auto\"\n      column role=\"group\"\n        button appearance=\"auto\" press=go\n          text \"Inner\"",
+        "column popover=\"auto\"\n  if busy\n    column popover=\"manual\"\n      column popover=\"auto\"\n        button appearance=\"auto\" press=go\n          text \"Inner\"",
+    ] {
+        contract::compile(&app(body)).unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+    for body in [
+        "column popover=\"auto\"\n  column popover=\"auto\"\n    row\n      button appearance=\"auto\" press=go\n        text \"Too deep\"",
+        "column popover=\"auto\"\n  column popover=\"auto\"\n    button press=go\n      button appearance=\"auto\" press=go\n        text \"Nested button\"",
+    ] {
+        let (id, message) = refused(body);
+        assert_eq!(id, "lower-button-context", "{body}: {message}");
     }
 }
 
@@ -643,6 +856,19 @@ fn platform_rows_belong_only_to_native_buttons_and_roundtrip_through_classes() {
             assert!(message.contains("native button"), "{body}: {message}");
         }
     }
+    // A segmented control takes a size, not a corner style (LLP 1069.011.001 D8)
+    for role in ["tablist", "radiogroup"] {
+        let item = if role == "tablist" { "tab" } else { "radio" };
+        let segments = format!(
+            "  button role=\"{item}\"\n    text \"A\"\n  button role=\"{item}\"\n    text \"B\""
+        );
+        let body = format!("row role=\"{role}\" -exact-control-size=\"large\"\n{segments}");
+        contract::compile(&app(&body)).unwrap_or_else(|e| panic!("{body}: {e}"));
+        let (id, message) = refused(&format!(
+            "row role=\"{role}\" -exact-corner-style=\"capsule\"\n{segments}"
+        ));
+        assert_eq!(id, "lower-button-style-attr", "{role}: {message}");
+    }
     let mut r = boot(&format!("style A\n  -exact-control-size=\"large\"\n  -exact-corner-style=\"capsule\"\nstyle B\n  opacity=1\n{}", app("button appearance=\"auto\" class=(n == 0 ? A : B) press=go testId=\"b\"\n  text \"Go\"")));
     let b = view_of(&r, "b");
     let style = r.kernel().button_face_style(b).unwrap();
@@ -717,6 +943,10 @@ fn the_default_is_native_and_explicit_none_is_bare() {
         ("", true),
         ("appearance=\"auto\"", true),
         ("appearance=\"none\"", false),
+        (
+            "-exact-layout-transition=\"-exact-spring(290, 34, 1)\"",
+            true,
+        ),
     ] {
         assert_eq!(
             appearance_of(&app(&format!("button {attrs} testId=\"b\"\n  text \"Go\""))),
@@ -956,6 +1186,11 @@ fn bare_reasons_live_only_in_the_development_map_and_migration_uses_merged_rows(
         ),
         (
             "button display=(n == 0 ? \"none\" : \"flex\") testId=\"b\"\n  text \"Go\"",
+            false,
+        ),
+        // A layout transition only moves the native button between its places
+        (
+            "button -exact-layout-transition=\"-exact-spring(290, 34, 1)\" testId=\"b\"\n  text \"Go\"",
             false,
         ),
     ] {

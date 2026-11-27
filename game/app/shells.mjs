@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path
 import { fileURLToPath } from 'node:url';
 import { pathWithin } from '../../scripts/paths.mjs';
 import { parseManifest, shaderFiles } from '../../scripts/app.mjs';
-import { lockBlocks, lockChanges, memberRefusal, mergeLockBlocks, outsideSdkLock, series, seriesId, staleLock } from '../../scripts/app-shells.mjs';
+import { lockBlocks, lockChanges, memberRefusal, mergeLockBlocks, outsideSdkLock, series, seriesId, staleLock, takenFromExact2 } from '../../scripts/app-shells.mjs';
 
 // Resolve authored keys in memory before writing the resolved manifest.
 const merge = (base, overrides) => {
@@ -204,6 +204,10 @@ export function gameShells(dir, game, workspace, {env = process.env, updateLock 
   const authoredLogic = existsSync(resolve(dir, 'logic/Cargo.toml'));
   cargo.workspace.members = ['bake','gpu','web','apple','linux','windows','android', authoredLogic ? '../logic' : 'logic', ...(data ? ['../data'] : []), ...(render ? ['../render'] : [])];
   delete cargo.workspace.exclude;
+  // Its members take exact2's crates from it, which names the checkout by its real path (scripts/paths.mjs `cargoCheckout`).
+  const taken = takenFromExact2([...(authoredLogic ? ['logic'] : []), ...(data ? ['data'] : []), ...(render ? ['render'] : [])]
+    .map(member => resolve(dir, member, 'Cargo.toml')).filter(existsSync), Object.keys(cargo.workspace.dependencies));
+  for (const { name, dir: crate, defaults } of taken.entries()) cargo.workspace.dependencies[name] = { path: crate, ...(defaults ? {} : { 'default-features': false }) };
   // Engine crates are dependencies here: the wildcard already optimizes them.
   // Retain member overrides and any settings distinct from that wildcard.
   const members = shellMembers(app.game, name);
@@ -643,9 +647,45 @@ export function refreshLock(dir, {source = gameRoot, env = process.env} = {}) {
     : `${own}: ${changes.length ? listed(changes, 24) : 'unchanged'}`;
 }
 
+/** Whether parsed rustflags tokens leave LLVM's floating-point contraction off. */
+function keepsFpContractOff(tokens) {
+  let state = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const arg = token === '-C' ? tokens[++i] : token.startsWith('-C') ? token.slice(2) : null;
+    if (!arg || !arg.startsWith('llvm-args=')) continue;
+    for (const part of arg.slice('llvm-args='.length).split(/\s+/)) {
+      if (part.startsWith('-fp-contract=')) state = part;
+    }
+  }
+  return state === '-fp-contract=off';
+}
+
+/** Retain `-C llvm-args=-fp-contract=off` whenever an inherited Cargo rustflags
+ * variable would displace the game workspace's `[build] rustflags` (game/engine/build.rs). */
+export function gameCargoEnv(env = process.env) {
+  let next = null;
+  const set = (key, value) => { next ??= { ...env }; next[key] = value; };
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== 'string') continue;
+    if (/^CARGO_ENCODED_RUSTFLAGS$/i.test(key)) {
+      const tokens = value ? value.split('\x1f') : [];
+      if (!keepsFpContractOff(tokens))
+        set(key, value ? `${value}\x1f-C\x1fllvm-args=-fp-contract=off` : '-C\x1fllvm-args=-fp-contract=off');
+    } else if (/^(RUSTFLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_.+_RUSTFLAGS)$/i.test(key)) {
+      const trimmed = value.trim();
+      const tokens = trimmed ? trimmed.split(/\s+/) : [];
+      if (!keepsFpContractOff(tokens))
+        set(key, trimmed ? `${trimmed} -C llvm-args=-fp-contract=off` : '-C llvm-args=-fp-contract=off');
+    }
+  }
+  return next ?? env;
+}
+
 /** The determinism lints (app/determinism/clippy.toml) on the game's logic
  * library; tests may time themselves. @ref llp/1046.003-game-engine-as-built.explainer.md#determinism-lints-2026-09-23 */
 export function lintGame(dir, game, {env = process.env, render = true} = {}) {
+  env = gameCargoEnv(env);
   const result = spawnSync('cargo', ['clippy', '-p', game.crate, '--lib', '--locked', '--offline', '--quiet', '--',
     '-A', 'clippy::all', '-D', 'clippy::disallowed_methods', '-D', 'clippy::disallowed_types'], {cwd:resolve(dir, '.shells'), env, encoding:'utf8', maxBuffer:64 * 1024 * 1024});
   if (result.error || result.status !== 0) throw new Error(`determinism lints refused ${game.crate} (game/README.md, "Determinism — the contract"):\n${result.stderr || result.error?.message}`);
@@ -660,7 +700,7 @@ export function lintGame(dir, game, {env = process.env, render = true} = {}) {
 export function checkGame(dir, {env = process.env} = {}) {
   const started = performance.now(), game = gameDefaults(dir)?.game;
   if (!game) throw new Error(`${dir}: no game logic to check`);
-  env = {...env, CARGO_TARGET_DIR:env.CARGO_TARGET_DIR ?? resolve(dir, 'target')};
+  env = gameCargoEnv({...env, CARGO_TARGET_DIR:env.CARGO_TARGET_DIR ?? resolve(dir, 'target')});
   prepareGame(dir, game, gameRoot, {env});
   const errors = [];
   const result = spawnSync('cargo', ['check', '-p', game.crate, '--lib', '--locked', '--offline', '--quiet'], {
@@ -738,6 +778,7 @@ export function sdkFetch({offline = false, source = gameRoot, env = process.env}
  * proof's first input inventory: the generated `.shells/` and the baked `assets/`. The
  * build then rewrites the same files and creates no entry under the proof's watch. */
 export function prepareProofTree(dir, env = process.env) {
+  env = gameCargoEnv(env);
   const game = gameDefaults(dir)?.game;
   if (!game) return bakeGameArt(dir, env);
   prepareGame(dir, game, gameRoot, {env});
@@ -755,6 +796,7 @@ export function prepareProofTree(dir, env = process.env) {
  * without art/ (or a manifest to prune) is left alone. */
 export function bakeGameArt(dir, env = process.env) {
   if (!hasArt(dir)) return false;
+  env = gameCargoEnv(env);
   const result = spawnSync('cargo', ['run', '--manifest-path', resolve(gameRoot, 'Cargo.toml'), '-p', 'exact-game-bake', '--locked', '--offline', '--', '--art', dir], {
     cwd:gameRoot, env, stdio:['ignore', 'inherit', 'inherit'],
   });
@@ -762,7 +804,7 @@ export function bakeGameArt(dir, env = process.env) {
   return true;
 }
 
-if (import.meta.main) {
+async function main() {
   const args = process.argv.slice(2), requested = args.find(arg => !arg.startsWith('--'));
   if (args.includes('--check')) {
     try { console.log(checkGame(resolve(requested ?? '.'))); }
@@ -779,7 +821,7 @@ if (import.meta.main) {
         prepareGame(dir, game);
         // The game's own target, beside the build-dir its config names: the SDK's
         // is shared with the SDK's builds and every other game's.
-        const env = {...process.env, CARGO_TARGET_DIR:process.env.CARGO_TARGET_DIR ?? resolve(dir,'target')};
+        const env = gameCargoEnv({...process.env, CARGO_TARGET_DIR:process.env.CARGO_TARGET_DIR ?? resolve(dir,'target')});
         bakeGameArt(dir, env);
         try { lintGame(dir, game, {env}); } catch (error) { console.error(error.message); failed = true; }
         const name = game.crate.slice(0, -'-logic'.length);
@@ -806,6 +848,9 @@ if (import.meta.main) {
       const { lockSwiftPackages } = await import('../../host/apple/compose.mjs');
       const swift = lockSwiftPackages({ dir, manifest: gameDefaults(dir) });
       if (swift) console.log(swift);
+      const { reportAndroidLock } = await import('../../scripts/app-cli.mjs');
+      const android = await reportAndroidLock(dir);
+      if (android) console.log(android);
     }
     catch (error) { console.error(error.message); process.exitCode = 1; }
   } else {
@@ -820,3 +865,5 @@ if (import.meta.main) {
     }
   }
 }
+
+if (import.meta.main) main().catch(error => { console.error(error); process.exitCode = 1; });

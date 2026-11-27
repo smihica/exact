@@ -18,6 +18,11 @@ fn the_detent_words_lower_and_others_are_refused() {
         "300 large",
         "fit-content",
         "fit-content large",
+        "medium fit-content",
+        "50% fit-content",
+        "25% 50% fit-content",
+        "300 fit-content",
+        "200 400 fit-content",
         "128.5",
         "45%",
         "45% large",
@@ -43,6 +48,8 @@ fn the_detent_words_lower_and_others_are_refused() {
         // `100%` is `large`: the same height, so one of them.
         ("100% large", "large"),
         ("45% 100% large", "large"),
+        ("300 50% fit-content", "50%"),
+        ("500 300 fit-content", "300"),
     ] {
         let error = compile(value).unwrap_err().to_string();
         assert!(
@@ -67,9 +74,16 @@ fn the_detent_words_lower_and_others_are_refused() {
         ("NaN%", "NaN%"),
         ("45 %", "%"),
         ("fit-content 300", "fit-content 300"),
-        ("300 fit-content", "300 fit-content"),
         ("fit-content medium", "fit-content medium"),
+        ("medium fit-content large", "medium fit-content large"),
         ("large fit-content", "large fit-content"),
+        ("100% fit-content", "100% fit-content"),
+        ("45% 100% fit-content", "45% 100% fit-content"),
+        ("fit-content fit-content", "fit-content fit-content"),
+        (
+            "medium fit-content fit-content",
+            "medium fit-content fit-content",
+        ),
     ] {
         let error = compile(value).unwrap_err().to_string();
         assert!(
@@ -108,10 +122,8 @@ fn sheet(route: &str, inner: &str) -> String {
     )
 }
 
-/// A sheet opens at the detent `navigationInitialDetent` names, one of the
-/// words of its route's `navigationDetent` (`large` when it says none); a
-/// literal naming another height is refused, a computed list is not
-/// checked, and off a route, where no host reads it, it is refused.
+/// An initial detent belongs to the sheet's list. With no list, a route
+/// opens large and a dialog fits its contents.
 #[test]
 fn the_initial_detent_is_one_of_the_sheets_heights() {
     let compile = |route: &str| contract::compile(&sheet(route, ""));
@@ -152,7 +164,18 @@ fn the_initial_detent_is_one_of_the_sheets_heights() {
             "{value:?}: {error}"
         );
     }
-    // Off a route: a box in one, and a keyed element no navigation root holds.
+    let dialog = |attrs| {
+        contract::compile(&format!(
+            "component App\n  view\n    dialog id=\"form\" {attrs}\n      text \"Form\"\n"
+        ))
+    };
+    dialog("navigationDetent=\"medium large\" navigationInitialDetent=\"large\"").unwrap();
+    dialog("navigationInitialDetent=\"fit-content\"").unwrap();
+    assert!(dialog("navigationInitialDetent=\"large\"")
+        .unwrap_err()
+        .to_string()
+        .contains("`fit-content` alone"));
+    // A box inside a route and a keyed element outside a navigation root.
     for src in [
         sheet("navigationDetent=\"medium large\"", "navigationInitialDetent=\"large\""),
         "component App\n  view\n    column\n      column navigationKey=\"sheet\" navigationPresentation=\"modal\" navigationDetent=\"medium large\" navigationInitialDetent=\"large\"\n        text \"Sheet\"\n".into(),
@@ -163,4 +186,92 @@ fn the_initial_detent_is_one_of_the_sheets_heights() {
             "{error}"
         );
     }
+}
+
+/// A selected detent is one of the sheet's heights, as an initial one is, and only a route says
+/// one (LLP 1123 D7).
+#[test]
+fn the_selected_detent_is_one_of_the_sheets_heights() {
+    let compile = |route: &str| contract::compile(&sheet(route, ""));
+    for route in [
+        "navigationDetent=\"medium large\" navigationSelectedDetent=\"large\"",
+        "navigationDetent=\"medium large\" navigationSelectedDetent=(detents)",
+        "navigationSelectedDetent=\"large\"",
+        "navigationDetent=\"medium large\" navigationInitialDetent=\"medium\" navigationSelectedDetent=\"large\"",
+    ] {
+        compile(route).unwrap_or_else(|e| panic!("{route:?}: {e}"));
+    }
+    let error = compile("navigationDetent=\"medium large\" navigationSelectedDetent=\"300\"")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("`navigationSelectedDetent=\"300\"` is not one of this sheet's heights"),
+        "{error}"
+    );
+    let error = contract::compile(
+        "component App\n  view\n    dialog id=\"form\" navigationSelectedDetent=\"fit-content\"\n      text \"Form\"\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("`navigationSelectedDetent` is read only on a route."),
+        "{error}"
+    );
+}
+
+/// A sheet's edge attachment, its scroll expansion and its sizing are words of their own; any
+/// other word is refused (LLP 1123 D7).
+#[test]
+fn the_sheet_choices_take_their_words() {
+    let compile = |attr: &str| {
+        contract::compile(&format!(
+            "component App\n  view\n    column navigationKey=\"a\" navigationPresentation=\"modal\" {attr}\n"
+        ))
+    };
+    for (name, good, bad) in [
+        (
+            "navigationEdgeAttachedInCompactHeight",
+            &["true", "false"][..],
+            &["yes", ""][..],
+        ),
+        ("navigationScrollExpands", &["true", "false"], &["auto", ""]),
+        (
+            "navigationWidthFollowsPreferredContentSize",
+            &["true", "false"],
+            &["preferred", ""],
+        ),
+        (
+            "navigationSizing",
+            &["page", "form", "automatic"],
+            &["fitted", "full", ""],
+        ),
+    ] {
+        for value in good {
+            compile(&format!("{name}=\"{value}\""))
+                .unwrap_or_else(|e| panic!("{name}={value:?}: {e}"));
+        }
+        for value in bad {
+            let error = compile(&format!("{name}=\"{value}\""))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("lower-attr-value") && error.contains(&format!("`{name}` takes")),
+                "{name}={value:?}: {error}"
+            );
+        }
+    }
+}
+
+/// An undimmed detent is one of the sheet's heights, on a route (LLP 1123 D7).
+#[test]
+fn the_undimmed_detent_is_one_of_the_sheets_heights() {
+    let compile = |route: &str| contract::compile(&sheet(route, ""));
+    compile("navigationDetent=\"medium large\" navigationUndimmedDetent=\"medium\"").unwrap();
+    let error = compile("navigationDetent=\"medium large\" navigationUndimmedDetent=\"300\"")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("`navigationUndimmedDetent=\"300\"` is not one of this sheet's heights"),
+        "{error}"
+    );
 }

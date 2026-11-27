@@ -49,6 +49,7 @@ fn a_derive_bound_spring_moves_on_the_native_clock() {
     );
 }
 
+const SCALE_KEYS: [&str; 2] = ["transform.scale.x", "transform.scale.y"];
 const APP: &str = r##"keyframes sweep
   from translate="-24px 0px"
   to translate="64px 8px"
@@ -150,7 +151,7 @@ fn a_boxs_transform_and_colour_keyframes_play_in_core_animation() {
         "{on}"
     );
     assert_eq!(keys(&on, id(&host, "spin")), ["transform.rotation.z"]);
-    assert_eq!(keys(&on, id(&host, "pulse")), ["transform.scale"]);
+    assert_eq!(keys(&on, id(&host, "pulse")), SCALE_KEYS);
     assert_eq!(keys(&on, id(&host, "glow")), ["backgroundColor"]);
     // A turn in radians, over one linear interval; the y axis its own track.
     let spin = specs(&on, id(&host, "spin")).unwrap();
@@ -305,7 +306,7 @@ fn the_native_host_lowers_box_keyframes() {
     assert_eq!(host.svg.box_motion, svg::render_server());
     let on = host.dispatch_at(id(&host, "go"), Event::Press, 100.0);
     if svg::render_server() {
-        assert_eq!(keys(&on, id(&host, "pulse")), ["transform.scale"]);
+        assert_eq!(keys(&on, id(&host, "pulse")), SCALE_KEYS);
     } else {
         assert!(keys(&on, id(&host, "sweep")).is_empty(), "{on}");
         assert!(on.contains("\"motion\":true"));
@@ -1154,12 +1155,12 @@ fn random_lowered_colour_tracks_play_as_the_engine_samples() {
 
 #[test]
 fn an_unsupported_transition_property_is_named() {
-    let literal = "component App\n  view\n    box transition=\"opacity 200ms, clip-path 200ms\"\n";
+    let literal = "component App\n  view\n    box transition=\"opacity 200ms, mask-image 200ms\"\n";
     let diagnostics = contract::compile(literal).unwrap_err();
     assert!(
-        format!("{diagnostics:?}").contains("`clip-path` is not a supported transition property")
+        format!("{diagnostics:?}").contains("`mask-image` is not a supported transition property")
     );
-    let source = "component App\n  state transitions = \"opacity 200ms, clip-path 200ms\"\n  view\n    box transition=transitions\n";
+    let source = "component App\n  state transitions = \"opacity 200ms, mask-image 200ms\"\n  view\n    box transition=transitions\n";
     let plan = contract::compile(source).unwrap().encode();
     let (host, _) = Host::boot(
         &plan,
@@ -1171,7 +1172,7 @@ fn an_unsupported_transition_property_is_named() {
     .unwrap();
     let logs = host.agent("{\"op\":\"logs\"}");
     assert!(logs.contains("invalid transition value"), "{logs}");
-    assert!(logs.contains("clip-path 200ms"), "{logs}");
+    assert!(logs.contains("mask-image 200ms"), "{logs}");
 }
 
 #[test]

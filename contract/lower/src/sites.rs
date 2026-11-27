@@ -8,6 +8,27 @@ use contract_syntax::{Expanded, Instance, Span};
 use exact_kernel::StyleId;
 use exact_plan::{BindingKind, BindingsRow};
 
+/// Source metadata to emit alongside the compiled program.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum SourceOutput {
+    /// Keep authored places in the release plan.
+    Places,
+    /// Also produce the development source map.
+    Mapped,
+    /// Omit authored places for comparisons between spellings.
+    Comparison,
+}
+
+impl From<bool> for SourceOutput {
+    fn from(mapped: bool) -> Self {
+        if mapped {
+            Self::Mapped
+        } else {
+            Self::Places
+        }
+    }
+}
+
 /// Where every row the map describes came from, in plan order.
 #[derive(Debug, Clone)]
 pub struct Sites {
@@ -238,12 +259,21 @@ pub(crate) fn node_site(
     }
 }
 
-/// The style rows of `bindings`, each with its origin.
+/// The style rows of `bindings`, each with its winning origin.
 pub(crate) fn style_rows(bindings: &[BindingsRow], origins: &[Origin]) -> Vec<(StyleId, Origin)> {
-    bindings
-        .iter()
-        .zip(origins)
-        .filter(|(b, _)| b.kind == BindingKind::Style)
-        .filter_map(|(b, o)| StyleId::from_bit(b.id as u32).map(|row| (row, o.clone())))
-        .collect()
+    let mut out: Vec<(StyleId, Origin)> = Vec::new();
+    for (b, o) in bindings.iter().zip(origins) {
+        if b.kind != BindingKind::Style {
+            continue;
+        }
+        let Some(row) = StyleId::from_bit(b.id as u32) else {
+            continue;
+        };
+        if let Some((_, existing)) = out.iter_mut().find(|(r, _)| *r == row) {
+            *existing = o.clone();
+        } else {
+            out.push((row, o.clone()));
+        }
+    }
+    out
 }

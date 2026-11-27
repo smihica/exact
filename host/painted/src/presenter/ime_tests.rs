@@ -23,7 +23,9 @@ fn boot(source: &str) -> (Presenter<()>, ViewId) {
 }
 
 fn fixture(attrs: &str) -> (Presenter<()>, ViewId) {
-    boot(&format!("component App\n  view\n    column\n      textarea testId=\"editor\" value=\"a🦀z\" width=220 height=64 padding=4 appearance=\"none\" outline=\"none\" font-size=16 line-height=\"24px\" {attrs}\n      input testId=\"other\" value=\"other\"\n"))
+    boot(&format!(
+        "component App\n  view\n    column\n      textarea testId=\"editor\" value=\"a🦀z\" width=220 height=64 padding=4 appearance=\"none\" outline=\"none\" font-size=16 line-height=\"24px\" {attrs}\n      input testId=\"other\" value=\"other\"\n"
+    ))
 }
 
 fn replace_crab(p: &mut Presenter<()>, editor: ViewId) -> Target {
@@ -156,15 +158,13 @@ fn input_handlers_hear_composition_but_their_rewrites_wait_until_commit() {
 
 #[test]
 fn ime_requires_an_editable_target_and_commits_with_field_limits() {
-    for attrs in [
-        "readonly=true",
-        "disabled=true",
-        "type=\"password\"",
-        "inputmode=\"none\"",
-    ] {
+    for attrs in ["readonly=true", "disabled=true", "inputmode=\"none\""] {
         let (p, _) = fixture(attrs);
         assert!(p.ime_target().is_none(), "{attrs}");
     }
+    let (p, _) =
+        boot("component App\n  view\n    input testId=\"editor\" type=\"password\" value=\"\"\n");
+    assert!(p.ime_target().is_none(), "a password field");
     let (mut p, editor) = fixture("maxlength=4");
     replace_crab(&mut p, editor);
     p.ime_preedit("にほんご", Some((12, 12)));
@@ -262,4 +262,54 @@ fn preedit_cursor_offsets_are_clamped_at_utf8_boundaries_and_underline_is_remove
         "composition ink must be visible and disappear on commit"
     );
     assert_eq!(p.field_text(editor), "a日🦀z");
+}
+
+#[test]
+fn a_filtered_edit_preserves_the_caret_and_waits_for_composition() {
+    let source = r#"component Stock
+  state digits = "40"
+  action edit(v: string)
+    digits = v.split("").filter(c => "0123456789".includes(c)).join("")
+  view
+    input value=digits input=edit testId="editor"
+"#;
+    let (mut p, editor) = boot(source);
+    for (a, b, typed, shown, caret) in [
+        (2, 2, "a", "40", 2),
+        (1, 1, "a", "40", 1),
+        (1, 1, "7x", "470", 2),
+        (1, 2, "a", "40", 1),
+    ] {
+        let before = p.field_text(editor);
+        p.mark_field(
+            editor,
+            &before,
+            FieldSelection {
+                start: a,
+                end: b,
+                direction: SelectionDirection::Forward,
+            },
+            false,
+        );
+        p.paste_field(editor, typed, 0.);
+        assert_eq!(p.field_text(editor), shown);
+        assert_eq!(p.field_selection(editor).start, caret);
+        assert_eq!(p.field_selection(editor).end, caret);
+    }
+    p.history_action(editor, false, 1.);
+    assert_eq!(p.field_text(editor), "40");
+    for commit in [false, true] {
+        p.mark_field(editor, "40", FieldSelection::caret(1), false);
+        assert!(p.ime_begin(p.ime_target().unwrap()));
+        p.ime_preedit("a", None);
+        assert_eq!(p.field_text(editor), "4a0");
+        if commit {
+            p.ime_commit("a");
+        } else {
+            p.ime_preedit("", None);
+        }
+        p.ime_end();
+        assert_eq!(p.field_text(editor), "40");
+        assert_eq!(p.field_selection(editor), FieldSelection::caret(1));
+    }
 }

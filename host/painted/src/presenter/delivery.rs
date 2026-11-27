@@ -225,10 +225,11 @@ impl<D: DataSource> Presenter<D> {
                     preferences: Some(self.host.runner().viewport().preferences),
                     time: Some(self.host.runner().wall_time()),
                     place: Some(self.host.runner().place().clone()),
+                    page: Some(self.candidate_page()),
                     ..exact_runner::time::Launch::NONE
                 },
                 || {
-                    Host::boot_with(
+                    Host::boot_candidate(
                         plan,
                         validation,
                         Box::new(Measurer(text.clone())),
@@ -360,7 +361,7 @@ impl<D: DataSource> Presenter<D> {
     /// already running.
     pub fn check_update(&mut self) -> bool {
         match &self.updates {
-            Some(u) => u.check(),
+            Some(u) => u.check(crate::wake::notify),
             None => false,
         }
     }
@@ -440,29 +441,29 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// A periodic check that is due, started; then a finished check, if one
-    /// landed: its line to stderr and the journal (`exact update: …`), the
-    /// store's facts into the runner, and under `immediate` the activation
-    /// it staged, which the next [`Presenter::run_commands`] applies.
+    /// Any finished checks that landed, drained first (logging each, syncing
+    /// delivery, and scheduling `immediate` activation if one staged); then a
+    /// periodic check that is due, started.
     pub fn poll_update(&mut self) -> bool {
+        let mut any = false;
+        while let Some(line) = self.updates.as_mut().and_then(|u| u.take_line()) {
+            any = true;
+            eprintln!("exact update: {line}");
+            self.host.log(format!("exact update: {line}"));
+            self.sync_delivery();
+            if self
+                .update_checks
+                .as_mut()
+                .is_some_and(|c| c.completed(&line))
+            {
+                self.owe_update(false);
+            }
+        }
         let now = self.update_clock();
         if self.update_checks.as_mut().is_some_and(|c| c.tick(now)) {
             self.check_update();
         }
-        let Some(line) = self.updates.as_mut().and_then(|u| u.take_line()) else {
-            return false;
-        };
-        eprintln!("exact update: {line}");
-        self.host.log(format!("exact update: {line}"));
-        self.sync_delivery();
-        if self
-            .update_checks
-            .as_mut()
-            .is_some_and(|c| c.completed(&line))
-        {
-            self.owe_update(false);
-        }
-        true
+        any
     }
 
     /// An interaction holds a replacement ([`Presenter::interaction_hold`]):
@@ -536,10 +537,11 @@ impl<D: DataSource> Presenter<D> {
                 preferences: Some(self.host.runner().viewport().preferences),
                 time: Some(self.host.runner().wall_time()),
                 place: Some(self.host.runner().place().clone()),
+                page: Some(self.candidate_page()),
                 ..exact_runner::time::Launch::NONE
             },
             || {
-                Host::boot_with(
+                Host::boot_candidate(
                     &candidate.plan,
                     data,
                     Box::new(Measurer(text.clone())),
@@ -577,6 +579,7 @@ impl<D: DataSource> Presenter<D> {
         // The reader's next drawing blesses the generation now counted.
         self.blessed = false;
         let faults = self.host.runner().faults().clone();
+        host.install_presence();
         self.host = host;
         self.host.runner_mut().share_faults(&faults);
         // The old executor lets go of everything, then says which uploads had
@@ -597,6 +600,7 @@ impl<D: DataSource> Presenter<D> {
         images.enable_decode();
         images.fit(self.viewport, self.brush.scale);
         self.images = images;
+        self.packages_publish_to_images();
         self.restore_focus(kept);
         self.pointer = None;
         // The reader opens sounds, videos and pages by path: it resolves
@@ -774,7 +778,7 @@ component App
         fn fd(&self) -> std::os::unix::io::RawFd {
             -1
         }
-        fn check(&self) -> bool {
+        fn check(&self, _: fn()) -> bool {
             false
         }
         fn take_line(&mut self) -> Option<String> {

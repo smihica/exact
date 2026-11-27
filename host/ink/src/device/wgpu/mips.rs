@@ -26,7 +26,7 @@ pub(super) fn pipeline(
             compilation_options: Default::default(),
             targets: &[Some(gpu::ColorTargetState {
                 format: gpu::TextureFormat::Rgba8Unorm,
-                blend: Some(gpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                blend: None,
                 write_mask: gpu::ColorWrites::ALL,
             })],
         }),

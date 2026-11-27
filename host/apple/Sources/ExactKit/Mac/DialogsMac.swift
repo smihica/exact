@@ -177,10 +177,12 @@ package final class DialogHost {
         presenter?.mouseChain.bubbledPress?.cancel(in: dialog)
         // What stands on its sheet leaves first: an alert, a dialog opened over it.
         clear(above: dialog)
-        guard let i = entries.firstIndex(where: { $0.dialog === dialog }) else { return }
+        guard entries.contains(where: { $0.dialog === dialog }) else { return }
         for popover in presenter?.menus.presented ?? [] where presenter?.menus.contains(dialog, popover) == true {
             presenter?.menus.close(popover, restoreFocus: false)
         }
+        // Closing a nested popover can run blur handlers that mutate `entries`.
+        guard let i = entries.firstIndex(where: { $0.dialog === dialog }) else { return }
         // The window the focus goes back to: the page's, or the one a sheet stood on.
         let window = entries[i].sheet?.over ?? presenter?.viewport.window
         let hadFocus = window.map { ownsFocus($0) } ?? false
@@ -256,8 +258,9 @@ package final class DialogHost {
                 close(entry.dialog, notify: false)
             }
         }
-        // A `::backdrop` colour that changed while it is open.
+        // A `::backdrop` colour that changed while it is open, and the header its sheet's rows show.
         for entry in entries where !entry.route {
+            if let sheet = entry.sheet, sheet.chrome != nil { presenter.navigation.syncDialogSheet(entry) }
             if let sheet = entry.sheet, sheet.begun { sheet.paintDim(entry.dialog.backdropColor, shown: true) }
             else { entry.backdrop.needsDisplay = true }
         }
@@ -307,9 +310,9 @@ package final class DialogHost {
     /// `start` when it is a responder in the dialog.
     private func stops(_ dialog: NodeView, start: NSView? = nil) -> (views: [(view: NSView, order: Int)], before: Int?) {
         guard let presenter else { return ([], nil) }
-        var views: [(view: NSView, order: Int)] = [], before: Int?
+        var views: [(view: NSView, order: Int)] = [], before: Int?, seen = Set<ObjectIdentifier>()
         func walk(_ node: NodeView) {
-            guard !node.inert, !node.isHidden else { return }
+            guard !node.inert, !node.isHidden, seen.insert(ObjectIdentifier(node)).inserted else { return }
             let view = presenter.keyView(of: node)
             if Presenter.tabbable(node) { views.append((view, node.tabOrder)) }
             else if node === start || view === start { before = views.count }
@@ -465,19 +468,20 @@ extension DialogHost {
     /// Whether the open top modal is a route's sheet, not a dialog.
     package var routeActive: Bool { entries.last?.route == true }
 
-    /// The parent supplies the percentage basis and automatic-size ceiling.
-    /// Routes subtract their chrome and retain authored sizes through Fit;
-    /// ordinary dialogs keep AtMost. Layout rows stay in the kernel.
+    /// The parent supplies the percentage basis and automatic-size ceiling,
+    /// less the sheet's own rows (a route's, or a dialog's whose header they
+    /// show). Routes retain authored sizes through Fit; dialogs keep AtMost.
+    /// Layout rows stay in the kernel.
     package func block(of entry: Entry) -> HostBlock? {
         guard var most = maximum else { return nil }
-        if entry.route, let chrome = entry.sheet?.chrome { most.height = max(0, most.height - chrome.rows) }
+        if let chrome = entry.sheet?.chrome { most.height = max(0, most.height - chrome.rows) }
         return entry.route ? .fit(most) : .atMost(most)
     }
 
     /// The driver's tap on an authored button a sheet's row stands for:
     /// the row's own click. Nil when `node` is no such button.
     func activate(_ node: NodeView) -> Bool? {
-        guard let entry = entries.last(where: { $0.route && ($0.header?.cancel === node || $0.header?.confirm === node) }),
+        guard let entry = entries.last(where: { $0.sheet?.chrome != nil && ($0.header?.cancel === node || $0.header?.confirm === node) }),
               let chrome = entry.sheet?.chrome else { return nil }
         let button = entry.header?.cancel === node ? (chrome.backButton.isHidden ? chrome.cancelButton : chrome.backButton) : chrome.confirmButton
         guard entry === entries.last, presenter?.alerts.presented == nil, !button.isHidden, button.isEnabled, !node.inert else { return false }
@@ -487,7 +491,7 @@ extension DialogHost {
 
     /// Whether `node` is shown by a sheet's own row: the heading its title, a button its push button.
     package func rowShows(_ node: NodeView) -> String? {
-        guard let header = entries.last(where: { $0.route && $0.header?.stoodFor.isEmpty == false && ($0.header?.heading === node || $0.header?.cancel === node || $0.header?.confirm === node) })?.header else { return nil }
+        guard let header = entries.last(where: { $0.sheet?.chrome != nil && $0.header?.stoodFor.isEmpty == false && ($0.header?.heading === node || $0.header?.cancel === node || $0.header?.confirm === node) })?.header else { return nil }
         return header.heading === node ? "title" : "NSButton"
     }
 

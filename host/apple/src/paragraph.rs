@@ -1,13 +1,23 @@
 //! Apple paragraph projection: inline kernel identities cross as values, never views.
 //! @ref LLP 1044.000 §6 S1
 use super::*;
+#[cfg(test)]
+#[path = "portal_tests.rs"]
+mod portal_tests;
 
 impl<D: DataSource> Host<D> {
-    /// Every node, parents before children: the order a whole tree's views
-    /// are made in.
+    /// Every live node, parents before children: the order a whole tree's
+    /// views are made in.
     pub(super) fn preorder(&self) -> Vec<ViewId> {
         let kernel = self.runner.kernel();
-        let mut stack: Vec<ViewId> = self.runner.roots().into_iter().rev().collect();
+        // A hidden `portal` mover is live and unattached (LLP 1013.002 D5):
+        // the host makes and updates its views as it does an attached one's.
+        let tops = self
+            .runner
+            .roots()
+            .into_iter()
+            .chain(self.runner.hidden_movers());
+        let mut stack: Vec<ViewId> = tops.rev().collect();
         let mut order = Vec::new();
         while let Some(id) = stack.pop() {
             order.push(id);
@@ -530,6 +540,42 @@ impl<D: DataSource> Host<D> {
         self.emit_separators_beside(id, batch);
     }
 
+    /// A placement moves a `portal` mover without touching it: each mover
+    /// whose declaration parent changed, or that became or stopped being one,
+    /// has its `declaredParent` (`props_of`) said again.
+    pub(super) fn tell_declared_parents(&mut self, batch: &mut Batch) {
+        let now = self.runner.declared_parents();
+        if now == self.declared_told {
+            return;
+        }
+        let told = std::mem::replace(&mut self.declared_told, now);
+        let mut changed: Vec<ViewId> = (self.declared_told.iter())
+            .filter(|pair| told.binary_search(pair).is_err())
+            .chain(
+                told.iter()
+                    .filter(|pair| self.declared_told.binary_search(pair).is_err()),
+            )
+            .map(|&(id, _)| id)
+            .collect();
+        changed.sort_unstable();
+        changed.dedup();
+        for id in changed {
+            if self.mirror.contains_key(&id) && self.runner.kernel().node(id).is_some() {
+                self.update(id, batch);
+            }
+        }
+    }
+
+    /// Whether `id`'s kernel children include one of `movers` it does not
+    /// show yet.
+    pub(super) fn receives(&self, id: ViewId, movers: &[ViewId]) -> bool {
+        let Some(node) = self.runner.kernel().node(id) else {
+            return false;
+        };
+        let held = self.mirror.get(&id).map(|m| &m.children);
+        (node.children().iter()).any(|c| movers.contains(c) && held.is_none_or(|h| !h.contains(c)))
+    }
+
     pub(super) fn emit_children(&mut self, id: ViewId, batch: &mut Batch) {
         if self.flat.nodes.contains(&id) {
             if let Some(parent) = self.presented_parent(id) {
@@ -634,8 +680,6 @@ impl<D: DataSource> Host<D> {
         let mut restyled = vec![(view, style::style_json_presented(&node, &env, &shown).0)];
         let mut runs = Vec::new();
         if inherits {
-            let mut inherited = style::Shown::default();
-            inherited.set(Property::Color, color);
             let mut stack = node.children();
             while let Some(child) = stack.pop() {
                 let Some(c) = kernel.node(child) else {
@@ -647,6 +691,12 @@ impl<D: DataSource> Host<D> {
                 if let Some((owner, _)) = self.inline_runs.get(&child) {
                     runs.push((child, *owner));
                 } else {
+                    // The child's own moving values (its clip, its filter,
+                    // its colours) with the colour it inherits
+                    let mut inherited = self.shown_paint(motion_node(c.key));
+                    if inherited.get(Property::Color).is_none() {
+                        inherited.set(Property::Color, color);
+                    }
                     restyled.push((child, style::style_json_inherited(&c, &env, &inherited).0));
                 }
                 stack.extend(c.children());
@@ -726,6 +776,11 @@ impl<D: DataSource> Host<D> {
                 props.insert("popoverParent", parent.to_string());
             }
         }
+        // A `portal` mover's events bubble through its declaration (LLP
+        // 1013.002 D1); the presenter walks that path itself.
+        if let Some(parent) = self.runner.declared_parent(node.id) {
+            props.insert("declaredParent", parent.to_string());
+        }
         if let Some(line) = super::layout::separator::json(self.runner.kernel(), node.id) {
             props.insert(super::layout::separator::PROP, line);
         }
@@ -783,7 +838,12 @@ pub(super) fn props_for(node: &NodeRef<'_>) -> exact_kernel::SortedMap<&'static 
             PropValue::Str(s) => s.to_string(),
             PropValue::Bool(b) => b.to_string(),
             PropValue::Int(i) => i.to_string(),
-            PropValue::Float(f) if matches!(id, PropId::Datetime | PropId::Start | PropId::End) => {
+            PropValue::Float(f)
+                if matches!(
+                    id,
+                    PropId::Datetime | PropId::Start | PropId::End | PropId::AppleMagnification
+                ) =>
+            {
                 f.to_string()
             }
             PropValue::Float(f) => style::num(*f as f32),

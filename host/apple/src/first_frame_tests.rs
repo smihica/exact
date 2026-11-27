@@ -903,7 +903,7 @@ fn box_transform_transitions_play_without_sampling_and_reclaim_for_the_agent() {
         text "Go"
       box testId="move" width=100 height=40 translate=(on ? "50% 10px" : "0px 0px") transition="translate 1s linear"
       box testId="turn" width=40 height=40 rotate=(on ? 180 : 0) transition="rotate 1s linear"
-      box testId="grow" width=40 height=40 scale=(on ? 2 : 1) transition="scale -exact-spring(200, 20, 1)"
+      box testId="grow" width=40 height=40 scale=(on ? "2 0.25" : "1 0.5") transition="scale -exact-spring(200, 20, 1)"
       box testId="hit" width=40 height=40 press=go translate=(on ? "40px 0px" : "0px 0px") transition="translate 1s linear"
       box testId="invoker-parent" width=100 height=40 translate=(on ? "40px 0px" : "0px 0px") transition="translate 1s linear"
         button popovertarget="more"
@@ -930,7 +930,7 @@ fn box_transform_transitions_play_without_sampling_and_reclaim_for_the_agent() {
     for (name, property, path) in [
         ("move", Property::Translate, "transform.translation.x"),
         ("turn", Property::Rotate, "transform.rotation.z"),
-        ("grow", Property::Scale, "transform.scale"),
+        ("grow", Property::Scale, "transform.scale.x"),
     ] {
         // LLP 1126 D10: watchOS has no render server, so they stay sampled.
         assert_eq!(
@@ -947,6 +947,24 @@ fn box_transform_transitions_play_without_sampling_and_reclaim_for_the_agent() {
             spec(&batch, id(&host, "move"))["v"],
             serde_json::json!([0, 50])
         );
+        let ops: serde_json::Value = serde_json::from_str(&batch).unwrap();
+        let grow = id(&host, "grow");
+        let tracks = ops["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["op"] == "animations" && op["id"] == grow)
+            .unwrap()["specs"]
+            .as_array()
+            .unwrap();
+        let y = tracks
+            .iter()
+            .find(|track| track["k"] == "transform.scale.y")
+            .unwrap()["v"]
+            .as_array()
+            .unwrap();
+        assert_eq!(y.first().unwrap(), 0.5);
+        assert_eq!(y.last().unwrap(), 0.25);
         let radians = spec(&batch, id(&host, "turn"))["v"][1].as_f64().unwrap();
         assert!((radians - std::f64::consts::PI).abs() < 1e-5);
     }
@@ -1184,4 +1202,42 @@ fn a_hidden_page_releases_holds_at_their_commit_and_holds_nothing() {
         "a commit while hidden starts at once"
     );
     assert!(host.runner.presented().seen);
+}
+
+/// A native button that moves and resizes with its layout keeps its laid-out size, where the platform draws its chrome,
+/// and moves by its centre, so its face stays centred in the box the move shows (LLP 1069.011 D6).
+const NATIVE_MOVING: &str = r##"component A
+  state wide = true
+  action go
+    wide = not wide
+  view
+    column width="100%" height="100%" position="relative"
+      button testId="tab" press=go position="absolute" top=0 left=(wide ? "0px" : "100px") width=(wide ? "200px" : "100px") height=44 -exact-layout-transition="200ms linear"
+        text "Tab"
+"##;
+
+#[test]
+fn a_native_button_moves_by_its_centre_at_its_laid_out_size() {
+    let plan = contract::compile(NATIVE_MOVING).unwrap().encode();
+    let (mut host, _) = Host::boot(
+        &plan,
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        390.0,
+        844.0,
+    )
+    .unwrap();
+    host.start_on_frame(true, 0.0);
+    let tab = id(&host, "tab");
+    let batch = host.dispatch_at(tab, Event::Press, 100.0);
+    let v: serde_json::Value = serde_json::from_str(&batch).unwrap();
+    let presented = v["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|op| op["id"] == tab && op["op"] == "present" && op["property"] == "layout")
+        .map(|op| ["x", "y", "w", "h"].map(|k| op[k].as_f64().unwrap()));
+    // From x 0, 200 wide, to x 100, 100 wide: its centre moves from 100 to 150, so it starts 50 left of its laid-out box
+    assert_eq!(presented, Some([-50.0, 0.0, 0.0, 0.0]), "{batch}");
 }

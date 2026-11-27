@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
 import { connect, createServer as createSocketServer } from 'node:net';
 import { tmpdir } from 'node:os';
+import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 import { fileURLToPath } from 'node:url';
@@ -15,11 +16,20 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 afterEach(() => stopAll());
 
-test('a page that closes is no build of the loop any more, by 127.0.0.1 or by localhost', async () => {
+test('pages join when a design appears and its writer releases the lock, and leave on close by IPv4 or IPv6', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-page-streams-')), dist = join(mkdtempSync(join(tmpdir(), 'exact-page-streams-dist-')), 'dist');
   writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Streams', app: { id: 'com.exact.streams', name: 'Streams' } }));
   writeFileSync(join(dir, 'app.contract'), 'component App\n  view\n    text "streams"\n');
-  writeFileSync(join(dir, 'app.forma'), 'forma streams\n\ntheme\n  ink = #000000\n');
+  const design = join(dir, 'app.forma'), source = 'forma streams\n\ntheme\n  ink = #000000\n';
+  writeFileSync(design, source);
+  const writer = spawnOwned('cargo', ['run', '-q', '-p', 'contract', '--', 'forma', 'serve', '--stdio', dir], { cwd: ROOT, stdio: ['pipe', 'pipe', 'inherit'] });
+  const locked = new Promise((ok, fail) => {
+    createInterface({ input: writer.stdout }).once('line', line => JSON.parse(line).ok ? ok() : fail(new Error(line)));
+    writer.once('exit', code => fail(new Error(`standalone writer exited ${code}`)));
+  });
+  writer.stdin.write('{"method":"hello"}\n');
+  await locked;
+  rmSync(design);
   const listener = createServer();
   await new Promise(ok => listener.listen(0, '127.0.0.1', ok));
   const port = listener.address().port;
@@ -40,6 +50,28 @@ test('a page that closes is no build of the loop any more, by 127.0.0.1 or by lo
     await until(() => out.includes(`127.0.0.1:${port}/`) && out.includes('plan ready'), 900_000, 'the first build');
     // localhost resolved to [::1] (as the design tool's canvas is reached first), not left to Chrome to choose.
     browser = await suiteBrowser('chromium', { args: ['--host-resolver-rules=MAP localhost [::1]'] });
+    const page = await browser.newPage();
+    await page.goto(base);
+    await until(() => out.includes('page connected'), 30_000, 'the page stream');
+    const status = async () => (await fetch(base + '/__forma/token')).status;
+    expect(await status()).toBe(404);
+    writeFileSync(design, source);
+    await until(() => out.includes('build registered:'), 20_000, 'the watcher enrolled the open page');
+    expect(await status()).toBe(200);
+    const token = (await (await fetch(base + '/__forma/token')).json()).token;
+    const hello = () => fetch(base + '/__forma', { method: 'POST', headers: { 'x-exact-forma-token': token }, body: '{"method":"hello"}' });
+    expect((await hello()).status).toBe(503);
+    expect((await fetch(base + '/__forma/subscribe', { method: 'POST', headers: { 'x-exact-forma-token': token } })).status).toBe(503);
+    expect((await fetch(base + '/__forma/events', { method: 'POST', headers: { 'x-exact-forma-token': token }, body: '{"after":0,"wait":false}' })).status).toBe(503);
+    writer.stdin.end();
+    await until(async () => (await hello()).status === 200, 30_000, 'writer handover');
+    await until(async () => await builds() === 1, 30_000, 'the existing page after the writer released its lock');
+    rmSync(design);
+    await until(async () => await status() === 404, 10_000, 'Forma gone with its design');
+    writeFileSync(design, source);
+    await until(async () => await status() === 200 && await builds() === 1, 30_000, 'the page after the design returned');
+    await page.close();
+    await until(async () => await builds() === 0, 10_000, 'the closed page');
     // IPv6 here at all (asked of a socket of its own, not of the loop): then the loop must answer on [::1].
     const six = await new Promise(ok => { const t = createSocketServer(); t.once('error', () => ok(false)); t.listen(0, '::1', () => t.close(() => ok(true))); });
     if (six) await new Promise((ok, fail) => { const c = connect(port, '::1'); c.once('connect', () => { c.destroy(); ok(); }); c.once('error', e => fail(new Error(`the loop does not answer on [::1]: ${e.code}`))); });
@@ -62,6 +94,7 @@ test('a page that closes is no build of the loop any more, by 127.0.0.1 or by lo
     expect(await builds()).toBe(0);
   } finally {
     await browser?.close();
+    await writer.stop();
     await dev.stop(30_000);
     rmSync(dir, { recursive: true, force: true });
     rmSync(dirname(dist), { recursive: true, force: true });
@@ -165,6 +198,65 @@ test('a page whose app replaces fetch still registers and inspects: the dev clie
     expect(events).not.toContain('"event":"unsupported"');
   } finally {
     stream.abort();
+    await browser?.close();
+    await dev.stop(30_000);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(dirname(dist), { recursive: true, force: true });
+  }
+}, 1_200_000);
+
+test('an agent reads the tab whose person gave it the code and allowed it there, until that tab reloads', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-page-attach-')), dist = join(mkdtempSync(join(tmpdir(), 'exact-page-attach-dist-')), 'dist');
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Attached', app: { id: 'com.exact.attached', name: 'Attached' } }));
+  writeFileSync(join(dir, 'app.contract'), 'component App\n  state ticks = 0\n  state note = ""\n  task tick when true\n    every(250, step)\n  action step\n    ticks = ticks + 1\n  action edit(v: string)\n    note = v\n  view\n    column\n      text `ticks ${ticks}` testId="ticks"\n      input value=note input=edit aria-label="Note" testId="note"\n');
+  const listener = createServer();
+  await new Promise(ok => listener.listen(0, '127.0.0.1', ok));
+  const port = listener.address().port;
+  await new Promise(ok => listener.close(ok));
+  const dev = spawnOwned(process.execPath, [resolve(ROOT, 'host/web/dev.mjs'), '--app', dir, '--port', String(port)], { cwd: ROOT, env: { ...process.env, EXACT_WEB_DIST: dist }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', browser;
+  dev.stdout.on('data', d => { out += d; });
+  dev.stderr.on('data', d => { out = (out + d).slice(-8000); });
+  const until = async (pass, ms, what) => { const end = Date.now() + ms; while (!(await pass())) { if (Date.now() > end) throw new Error(`${what}: not seen in ${out.slice(-2000)}`); await new Promise(ok => setTimeout(ok, 100)); } };
+  const panel = (page) => page.evaluate(() => document.querySelector('exact-agent-attach')?.shadowRoot.querySelector('.box').innerText ?? null);
+  const press = async (page, label) => {
+    const box = await page.evaluate((l) => { const b = [...document.querySelector('exact-agent-attach').shadowRoot.querySelectorAll('button')].find(b => b.textContent === l).getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; }, label);
+    await page.mouse.click(box.x, box.y);
+  };
+  try {
+    await until(() => out.includes('plan ready'), 900_000, 'the first build');
+    browser = await suiteBrowser('chromium');
+    const context = await browser.newContext(), tabs = [await context.newPage(), await context.newPage()];
+    for (const [i, tab] of tabs.entries()) { await tab.goto(`http://127.0.0.1:${port}/`); await tab.getByTestId('note').fill(`tab ${i}`); }
+    await tabs[0].keyboard.press('Alt+Shift+KeyA');
+    let code;
+    await until(async () => (code = /[A-Z2-9]{4}(-[A-Z2-9]{4}){4}/.exec(await panel(tabs[0]) ?? '')?.[0]), 10_000, 'the pairing code');
+    const agent = spawnOwned(process.execPath, [resolve(ROOT, 'scripts/agent.mjs'), 'web', '--app', dir, '--attach', 'tree', 'clock until state ticks == 9999 within 60000'], { cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
+    let said = '', err = '';
+    agent.stdout.on('data', d => { said += d; });
+    agent.stderr.on('data', d => { err += d; });
+    agent.stdin.end(`${code}\n`);
+    await until(async () => /asks to read/.test(await panel(tabs[0]) ?? ''), 30_000, `the ask (${err})`);
+    // A script's click is not the person's.
+    await tabs[0].evaluate(() => [...document.querySelector('exact-agent-attach').shadowRoot.querySelectorAll('button')].find(b => b.textContent === 'Allow').click());
+    await new Promise(ok => setTimeout(ok, 300));
+    expect(said).toBe('');
+    await press(tabs[0], 'Allow');
+    await until(() => said.includes('"tab 0"'), 30_000, `the tab's tree (${err})`);
+    expect(said).not.toContain('tab 1');
+    expect(await panel(tabs[0])).toContain('Agent Attached');
+    // The tab reloads: the wait ends, with the app's clock as it last read it.
+    await tabs[0].reload();
+    await until(() => agent.exitCode !== null, 15_000, 'the driver to end');
+    expect(err).toMatch(/ticks was \d+[^]*the tab reloaded/);
+    // A code is good once.
+    const again = spawnOwned(process.execPath, [resolve(ROOT, 'scripts/agent.mjs'), 'web', '--app', dir, '--attach', 'tree'], { cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
+    let refusal = '';
+    again.stderr.on('data', d => { refusal += d; });
+    again.stdin.end(`${code}\n`);
+    await until(() => again.exitCode !== null, 30_000, 'the second driver');
+    expect(refusal).toContain('no tab on this dev loop shows that pairing code');
+  } finally {
     await browser?.close();
     await dev.stop(30_000);
     rmSync(dir, { recursive: true, force: true });

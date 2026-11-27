@@ -3,6 +3,7 @@
 //! compiler refuses or warns of.
 
 use crate::scratch::Scratch;
+use crate::source::{boxed, Source};
 use exact_kernel::{Kernel, Offer};
 use exact_plan::Plan;
 use exact_runner::Runner;
@@ -22,15 +23,21 @@ component App
         column height=`calc(var(--gap) + ${2 + 1}px)` testId="computed"
 "#;
 
-fn boot(source: &str) -> Runner<()> {
+fn boot(source: &str) -> Runner<Source> {
     let plan = contract::compile(source).unwrap_or_else(|e| panic!("{e}"));
     boot_plan(&plan)
 }
 
-fn boot_plan(plan: &Plan) -> Runner<()> {
+fn boot_plan(plan: &Plan) -> Runner<Source> {
     let plan = Plan::decode(&plan.encode()).unwrap();
-    let mut runner =
-        Runner::boot(plan, (), Kernel::with_monospace(), Default::default(), "/").unwrap();
+    let mut runner = Runner::boot(
+        plan,
+        boxed(()),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
     runner
         .kernel_mut()
         .compute_layout(1, Offer::definite(390.0, 844.0))
@@ -38,7 +45,7 @@ fn boot_plan(plan: &Plan) -> Runner<()> {
     runner
 }
 
-fn frame(runner: &Runner<()>, test_id: &str) -> exact_kernel::Frame {
+fn frame(runner: &Runner<Source>, test_id: &str) -> exact_kernel::Frame {
     let kernel = runner.kernel();
     kernel
         .node_by_key(kernel.find_by_test_id(test_id)[0])
@@ -85,6 +92,59 @@ fn a_fallback_of_an_undeclared_name_is_admitted_and_warned() {
         warnings
             .iter()
             .any(|w| w.to_string().contains("did you mean `--gap`?")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_fallback_carried_by_an_argument_is_warned_at_the_argument() {
+    let card = "\n\ncomponent Card\n  props\n    w: string\n  view\n    column width=w height=10 testId=\"card\"\n\ncomponent Label\n  props\n    words: string\n  view\n    text words\n";
+    let app = format!("component App\n  view\n    column height=844\n      Card(w=\"var(--missing, 1px)\")\n      Label(words=\"var(--other, 2px)\"){card}");
+    let (plan, warnings) = contract::compile_warned(&app);
+    let undeclared: Vec<_> = (warnings.iter())
+        .filter(|w| w.to_string().contains("lower-var-undeclared"))
+        .collect();
+    // At the argument a length reads, as the same value written on `width` is warned
+    assert_eq!(undeclared.len(), 1, "{warnings:?}");
+    let w = undeclared[0];
+    assert!(w.to_string().contains("--missing"), "{w}");
+    assert_eq!((w.span.line, w.span.col), (4, 14), "{w}");
+    assert_eq!(frame(&boot_plan(&plan.unwrap()), "card").width, 1.0);
+    // A row's own `var()` is warned once, by the loader
+    let direct = app.replace(
+        "column width=w",
+        "column width=w min-height=\"var(--direct, 2px)\"",
+    );
+    let (_, warnings) = contract::compile_warned(&direct);
+    let mut undeclared: Vec<_> = (warnings.iter())
+        .filter(|w| w.to_string().contains("lower-var-undeclared"))
+        .map(|w| (w.span.line, w.span.col))
+        .collect();
+    undeclared.sort();
+    assert_eq!(undeclared, [(4, 14), (11, 31)], "{warnings:?}");
+    // A row's own literal over several lines, alone or in a ternary, is the loader's alone
+    for (value, at) in [
+        ("(\n      \"var(--missing, 1px)\"\n    )", (5, 7)),
+        (
+            "(on\n      ? \"var(--missing, 1px)\"\n      : \"2px\")",
+            (5, 9),
+        ),
+    ] {
+        let own = format!(
+            "component App\n  state on = true\n  view\n    column width={value} height=10\n"
+        );
+        let (_, warnings) = contract::compile_warned(&own);
+        let undeclared: Vec<_> = (warnings.iter())
+            .filter(|w| w.to_string().contains("lower-var-undeclared"))
+            .map(|w| (w.span.line, w.span.col))
+            .collect();
+        assert_eq!(undeclared, [at], "{value}: {warnings:?}");
+    }
+    // A declared name is not warned through an argument either
+    let declared = app.replace("column height=844", "column height=844 --missing=\"3px\"");
+    let (_, warnings) = contract::compile_warned(&declared);
+    assert!(
+        !warnings.iter().any(|w| w.to_string().contains("--missing")),
         "{warnings:?}"
     );
 }
@@ -150,7 +210,7 @@ fn a_class_choice_or_an_absent_option_drops_one_declaration_and_keeps_the_rest()
     // an option a button clears
     let app = "style Spaced\n  --gap=\"8px\"\n\nstyle Plain\n  color=\"#000000\"\n\ncomponent App\n  state on = true\n  state pad = some(\"6px\")\n  action flip\n    on = !on\n  action clear\n    pad = none\n  view\n    column class=(on ? Spaced : Plain) --keep-2=\"2px\" --pad=pad height=844\n      button \"Flip\" press=flip testId=\"flip\"\n      button \"Clear\" press=clear testId=\"clear\"\n      column height=\"var(--gap, 5px)\" testId=\"gap\"\n      column height=\"var(--keep-2)\" testId=\"keep\"\n      column height=\"var(--pad, 3px)\" testId=\"pad\"\n";
     let mut runner = boot(app);
-    let press = |runner: &mut Runner<()>, test_id: &str| {
+    let press = |runner: &mut Runner<Source>, test_id: &str| {
         let kernel = runner.kernel();
         let view = kernel
             .node_by_key(kernel.find_by_test_id(test_id)[0])
@@ -163,7 +223,7 @@ fn a_class_choice_or_an_absent_option_drops_one_declaration_and_keeps_the_rest()
             .compute_layout(1, Offer::definite(390.0, 844.0))
             .unwrap();
     };
-    let heights = |runner: &Runner<()>| ["gap", "keep", "pad"].map(|t| frame(runner, t).height);
+    let heights = |runner: &Runner<Source>| ["gap", "keep", "pad"].map(|t| frame(runner, t).height);
     assert_eq!(heights(&runner), [8.0, 2.0, 6.0]);
     press(&mut runner, "flip");
     assert_eq!(heights(&runner), [5.0, 2.0, 6.0]);

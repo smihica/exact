@@ -141,7 +141,7 @@ impl crate::delivery::Store for StagedModule {
     fn fd(&self) -> std::os::unix::io::RawFd {
         -1
     }
-    fn check(&self) -> bool {
+    fn check(&self, _: fn()) -> bool {
         true
     }
     fn take_line(&mut self) -> Option<String> {
@@ -1347,9 +1347,9 @@ fn a_touch_the_reader_took_holds_a_replacement_until_the_finger_lifts() {
     .unwrap();
     assert!(error.is_none(), "{error:?}");
     assert!(!p.set_touching(true));
-    p.reader_touch(0, 100., 100., 0.).unwrap();
-    p.reader_touch(2, 100., 140., 1.).unwrap();
-    p.reader_touch(3, 100., 140., 2.).unwrap();
+    p.reader_touch(0, 100., 100., 0., 0.).unwrap();
+    p.reader_touch(2, 100., 140., 1., 1.).unwrap();
+    p.reader_touch(3, 100., 140., 2., 2.).unwrap();
     assert!(p.contact_position().is_none());
     let held = p.reload(&plan("two"), ()).unwrap();
     assert_eq!(held, ReloadResult::Held("pointer"));

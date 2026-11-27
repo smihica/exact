@@ -10,9 +10,12 @@ package enum NavigationPaintRole {
 }
 
 /// A transform handle's contact, which the Drag module keeps: the core asks
-/// only for its pinch, which gesture precedence orders.
+/// for its pinch, which gesture precedence orders, and tells it each touch its
+/// pan receives.
 package protocol TransformPinchContact: AnyObject {
     var pinchRecognizer: UIGestureRecognizer { get }
+    /// A touch the pan receives, at `point` (window points).
+    func panReceived(_ touch: UITouch, at point: CGPoint)
 }
 
 /// What most nodes never set — gestures and their holds, editors and
@@ -60,7 +63,7 @@ final class TextSpecs {
 /// extent. Made on the first write that is not a default (`NodeView.aside`).
 final class NodeAside {
     var translatePx = CGPoint.zero, translatePercent = CGPoint.zero
-    var scale: CGFloat = 1
+    var scale = CGPoint(x: 1, y: 1)
     var rotate: CGFloat = 0
     var rotationAxis: [Double] = [0, 0, 0]
     var content = CGSize.zero
@@ -119,12 +122,18 @@ final class NodeExtras {
     /// Its surface at a layout transition's size (`Surface.swift`).
     var surface: SurfaceLayer?
     var layoutPanRecognizer: UIPanGestureRecognizer?
-    var layoutPanOrigin: CGPoint = .zero
+    var layoutPanOrigin: CGPoint?
     var swipeRecognizer: UIPanGestureRecognizer?
     var swipeArmed: Bool = false
     /// Where a swipe's first finger landed, in the window (its shouldBegin's edge rule).
     var swipeDownX: CGFloat?
     var swipeHold: SwipeHold?
+    /// Its `swipe`'s recognizer (`DiscreteSwipeIOS.swift`).
+    var discreteSwipe: UISwipeGestureRecognizer?
+    #if os(iOS)
+    var reportingPinch: ReportingPinch?
+    var reportingIndirectPinch: ReportingIndirectPinch?
+    #endif
     var heightRecognizer: UIPanGestureRecognizer?
     var heightHold: DragInput?
     var contextTransform = CGAffineTransform.identity
@@ -141,6 +150,9 @@ final class NodeExtras {
     var swipeOrigin: Double = 0
     var contextRecognizer: UILongPressGestureRecognizer?
     var doubleRecognizer: UITapGestureRecognizer?
+    #if os(iOS)
+    var portalRelay: MountRelay?
+    #endif
     #if !os(tvOS)
     var hoverRecognizer: UIHoverGestureRecognizer?
     var lookHoverRecognizer: UIHoverGestureRecognizer?
@@ -154,6 +166,7 @@ final class NodeExtras {
     var stepper: FieldStepper?
     #endif
     var toldText: String?
+    var pendingFiltered = false
     var pendingValue: String?
     /// A native field in a grouped list's row (`isCellField`).
     var fieldInCell = false
@@ -171,7 +184,6 @@ final class NodeExtras {
     var symbolRefusal: String?
     var listSymbol = false
     var listRow = false
-    var scrollCornered = false
     var focusRing: CAShapeLayer?
     var scrollEventQueued: Bool = false
     /// The last `scroll` event's values (`sendScrollEvent`).
@@ -198,6 +210,10 @@ final class NodeExtras {
     /// While a pull-down's menu has this invoker (`MenuButton`), its fill is
     /// painted here, which UIKit's stand-in draws, instead of on its layer.
     var lentFill: CAShapeLayer?
+    /// The box's extension (`setExtension`, LLP 1123 D13), while its picture is mirrored past its border box.
+    var boxExtension: BoxExtension?
+    /// The extension's outsets as last asked (`setExtension`), which it keeps while the box does not allow it.
+    var extensionAsked = UIEdgeInsets.zero
     /// `glassGroup`'s view and a grouped glass's slot (`GlassGroup.swift`).
     var glassGroupView: GlassGroupView?
     var glassSlot: GlassSlot?
@@ -206,12 +222,13 @@ final class NodeExtras {
     /// A `scrollZoom` written and not yet applied (`ScrollZoomIOS.swift`).
     var pendingZoom: Double?
     var pendingScrollTransfer = false
-    /// A collapsing title's scroller (LLP 1075.003 Stage 3): its expanded
-    /// title's inset, where `scrollTop` 0 rests; 0 for every other scroller.
+    var afterScrollAnimation: (() -> CGPoint?)?
+    var lastScrollAsk: UInt64 = 0
     package var controlRide: CGFloat = 0
+    /// A scroller under a route's bar (LLP 1075.003 Stage 3): the inset where
+    /// `scrollTop` 0 lays its content out, with a large title open, as it last
+    /// rested at its top; 0 for every other scroller.
     package var scrollOrigin: CGFloat = 0
-    /// …and the smallest inset it has had: its title collapsed.
-    package var scrollCollapsed: CGFloat = 0
     /// What the style last said of the scroll view's indicators and deceleration.
     weak var nativeScrollView: UIScrollView?
     weak var nativeScrollDelegate: (any UIScrollViewDelegate)?
@@ -223,18 +240,20 @@ final class NodeExtras {
     /// The part of the band its scroll view's `contentInset` holds (LLP 1131 D2).
     package var bandInset = UIEdgeInsets.zero
     /// How far D13's reach outsets its scroll view past its box on each edge, as the kernel's
-    /// terms give it (LLP 1123 D13); D14's writer holds the insets that go with it.
+    /// terms give it (LLP 1123 D13); D14's writer holds the insets that go with it. Until the kernel
+    /// gives one, the side reach the host gives it (`setSideReach`), whose insets are `sideInset`.
     var reach = UIEdgeInsets.zero
     /// Whether the kernel has given its reach (`setReach`), zero included: until then a grouped list reaches by its own
     /// rule (`GroupedListView.sideReach`).
     var reachGiven = false
     /// The bottom inset a keyboard toolbar gives its scroll view (`KeyboardToolbarIOS.swift`).
     var keyboardInset: CGFloat = 0
-    /// A control bar over a scroller's content (LLP 1131 D3, D4): the scroller's paint rank, which it is placed
-    /// above, and UIKit's edge effect.
-    var bandOver: Int64?
+    /// A control bar over a scroller's content (LLP 1131 D3, D4): its sibling that holds the scroller, which
+    /// it is placed above, and UIKit's edge effect.
+    weak var bandOver: NodeView?
     var navigationPaint = NavigationPaintRole.sibling
     var edgeInteraction: AnyObject?
+    var scrollportHolder: ScrollportHolder?
     var scrollWritten: String?
     /// A hatched node whose hatch undoes its own additions: its row may be
     /// reused (LLP 1075.003.000.000 §8).
@@ -283,7 +302,7 @@ extension NodeView {
     /// `translate`: its lengths, and its percentages of the box (chess diary #4).
     var translatePx: CGPoint { get { aside?.translatePx ?? .zero } set { if newValue != .zero || aside != nil { asideMade.translatePx = newValue } } }
     var translatePercent: CGPoint { get { aside?.translatePercent ?? .zero } set { if newValue != .zero || aside != nil { asideMade.translatePercent = newValue } } }
-    package var scale: CGFloat { get { aside?.scale ?? 1 } set { if newValue != 1 || aside != nil { asideMade.scale = newValue } } }
+    package var scale: CGPoint { get { aside?.scale ?? CGPoint(x: 1, y: 1) } set { if newValue != CGPoint(x: 1, y: 1) || aside != nil { asideMade.scale = newValue } } }
     var rotationAxis: [Double] { get { aside?.rotationAxis ?? [0, 0, 0] } set { if newValue != [0, 0, 0] || aside != nil { asideMade.rotationAxis = newValue } } }
     package var rotate: CGFloat { get { aside?.rotate ?? 0 } set { if newValue != 0 || aside != nil { asideMade.rotate = newValue } } }
     /// A scroll container's content extent (the `content` op), before the
@@ -345,17 +364,18 @@ extension NodeView {
     package var stickyOffset: CGPoint { get { extras?.stickyOffset ?? .zero } set { if newValue != .zero || extras != nil { more.stickyOffset = newValue } } }
     var zoomFactor: CGFloat { get { extras?.zoomFactor ?? 1 } set { if newValue != 1 || extras != nil { more.zoomFactor = newValue } } }
     var zoomShift: CGPoint { get { extras?.zoomShift ?? .zero } set { if newValue != .zero || extras != nil { more.zoomShift = newValue } } }
-    var authoredAccentTint: UIColor? { get { extras?.authoredAccentTint } set { if newValue != nil || extras != nil { more.authoredAccentTint = newValue } } }
+    package var authoredAccentTint: UIColor? { get { extras?.authoredAccentTint } set { if newValue != nil || extras != nil { more.authoredAccentTint = newValue } } }
     /// How far a keyboard toolbar rides up with the keyboard (KeyboardToolbarIOS).
     var keyboardLift: CGFloat { get { extras?.keyboardLift ?? 0 } set { if newValue != 0 || extras != nil { more.keyboardLift = newValue } } }
     var layoutResize: CGSize { get { extras?.layoutResize ?? .zero } set { if newValue != .zero || extras != nil { more.layoutResize = newValue } } }
     var surface: SurfaceLayer? { get { extras?.surface } set { if newValue != nil || extras != nil { more.surface = newValue } } }
     var layoutPanRecognizer: UIPanGestureRecognizer? { get { extras?.layoutPanRecognizer } set { if newValue != nil || extras != nil { more.layoutPanRecognizer = newValue } } }
-    var layoutPanOrigin: CGPoint { get { extras?.layoutPanOrigin ?? .zero } set { if newValue != .zero || extras != nil { more.layoutPanOrigin = newValue } } }
+    var layoutPanOrigin: CGPoint? { get { extras?.layoutPanOrigin } set { if newValue != nil || extras != nil { more.layoutPanOrigin = newValue } } }
     var swipeRecognizer: UIPanGestureRecognizer? { get { extras?.swipeRecognizer } set { if newValue != nil || extras != nil { more.swipeRecognizer = newValue } } }
     var swipeDownX: CGFloat? { get { extras?.swipeDownX } set { if newValue != nil || extras != nil { more.swipeDownX = newValue } } }
     var swipeArmed: Bool { get { extras?.swipeArmed ?? false } set { if newValue || extras != nil { more.swipeArmed = newValue } } }
     var swipeHold: SwipeHold? { get { extras?.swipeHold } set { if newValue != nil || extras != nil { more.swipeHold = newValue } } }
+    var discreteSwipe: UISwipeGestureRecognizer? { get { extras?.discreteSwipe } set { if newValue != nil || extras != nil { more.discreteSwipe = newValue } } }
     package var heightRecognizer: UIPanGestureRecognizer? { get { extras?.heightRecognizer } set { if newValue != nil || extras != nil { more.heightRecognizer = newValue } } }
     package var heightHold: DragInput? { get { extras?.heightHold } set { if newValue != nil || extras != nil { more.heightHold = newValue } } }
     package var reorderPan: UIPanGestureRecognizer? { get { extras?.reorderPan } set { if newValue != nil || extras != nil { more.reorderPan = newValue } } }
@@ -381,6 +401,10 @@ extension NodeView {
     var swipeOrigin: Double { get { extras?.swipeOrigin ?? 0 } set { if newValue != 0 || extras != nil { more.swipeOrigin = newValue } } }
     var contextRecognizer: UILongPressGestureRecognizer? { get { extras?.contextRecognizer } set { if newValue != nil || extras != nil { more.contextRecognizer = newValue } } }
     var doubleRecognizer: UITapGestureRecognizer? { get { extras?.doubleRecognizer } set { if newValue != nil || extras != nil { more.doubleRecognizer = newValue } } }
+    #if os(iOS)
+    /// A `portal` mover's relay to its declaration's listeners (`syncPortalRelay`).
+    var portalRelay: MountRelay? { get { extras?.portalRelay } set { if newValue != nil || extras != nil { more.portalRelay = newValue } } }
+    #endif
     #if !os(tvOS)
     var hoverRecognizer: UIHoverGestureRecognizer? { get { extras?.hoverRecognizer } set { if newValue != nil || extras != nil { more.hoverRecognizer = newValue } } }
     var lookHoverRecognizer: UIHoverGestureRecognizer? { get { extras?.lookHoverRecognizer } set { if newValue != nil || extras != nil { more.lookHoverRecognizer = newValue } } }
@@ -395,6 +419,7 @@ extension NodeView {
     var selectionField: UITextField? { headerField ?? field }
     /// The editor's text as the app was last told it; nil once the app has set the value since (`FieldComposition.swift`).
     var toldText: String? { get { extras?.toldText } set { if newValue != nil || extras != nil { more.toldText = newValue } } }
+    var pendingFiltered: Bool { get { extras?.pendingFiltered ?? false } set { if newValue || extras != nil { more.pendingFiltered = newValue } } }
     /// A `value` that arrived while text was marked, applied when the composition ends.
     var pendingValue: String? { get { extras?.pendingValue } set { if newValue != nil || extras != nil { more.pendingValue = newValue } } }
     package var video: (any VideoPlaying)? { get { extras?.video } set { if newValue != nil || extras != nil { more.video = newValue } } }
@@ -461,8 +486,6 @@ extension NodeView {
             accessibilityTraits.insert(newValue ? .button : .link); accessibilityTraits.remove(newValue ? .link : .button)
         }
     }
-    /// Whether its scroll view holds a default surface's corner (`syncDefaultSurfaceScroll`).
-    var scrollCornered: Bool { get { extras?.scrollCornered ?? false } set { if newValue || extras != nil { more.scrollCornered = newValue } } }
     var focusRing: CAShapeLayer? { get { extras?.focusRing } set { if newValue != nil || extras != nil { more.focusRing = newValue } } }
     var scrollEventQueued: Bool { get { extras?.scrollEventQueued ?? false } set { if newValue || extras != nil { more.scrollEventQueued = newValue } } }
     var lastScrollEvent: [Double] { get { extras?.lastScrollEvent ?? [] } set { if !newValue.isEmpty || extras != nil { more.lastScrollEvent = newValue } } }
@@ -504,7 +527,18 @@ extension NodeView {
 extension NodeView {
     package var controlRide: CGFloat { get { extras?.controlRide ?? 0 } set { if newValue != 0 || extras != nil { more.controlRide = newValue } } }
     package var scrollOrigin: CGFloat { get { extras?.scrollOrigin ?? 0 } set { if newValue != 0 || extras != nil { more.scrollOrigin = newValue } } }
-    package var scrollCollapsed: CGFloat { get { extras?.scrollCollapsed ?? 0 } set { if newValue != 0 || extras != nil { more.scrollCollapsed = newValue } } }
+    /// Asked when UIKit's scroll animation on its scroller ends (`scrollViewDidEndScrollingAnimation`), once: where
+    /// the scroll goes on to, or nil where it ends. A drag, a reveal or another write drops it.
+    package var afterScrollAnimation: (() -> CGPoint?)? { get { extras?.afterScrollAnimation } set { if newValue != nil || extras != nil { more.afterScrollAnimation = newValue } } }
+    /// When the app last asked its scroller to move, on the presenter's count (`scrollAskCount`): a `scrollTop` or
+    /// `scrollLeft` write, or a `scrollIntoView` of something inside it. A host default that would move it gives way
+    /// to an ask made after the press it answers began (LLP 1070.000 §2.6).
+    package var lastScrollAsk: UInt64 { extras?.lastScrollAsk ?? 0 }
+    func askedToScroll() {
+        guard let presenter else { return }
+        presenter.scrollAskCount &+= 1
+        more.lastScrollAsk = presenter.scrollAskCount
+    }
     var scrollWritten: String? { get { extras?.scrollWritten } set { if newValue != nil || extras != nil { more.scrollWritten = newValue } } }
     package var hatchReusable: Bool { get { extras?.hatchReusable ?? false } set { if newValue || extras != nil { more.hatchReusable = newValue } } }
     package var navigationPaint: NavigationPaintRole { get { extras?.navigationPaint ?? .sibling } set { if newValue != .sibling || extras != nil { more.navigationPaint = newValue } } }
@@ -520,10 +554,19 @@ extension NodeView {
     }
     /// Its page band (`NodeExtras.pageBand`), zero for most.
     package var pageBand: UIEdgeInsets { extras?.pageBand ?? .zero }
-    /// Its reach (`NodeExtras.reach`), zero until activation applies the kernel's.
+    /// Its reach (`NodeExtras.reach`).
     package var reach: UIEdgeInsets { extras?.reach ?? .zero }
+    /// Its extension (`setExtension`), nil while its picture is not mirrored.
+    package var boxExtension: BoxExtension? { extras?.boxExtension }
     /// Whether the kernel has given its reach (`NodeExtras.reachGiven`).
     package var reachGiven: Bool { extras?.reachGiven ?? false }
+    /// Whether it reaches past its top or bottom.
+    var reachesDown: Bool { reach.top > 0 || reach.bottom > 0 }
+    /// A scroll view that comes or goes reaches no band, and has no reach, until asked (LLP 1130 D3, LLP 1123 D13).
+    func forgetReach() {
+        guard let extras, pageBand != .zero || bandInset != .zero || reach != .zero || reachGiven else { return }
+        (extras.pageBand, extras.bandInset, extras.reach, extras.reachGiven) = (.zero, .zero, .zero, false)
+    }
     /// How far its scroll view lies past its box on each edge: its page band's top and bottom, or
     /// its reach, whichever is larger, the page band reaching no side.
     package var scrollOutset: UIEdgeInsets {
@@ -532,14 +575,15 @@ extension NodeView {
     }
     /// The part of each of `sv`'s insets it draws its content through (LLP 1123 D13, LLP 1130 D3): with reach, the smaller
     /// of how far it lies past its box (`scrollOutset`) and its inset less native content room (`scrollPortInsets`), never
-    /// below zero; with none, the page band, which counts whole as it lands, while the inset holding it may still lag. A
-    /// windowed list counts it as port and as padding before its first row and after its last, and the rest of the inset
-    /// narrows its port.
+    /// below zero; on a top and bottom with none, the page band, which counts whole as it lands, while the inset holding
+    /// it may still lag. A windowed list counts it as port and as padding before its first row and after its last, and the
+    /// rest of the inset narrows its port.
     package func scrollDrawnThrough(_ sv: UIScrollView) -> UIEdgeInsets {
         guard reach != .zero else { return pageBand }
         let o = scrollOutset, a = scrollPortInsets(sv)
         let t = { (o: CGFloat, a: CGFloat) in max(0, min(o, a)) }
-        return UIEdgeInsets(top: t(o.top, a.top), left: t(o.left, a.left), bottom: t(o.bottom, a.bottom), right: t(o.right, a.right))
+        return UIEdgeInsets(top: reachesDown ? t(o.top, a.top) : pageBand.top, left: t(o.left, a.left),
+                            bottom: reachesDown ? t(o.bottom, a.bottom) : pageBand.bottom, right: t(o.right, a.right))
     }
     /// The outset a scroll event counts into CSS's scroll position: all of it but what the scroll view's own layout
     /// consumes of a side reach (`BandConsumer`), across which its content stays put, as a grouped list's cards do.
@@ -553,13 +597,15 @@ extension NodeView {
         return o
     }
     /// Where CSS's `scrollLeft` 0 is in UIKit's offsets: past the scroller's left inset when UIKit
-    /// insets it, or past native content room, as `scrollTopInset` is for `scrollTop`.
+    /// insets it, or past native content room and its side reach, as `scrollTopInset` is for `scrollTop`.
     package func scrollLeftInset(_ sv: UIScrollView) -> CGFloat {
-        sv.contentInsetAdjustmentBehavior != .never ? sv.adjustedContentInset.left : extras?.nativeScrollContentInsets.left ?? 0
+        sv.contentInsetAdjustmentBehavior != .never ? sv.adjustedContentInset.left : (extras?.nativeScrollContentInsets.left ?? 0) + sideInset.left
     }
     package var bandInset: UIEdgeInsets { extras?.bandInset ?? .zero }
-    var bandOver: Int64? { get { extras?.bandOver } set { if newValue != nil || extras != nil { more.bandOver = newValue } } }
+    var bandOver: NodeView? { get { extras?.bandOver } set { if newValue != nil || extras != nil { more.bandOver = newValue } } }
     var edgeInteraction: AnyObject? { get { extras?.edgeInteraction } set { if newValue != nil || extras != nil { more.edgeInteraction = newValue } } }
+    /// The view holding its bars on its scrollport, over its scroll view (`ScrollportBars`, LLP 1123 D12).
+    package var scrollportHolder: ScrollportHolder? { get { extras?.scrollportHolder } set { if newValue != nil || extras != nil { more.scrollportHolder = newValue } } }
     /// Whether a touch at `point` can reach this box's children. Overflow
     /// that is not visible clips them at the padding edge (CSS Overflow 3
     /// §3), so a touch on the border is the box's own, as a browser hit-tests
@@ -634,7 +680,7 @@ extension NodeView {
     /// sheet is UIKit's glass (LLP 1141.001 D3).
     package var groundIsSheets: Bool {
         #if os(iOS)
-        guard props["navigationPresentation"] == "modal", !wrote("background_color"),
+        guard NavigationRules.sheetLike(props["navigationPresentation"]), !wrote("background_color"),
               case .object(let o)? = style["background_color"] else { return false }
         return o["sys"]?.string == "systemBackgroundColor"
         #else

@@ -20,7 +20,7 @@ use exact_runner::{
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 fn unavailable(message: impl Into<String>) -> DataError {
     DataError::Unavailable(message.into())
@@ -32,6 +32,7 @@ pub type Obtain<D> = Box<dyn FnOnce() -> Result<D, DataError> + Send + 'static>;
 /// One turn for the owner: a call, or a resumption after a yield. A plan
 /// `Value` is not `Send`, so arguments cross as their canonical bytes.
 enum Job {
+    SendReplacers(Vec<String>, Arc<OnceLock<SendReplacers>>),
     Answer {
         instance: Option<exact_runner::ModuleInstance>,
         target: Option<Target>,
@@ -40,6 +41,8 @@ enum Job {
         snapshot: Vec<(String, Vec<u8>)>,
         /// The runner's clock at dispatch (`Store::clock_ms`).
         clock: f64,
+        /// The launch wall-clock epoch at `clock == 0` (`Store::epoch_at_zero`).
+        epoch: f64,
         reply: Reply,
     },
     Resume {
@@ -52,6 +55,7 @@ enum Job {
         outcome: Outcome,
         snapshot: Vec<(String, Vec<u8>)>,
         clock: f64,
+        epoch: f64,
         reply: Reply,
     },
     /// What is still in flight, after a commit that let requests go: the
@@ -67,6 +71,7 @@ enum Job {
         outcome: Outcome,
         snapshot: Vec<(String, Vec<u8>)>,
         clock: f64,
+        epoch: f64,
         reply: Reply,
     },
 }
@@ -253,11 +258,33 @@ enum Spawn<D> {
     Build(fn(&D, Arc<AtomicBool>) -> Obtain<D>),
 }
 
+struct SendReplacers {
+    default: Option<exact_runner::QueuedSendReplacer>,
+    named: BTreeMap<String, Option<exact_runner::QueuedSendReplacer>>,
+}
+
+impl SendReplacers {
+    fn read(source: &mut impl DataSource, names: Vec<String>) -> Self {
+        Self {
+            default: source.queued_send_replacer(None),
+            named: names
+                .into_iter()
+                .map(|name| {
+                    let replacer = source.queued_send_replacer(Some(&name));
+                    (name, replacer)
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A source with a placement.
 pub struct Placed<D> {
     /// The source (`Main`), the template (`Worker`, built there), or nothing
     /// once moved to its owner (`Worker`, moved there).
     inner: Option<D>,
+    queued_send_names: Vec<String>,
+    queued_send_replacers: Arc<OnceLock<SendReplacers>>,
     identity: Option<exact_runner::ModuleIdentity>,
     generation: Option<exact_runner::ModuleInstance>,
     placement: Placement,
@@ -304,6 +331,8 @@ pub struct Placed<D> {
     /// with no reply to bring the host (a let-go's).
     abort_wake: Arc<std::sync::Mutex<Option<AbortWake>>>,
     storage_changed: Arc<std::sync::atomic::AtomicBool>,
+    ambient_clock: Arc<std::sync::atomic::AtomicBool>,
+    ambient_entropy: Arc<std::sync::atomic::AtomicBool>,
     /// The sources the journal said don't overlay on the owner thread.
     told_overlay: std::collections::BTreeSet<String>,
 }
@@ -337,7 +366,11 @@ impl<D: DataSource + 'static> Placed<D> {
 
     fn with_spawn(source: D, placement: Placement, spawn: Spawn<D>) -> Self {
         Self {
+            queued_send_names: Vec::new(),
+            queued_send_replacers: Arc::default(),
             storage_changed: Default::default(),
+            ambient_clock: Default::default(),
+            ambient_entropy: Default::default(),
             app_id: source.app_id().to_string(),
             grants: source.grants().to_string(),
             preloads: source.preloads().to_vec(),
@@ -418,6 +451,19 @@ impl<D: DataSource + 'static> Placed<D> {
 }
 
 impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
+    fn queued_send_replacer(
+        &mut self,
+        source: Option<&str>,
+    ) -> Option<exact_runner::QueuedSendReplacer> {
+        if self.placement == Placement::Main || self.validation {
+            return self.inner.as_mut()?.queued_send_replacer(source);
+        }
+        let replacers = self.queued_send_replacers.get()?;
+        source
+            .and_then(|name| replacers.named.get(name).copied())
+            .unwrap_or(replacers.default)
+    }
+
     fn prepare_snapshot(
         &mut self,
         module: Option<exact_runner::SnapshotModule<'_>>,
@@ -461,6 +507,17 @@ impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
         if let Some(inner) = &mut self.inner {
             inner.render_web();
         }
+    }
+
+    fn ambient_taint(&self, source: &str) -> (bool, bool) {
+        let (ic, ie) = self
+            .inner
+            .as_ref()
+            .map_or((false, false), |inner| inner.ambient_taint(source));
+        (
+            ic || self.ambient_clock.load(Ordering::Acquire),
+            ie || self.ambient_entropy.load(Ordering::Acquire),
+        )
     }
 
     /// The wrapper's envelope lines, plus the inline module's journal.
@@ -617,6 +674,15 @@ impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
         if let Some(inner) = self.inner.as_mut() {
             inner.bind(plan);
         }
+        if self.placement == Placement::Worker {
+            self.queued_send_names = plan
+                .sources
+                .iter()
+                .map(|row| plan.str(row.name).to_owned())
+                .collect();
+            self.queued_send_replacers = Arc::default();
+            self.request_send_replacers();
+        }
     }
 
     /// A source on a worker is not told: a value reaches it only as a copy,
@@ -670,10 +736,20 @@ impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
                     self.inner = Some(source);
                     return Err(e);
                 }
+                // The pure mergers stay on the runner's owner when the
+                // data source moves to its own (LLP 1027.002 D2).
+                let _ = self.queued_send_replacers.set(SendReplacers::read(
+                    &mut source,
+                    self.queued_send_names.clone(),
+                ));
                 moved(source)
             }
         };
-        self.spawn_owner(obtain)
+        self.spawn_owner(obtain)?;
+        if self.queued_send_replacers.get().is_none() {
+            self.request_send_replacers();
+        }
+        Ok(())
     }
 
     /// Validation is disposable and runs inline, on this thread: a candidate
@@ -911,6 +987,7 @@ impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
             ),
         };
         let clock = store.clock_ms();
+        let epoch = store.epoch_at_zero();
         let key = target.map(|target| (target, source.clone(), args.clone()));
         owner.lock().unwrap().unqueued.insert(token, key);
         // An abandoned closure (the host drops it unrun) leaves no entry.
@@ -925,6 +1002,7 @@ impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
                     args,
                     snapshot,
                     clock,
+                    epoch,
                     reply,
                 },
                 Some((fetch, continuation, outcome)) => Job::Resume {
@@ -937,6 +1015,7 @@ impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
                     outcome,
                     snapshot,
                     clock,
+                    epoch,
                     reply,
                 },
             };

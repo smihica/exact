@@ -13,6 +13,7 @@ pub(super) struct PreparedHost<D: DataSource> {
     pub(super) host: crate::host::Host<D>,
     pub(super) batch: String,
     pub(super) bindings: Option<ibex2::host::Bindings>,
+    pub(super) presence: Option<(exact_runner::presence::Backend, Option<String>)>,
     pub(super) hooks: Hooks,
     pub(super) module: bool,
     pub(super) let_go: bool,
@@ -20,6 +21,31 @@ pub(super) struct PreparedHost<D: DataSource> {
 }
 
 impl<D: DataSource> Bridge<D> {
+    pub(super) fn install_presence(
+        &self,
+        host: &mut crate::host::Host<D>,
+        bindings: Option<&ibex2::host::Bindings>,
+        presence: Option<(exact_runner::presence::Backend, Option<String>)>,
+    ) {
+        let presence = presence.or_else(|| {
+            self.links.io.and_then(|io| {
+                let grants = host.grants();
+                let app_id = host.runner().data_ref().app_id();
+                (io.presence)(bindings, &grants, app_id)
+            })
+        });
+        if let Some((backend, keystore)) = presence {
+            host.runner_mut().install_presence(backend, keystore);
+        }
+    }
+
+    pub(super) fn replace_host(&mut self, host: crate::host::Host<D>, batch: String) -> String {
+        self.clear_view_bindings();
+        let batch = crate::host::Host::ending(self.host.replace(host), batch);
+        self.rebind();
+        batch
+    }
+
     /// Prepare with candidate delivery facts, without publishing them globally.
     pub fn prepare_plan_with_delivery(
         &mut self,
@@ -216,9 +242,7 @@ impl<D: DataSource> Bridge<D> {
                     host.log(&format!("{why}; every request is refused"));
                 }
                 host.runner_mut().forget_unread_kept(&unread_kept);
-                if let Some((backend, keystore)) = presence {
-                    host.runner_mut().install_presence(backend, keystore);
-                }
+                self.install_presence(&mut host, bindings.as_ref(), presence);
                 host.commit_boot();
                 let executor = self.links.io.map(|io| {
                     (io.start)(
@@ -240,7 +264,7 @@ impl<D: DataSource> Bridge<D> {
                 self.wake = hooks.wake.map(|w| (w, hooks.wake_ctx));
                 self.executor = executor;
                 self.restore_window.clear();
-                let batch = Host::ending(self.host.replace(host), batch);
+                let batch = self.replace_host(host, batch);
                 self.launch_layout.insets = None;
                 self.parked.clear();
                 Ok(batch)

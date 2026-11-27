@@ -129,6 +129,7 @@ shape Nav
   groups: NavGroup[]
   year: string
   shareImage: string
+  siteName: string
   agentIntro: string
   startPrompt: string
   startLabel: string
@@ -147,6 +148,14 @@ shape Address
 
 shape Viewport
   width: number
+
+shape ToolAnswer
+  failed: bool
+  text: string
+
+shape ToolDestination
+  url: string
+  error: string
 
 shape SearchPart
   id: string

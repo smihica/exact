@@ -275,7 +275,7 @@ fn each_request_is_queued_taken_once_and_answered_by_its_id() {
             "tel:+15550100"
         ]
     );
-    assert_eq!(says(&p, "openURL refused: \"file:///etc/passwd\""), 1);
+    assert_eq!(says(&p, "openURL refused: file: is not"), 1);
     assert_eq!(says(&p, "no browser"), 0, "nothing is logged as unopenable");
     // The share sheet: what the app gave, and which of the three it gave.
     tap(&mut p, "send");
@@ -482,12 +482,12 @@ fn a_date_or_time_controls_press_asks_the_shell_for_its_picker_and_its_answer_is
     assert_eq!(asked.len(), 1);
     let (kind, request, body) = &asked[0];
     assert_eq!((*kind, body[0] as u32), (9, id(&p, "day")));
-    // Five strings, then the accent: none set.
+    // Five strings, then the accent and the scheme: neither set.
     assert_eq!(
-        strings(&body[..body.len() - 1], 1),
+        strings(&body[..body.len() - 2], 1),
         ["date", "2026-10-16", "2026-01-01", "2026-12-31", ""]
     );
-    assert_eq!(body.last(), Some(&0));
+    assert_eq!(body[body.len() - 2..], [0, 0]);
     // The answer is the person's choice: `change` runs, and the bound value moves.
     assert!(p.answer_request(*request, Some("2026-11-02")));
     p.run_commands(|| Nothing);
@@ -496,14 +496,10 @@ fn a_date_or_time_controls_press_asks_the_shell_for_its_picker_and_its_answer_is
     let asked = decode(p.take_requests());
     let body = &asked[0].2;
     assert_eq!(
-        strings(&body[..body.len() - 1], 1),
+        strings(&body[..body.len() - 2], 1),
         ["time", "", "", "", "60"]
     );
-    assert_eq!(
-        *body.last().unwrap() as u32,
-        0xffff_0000,
-        "its accent-color"
-    );
+    assert_eq!(body[body.len() - 2] as u32, 0xffff_0000, "its accent-color");
     // A dismissal changes nothing, and is journaled.
     assert!(p.answer_request(asked[0].1, None));
     assert_eq!(value(&p, "at"), "");
@@ -760,12 +756,14 @@ fn auth_ephemeral_refuses_without_queuing_a_browser_launch() {
         let node = runner.kernel().node_by_key(key).unwrap().id;
         runner.dispatch(node, Event::Press).unwrap();
         let mut out = runner.take_requests().pop().unwrap();
+        let reach = out.request.reach;
         out.request = exact_data::auth::open_auth_session(
             "https://as.test/a",
             "app.test:/cb",
             "s1",
             ephemeral,
         );
+        out.request.reach = reach;
         let auth::Arm::Present(session) =
             auth::arm(runner, &out, false, auth::Browser::Android, None)
         else {

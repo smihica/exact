@@ -57,8 +57,6 @@ const gate = { on: false, started: 0, streams: {}, current: null, decoders: new 
     if (d?.decoder.state === 'configured') d.decoder.decode(new EncodedVideoChunk({ type, timestamp, data }));
   },
 };
-(globalThis.exact ??= {}).streamGate = gate;
-globalThis.__exact_gate_decode = (...args) => gate.decode(...args);
 function streamTiming(start) {
   if (start) Object.assign(gate, { on: true, started: performance.now(), streams: {} });
   if (!gate.on) return { measuring: false };
@@ -84,19 +82,20 @@ function dropStreams(prefix) {
 import { inertAncestor, displayMode, environment, navigation, routeFlags, foldEnv, preferFold, FOLD_EVENT, preferDisplayMode, typedControl, settleValue, animationClock, pageReporter } from './navigation.js';
 import { backButton } from './input-glue.js';
 import { guestOutline, guestTap, guestType, viewBox, textBaseline, reveal, selectAll, scrollRange, typeControl, watchGlides, glidesSettled, scrollsSeen } from './agent-input.js';
+import { loadOnce } from '../web/load-once.js';
+
 // A zoomable scroller's zoom and range (zoom.js, LLP 1057.001.000 §6).
 const zoomOf = e => (e.$zoomRange ? { scrollZoom: e.$zoom, minZoom: e.$zoomRange[0], maxZoom: e.$zoomRange[1] } : {});
-watchGlides();
 // How long `clock settle` waits for a scroller gliding on its own, as a native host waits (agent.mjs reason `scroll`).
 const GLIDE_BOUND_MS = 4000;
 // A runtime value as the runner's typed JSON: records by field name.
 const typed = (v, t) => v == null || typeof t === 'string' ? v : Array.isArray(t) ? (t[0] === '?' ? typed(v, t[1]) : v.map(x => typed(x, t[1]))) : Object.fromEntries(Object.keys(t).map((k, i) => [k, typed(v[i], t[k])]));
 // `state`'s reply with every string a live password field holds as the tree shows the field, `•••`: the slot it writes and
 // a value that copies it are the same secret (LLP 1156.001 D6). `expect state` asks `reveal` to compare; nothing prints that.
-const masked = (req, reply) => { const secrets = req.reveal ? [] : [...document.querySelectorAll('#exact-root input[type=password]')].map(e => e.value).filter(Boolean), hide = v => typeof v === 'string' ? secrets.includes(v) ? '•••' : v : Array.isArray(v) ? v.map(hide) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, hide(x)])) : v; return secrets.length ? { ...reply, slots: hide(reply.slots), derives: hide(reply.derives), resources: hide(reply.resources) } : reply; };
+const masked = (req, reply) => { const secrets = req.reveal ? [] : [...document.querySelectorAll('#exact-root input[type=password]')].map(e => e.value).filter(Boolean), hide = v => typeof v === 'string' ? secrets.includes(v) ? '•••' : v : Array.isArray(v) ? v.map(hide) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, hide(x)])) : v; return secrets.length ? hide(reply) : reply; };
 const PROPS = [['aria-live', 'accessibilityLive'], ['role', 'accessibilityRole'], ['data-alertpart', 'alertPart'], ['aria-controls', 'accessibilityControls'], ['aria-activedescendant', 'accessibilityActiveDescendant'], ['id', 'id'], ['aria-description', 'accessibilityHint'], ['aria-keyshortcuts', 'accessibilityKeyShortcuts'], ['aria-orientation', 'accessibilityOrientation'], ['aria-pressed', 'accessibilityPressed'], ['aria-current', 'accessibilityCurrent'], ['aria-sort', 'accessibilitySort'], ['colspan', 'colSpan', 1], ['rowspan', 'rowSpan', 1], ['scope', 'scope'], ['aria-level', 'accessibilityHeadingLevel', 1], ['aria-posinset', 'accessibilityPosInSet', 1], ['aria-setsize', 'accessibilitySetSize', 1], ['aria-valuenow', 'accessibilityValueNow'], ['aria-valuemin', 'accessibilityValueMin'], ['aria-valuemax', 'accessibilityValueMax'], ['aria-valuetext', 'accessibilityValueText'], ['placeholder', 'placeholder'], ['autocomplete', 'autocomplete'], ['viewportFit', 'viewportFit'], ['interactiveWidget', 'interactiveWidget'], ['data-hatch', 'hatch'], ['data-nativeviewmodulename', 'nativeViewModuleName'], ['data-nativeviewprops', 'nativeViewProps'],
   ['aria-invalid', 'accessibilityInvalid'],
-  ['data-datatransfertext', 'dataTransferText'], ['data-datatransferurl', 'dataTransferUrl'], ['data-datatransferfiles', 'dataTransferFiles'],
+  ['data-datatransfertext', 'dataTransferText'], ['data-datatransferurl', 'dataTransferUrl'], ['data-datatransferfiles', 'dataTransferFiles'], ['data-datatransfernames', 'dataTransferNames'],
   ['navigationKey', 'navigationKey'], ['navigationBack', 'navigationBack'], ['data-navigationbar', 'navigationBar'],
   ['navigationPresentation', 'navigationPresentation'], ['type', 'type'], ['popover', 'popover'],
   ['popovertarget', 'popovertarget'], ['popovertargetaction', 'popovertargetaction'], ['commandfor', 'commandfor'], ['command', 'command'],
@@ -106,11 +105,21 @@ const TYPES = { TEMPLATE: 'Head', BUTTON: 'Pressable', INPUT: 'TextInput', TEXTA
 /** The view an operation names: its id, else the first node with that testId on an active screen, a covered
  * screen's or an unselected tab's copy only when no active one carries it, as the runner's `target`. */
 const targetOf = (nodes, t) => { const named = nodes.filter(n => n.props.testId === t); return nodes.find(n => n.id === t) ?? named.find(n => !n.inactive) ?? named[0]; };
-export function install(exact) {
+/** The reads an attached session makes of a page a person has open (LLP 1012.000 D3). */
+const PASSIVE = new Set(['tree', 'layout', 'logs', 'perf', 'state', 'tags']);
+/** The agent's door into this page: `exact.agentSettled`, which takes the page's clock and animations. `passive`
+ * instead returns a reader for an attached session (LLP 1012.000 D2, D3): the page keeps its own clock, animations,
+ * storage and journal; it answers only the reads in PASSIVE, waits for no work and presents nothing. */
+export function install(exact, { passive = false } = {}) {
   const views = exact.views, id = exact.viewId;
   let page;
-  const ownPage = () => page ??= (f => ({ prefer: p => { f.prefer(p); return f.read(); }, read: () => f.read() }))(pageReporter(true));
-  setFaultLog(line => journal.push(`t=${exact.clock.now} ${line}`)); // the runner's journal line for an injected failure (LLP 1103 D2)
+  const ownPage = () => page ??= (f => ({ prefer: p => { f.prefer(p); return f.read(); }, read: () => f.read() }))(pageReporter(!passive));
+  if (!passive) {
+    setFaultLog(line => journal.push(`t=${exact.clock.now} ${line}`)); // the runner's journal line for an injected failure (LLP 1103 D2)
+    exact.streamGate = gate;
+    globalThis.__exact_gate_decode = (...args) => gate.decode(...args);
+    watchGlides();
+  }
   // A Markdown text's pieces are its content, not views.
   // A view leaving with its exit animation (presence-glue.js) is no view: the runner destroyed it.
   // A paragraph text flows around shapes is its fragments on the page; the
@@ -146,14 +155,15 @@ export function install(exact) {
     // A determinate progress's `value` and `max` as written (LLP 1116 D8): the DOM's `value` is a number.
     if (el.tagName === 'PROGRESS') { for (const k of ['value', 'max']) if (el.hasAttribute(k)) props[k] = el.getAttribute(k); }
     else if ('value' in el && el.tagName !== 'BUTTON' && (!(el.tagName === 'OPTION' || el.type === 'checkbox' || el.type === 'radio') || el.hasAttribute('value'))) props.value = el.value;
-    // A password field's value is never agent output (#134): a fixed mark, whatever its length, and its `type` as the runner's tree gives it.
+    // A password field's value is never agent output: a fixed mark, whatever its length, and its `type` as the runner's tree gives it.
     if (el.tagName === 'INPUT' && el.type === 'password') { props.type = 'password'; if (props.value) props.value = '•••'; }
     // A checkbox's or radio's model value, as the runner's tree gives its `checked` row.
     if (el.$checked !== undefined) props.checked = el.$checked;
     // The runner's props that element.rs writes as attributes, by its names. A sheet's `role="dialog"` and `aria-modal`
-    // are the host's presentation of a modal route, not props (input-glue.js marks them; LLP 1115.000 D4.5).
+    // are the host's presentation of a modal route, not props (input-glue.js marks them; LLP 1115.000 D4.5), as is the
+    // `popover` of a popover route the browser presents (route-popovers.js).
     const sheet = el.hasAttribute('data-exact-dialog');
-    for (const [attr, prop, num] of PROPS) if (el.hasAttribute(attr) && !(hostRole && attr === 'role')) props[prop] = num ? Number(el.getAttribute(attr)) : el.getAttribute(attr);
+    for (const [attr, prop, num] of PROPS) if (el.hasAttribute(attr) && !(hostRole && attr === 'role') && !(attr === 'popover' && el.hasAttribute('data-exact-route-popover'))) props[prop] = num ? Number(el.getAttribute(attr)) : el.getAttribute(attr);
     if (el.exactDraggable != null) props.draggable = el.exactDraggable;
     // The intent `tree --ax` reads (LLP 1080.002 D7), as the runner names it.
     if (el.hasAttribute('inert')) props.inert = true;
@@ -228,7 +238,8 @@ export function install(exact) {
   // load event of the src it has now.
   const loaded = new WeakMap();
   // (A load event does not reach the window: the document hears it.)
-  document.addEventListener('load', e => { if (e.target instanceof HTMLIFrameElement) loaded.set(e.target, e.target.getAttribute('src')); }, true);
+  // (A passive reader adds no listener to the person's page; a frame then reads as loading from its own marks alone.)
+  if (!passive) document.addEventListener('load', e => { if (e.target instanceof HTMLIFrameElement) loaded.set(e.target, e.target.getAttribute('src')); }, true);
   for (const f of document.querySelectorAll('#exact-root iframe')) { try { if (f.contentDocument?.readyState === 'complete' && f.contentWindow.location.href !== 'about:blank') loaded.set(f, f.getAttribute('src')); } catch {} }
   // `layout <node>` (LLP 1035.002 D1), as glue.js `nodeDetail` gives the
   // host's half. The JS target keeps no kernel, so the rows are the page's:
@@ -311,7 +322,7 @@ export function install(exact) {
       browser: Object.fromEntries(Object.entries(INHERITED).map(([row, prop]) => [row, cs.getPropertyValue(prop)])),
       observed: { clock: exact.clock.now, wall: Date.now() },
       // What is held on it (LLP 1122 D8): its state and the rows it shows.
-      ...((h) => { if (h?.held && h.held.node == null && h.held.el) h.held.node = id(h.held.el); return h ?? {}; })(exact.heldOf?.(el)),
+      ...((h) => { if (h?.held && h.held.node == null && h.held.el) { if (passive) return { ...h, held: { ...h.held, node: id(h.held.el) } }; h.held.node = id(h.held.el); } return h ?? {}; })(exact.heldOf?.(el)),
     };
   };
   // presence-glue.js `observation`, by this runtime's view ids (its elements carry no `data-view`).
@@ -328,10 +339,10 @@ export function install(exact) {
   // Animated images held to the agent's clock (LLP 1011.000): the web host's
   // own `image-glue.js`, fetched at the first seek of a page with a GIF or
   // WebP (the only images it holds; a page without one does no work).
-  let images = null;
+  const loads = {};
   const holdImages = () => {
-    if (!images && document.querySelector('#exact-root img[src*=".gif" i], #exact-root img[src*=".webp" i]')) images = import('./image-glue.js').then(() => exact.holdImages({ root: document.getElementById('exact-root'), now: () => exact.clock.now }));
-    images?.then(h => h.seek());
+    if (!loads.images && document.querySelector('#exact-root img[src*=".gif" i], #exact-root img[src*=".webp" i]')) loadOnce(loads, 'images', () => import('./image-glue.js').then(() => exact.holdImages({ root: document.getElementById('exact-root'), now: () => exact.clock.now })), error => journal.push(`images: ${error.message}`));
+    loads.images?.then(h => h?.seek());
   };
   const seek = (sync = true) => { anim.register(exact.clock.now); anim.seek(exact.clock.now, sync); holdImages(); };
   // Deliver world records before later timers (LLP 1012, LLP 1046.003).
@@ -344,12 +355,14 @@ export function install(exact) {
   };
   // Whether this clock runs `a` (a refused tap's advice, scripts/agent-aim.mjs `pageOutside`): on the document's timeline,
   // and not held by its author, then or, not yet registered, at its registration.
-  exact.clockRuns = anim.runs;
-  // motion.js owns post-commit reconciliation. The agent registers a
-  // commit's new animations here, and reconciles only when its clock moves.
-  exact.After.push(() => seek(false));
-  // What the page held before this module came (main.js's `holdEarly`) is this clock's from here.
-  { const i = exact.After.indexOf(exact.holdEarly); if (i >= 0) { exact.After.splice(i, 1); seek(false); } }
+  if (!passive) {
+    exact.clockRuns = anim.runs;
+    // motion.js owns post-commit reconciliation. The agent registers a
+    // commit's new animations here, and reconciles only when its clock moves.
+    exact.After.push(() => seek(false));
+    // What the page held before this module came (main.js's `holdEarly`) is this clock's from here.
+    const i = exact.After.indexOf(exact.holdEarly); if (i >= 0) { exact.After.splice(i, 1); seek(false); }
+  }
   // Held device requests (LLP 1069.007 D3): `openAuthSession`'s (auth.js).
   const holds = () => [...exact.auth?.holds() ?? [], ...exact.files?.holds() ?? [], ...exact.extensions?.holds?.() ?? []];
   // What in flight no settle waits on: a held request, which the agent answers, and a send answered after a span,
@@ -357,18 +370,22 @@ export function install(exact) {
   const unwaited = () => holds().length + (exact.extensions?.spans?.() ?? 0);
   // Asks the server holds (`exactHeld`, LLP 1016.000 D9): no clock waited on them; the reply says which.
   const heldNamed = r => { const h = exact.heldAsks?.() ?? []; return h.length && r && !r.error ? { ...r, held: h.length, heldTargets: h.map(x => x.name) } : r; };
-  const settleGpu = async () => await exact.gpu?.settled?.() ?? [];
+  const settleGpu = async (wakes = false) => await exact.gpu?.settled?.(wakes) ?? [];
   const gpuPendingReply = (req, pending) => {
     const names = pending.map(item => item.name ?? 'GPU work');
     return req.op === 'clock' ? heldNamed({ ...tags(), settled: false, reason: 'gpu', pending: names })
       : { error: `GPU is not settled: ${names.join(', ')}`, pending: names };
   };
   const answer = async (req) => {
-    await pieces();
-    const beforeGpu = await settleGpu();
-    if (beforeGpu.length) return gpuPendingReply(req, beforeGpu);
-    // A read presents this clock without standing in for a commit hook.
-    seek(false);
+    if (passive) {
+      if (!PASSIVE.has(req.op) || req.reveal || req.picture || req.frames || req.streams || req.hatches) return { error: `unsupported: ${req.op} is not a read of a page a person has open` };
+    } else {
+      await pieces();
+      const beforeGpu = await settleGpu();
+      if (beforeGpu.length) return gpuPendingReply(req, beforeGpu);
+      // A read presents this clock without standing in for a commit hook.
+      seek(false);
+    }
     // `tap @t <choice>` / `type @t <value>` answer a held request (D4).
     if ((req.op === 'tap' || req.op === 'type') && req.ticket != null) return (await exact.files?.answer(req)) ?? exact.extensions?.answer?.(req) ?? (exact.auth ? exact.auth.answer(req) : { error: `not pending: @${req.ticket}` });
     switch (req.op) {
@@ -387,6 +404,8 @@ export function install(exact) {
         // A hatch's regions and parts, under their node (LLP 1075.003.000.001 §3.4, §3.5; hatches.js).
         if (exact.hatchRegions) nodes = nodes.map(n => { const o = exact.hatchRegions.of(views.get(n.id)); return o ? { ...n, ...o } : n; });
         nodes = nodes.map(n => { const ids = packaged(views.get(n.id))?.partIds?.(); return ids?.length ? { ...n, parts: ids.map(id => ({ id, live: true })) } : n; });
+        const floating = document.pictureInPictureElement;
+        if (floating) for (const n of nodes) if (views.get(n.id) === floating) n.pictureInPicture = { presentation: "system" };
         if (req.plan) for (const n of nodes) { const site = views.get(n.id)?.dataset?.site; if (site != null) n.site = Number(site); }
         return { nodes, roots, ...tags(), ...(req.plan && exact.plan ? { planDigest: exact.plan } : {}) };
       }
@@ -429,7 +448,13 @@ export function install(exact) {
         // The agent's `back` from a route (LLP 1116.006 D4; the driver took an open dialog's first): the browser's Back.
         if (req.back) return (pageHistory() ?? navigation).back(document.getElementById('exact-root'));
         // The browser's own traversal (LLP 1038 D11); popstate reaches the app.
-        if (req.history) { history.go(req.history); await new Promise(r => setTimeout(r, 300)); return { history: req.history, delivery: 'platform' }; }
+        if (req.history) {
+          const routes = pageHistory();
+          if (routes) return routes.travel(document.getElementById('exact-root')?.querySelector('[navigationBack]'), req.history);
+          history.go(req.history);
+          await new Promise(r => setTimeout(r, 300));
+          return { history: req.history, delivery: 'platform' };
+        }
         {
           const el = views.get(req.id);
           if (el && (inertAncestor(el) || ['hidden', 'collapse'].includes(getComputedStyle(backButton(el) ?? el).visibility))) return { handled: true, error: `view ${req.id} is hidden or inert` };
@@ -520,7 +545,7 @@ export function install(exact) {
             // round, so a run of sends never spends the rounds. Past the deadline,
             // or 4096 stops, the rest is one advance.
             // An answer's own timer (ts-fetch.js) is due as a task is: the settle goes to it, while its answer is live.
-            const gpuPending = await settleGpu();
+            const gpuPending = await settleGpu(true);
             if (gpuPending.length) return gpuPendingReply(req, gpuPending);
             world = exact.gpu?.clock?.(true) ?? {};
             const at = exact.clock.now, epoch = exact.clock.epoch, to = Math.max(anim.settle(), world.settleAt ?? 0, ...exact.clock.timers.filter(t => t.data && t.live()).map(t => t.due));
@@ -545,7 +570,7 @@ export function install(exact) {
             seek();
             await new Promise(r => requestAnimationFrame(() => r()));
           }
-          const gpuPending = await settleGpu();
+          const gpuPending = await settleGpu(true);
           if (gpuPending.length) return gpuPendingReply(req, gpuPending);
           const waiting = holds();
           if (waiting.length) return { clock: exact.clock.now, settled: false, reason: 'device', tickets: waiting.map(h => h.ticket) };
@@ -587,7 +612,7 @@ export function install(exact) {
         for (const end = performance.now() + 20000; exact.extensions?.polling?.() && performance.now() < end;) await new Promise(r => setTimeout(r, 1));
         seek();
         await new Promise(r => requestAnimationFrame(() => r()));
-        const gpuPending = await settleGpu();
+        const gpuPending = await settleGpu(true);
         if (gpuPending.length) return gpuPendingReply(req, gpuPending);
         // Requests still in flight on real time, which a jump does not wait for (`clock settle` does): the driver says so.
         const inflight = exact.inflight.n - unwaited(), b = exact.data?.background?.(), background = b ? b.queued + b.inFlight : 0;
@@ -658,7 +683,7 @@ export function install(exact) {
         const head = { ...Object.fromEntries(['title', 'description', 'image', 'canonical', 'robots', 'status'].map(k => [k, Head['head' + k[0].toUpperCase() + k.slice(1)] ?? null])), edited: Head.headEdited === 'true' };
         // The drive's app storage (trivia F7): none unless it names a scratch store, as storage-environment.js's `storageKey`.
         const store = new URL(performance.getEntriesByType?.('navigation')[0]?.name ?? location.href).searchParams.get('storage');
-        const storage = store == null ? { available: false, code: 'agent', message: 'storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)' } : { available: true, store };
+        const storage = passive ? { available: true, store: 'page', message: "the page's own storage, which an attached session neither reads nor writes" } : store == null ? { available: false, code: 'agent', message: 'storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)' } : { available: true, store };
         // Each queue's waiting sends (LLP 1092 D10), as the runner's `state.queued`.
         const queued = Object.fromEntries((exact.mutations ?? []).filter(m => m.wait?.length).map(m => [m.name, m.wait.length]));
         // Each task's next due time, `null` while idle or spent (LLP 1092 D10), as the runner's `state.tasks`.
@@ -676,7 +701,7 @@ export function install(exact) {
         const mutationFailures = Object.fromEntries(exact.mutations.flatMap(m => { const failure = m.e(); return failure ? [[m.name, {code: failure[0], message: failure[1]}]] : []; }));
         // The writes shown over resources until they end or are answered (overlay.js), as the runner's `state.writes`.
         const writes = exact.writes?.() ?? [];
-        return masked(req, { replacement: replacementState(), delivery: deliveryFacts, slots, derives, resources, ...ownedState, ...(observed.length ? { planDigest: exact.plan ?? null, resourceStatus, resourcesMeasuredFrom: exact.resources.find(r => r.observation).resourcesMeasuredFrom, failures } : {}), ...(Object.keys(mutationFailures).length ? {mutationFailures} : {}), mutationRequests: exact.mutations.reduce((n,m)=>n+m.requests,exact.mutations.retired ?? 0), device: { screenReader: (exact.page ?? ownPage()).read()["screen-reader"], frozen: (exact.page ?? ownPage()).read().frozen, displayMode: displayMode(), navigationType: ownPage().read()['navigation-type'], gpuTier: (exact.page ?? ownPage()).read()['gpu-tier'], presented: (exact.page ?? ownPage()).read().presented }, ...(writes.length ? { writes } : {}), ...(Object.keys(failed).length ? { failed } : {}), pending, ...(Object.keys(exact.heldReplies?.() ?? {}).length ? { heldReplies: exact.heldReplies() } : {}), streams, watches: exact.watchState?.() ?? [], ...(faults.length ? { faults } : {}), ...(background ? { background } : {}), tasks, taskTiming, queued, ...(exact.extensions?.declared?.() ?? {}), ...(exact.extensions?.wake?.() ? { wake: exact.extensions.wake() } : {}), ...(exact.sounds ? { sounds: exact.sounds.state(req.sounds === 'all') } : {}), ...(exact.transport?.declared() ? { transport: exact.transport.state() } : {}), ...(exact.midi ? { midi: exact.midi.state(req.midi === 'all') } : {}), ...(exact.extensions ? { extensions: exact.extensions.state() } : {}), ...(exact.calls ? { intents: exact.calls.state() } : {}), wakelock: exact.wakelock?.() ?? { held: false, by: [] }, orientationlock: exact.orientationlock?.() ?? { held: false, by: [], words: [], lock: null, conflict: null, applied: 'unavailable' }, head, focus, language, storage, keyboard, atoms, decorations, navigation: (pageHistory() ?? navigation).observation(document.getElementById('exact-root')), media, mediaSession: exact.mediaSession?.state(id) ?? { owner: null, claimants: [], actions: [], playbackState: 'none', published: 'none' }, window: { title: document.title }, ...(exact.canvas2dState ? { canvas: exact.canvas2dState() } : {}), ...(exact.surfaceRefusals ? { surfaceRefusals: exact.surfaceRefusals() } : {}), reorder: exact.reorderState?.() ?? null, ...(exact.lists ? { scrollIntoView: exact.lists.intoView() } : {}), ...(exact.presenceLive ? { presence: presence() } : {}), ...(exact.hatchState ? { hatches: exact.hatchState() } : {}), ...tags() });
+        return masked(req, { replacement: replacementState(), delivery: deliveryFacts, slots, derives, resources, ...ownedState, ...(observed.length ? { planDigest: exact.plan ?? null, resourceStatus, resourcesMeasuredFrom: exact.resources.find(r => r.observation).resourcesMeasuredFrom, failures } : {}), ...(Object.keys(mutationFailures).length ? {mutationFailures} : {}), mutationRequests: exact.mutations.reduce((n,m)=>n+m.requests,exact.mutations.retired ?? 0), device: { screenReader: (exact.page ?? ownPage()).read()["screen-reader"], frozen: (exact.page ?? ownPage()).read().frozen, displayMode: displayMode(), navigationType: ownPage().read()['navigation-type'], gpuTier: (exact.page ?? ownPage()).read()['gpu-tier'], presented: (exact.page ?? ownPage()).read().presented }, ...(writes.length ? { writes } : {}), ...(Object.keys(failed).length ? { failed } : {}), pending, ...(Object.keys(exact.heldReplies?.() ?? {}).length ? { heldReplies: exact.heldReplies() } : {}), streams, watches: exact.watchState?.() ?? [], ...(faults.length ? { faults } : {}), ...(background ? { background } : {}), tasks, taskTiming, queued, ...(exact.extensions?.declared?.() ?? {}), ...(exact.extensions?.wake?.() ? { wake: exact.extensions.wake() } : {}), ...(exact.sounds ? { sounds: exact.sounds.state(req.sounds === 'all') } : {}), ...(exact.transport?.declared() ? { transport: exact.transport.state() } : {}), ...(exact.midi ? { midi: exact.midi.state(req.midi === 'all') } : {}), ...(exact.extensions ? { extensions: exact.extensions.state() } : {}), ...(exact.calls ? { intents: exact.calls.state() } : {}), ...(exact.controls ? { controls: exact.controls } : {}), wakelock: exact.wakelock?.() ?? { held: false, by: [] }, orientationlock: exact.orientationlock?.() ?? { held: false, by: [], words: [], lock: null, conflict: null, applied: 'unavailable' }, head, focus, language, storage, keyboard, atoms, decorations, navigation: (pageHistory() ?? navigation).observation(document.getElementById('exact-root')), media, mediaSession: exact.mediaSession?.state(id) ?? { owner: null, claimants: [], actions: [], playbackState: 'none', published: 'none' }, window: { title: document.title }, ...(exact.canvas2dState ? { canvas: exact.canvas2dState() } : {}), ...(exact.surfaceRefusals ? { surfaceRefusals: exact.surfaceRefusals() } : {}), reorder: exact.reorderState?.() ?? null, ...(exact.lists ? { scrollIntoView: exact.lists.intoView() } : {}), ...(exact.presenceLive ? { presence: presence() } : {}), ...(exact.hatchState ? { hatches: exact.hatchState() } : {}), ...tags() });
       }
       // The page group (LLP 1069.000 D6), where the plan reads `exactPage` (facts.js); else the drive's facts
       // held here, so `root-font-size` still sets the root element's size `rem` follows (D3), as glue.js does.
@@ -692,10 +717,12 @@ export function install(exact) {
       case 'cancel': return exact.calls ? exact.calls.cancel(req.id) : { error: 'cancel: this app declares no tool' };
       case 'launchEntry': if (req.launch === 'call' && exact.calls) { const [, tool, args] = String(req.entry ?? '').trim().match(/^(\S+)\s*(.*)$/s) ?? []; return { ...exact.calls.call({ tool, args: args || '{}', door: req.door ?? 'agent', cold: true }), cold: true }; }
         return exact.extensions?.launch ? exact.extensions.launch(req) : { error: `--${req.launch}: this app reads no module` }; // LLP 1133.004 §7
-      case 'prefer': { if (req.faults) return 'dropStream' in req.faults ? dropStreams(req.faults.dropStream) : faultOp(req.faults); if (req.extension || req.permission) return exact.extensions ? exact.extensions.prefer(req) : { error: 'prefer: this app reads no module' }; if (req.midi) return exact.midi ? exact.midi.prefer(req.midi) : { error: 'prefer midi: this plan keeps no MIDI queue' }; const pins = Object.entries(req.mode ?? {}), why = req.mode && (exact.modes ? exact.modes.check(pins) : pins.length > 0 && `${pins.map(([a, v]) => `\`${a}=${v}\``).join(" ")} names an axis or value the app's design lacks, or an axis twice`); if (why) return { error: `prefer mode: ${why}` }; try { const facts = (exact.page ?? ownPage()).prefer(req.page ?? {}); if (req.page?.['root-font-size'] !== undefined) dispatchEvent(new Event('resize')); if (req.page?.['visibility-state'] !== undefined) exact.foreground?.(facts['visibility-state'] !== 'hidden'); const fold = !req.fold ? foldEnv() : exact.fold ? exact.fold.prefer(req.fold) : preferFold(Object.keys(req.fold).length ? req.fold : null); const display = req.media?.['display-mode']; if (display != null) (exact.displayMode?.prefer ?? preferDisplayMode)(display); if (req.mode) exact.modes?.set(pins); if (req.fold) dispatchEvent(new Event(FOLD_EVENT)); return { page: facts, fold, ...(req.mode ? { mode: exact.modes?.read() ?? {} } : {}) }; } catch (e) { return { error: e.message, ...(e.malformed === true ? { malformed: true } : {}) }; } } // @ref LLP 1121 D13 — the mode group: checked before any fact is set, set after the rest
+      case 'prefer': { if (req.faults) return 'dropStream' in req.faults ? dropStreams(req.faults.dropStream) : faultOp(req.faults); if (req.extension || req.permission) return exact.extensions ? exact.extensions.prefer(req, "drive") : { error: 'prefer: this app reads no module' }; if (req.midi) return exact.midi ? exact.midi.prefer(req.midi) : { error: 'prefer midi: this plan keeps no MIDI queue' }; const pins = Object.entries(req.mode ?? {}), why = req.mode && (exact.modes ? exact.modes.check(pins) : pins.length > 0 && `${pins.map(([a, v]) => `\`${a}=${v}\``).join(" ")} names an axis or value the app's design lacks, or an axis twice`); if (why) return { error: `prefer mode: ${why}` }; try { const facts = (exact.page ?? ownPage()).prefer(req.page ?? {}); if (req.page?.['root-font-size'] !== undefined) dispatchEvent(new Event('resize')); if (req.page?.['visibility-state'] !== undefined) exact.foreground?.(facts['visibility-state'] !== 'hidden'); const fold = !req.fold ? foldEnv() : exact.fold ? exact.fold.prefer(req.fold) : preferFold(Object.keys(req.fold).length ? req.fold : null); const display = req.media?.['display-mode']; if (display != null) (exact.displayMode?.prefer ?? preferDisplayMode)(display); if (req.mode) exact.modes?.set(pins); if (req.fold) dispatchEvent(new Event(FOLD_EVENT)); return { page: facts, fold, ...(req.mode ? { mode: exact.modes?.read() ?? {} } : {}) }; } catch (e) { return { error: e.message, ...(e.malformed === true ? { malformed: true } : {}) }; } } // @ref LLP 1121 D13 — the mode group: checked before any fact is set, set after the rest
       default: return { error: `${req.op} is not carried by the JS target` };
     }
   };
-  exact.agentSettled = async req => { const reply = await answer(req); return { ...tags(), ...reply }; };
+  const settled = async req => { const reply = await answer(req); return { ...tags(), ...reply }; };
+  if (passive) return settled;
+  exact.agentSettled = settled;
   return true;
 }

@@ -9,7 +9,7 @@ const IDLE_BITMAPS: usize = 64;
 #[derive(Default)]
 pub(super) struct Images {
     bitmaps: HashMap<(usize, [u32; 2]), (Arc<Bitmap>, TextureId)>,
-    idle: Option<IdleBitmaps>,
+    idle: IdleBitmaps,
     pixmaps: HashMap<usize, Uploaded>,
     /// A recorded revision keeps its texture without holding the CPU pixels.
     frames: HashMap<(u64, bool), TextureId>,
@@ -23,12 +23,26 @@ pub(super) struct Images {
 
 #[derive(Default)]
 struct IdleBitmaps {
-    // In the order they left the frame. Only a full decoded size enters here.
+    /// Full-size bitmap textures kept in the order they left the frame.
     entries: VecDeque<(Weak<Bitmap>, TextureId, u64)>,
     bytes: u64,
 }
 
 impl IdleBitmaps {
+    fn mip_bytes(width: u32, height: u32) -> u64 {
+        let desc = TextureDesc {
+            mipmapped: true,
+            ..TextureDesc::rgba(width, height)
+        };
+        (0..desc.levels())
+            .map(|level| {
+                u64::from((desc.width >> level).max(1))
+                    * u64::from((desc.height >> level).max(1))
+                    * u64::from(desc.format.channels())
+            })
+            .sum()
+    }
+
     fn remove(&mut self, index: usize) -> TextureId {
         let (_, texture, bytes) = self.entries.remove(index).unwrap();
         self.bytes -= bytes;
@@ -39,12 +53,19 @@ impl IdleBitmaps {
         if size != [image.width(), image.height()] {
             return None;
         }
-        // A Weak keeps its address reserved even after the decoded pixels drop.
+        // A Weak keeps its allocation address reserved even after the decoded pixels drop.
         let i = self
             .entries
             .iter()
             .position(|(owner, _, _)| owner.as_ptr() == Arc::as_ptr(image))?;
         Some(self.remove(i))
+    }
+
+    fn take_texture(&mut self, texture: TextureId) -> Option<Arc<Bitmap>> {
+        let i = self.entries.iter().position(|(_, t, _)| *t == texture)?;
+        let image = self.entries[i].0.upgrade()?;
+        self.remove(i);
+        Some(image)
     }
 
     fn sweep(&mut self, device: &mut impl Device, all: bool) -> Result<()> {
@@ -62,13 +83,11 @@ impl IdleBitmaps {
         image: Arc<Bitmap>,
         texture: TextureId,
     ) -> Result<()> {
-        if Arc::strong_count(&image) == 1 {
+        let (w, h) = (image.width(), image.height());
+        if Arc::strong_count(&image) == 1 || w == 0 || h == 0 {
             return device.retire_texture(texture);
         }
-        let (w, h) = (image.width(), image.height());
-        let bytes: u64 = (0..=w.max(h).ilog2())
-            .map(|level| u64::from((w >> level).max(1)) * u64::from((h >> level).max(1)) * 4)
-            .sum();
+        let bytes = Self::mip_bytes(w, h);
         if bytes > IDLE_BYTES {
             return device.retire_texture(texture);
         }
@@ -95,18 +114,18 @@ struct Spare {
 }
 
 impl Images {
-    pub(super) fn new(cache_idle: bool) -> Self {
-        Self {
-            idle: cache_idle.then(IdleBitmaps::default),
-            ..Self::default()
-        }
-    }
-
     pub fn pin(&mut self, texture: TextureId) {
         if self.bitmaps.values().any(|(_, t)| *t == texture)
             || self.pixmaps.values().any(|u| u.texture == texture)
             || self.frames.values().any(|&t| t == texture)
         {
+            *self.pins.entry(texture).or_default() += 1;
+        } else if let Some(image) = self.idle.take_texture(texture) {
+            let key = (
+                Arc::as_ptr(&image) as usize,
+                [image.width(), image.height()],
+            );
+            self.bitmaps.insert(key, (image, texture));
             *self.pins.entry(texture).or_default() += 1;
         }
     }
@@ -139,9 +158,7 @@ impl Images {
         {
             device.retire_texture(texture)?;
         }
-        if let Some(idle) = &mut self.idle {
-            idle.sweep(device, false)?;
-        }
+        self.idle.sweep(device, false)?;
         for unused in self.spare.drain(..) {
             device.retire_texture(unused.texture)?;
         }
@@ -165,31 +182,31 @@ impl Images {
 
     pub(super) fn trim(&mut self, device: &mut impl Device) -> Result<()> {
         self.used.clear();
-        if let Some(idle) = &mut self.idle {
-            idle.sweep(device, true)?;
-        }
+        self.idle.sweep(device, true)?;
         self.release_unused(device, false)
     }
 
     fn release_unused(&mut self, device: &mut impl Device, keep_idle: bool) -> Result<()> {
-        let unused =
-            |texture: &TextureId| !self.used.contains(texture) && !self.pins.contains_key(texture);
-        for (_, texture) in self.frames.extract_if(|_, t| unused(t)) {
+        for (_, texture) in self
+            .frames
+            .extract_if(|_, t| !self.used.contains(t) && !self.pins.contains_key(t))
+        {
             device.retire_texture(texture)?;
         }
-        let mut idle = self.idle.as_mut().filter(|_| keep_idle);
-        if let Some(cache) = &mut idle {
-            // Release unused reduced variants first: their Arcs cannot keep a full-size bitmap eligible.
+        let unused =
+            |texture: &TextureId| !self.used.contains(texture) && !self.pins.contains_key(texture);
+        if keep_idle {
+            // Release unused reduced variants first so their Arcs do not keep a full-size bitmap eligible.
             for (_, (_, texture)) in self.bitmaps.extract_if(|(_, size), (image, t)| {
                 unused(t) && *size != [image.width(), image.height()]
             }) {
                 device.retire_texture(texture)?;
             }
-            cache.sweep(device, false)?;
+            self.idle.sweep(device, false)?;
         }
         for (_, (image, texture)) in self.bitmaps.extract_if(|_, (_, t)| unused(t)) {
-            if let Some(cache) = &mut idle {
-                cache.keep(device, image, texture)?;
+            if keep_idle {
+                self.idle.keep(device, image, texture)?;
             } else {
                 device.retire_texture(texture)?;
             }
@@ -216,7 +233,7 @@ impl Images {
             self.used.insert(*texture);
             return Ok(*texture);
         }
-        let texture = match self.idle.as_mut().and_then(|idle| idle.take(image, size)) {
+        let texture = match self.idle.take(image, size) {
             Some(texture) => texture,
             None => upload_bitmap(device, image, size)?,
         };
@@ -280,7 +297,9 @@ impl Images {
         let texture = match self.spare.iter().position(fits) {
             Some(i) => {
                 let texture = self.spare.swap_remove(i).texture;
-                fill(device, texture, pixels, mipmapped)?;
+                if let Err(error) = fill(device, texture, pixels, mipmapped) {
+                    return Err(retire_after_error(device, texture, error));
+                }
                 texture
             }
             None => upload(device, pixels, mipmapped)?,
@@ -323,8 +342,18 @@ fn upload(
         mipmapped,
         ..TextureDesc::rgba(pixels.width(), pixels.height())
     })?;
-    fill(device, texture, pixels, mipmapped)?;
+    if let Err(error) = fill(device, texture, pixels, mipmapped) {
+        return Err(retire_after_error(device, texture, error));
+    }
     Ok(texture)
+}
+
+fn retire_after_error(device: &mut impl Device, texture: TextureId, error: Error) -> Error {
+    match (error, device.retire_texture(texture)) {
+        (error @ Error::DeviceLost(_), _) => error,
+        (_, Err(lost @ Error::DeviceLost(_))) => lost,
+        (error, _) => error,
+    }
 }
 
 fn fill_area(

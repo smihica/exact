@@ -39,6 +39,7 @@ public final class RecordingModule: ExactPackage {
     private let context: ExactPackageContext
     private var recorders: [String: MediaTake] = [:]
     private var meters: [String: Meter] = [:]
+    private var waveforms: [String: Waveform] = [:]
     private var next = 0
 
     public init(context: ExactPackageContext) { self.context = context }
@@ -81,19 +82,28 @@ public final class RecordingModule: ExactPackage {
     /// `<audio-waveform>` (D13).
     public func view(_ tag: String, id: String, props: [String: String], events: ExactPackageEvents) throws -> ExactPackageView {
         guard tag == "audio-waveform" else { throw ExactPackageRefusal("no view \(tag)") }
-        let waveform = Waveform(module: self)
+        waveforms[id]?.destroy()
+        let waveform = Waveform(id: id, module: self)
+        waveforms[id] = waveform
         try waveform.setProps(props)
         return waveform
     }
 
-    var now: Double { context.now() }
-
-    /// A waveform's own meter of `track`, a reader that never starts it.
-    func waveformMeter(_ track: String) -> Meter? {
-        let m = Meter(interval: WaveformBars.step, history: WaveformBars.history, agent: context.agent, now: context.now())
-        m.subscription = try? context.tracks.subscribe(track, m, start: false, origin: context.origin)
-        return m.subscription == nil ? nil : m
+    func propsChanged(_ waveform: Waveform) {
+        guard waveforms[waveform.id] === waveform else { return }
+        waveform.presentation?.cancel()
+        let agent = context.agent, now = context.now
+        waveform.presentation = context.tracks.present("audio-waveform", id: waveform.id, prop: "track", value: waveform.track, kind: "audio") { _ in
+            WaveformMeter(agent: agent, now: now())
+        } show: { [weak waveform] reader in waveform?.canvas.meter = reader as? WaveformMeter }
     }
+
+    func gone(_ waveform: Waveform) {
+        waveform.presentation?.cancel()
+        if waveforms[waveform.id] === waveform { waveforms[waveform.id] = nil }
+    }
+
+    var now: Double { context.now() }
 
     private func announce() { context.changed("recording.mediaRecorderState") }
 
@@ -183,6 +193,7 @@ public final class RecordingModule: ExactPackage {
 
     /// The session ends: every recorder stops and its file is finished (D6).
     public func destroy(_ done: @escaping () -> Void) {
+        for w in waveforms.values { w.destroy() }
         for m in meters.values { m.stop() }
         let group = DispatchGroup()
         for r in recorders.values {
@@ -199,6 +210,8 @@ final class Recorder: ExactTrackConsumer, MediaTake {
     private let track: String
     private(set) var state = "recording", reason: String?, error: String?
     private var result: [String: Any]?
+    /// What every stop is answered once finished: `result`, or the error that prevented a valid file.
+    private var answer: [String: Any]?
     private var limit: (() -> Void)?
     private let maxDuration: Double
     func arm() {
@@ -264,7 +277,8 @@ final class Recorder: ExactTrackConsumer, MediaTake {
         state = "recording"; reason = nil; since = context.now(); recordingFlag.value = true
         if context.agent { spans.append((context.now(), nil)) }
         arm()
-        // A reset or a failed foreground activation can leave the track without a capture.
+        // A resumed subscription gets its own tap and appends to the same writer.
+        tap?.cancel(); tap = nil
         subscription?.cancel(); subscription = nil
         do {
             subscription = try context.tracks.subscribe(track, self, start: true, origin: context.origin)
@@ -281,8 +295,11 @@ final class Recorder: ExactTrackConsumer, MediaTake {
         guard let source, tap == nil, state != "inactive" else { return }
         let format = source.format, pending = pending, limit = AVAudioFrameCount(format.sampleRate * 2)
         do {
-            let writer = try Writer(url: url, type: type, format: format, bitRate: bitRate, bitRateMode: bitRateMode, apple: apple)
-            queue.sync { self.writer = writer }
+            try queue.sync {
+                if writer == nil {
+                    writer = try Writer(url: url, type: type, format: format, bitRate: bitRate, bitRateMode: bitRateMode, apple: apple)
+                }
+            }
             context.log("recording: \(id) writes \(Writer.describe(format))")
         } catch {
             return finish("error", error: "the file did not open: \(error)") { _ in }
@@ -320,7 +337,7 @@ final class Recorder: ExactTrackConsumer, MediaTake {
 
     /// Stop for `why`, finish the file, answer the result; sticky once inactive (D1).
     func finish(_ why: String, error: String? = nil, _ done: @escaping ([String: Any]) -> Void) {
-        if let result { return done(result) }
+        if let answer { return done(answer) }
         finishing.append(done)
         guard state != "inactive" else { return }
         recorded = duration; since = nil
@@ -332,25 +349,45 @@ final class Recorder: ExactTrackConsumer, MediaTake {
         changed()
         let spans = spans, agent = context.agent, url = url, duration = recorded, writer = writer
         queue.async { [self] in
+            var agentFailure: String?
             if agent {
-                try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? Writer.tone(spans).write(to: url)
+                do {
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try Writer.tone(spans).write(to: url)
+                } catch {
+                    agentFailure = "the file was not written: \(error)"
+                }
             }
-            let complete = { let failure = writer?.failure; DispatchQueue.main.async { self.completed(why, duration, failure: failure) } }
+            let complete = {
+                let failure = agentFailure ?? writer?.failure
+                DispatchQueue.main.async { self.completed(why, duration, failure: failure) }
+            }
             if let writer { writer.finish(complete) } else { complete() }
         }
     }
 
-    /// The file is finished: the result, answered to every stop that waited.
+    /// The file is finished: the result or failure, answered to every stop that waited.
     private func completed(_ why: String, _ duration: Double, failure: String?) {
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
         subscription?.cancel(); subscription = nil
-        let result: [String: Any] = ["path": path, "mimeType": type, "duration": duration, "size": size]
-        self.result = result
-        context.log("recording: \(id) stopped (\(why)), \(path), \(size) bytes" + (failure.map { "; the writer failed: \($0)" } ?? ""))
+        let unwritten = self.error ?? failure ?? (size == 0 ? "the file was not written" : nil)
+        let out: [String: Any]
+        if let unwritten {
+            reason = "error"
+            self.error = unwritten
+            self.result = nil
+            out = ["error": "UnknownError", "message": unwritten]
+            context.log("recording: \(id) stopped (\(why)), \(path) not written: \(unwritten)")
+        } else {
+            out = ["path": path, "mimeType": type, "duration": duration, "size": size]
+            self.result = out
+            context.log("recording: \(id) stopped (\(why)), \(path), \(size) bytes")
+        }
+        self.answer = out
         changed()
-        for f in finishing { f(result) }
+        let callbacks = finishing
         finishing = []
+        for f in callbacks { f(out) }
     }
 
     /// A buffer's frames, copied off the audio thread's reuse.
@@ -453,11 +490,16 @@ final class Writer {
     /// One buffer, on the recorder's queue. Its time is the frames written,
     /// so a pause leaves no gap in the file.
     func append(_ buffer: AVAudioPCMBuffer) {
-        guard let buffer = conformed(buffer) else {
+        guard buffer.frameLength > 0 else { return }
+        guard let converted = conformed(buffer) else {
             let why = "a buffer of \(Writer.describe(buffer.format)) did not convert to \(Writer.describe(format))"
             backupFailure = why
             return fail(why)
         }
+        for chunk in converted where chunk.frameLength > 0 { writeChunk(chunk) }
+    }
+
+    private func writeChunk(_ buffer: AVAudioPCMBuffer) {
         if let file {
             do { try file.write(from: buffer) } catch { fail(Writer.code(error)) }
             return
@@ -483,19 +525,66 @@ final class Writer {
 
     static func describe(_ f: AVAudioFormat) -> String { "\(Int(f.sampleRate)) Hz, \(f.channelCount) ch" }
 
-    /// `buffer` in the file's format.
-    private func conformed(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if buffer.format == format { return buffer }
-        if converter?.inputFormat != buffer.format { converter = AVAudioConverter(from: buffer.format, to: format) }
-        guard let converter else { return nil }
-        let capacity = AVAudioFrameCount((Double(buffer.frameLength) * format.sampleRate / buffer.format.sampleRate).rounded(.up)) + 1
-        guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return nil }
-        var given = false
-        let status = converter.convert(to: out, error: nil) { _, state in
-            if given { state.pointee = .noDataNow; return nil }
-            given = true; state.pointee = .haveData; return buffer
+    /// `buffer` in the file's format, draining any prior converter at a format boundary
+    /// and looping until `buffer` is fully consumed.
+    private func conformed(_ buffer: AVAudioPCMBuffer) -> [AVAudioPCMBuffer]? {
+        guard buffer.format.sampleRate > 0, format.sampleRate > 0 else { return nil }
+        var chunks: [AVAudioPCMBuffer] = []
+        if let previous = converter,
+           buffer.format == format || previous.inputFormat != buffer.format || previous.outputFormat != format {
+            drainConverter(previous, into: &chunks)
+            converter = nil
         }
-        return status == .error ? nil : out
+        if buffer.format == format {
+            chunks.append(buffer)
+            return chunks
+        }
+        if converter == nil { converter = AVAudioConverter(from: buffer.format, to: format) }
+        guard let active = converter else { return nil }
+        let capacity = max(AVAudioFrameCount((Double(buffer.frameLength) * format.sampleRate / buffer.format.sampleRate).rounded(.up)) + 64, 256)
+        var given = false
+        while true {
+            guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return nil }
+            var error: NSError?
+            let status = active.convert(to: out, error: &error) { _, state in
+                if given { state.pointee = .noDataNow; return nil }
+                given = true; state.pointee = .haveData; return buffer
+            }
+            if status == .error || error != nil {
+                converter = nil
+                return nil
+            }
+            if out.frameLength > 0 { chunks.append(out) }
+            switch status {
+            case .haveData:
+                if out.frameLength == 0 && given { return chunks }
+            case .inputRanDry:
+                return chunks
+            case .endOfStream:
+                converter = nil
+                return chunks
+            case .error:
+                converter = nil
+                return nil
+            @unknown default:
+                return chunks
+            }
+        }
+    }
+
+    private func drainConverter(_ active: AVAudioConverter, into chunks: inout [AVAudioPCMBuffer]) {
+        let capacity: AVAudioFrameCount = 1024
+        while true {
+            guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return }
+            var error: NSError?
+            let status = active.convert(to: out, error: &error) { _, state in
+                state.pointee = .endOfStream
+                return nil
+            }
+            if status == .error || error != nil { return }
+            if out.frameLength > 0 { chunks.append(out) }
+            if status != .haveData || out.frameLength == 0 { return }
+        }
     }
 
     private func sample(_ buffer: AVAudioPCMBuffer) -> CMSampleBuffer? {
@@ -534,13 +623,14 @@ final class Writer {
     }
 
     /// Re-encode only a failed take, with bounded memory. Preserve the original
-    /// and PCM if recovery fails; replace the playable path only after closing AAC.
+    /// and PCM if recovery fails; replace the playable path only after closing the re-encoded file.
     func recover() throws {
         if let backupFailure { throw CaptureFailure(backupFailure) }
         guard let backupURL else { throw CaptureFailure("no recovery audio") }
         backup = nil
         let source = try AVAudioFile(forReading: backupURL, commonFormat: format.commonFormat, interleaved: format.isInterleaved)
-        let rebuilt = url.deletingPathExtension().appendingPathExtension("recovered.m4a")
+        let ext = (encoding[AVFormatIDKey] as? AudioFormatID) == kAudioFormatOpus ? "recovered.mp4" : "recovered.m4a"
+        let rebuilt = url.deletingPathExtension().appendingPathExtension(ext)
         defer { try? FileManager.default.removeItem(at: rebuilt) }
         var output: AVAudioFile? = try AVAudioFile(forWriting: rebuilt, settings: encoding,
                                                   commonFormat: format.commonFormat, interleaved: format.isInterleaved)
@@ -583,7 +673,7 @@ struct CaptureFailure: Error, CustomStringConvertible {
 }
 
 /// A level on one track with one argument group (D1).
-final class Meter: ExactTrackConsumer {
+class Meter: ExactTrackConsumer {
     let interval: Double, history: Int, agent: Bool
     var subscription: ExactSubscription?
     private var tap: ExactSubscription?
@@ -718,16 +808,28 @@ struct WaveformBars {
     }
 }
 
+/// A runner node owns the meter and its scrolling history across native view replacement.
+final class WaveformMeter: Meter {
+    var bars: WaveformBars
+    init(agent: Bool, now: Double) {
+        bars = WaveformBars(start: now)
+        super.init(interval: WaveformBars.step, history: WaveformBars.history, agent: agent, now: now)
+    }
+}
+
 /// `<audio-waveform track=…>`: the track's levels as bars, newest at the
 /// right, drawn each display frame from a meter of its own, so no level
 /// crosses into Contract. A reader of the track, never a start: an idle
 /// track draws silence.
 final class Waveform: NSObject, ExactPackageView {
-    private let canvas = WaveformCanvas()
+    fileprivate let canvas = WaveformCanvas()
+    fileprivate var presentation: ExactSubscription?
     private let module: RecordingModule
-    private var track = ""
+    private(set) var track = ""
+    let id: String
 
-    init(module: RecordingModule) {
+    init(id: String, module: RecordingModule) {
+        self.id = id
         self.module = module
         super.init()
         canvas.advance = { [weak self] in self?.advance() }
@@ -738,20 +840,23 @@ final class Waveform: NSObject, ExactPackageView {
     func setProps(_ props: [String: String]) throws {
         canvas.color = props["tint"].flatMap(Waveform.color) ?? canvas.color
         let next = props["track"] ?? ""
-        guard next != track else { return }
-        canvas.meter?.stop()
-        track = next
-        canvas.meter = track.isEmpty ? nil : module.waveformMeter(track)
-        canvas.bars = WaveformBars(start: module.now)
+        if next != track {
+            track = next
+            module.propsChanged(self)
+        }
     }
 
     private func advance() {
         guard let meter = canvas.meter else { return }
         let now = module.now
-        canvas.bars.advance(now, meter.advance(now))
+        meter.bars.advance(now, meter.advance(now))
     }
 
-    func destroy() { canvas.stop(); canvas.meter?.stop() }
+    func destroy() {
+        module.gone(self)
+        canvas.stop()
+        canvas.meter = nil
+    }
 
     /// `#rgb` or `#rrggbb`.
     static func color(_ hex: String) -> WaveformColor? {
@@ -765,8 +870,7 @@ final class Waveform: NSObject, ExactPackageView {
 
 final class WaveformCanvas: ExactPackagePlatformView {
     var color: WaveformColor = .systemRed
-    var meter: Meter?
-    var bars = WaveformBars(start: 0)
+    var meter: WaveformMeter?
     var advance: () -> Void = {}
     private var link: AnyObject?
     static let bar: CGFloat = 3, gap: CGFloat = 2
@@ -812,6 +916,7 @@ final class WaveformCanvas: ExactPackagePlatformView {
         #else
         guard let g = UIGraphicsGetCurrentContext() else { return }
         #endif
+        guard let bars = meter?.bars else { return }
         let w = bounds.width, h = bounds.height
         // One bar more than fits: the oldest slides out at the left as the bars scroll.
         let fit = max(0, Int((w + Self.gap) / (Self.bar + Self.gap))) + 1, shown = bars.bars.suffix(fit), phase = CGFloat(bars.phase)

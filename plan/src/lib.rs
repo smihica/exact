@@ -24,7 +24,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod drag_name;
 mod http_url;
+pub use drag_name::{decode_drag_entries, drag_name_refusal, offered_drag_name, DRAG_NAMES_MARK};
 pub use http_url::{has_http_scheme, http_url_refusal};
 pub mod asm;
 pub mod builder;
@@ -62,6 +64,7 @@ pub const HAPTIC_KINDS: [&str; 10] = [
 ];
 
 pub mod shared;
+pub mod shortcut;
 pub mod strings;
 pub mod surface_arguments;
 pub mod value;
@@ -632,7 +635,18 @@ impl Plan {
             let mut names: Vec<&str> = Vec::new();
             let mut positional = false;
             for id in surface.args.iter() {
-                let name = self.str(self.surface_arg(id).name);
+                let arg = self.surface_arg(id);
+                if arg
+                    .color
+                    .is_some_and(|t| self.theme.get(t.0 as usize).is_none_or(|row| row.kind != 0))
+                {
+                    return Err(PlanError::BadReference {
+                        table: "surface_args",
+                        row: id.0,
+                        field: "color",
+                    });
+                }
+                let name = self.str(arg.name);
                 positional |= name.is_empty();
                 let repeated = !name.is_empty() && names.contains(&name);
                 if !name.is_empty() && !repeated {
@@ -1170,6 +1184,26 @@ impl Plan {
     pub fn set_tool_face(&mut self, i: usize, json: &str) {
         let id = self.intern(json);
         self.tools[i].face = id;
+    }
+
+    /// Add a `controls` row after lowering (LLP 1126.004 D1): the app pass
+    /// reads it from `app.json` with its derived effects and digest.
+    pub fn add_control(
+        &mut self,
+        kind: &str,
+        tool: Option<ToolsId>,
+        url: &str,
+        effects: &str,
+        digest: &str,
+    ) {
+        let row = ControlsRow {
+            kind: self.intern(kind),
+            tool,
+            url: self.intern(url),
+            effects: self.intern(effects),
+            digest: self.intern(digest),
+        };
+        self.controls.push(row);
     }
 
     /// The package view row of `tag`, if a package serves it.

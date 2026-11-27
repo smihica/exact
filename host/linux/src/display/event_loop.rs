@@ -6,7 +6,9 @@ use exact_painted::presenter::{PanelImage, Presenter, SubmittedFrame};
 use exact_runner::DataSource;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::{Instant, SystemTime};
 use tiny_skia::Pixmap;
 
 pub(crate) struct PanelFrame {
@@ -14,6 +16,7 @@ pub(crate) struct PanelFrame {
     sample: Option<exact_painted::frames::Submission>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum Completion<F = PanelFrame> {
     Pending,
     Shown(F),
@@ -295,6 +298,7 @@ pub(crate) fn run<D: DataSource>(
         let mut fds = events.fds();
         fds.push(p.executor_fd());
         fds.push(p.image_fd());
+        fds.push(p.surface_wake_fd());
         if let Some(fd) = p.content_region_fd() {
             fds.push(fd);
         }
@@ -454,7 +458,9 @@ pub(super) fn poll(fds: &[i32], display_fd: i32, timeout: i32) -> Result<bool, S
         };
     }
     if let Some(fd) = pfds.iter().find(|fd| {
-        fd.fd == display_fd && fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        fd.fd == display_fd
+            && (fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+                || (fd.revents & libc::POLLHUP != 0 && fd.revents & libc::POLLIN == 0))
     }) {
         return Err(format!("poll fd {} flags {}", fd.fd, fd.revents));
     }
@@ -540,6 +546,9 @@ mod timer_tests {
 #[cfg(test)]
 #[path = "event_loop/activation_tests.rs"]
 mod activation_tests;
+#[cfg(all(test, feature = "attach"))]
+#[path = "event_loop/attach_tests.rs"]
+mod attach_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "event_loop/ahead_tests.rs"]

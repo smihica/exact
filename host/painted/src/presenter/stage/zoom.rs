@@ -272,6 +272,7 @@ impl<D: DataSource> Presenter<D> {
     /// moved, or become clipped while its route was covered. This geometry
     /// walk draws no pixels and leaves the frame's tapes and hit boxes alone.
     fn return_boxes(&self, beneath: ViewId) -> Vec<PaintedBox> {
+        let displaced = self.displaced_scroll(&self.scroll);
         let host = &self.host;
         let roots = host.roots();
         let scene = Scene {
@@ -279,9 +280,11 @@ impl<D: DataSource> Presenter<D> {
             roots: &roots,
             hidden: &|id| host.route_hidden_but(id, &[beneath]),
             presented: &|id| host.presented(id),
+            scaled_presented: host.scaled_presented(),
             paths: &|id| host.presented_path(id),
             filters: &|id| host.presented_filter(id),
-            scroll: &self.scroll,
+            clips: &|id| host.presented_clip(id),
+            scroll: displaced.as_ref().unwrap_or(&self.scroll),
             page: self.page,
             images: &self.images.bitmaps,
             focus: None,

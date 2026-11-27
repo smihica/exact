@@ -44,13 +44,18 @@ import {
 import { booting, checkpoint, READER, keptAnswer } from './mount.js';
 /** Resource instances, including list members; list aggregates have no entry. */
 export const Resources = [];
+const plainRead = req => typeof req?.url === 'string' && !req.stream && !req.socket && req.listen == null && !req.longPoll &&
+  req.storage === undefined && !req.canvas && (!req.http || req.http === 'ordered' || req.http === 'ordered held');
 /** A source change during an ordinary request waits for its reply. Several changes
  * while it is in flight owe one more ask (LLP 1016.002 D4). */
 export function sourceChanged(r, topic) {
   const t = r.ticket;
-  if (!t || t.stream || t.req?.stream) return R(r, true);
-  if (!t.again) say(`changed ${topic}: ticket ${t.id} (${r.name}) lands first, then it is asked again`);
-  t.again = true;
+  if (!t || t.stream || t.req?.stream) {
+    if (r.landing) r.landing.refresh = true;
+    return R(r, true);
+  }
+  if (!t.again?.refresh) say(`changed ${topic}: ticket ${t.id} (${r.name}) lands first, then it is asked again`);
+  t.again = { ...t.again, refresh: true };
 }
 
 let ResourceIndex = 0;
@@ -60,10 +65,32 @@ export const ticket = () => Ticket,
 /** What its resource reads (a watched topic, ts-data.js `changed`, LLP 1016.002 D4; the store, `lateReaders`) changed
  * while ticket `t` was in flight (`t.again`): its reply landed or failed, so the resource is asked again. */
 const again = t => {
-    if (t.again) {
-      t.again = false;
-      say(`${t.r.name}: asked again, what it reads changed while ticket ${t.id} was in flight`);
-      R(t.r, true);
+    const r = t.r, why = t.again;
+    if (why?.context) {
+      // The parser can change this instance's props, close its gate or retire it.
+      // Hold its value until the reply's commit has applied those changes.
+      const landing = r.landing = { out: Out, refresh: !!why.refresh, origin: why.origin };
+      const follow = () => {
+        if (r.landing !== landing) return;
+        r.landing = null;
+        if (r.gone) return;
+        say(`${r.name}: asked again, a with value changed while ticket ${t.id} was in flight`);
+        const refresh = landing.refresh;
+        Origin.run(landing.origin, () => Invocation.run(refresh ? 0 : t.invocation, () => recommit(() => {
+          if (refresh) R(r);
+          else {
+            r.failed = r.code = r.reason = r.error = undefined;
+            r.revise();
+          }
+        }, `follow-up ${r.name}`, r)), t.input);
+      };
+      (Out.followUps ??= []).push(Object.assign(() => { if (!deferForReplacement(follow)) follow(); }, {
+        refused: () => { if (r.landing === landing) r.landing = null; },
+      }));
+    } else if (why?.refresh) {
+      t.again = undefined;
+      say(`${r.name}: asked again, what it reads changed while ticket ${t.id} was in flight`);
+      R(r, true);
     }
   },
   openEnded = t => !!(t.stream || t.req?.stream || t.req?.longPoll || t.call?.held > 0),
@@ -73,12 +100,22 @@ const again = t => {
   // reply lands, marked before that commit's checkpoint so a refusal keeps the mark, and one whose request may never
   // land (a stream, a long poll, a held fetch) now.
   lateReaders = () => {
-    for (const r of Resources) if (reads(r) && r.ticket && !openEnded(r.ticket)) r.ticket.again = true;
+    for (const r of Resources) {
+      if (reads(r) && r.ticket && !openEnded(r.ticket)) r.ticket.again = { ...r.ticket.again, refresh: true };
+      if (reads(r) && r.landing) r.landing.refresh = true;
+    }
   },
   lateIdle = () => {
     for (const r of Resources) if (reads(r) && (!r.ticket || openEnded(r.ticket))) R(r, true);
   };
 export { lateReaders, lateIdle };
+function sameBytes(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.byteLength !== b.byteLength) return false;
+  const bytes = value => value instanceof Uint8Array ? value : new Uint8Array(value);
+  const right = bytes(b);
+  return bytes(a).every((byte, i) => byte === right[i]);
+}
 const sameReq = (a, b) =>
   a &&
   b &&
@@ -89,6 +126,7 @@ const sameReq = (a, b) =>
   a.method === b.method &&
   a.url === b.url &&
   a.body === b.body &&
+  (!(plainRead(a) && plainRead(b)) || sameBytes(a.raw, b.raw)) &&
   JSON.stringify(a.headers) === JSON.stringify(b.headers) &&
   a.http === b.http &&
   a.cache === b.cache &&
@@ -115,7 +153,7 @@ function ask(source, args, name, mutation, forced, owner = mutation) {
   }
   // (a reaped build's lazy chunk fails here: the page loads again, generation-reload.js)
   return a && a.then
-    ? (a.then(undefined, e => globalThis.exact?.generationGone?.(e)), { promise: a, call: a.call })
+    ? (a.then(undefined, e => globalThis.exact?.generationGone?.(e)), { promise: a, call: a.call, madeBy: a.call })
     : a;
 }
 /** The reply to ticket `t` while its target `held()` it: a commit in which `f` takes the source's answer (a TypeScript
@@ -158,7 +196,7 @@ function reply(t, name, source, held, f, next, gone) {
     recommit(() => {
       if (t.r) again(t);
     }, 'a failed request');
-  }));
+  }), t.input);
   return o => {
     if (!deferForReplacement(() => land(o))) return land(o);
   };
@@ -269,8 +307,9 @@ export function res(
         r.value = r.settled = undefined;
         r.stand = null;
       }
+      r.landing = null;
       r.asleep = r.slept = true;
-      r.forced = r.rev = r.reconciling = false;
+      r.forced = r.rev = r.reconciling = r.launch = false;
       if (!r.ticket?.upload) release();
       if (r.failed) {
         r.failed = null;
@@ -305,7 +344,10 @@ export function res(
     r.slept = false;
     // In a render, keep the call that gave the answer taken: the checkpoint lists the answer in `open` when that call
     // watched a document or was refused storage or visitor credentials (checkpoint.js `answers`)
-    if (globalThis.__exactRender) r.renderCall = call;
+    if (globalThis.__exactRender) {
+      r.renderCall = call;
+      if (!globalThis.__exactProduction) for (const url of call?.urls ?? []) (r.renderUrls ??= new Set()).add(url);
+    }
     r.stand = null;
     r.stale = false;
     r.passed = undefined;
@@ -323,6 +365,7 @@ export function res(
         t,
         (p, o) => {
           if (t.call?.seen?.read || p.store) r.store = t.read = true;
+          if (t.call?.clockRead || p.clock) r.clock = true;
           if (p.req) {
             // A request its reply asks for is the same answer's, asked by the same origin.
             const req = { ...p.req, forced: t.forced, origin: t.req?.origin };
@@ -343,13 +386,13 @@ export function res(
               r.ticket = n;
               send(n, land(n));
             } else {
+              if (req.stream || req.socket || req.longPoll) t.again = { refresh: t.again?.refresh };
               t.req = req;
               t.id = ++Ticket;
               send(t, land(t));
             }
             return;
           }
-          if (globalThis.__exactRender && !globalThis.__exactProduction) for (const url of t.call?.urls ?? []) (r.renderUrls ??= new Set()).add(url);
           // what the first frame showed, said once the answer is taken
           const stood = r.stale && r.stand && [eq(p.v, r.value), r.stand];
           take(p.v, t.args, t.origin, t.generation, t.madeBy);
@@ -366,6 +409,7 @@ export function res(
         'it keeps its last value',
         (error, code, reason) => {
           if (t.call?.seen?.read || t.read || data.threwRead?.()) r.store = true;
+          if (t.call?.clockRead || data.threwClock?.()) r.clock = true;
           r.ticket = null;
           r.failed = t.args;
           r.error = error;
@@ -391,7 +435,11 @@ export function res(
         // `asked`: the overlay's arguments while a placeholder stands; a refused commit put `failed` back, and `fail`
         // follows it there too
         const a = (r.asked = args());
-        if (Restoring) return (flag(fail, failure()), r.value);
+        // Hold the landed value during its own reply commit and outside commits
+        // (while the tree flushes); a later commit must still evaluate new arguments
+        // so refusals roll back immediately.
+        if (Restoring || (r.landing && (!Writes || r.landing.out === Out)))
+          return (flag(fail, failure()), r.value);
         // `reconciling`: asked after a write ended, a refusal fails it (overlay.js); `mk`: an upload asked at these
         // arguments, not asked again (LLP 1016.000 D10), and none at non-finite ones (settlement.rs `valid_args`)
         // `forced` 2: a device re-ask's
@@ -401,7 +449,8 @@ export function res(
           rev = r.rev,
           reconciling = r.reconciling,
           mk = finiteArguments(a) ? data.uploads.at(r, a) : null;
-        // `launch`: true while the launch's own ask waits for the source, false once a refresh was asked meanwhile
+        // `launch`: true while the launch's own ask waits for the source, false once a refresh was asked meanwhile or
+        // the gate closed, as a wake is asked as a refresh is (LLP 1161.002 D3)
         r.forced = r.rev = r.reconciling = false;
         if (forced) r.launch = undefined;
         // A failure keeps the value for its arguments, including NaN; `refresh` or new ones ask again (settlement.rs),
@@ -426,11 +475,13 @@ export function res(
           root = r.path === undefined;
         r.baked = false;
         if (baked) r.stale = true;
-        // the first frame's build-time answer, said once when it starts to stand in for an answer (the runner's
-        // `journal_build_time`)
+        // the first frame's build-time answer, or a store reader's placeholder in place of one (store-reader.js), said
+        // once when it starts to stand in for an answer (the runner's `journal_build_time`)
         let quiet = false;
         const stands = () => {
-          if (!was && !quiet && r.stale && r.stand === 'build') say(`${name} shows its build-time answer until its source answers`);
+          if (was || quiet || !r.stale) return;
+          if (r.stand === 'build') say(`${name} shows its build-time answer until its source answers`);
+          else r.unseen?.();
         };
         if (!forced && !rev) {
           // Reuse follows the request in flight; the displayed value may answer older arguments (LLP 1016 D5).
@@ -442,14 +493,22 @@ export function res(
           }
           if (r.ticket && equal(a, r.ticket.args)) return r.value;
         }
+        // A later commit that asks the resource again supersedes any deferred
+        // follow-up while preserving an owed forced refresh policy and origin.
+        const pendingRefresh = !!r.landing?.refresh;
+        const pendingOrigin = r.landing?.origin;
+        r.landing = null;
         let ans;
         Inspections.begin(r);
         // the launch's own ask is sent as an ordinary one (LLP 1162.000 D1; `Runner::launch` in the runner)
-        const refresh = forced && waited !== true;
+        const refresh = (forced && waited !== true) || pendingRefresh || r.forcedIn === Out;
+        if (refresh) r.forcedIn = Out;
         // Device re-asks keep the reader's last ask origin, but belong to no invocation (LLP 1133.023 D7): a call's ask
         // they let go, however they answer, supersedes the call.
         if (globalThis.__exactRender && !globalThis.__exactProduction) r.renderUrls = new Set();
-        const invocation = reasking ? 0 : Invocation.id, origin = reasking ? r.askOrigin ?? 'app' : Origin.now();
+        const invocation = reasking ? 0 : Invocation.id;
+        const baseOrigin = reasking ? r.askOrigin ?? 'app' : Origin.now();
+        const origin = pendingOrigin ? Origin.least(pendingOrigin, baseOrigin) : baseOrigin;
         try {
           ans = Origin.run(origin, () => Invocation.run(invocation, () => ask(source, a, name, false, refresh, r)));
           // what its source sent on a socket goes once this commit stands (LLP 1016.000 D7, amended 2026-10-18)
@@ -457,6 +516,7 @@ export function res(
         } catch (e) {
           // a failed ask watched what it read, the shown answer's topics kept
           if (data.threwRead?.()) r.store = true;
+          if (data.threwClock?.()) r.clock = true;
           for (const t of data.threwWatches?.() ?? []) (r.watches ??= new Set()).add(t);
           if (e instanceof Refusal && !(reconciling && e instanceof Failed)) throw e;
           if (e.refuse && !reconciling) throw new Failed(`resource ${name}: ${e.message}`);
@@ -466,9 +526,11 @@ export function res(
         }
         // a fresh answer's topics replace the last's (LLP 1016.002 D2), a later turn's joining them
         if (ans && ans.store) r.store = true;
+        if (ans && ans.clock) r.clock = true;
         r.watches = ans?.watches;
         if (ans && 'v' in ans) {
-          stands();
+          // a placeholder answered as it is asked shows in no frame
+          if (r.stand) stands();
           const stood = r.stale && r.stand && [eq(ans.v, r.value), r.stand];
           try {
             take(ans.v, a, Ov.tick(), undefined, ans.madeBy);
@@ -497,11 +559,20 @@ export function res(
           !forced &&
           !rev &&
           r.ticket &&
+          !r.ticket.refused &&
           !equal(a, r.ticket.args) &&
           ((ans.req && r.ticket.req && sameReq(ans.req, r.ticket.req)) ||
             (ans.upload && ans.upload === r.ticket.upload))
         ) {
           say(`keep request ${r.ticket.id} (${name}): the same request for newer arguments`);
+          const t = r.ticket;
+          if (r.context && t.waiting !== undefined && !t.refused && !t.upload && !t.stream && plainRead(t.req) && plainRead(ans.req)) {
+            t.again = {
+              refresh: t.again?.refresh,
+              context: t.again?.context || !equal(a.slice(-r.context), t.args.slice(-r.context)),
+              origin: Origin.least(t.again?.origin ?? t.askOrigin, origin),
+            };
+          }
           r.ticket.args = a;
           r.ticket.generation = r.inspection?.request;
           return data.uploads.kept(r, a); // what it shows meanwhile; an upload's mark covers these arguments too
@@ -616,6 +687,8 @@ export function res(
       r.renderCall,
       r.stand,
       r.stale,
+      r.asked,
+      r.landing,
     ],
     restore: x => {
       [r.value, r.settled, r.ticket] = x;
@@ -645,6 +718,8 @@ export function res(
       r.renderCall = x[25];
       r.stand = x[26];
       r.stale = x[27];
+      r.asked = x[28];
+      r.landing = x[29];
       write(pend.n, x[19]);
       // and what it shows is read again, from what was put back
       write(ver.n, ver.n.v + 1);
@@ -673,6 +748,7 @@ export function res(
   // its region ended: an open stream closes (`Open`)
   onEnd(() => {
     r.gone = true;
+    r.landing = null;
   });
   Resources.push(r);
   m.p = () => (m(), pend());
@@ -760,7 +836,7 @@ export function mut(name, slot, refreshes, type, mode) {
         if (p.req) {
           const req = { ...p.req, origin: t.req?.origin };
           if (o.more) {
-            const n = { id: ++Ticket, name, owner: m, invocation: t.invocation, askOrigin: t.askOrigin, source: t.source, args: t.args, req, write: t.write, send: t.send };
+            const n = { id: ++Ticket, name, owner: m, invocation: t.invocation, askOrigin: t.askOrigin, input: t.input, source: t.source, args: t.args, req, write: t.write, send: t.send };
             if (m.parallel) m.tickets = [...m.tickets.filter(x => x !== t), n];
             else m.ticket = n;
             send(n, land(n));
@@ -876,6 +952,7 @@ export function mut(name, slot, refreshes, type, mode) {
           owner: m,
           invocation: Invocation.id,
           askOrigin: Origin.now(),
+          input: Origin.input,
           source,
           args,
           req: a.req && { ...a.req, origin: Origin.now() },

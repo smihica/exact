@@ -109,7 +109,7 @@ impl<D: DataSource> ModuleLinks<D> {
                 true => &NoModules,
                 false => self.modules,
             },
-            tools: match plan.tools.is_empty() {
+            tools: match plan.tools.is_empty() && plan.controls.is_empty() {
                 true => &NoTools,
                 false => self.tools,
             },
@@ -147,8 +147,8 @@ pub trait Tools<D: DataSource> {
     fn call_superseded(&self, _: &mut Runner<D>, _: u64, _: bool) {}
     /// A name that needs a person was called by the running call's work.
     fn call_person_required(&self, _: &mut Runner<D>) {}
-    /// Take off this commit's commands from `first` that a call does not run.
-    fn skip_in_call(&self, _: &mut Runner<D>, _: usize) {}
+    /// The running call's work skipped host command `name`.
+    fn call_skipped(&self, _: &mut Runner<D>, _: &str) {}
     /// Whether a running call is in a session no one sees.
     fn call_stops_timers(&self, _: &Runner<D>) -> bool {
         false
@@ -167,6 +167,31 @@ pub trait Tools<D: DataSource> {
     }
     /// `state.intents`.
     fn intents_state(&self, _: &Runner<D>) -> Option<Json> {
+        None
+    }
+    /// A person's press of control `kind`: [`Runner::press_control`].
+    fn press_control(
+        &self,
+        _: &mut Runner<D>,
+        kind: &str,
+        _: &str,
+        _: CallHow,
+    ) -> Result<u64, String> {
+        Err(format!("no control `{kind}`: this app declares none"))
+    }
+    /// Whether invocation `id` is a call running uncancelled within its bound.
+    fn call_live(&self, _: &Runner<D>, _: u64) -> bool {
+        false
+    }
+    /// Whether invocation `id` is a live press of a control the binary
+    /// offers as a recording.
+    fn press_records(&self, _: &Runner<D>, _: u64) -> bool {
+        false
+    }
+    /// The host's placement of each control: [`Runner::place_controls`].
+    fn place_controls(&self, _: &mut Runner<D>, _: Json) {}
+    /// `state.controls`.
+    fn controls_state(&self, _: &Runner<D>) -> Option<Json> {
         None
     }
 }
@@ -332,7 +357,7 @@ pub trait PresenceSecrets<D: DataSource> {
         false
     }
     /// A store's presence call: with no presence name, refused by its name.
-    fn presence_call(&self, _: &mut Runner<D>, body: &[u8]) -> Option<Dispatch> {
+    fn presence_call(&self, _: &mut Runner<D>, body: &[u8], _: Option<&str>) -> Option<Dispatch> {
         let (_, name, _) = presence_body(body)?;
         let message = format!("{name} is not a secret.keep name with a presence policy");
         let answer = json!({ "error": "NotSupportedError", "message": message });
@@ -358,6 +383,8 @@ pub trait PresenceSecrets<D: DataSource> {
     fn pump_presence(&self, _: &mut Runner<D>) {}
     /// The agent answered a presence hold.
     fn presence_answered(&self, _: &mut Runner<D>, _: u64, _: &HoldAnswer) {}
+    /// Presence calls whose request is no longer held leave their queues.
+    fn presence_let_go(&self, _: &mut Runner<D>) {}
     /// The backend's occupancy, adopted into the store.
     fn adopt_presence(&self, _: &mut Runner<D>) {}
 }
@@ -388,6 +415,9 @@ impl<D: DataSource> Runner<D> {
         let mut out = self.module_declared_state();
         if let Some(intents) = self.intents_state() {
             out.insert("intents".into(), intents);
+        }
+        if let Some(controls) = self.links_tools().controls_state(self) {
+            out.insert("controls".into(), controls);
         }
         out.into_iter().collect()
     }
@@ -428,11 +458,6 @@ impl<D: DataSource> Runner<D> {
         t.call_person_required(self)
     }
 
-    pub(in crate::runner) fn skip_in_call(&mut self, first: usize) {
-        let t = self.links_tools();
-        t.skip_in_call(self, first)
-    }
-
     pub(in crate::runner) fn call_stops_timers(&self) -> bool {
         self.links_tools().call_stops_timers(self)
     }
@@ -448,6 +473,57 @@ impl<D: DataSource> Runner<D> {
 
     fn call_answer(&self, id: u64) -> Result<String, String> {
         self.links_tools().call_answer(self, id)
+    }
+
+    /// A person's press of the compiled control `kind`, which carries
+    /// `digest` (LLP 1126.004 D2): its tool is called with no arguments as
+    /// an invocation of origin `action`, polled and cancelled by id as a
+    /// tool call is. Only a native host's press entry calls this; the
+    /// agent's `call` and the tool doors enter as `tool` whatever door they
+    /// name. `Err` for a kind the plan has no tool control of.
+    pub fn press_control(&mut self, kind: &str, digest: &str, how: CallHow) -> Result<u64, String> {
+        let t = self.links_tools();
+        t.press_control(self, kind, digest, how)
+    }
+
+    /// What this host's build offers of each control, which `state.controls`
+    /// reports: each row's placement in `compat`, the binary's compat.json
+    /// (`inputs.controls`, which `bake/src/controls.rs` derives). A kind it
+    /// leaves out, and every control of a host that never calls this, is
+    /// `absent`.
+    pub fn place_controls(&mut self, compat: &str) {
+        let Ok(compat) = serde_json::from_str::<Json>(compat) else {
+            return;
+        };
+        let rows = compat["inputs"]["controls"]
+            .as_array()
+            .into_iter()
+            .flatten();
+        let placed: serde_json::Map<String, Json> = rows
+            .filter_map(|c| {
+                Some((
+                    c["control"]["kind"].as_str()?.to_owned(),
+                    c["placement"].clone(),
+                ))
+            })
+            .collect();
+        if !placed.is_empty() {
+            let t = self.links_tools();
+            t.place_controls(self, Json::Object(placed))
+        }
+    }
+
+    /// Whether invocation `id` is a call running uncancelled within its
+    /// bound: its grants hold only while it is (LLP 1133.023 D7a).
+    pub(in crate::runner) fn call_live(&self, id: u64) -> bool {
+        self.links_tools().call_live(self, id)
+    }
+
+    /// Whether invocation `id` is a press running uncancelled within its
+    /// bound, of a control whose placement offers it as a recording, which
+    /// only a qualification build's bake does (LLP 1126.004 §6d).
+    pub(in crate::runner) fn press_records(&self, id: u64) -> bool {
+        self.links_tools().press_records(self, id)
     }
 
     /// `state.intents`: each tool with its word, modifiers, availability
@@ -480,6 +556,7 @@ impl<D: DataSource> Runner<D> {
                     cold: true,
                     hidden: true,
                     digest: None,
+                    foreground: false,
                 };
                 self.log(format!("launch --call ({tool})"));
                 let id = self.call_tool(tool, args.trim(), how);
@@ -496,6 +573,7 @@ impl<D: DataSource> Runner<D> {
                     cold: v["cold"] == true,
                     hidden: v["hidden"] == true,
                     digest: v["digest"].as_str().map(str::to_owned),
+                    foreground: false,
                 };
                 let id = self.call_tool(&tool, &args, how);
                 Some(
@@ -579,9 +657,13 @@ impl<D: DataSource> Runner<D> {
         self.seams.presence.presence_holds(self, ticket)
     }
 
-    pub(in crate::runner) fn presence_call(&mut self, body: &[u8]) -> Option<Dispatch> {
+    pub(in crate::runner) fn presence_call(
+        &mut self,
+        body: &[u8],
+        grants: Option<&str>,
+    ) -> Option<Dispatch> {
         let p = self.seams.presence;
-        p.presence_call(self, body)
+        p.presence_call(self, body, grants)
     }
 
     pub(in crate::runner) fn presence_writes(
@@ -616,6 +698,11 @@ impl<D: DataSource> Runner<D> {
     pub(in crate::runner) fn presence_answered(&mut self, hold: u64, answer: &HoldAnswer) {
         let p = self.seams.presence;
         p.presence_answered(self, hold, answer)
+    }
+
+    pub(in crate::runner) fn presence_let_go(&mut self) {
+        let p = self.seams.presence;
+        p.presence_let_go(self)
     }
 
     pub(in crate::runner) fn adopt_presence(&mut self) {
@@ -806,7 +893,7 @@ mod tests {
         .unwrap();
         let body = br#"{"presence":"unlock","name":"token","reason":"Sign in"}"#;
         let Some(crate::request::Dispatch::Run(crate::request::Work::Now(answer))) =
-            r.presence_call(body)
+            r.presence_call(body, None)
         else {
             panic!("a presence call is answered now");
         };
@@ -819,7 +906,7 @@ mod tests {
             said["message"],
             "token is not a secret.keep name with a presence policy"
         );
-        assert!(r.presence_call(br#"{"op":"other"}"#).is_none());
+        assert!(r.presence_call(br#"{"op":"other"}"#, None).is_none());
         assert!(r.presence_list().is_empty() && r.take_presence_asks().is_empty());
         assert!(!r.presence_secrets() && r.presence_due_ms().is_none());
     }

@@ -32,7 +32,7 @@ pub(super) struct Checkpoint {
     timers: Vec<super::Timer>,
     owned_sends: Vec<Option<super::owned_sends::OwnedSend>>,
     then_due: Vec<f64>,
-    landed: Vec<usize>,
+    landed: Vec<(usize, super::provenance::Cause)>,
     render: Option<super::owned_tasks::RenderCheckpoint>,
     published: Option<Box<Published>>,
     commands: usize,
@@ -73,6 +73,11 @@ impl<D: DataSource> Runner<D> {
     /// Before a commit, including every resource field a refusal restores.
     pub(super) fn checkpoint(&mut self) -> Checkpoint {
         self.start_commit();
+        self.started_checkpoint()
+    }
+
+    /// [`Self::checkpoint`] of a commit already started.
+    fn started_checkpoint(&mut self) -> Checkpoint {
         self.derives_evaluated = 0;
         self.copied_at_checkpoint = self.store.copied_bytes();
         let store = self.store.checkpoint();
@@ -162,9 +167,10 @@ impl<D: DataSource> Runner<D> {
                 let kept = self.restore_store_refused(c.store);
                 self.slots = c.slots;
                 let mut resources = c.resources;
-                // A refused call still drew randomness; the bake must not keep its answer.
+                // A refused call still drew randomness or read the clock; bake must not keep its answer.
                 for (old, attempted) in resources.iter_mut().zip(&self.resources) {
                     old.entropy_reader |= attempted.entropy_reader;
+                    old.clock_reader |= attempted.clock_reader;
                 }
                 self.resources = resources;
                 self.readers_restore(c.module_readers);
@@ -272,8 +278,19 @@ impl<D: DataSource> Runner<D> {
         }
     }
 
-    /// Run an action by name with `args` — what a test or an agent does.
+    /// Run an action by name with `args` as the person's act — what a test
+    /// or an agent does.
     pub fn act(&mut self, name: &str, args: Vec<Value>) -> Result<CommitReceipt, RunnerError> {
+        let person = super::provenance::Cause::person();
+        self.as_cause(person, |r| r.act_named(name, args))
+    }
+
+    /// [`Self::act`] under the cause installed.
+    pub(super) fn act_named(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<CommitReceipt, RunnerError> {
         let what = format!("act {name}");
         let was_poisoned = self.poisoned;
         let result = match self
@@ -303,13 +320,77 @@ impl<D: DataSource> Runner<D> {
         args: Vec<Value>,
         frames: &[Frame],
     ) -> Result<CommitReceipt, RunnerError> {
+        self.run_action_from(action, args, frames, None)
+    }
+
+    pub(super) fn run_action_from(
+        &mut self,
+        action: ActionsId,
+        args: Vec<Value>,
+        frames: &[Frame],
+        edit: Option<field::InputEdit>,
+    ) -> Result<CommitReceipt, RunnerError> {
         let was_poisoned = self.poisoned;
         let checkpoint = self.checkpoint();
-        let result = self.run_action_inner(action, args, frames);
+        let result = self.run_action_inner(action, args, frames, edit);
         self.conclude(checkpoint, &result, was_poisoned);
         self.arm_then(result.is_ok());
         self.arm_next(result.is_ok());
         result
+    }
+
+    /// A task's firing: [`Self::run_action`], or `None` and no commit when
+    /// the firing is idle ([`Self::changes_nothing`]). The body runs once
+    /// either way, at the firing's sample of the clock.
+    pub(super) fn run_task(
+        &mut self,
+        action: ActionsId,
+        args: &[Value],
+        frames: &[Frame],
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        let was_poisoned = self.poisoned;
+        self.start_commit();
+        let outcome = self.action_outcome(action, args, frames);
+        if matches!(&outcome, Ok(outcome) if self.changes_nothing(outcome)) {
+            // As a commit's end does: the next beat follows the body's time.
+            self.sample();
+            return Ok(None);
+        }
+        let checkpoint = self.started_checkpoint();
+        let result = outcome.and_then(|outcome| self.commit_outcome(outcome, frames, None));
+        self.conclude(checkpoint, &result, was_poisoned);
+        self.arm_then(result.is_ok());
+        self.arm_next(result.is_ok());
+        result.map(Some)
+    }
+
+    /// Whether committing `outcome` would change nothing a settlement, the
+    /// view or a host reads. It sends, commands and refreshes nothing, writes
+    /// no row's slot, and writes a root slot only a value equivalent to the
+    /// one it holds, which settlement already reads as unchanged; a write to
+    /// a mutation's slot also ends its request, so it is never idle. Nothing
+    /// evaluated at a commit may read the clock: the commit would show it
+    /// (a task's gate and key cannot, `analyze-task-gate-clock`).
+    fn changes_nothing(&self, outcome: &vm::Outcome) -> bool {
+        // Every field: one added later is read here before it is idle.
+        let vm::Outcome {
+            value: _,
+            writes,
+            row_writes,
+            commands,
+            sends,
+            refreshes,
+            store_dependent: _,
+        } = outcome;
+        sends.is_empty()
+            && commands.is_empty()
+            && refreshes.is_empty()
+            && row_writes.is_empty()
+            && writes.iter().all(|(slot, value)| {
+                crate::compare::equivalent(&self.slots[*slot as usize], value)
+                    && !self.plan.mutations.iter().any(|m| m.slot.0 == *slot)
+            })
+            && !self.sites.deps().reads_clock
     }
 
     /// Arm the `then` action of each mutation answered in the commit just
@@ -318,10 +399,10 @@ impl<D: DataSource> Runner<D> {
     /// past (`timer_due_ms`): the answer's commit is never extended by
     /// what it causes, and a refused `then` leaves the answer standing.
     pub(super) fn arm_then(&mut self, stood: bool) {
-        for m in std::mem::take(&mut self.landed) {
+        for (m, cause) in std::mem::take(&mut self.landed) {
             if stood && self.mutation_row(m).then.is_some() {
                 self.then_due[m] = self.armed_at();
-                self.note_then(m);
+                self.note_then(m, cause);
             }
         }
     }
@@ -344,7 +425,19 @@ impl<D: DataSource> Runner<D> {
         action: ActionsId,
         args: Vec<Value>,
         frames: &[Frame],
+        edit: Option<field::InputEdit>,
     ) -> Result<CommitReceipt, RunnerError> {
+        let outcome = self.action_outcome(action, &args, frames)?;
+        self.commit_outcome(outcome, frames, edit)
+    }
+
+    /// What the action's body asks for at `args`; nothing is applied.
+    fn action_outcome(
+        &mut self,
+        action: ActionsId,
+        args: &[Value],
+        frames: &[Frame],
+    ) -> Result<vm::Outcome, RunnerError> {
         if self.poisoned {
             return Err(RunnerError::Poisoned);
         }
@@ -416,15 +509,24 @@ impl<D: DataSource> Runner<D> {
             }
             None => None,
         };
-        let outcome = {
-            // The frames in force at the view the event hit (LLP 1017 P4c):
-            // a row action reads and writes its row through them.
-            let mut env = self.env(&args, frames);
-            env.geometry = geometry.as_ref();
-            vm::eval(self.plan.code(row.body), &env, &allowed).map_err(|t| {
-                RunnerError::from(t).evaluated(|| format!("action {:?}", self.plan.str(row.name)))
-            })?
-        };
+        // The frames in force at the view the event hit (LLP 1017 P4c):
+        // a row action reads and writes its row through them.
+        let mut env = self.env(args, frames);
+        env.geometry = geometry.as_ref();
+        vm::eval(self.plan.code(row.body), &env, &allowed).map_err(|t| {
+            RunnerError::from(t).evaluated(|| format!("action {:?}", self.plan.str(row.name)))
+        })
+    }
+
+    /// Commit what an action's body asked for: its sends, its writes,
+    /// settlement and the update.
+    fn commit_outcome(
+        &mut self,
+        outcome: vm::Outcome,
+        frames: &[Frame],
+        edit: Option<field::InputEdit>,
+    ) -> Result<CommitReceipt, RunnerError> {
+        let rewrite = edit.and_then(|edit| self.reconciled_input(edit, frames, &outcome));
         // Sends (LLP 1016 §4): each asks the source now. An answer lands in
         // the mutation's slot inside this commit; a request goes to the host
         // once the commit stands. A queue mutation's send is asked only when
@@ -468,9 +570,16 @@ impl<D: DataSource> Runner<D> {
                 }
             }
             let target = self.send_target(m);
-            let write = self.accept_write(target, source, sargs);
             let early = !self.source_ready(source) && !exact_plan::runner_owned_source(source);
-            if early && !queue {
+            if queue && (early || asked.contains(&m) || !self.asks_now(m)) {
+                if let Err(e) = self.wait_turn(m, source, sargs) {
+                    self.discard_later(&later);
+                    return Err(e);
+                }
+                continue;
+            }
+            let write = self.accept_write(target, source, sargs);
+            if early {
                 if let Err(e) = self.check_send_arguments(m, sargs) {
                     self.discard_later(&later);
                     return Err(e);
@@ -483,18 +592,11 @@ impl<D: DataSource> Runner<D> {
                 unsent.push((target, source.clone(), sargs.clone(), self.sent_by()));
                 continue;
             }
-            if queue && (early || asked.contains(&m) || !self.asks_now(m)) {
-                if let Err(e) = self.wait_turn(m, source, sargs, write) {
-                    self.discard_later(&later);
-                    return Err(e);
-                }
-                continue;
-            }
             asked.push(m);
             match self.ask_send(target, source, sargs, write) {
                 Ok(super::queue::Asked::Now(slot, v)) => {
                     answered.push((m, slot, v));
-                    self.landed.push(m);
+                    self.landed.push((m, self.cause()));
                     landed_now.push(m);
                     // It replaces an earlier send of this action still to go
                     // out (newest wins): that request never goes.
@@ -581,6 +683,8 @@ impl<D: DataSource> Runner<D> {
         }
         for (name, args) in outcome.commands {
             self.commands.push(Command {
+                window_reach: (name == "focus" && args.is_empty())
+                    .then(|| self.reach_of(self.cause())),
                 name,
                 args,
                 source: self.input_source,
@@ -744,8 +848,9 @@ impl<D: DataSource> Runner<D> {
         // A module's sends that answer nothing (LLP 1133.004 D5): the
         // runner's, run once the commit stands.
         let effects = self.take_module_effects(first_command);
+        // A hidden window's refusal precedes D4a's ordinary focus skip.
+        self.filter_call_commands(first_command);
         self.refuse_in_wake(first_command);
-        self.skip_in_call(first_command);
         // The scheme and root size a development host holds: kept as asked, not applied (LLP 1122 T7).
         self.take_held(first_command);
         // `setRootFontSize` is the runner's too: the size lands in this
@@ -763,10 +868,8 @@ impl<D: DataSource> Runner<D> {
             i += 1;
         }
         // A world hears whose commit posted to it (`world_origin.rs`).
-        super::world_origin::mark_world_posts(
-            self.call_origin(),
-            &mut self.commands[first_command..],
-        );
+        let cause = self.cause();
+        super::world_origin::mark_world_posts(cause, &mut self.commands[first_command..]);
         let commands: Vec<String> = self.commands[first_command..]
             .iter()
             .map(|c| {
@@ -796,7 +899,17 @@ impl<D: DataSource> Runner<D> {
                 Err(why) => self.log(format!("scrollIntoView refused: {why}")),
             }
         }
-        let result = self.update();
+        let mut result = self.update();
+        if let (Ok(receipt), Some((key, old))) = (&mut result, rewrite) {
+            if !receipt.renewed.contains(&key)
+                && self
+                    .kernel
+                    .node_by_key(key)
+                    .is_some_and(|n| exact_kernel::control::bound_field_value(n.props) == old)
+            {
+                receipt.reconcile_field = Some(key);
+            }
+        }
         if result.is_err() && !self.poisoned {
             for (rows, slot, old) in row_undo.into_iter().rev() {
                 match old {
@@ -955,7 +1068,10 @@ impl<D: DataSource> Runner<D> {
         let single =
             requests.len() == 1 && self.pending.iter().filter(|p| p.target == target).count() == 1;
         let request = &requests[0];
-        if single && Self::keepable(target, request) && !forced {
+        if let (Target::Resource(i), true) =
+            (target, single && Self::keepable(target, request) && !forced)
+        {
+            let identity_len = self.identity_len(i);
             if let Some(p) = self.pending.iter_mut().find(|p| {
                 p.target == target
                     && !p.refused
@@ -972,16 +1088,17 @@ impl<D: DataSource> Runner<D> {
                             }
                     })
             }) {
+                // An upload's status read still belongs to the upload.
+                if !p.upload
+                    && request.is_plain_http()
+                    && p.args.get(identity_len..) != args.get(identity_len..)
+                {
+                    p.ask_again.context = true;
+                }
                 p.args = args;
                 // (new arguments: a new streak after a turn over its budget)
                 p.reasks = 0;
-                if let Target::Resource(i) = target {
-                    p.inspection_generation = self
-                        .resources
-                        .get(i)
-                        .map(|row| &row.inspection)
-                        .map_or(0, |w| w.request);
-                }
+                p.inspection_generation = self.resources[i].inspection.request;
                 let (ticket, upload) = (p.ticket, p.upload);
                 // An upload kept for newer arguments is asked at them too (D10).
                 if upload {
@@ -1050,8 +1167,10 @@ impl<D: DataSource> Runner<D> {
         let name = self.target_name(target);
         let mut request = request;
         crate::canvas_capture::from_fetch(&mut request);
+        request.mutation_ticket =
+            (request.is_native() && !matches!(target, Target::Resource(_))).then_some(ticket);
         self.number_data_call(&mut request);
-        request.reach = self.reach_of(self.origin_for(Some(target)));
+        request.reach = self.reach_of(self.cause_for(target));
         self.log(super::lines::enqueued(ticket, &name, &request));
         let refusal = self.ask_refusal(target, &args, &request);
         self.note_asked(target, ticket);
@@ -1068,7 +1187,7 @@ impl<D: DataSource> Runner<D> {
                 Target::Resource(i) => self.inspected_request(i),
                 Target::Mutation(_) | Target::Sent(..) => 0,
             },
-            refusal: refusal.map(|why| (why, false)),
+            refusal: refusal.map(|why| (why.into(), false)),
             refused: false,
             ticket,
             target,
@@ -1092,7 +1211,7 @@ impl<D: DataSource> Runner<D> {
                 })
                 .flatten()
                 .map(str::to_string),
-            ask_again: false,
+            ask_again: Default::default(),
             module_again: None,
             effects: request.has_effects(),
             replay_unsafe: request.has_effects(),
@@ -1124,6 +1243,7 @@ impl<D: DataSource> Runner<D> {
                 target: name,
                 class: match target {
                     Target::Resource(_) if request.is_plain_http() => RequestClass::Read,
+                    Target::Resource(_) if request.is_local_work() => RequestClass::Local,
                     Target::Sent(m, _) if request.is_plain_http() => {
                         RequestClass::Parallel(m as u32)
                     }
@@ -1209,7 +1329,7 @@ impl<D: DataSource> Runner<D> {
         if let Some(dispatch) = self.module_dispatch(token).or(Self::held_dispatch(token)) {
             return dispatch;
         }
-        self.store.set_clock_ms(self.now_ms);
+        self.sync_store_clock();
         self.data.dispatch(token, &self.store)
     }
 
@@ -1231,7 +1351,7 @@ impl<D: DataSource> Runner<D> {
         }
         // A store's presence call: the host's backend, on the store's own
         // path, never a module's (LLP 1133.010 D13).
-        if let Some(dispatch) = self.presence_call(&request.body) {
+        if let Some(dispatch) = self.presence_call(&request.body, request.grants.as_deref()) {
             return dispatch;
         }
         // A module's name called from data code: the runner's admission, then

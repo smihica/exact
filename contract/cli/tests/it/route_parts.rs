@@ -6,16 +6,9 @@
 //! platform's transition). The shorthand alone, literal arms, an animation
 //! that ends and keyframes that move a picture; nowhere but on a route.
 
+use crate::source::{boxed, NoData, Source};
 use exact_kernel::{Kernel, StyleId};
-use exact_runner::{DataError, DataSource, Event, Runner, Value};
-
-struct NoData;
-
-impl DataSource for NoData {
-    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
-        Err(DataError::UnknownSource(source.into()))
-    }
-}
+use exact_runner::{Event, Runner};
 
 const KEYFRAMES: &str = "keyframes fade-in
   from opacity=0
@@ -51,11 +44,11 @@ fn screen(styles: &str, route: &str) -> String {
         .replace("ROUTE", route)
 }
 
-fn boot(source: &str) -> Runner<NoData> {
+fn boot(source: &str) -> Runner<Source> {
     let plan = contract::compile(source).unwrap_or_else(|e| panic!("{e}"));
     Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -67,7 +60,7 @@ fn boot(source: &str) -> Runner<NoData> {
 /// its animations (`none` for none) and the keyframes each carries.
 type Part = Option<(String, Vec<usize>)>;
 
-fn parts(r: &Runner<NoData>) -> (Part, Part) {
+fn parts(r: &Runner<Source>) -> (Part, Part) {
     let key = r.kernel().find_by_test_id("route")[0];
     let style = &r.kernel().node_by_key(key).unwrap().style;
     let part = |row, list: &exact_motion::Animations| {
@@ -155,7 +148,7 @@ fn a_part_is_refused_where_it_cannot_play_and_names_what_to_write() {
             "admits only `animation`",
         ),
         (
-            route(&part("`fade-in ${180}ms`")),
+            route(&part("`fade-in ${still ? 180 : 200}ms`")),
             "lower-route-part",
             "built at run time",
         ),
@@ -171,11 +164,16 @@ fn a_part_is_refused_where_it_cannot_play_and_names_what_to_write() {
         ),
         (route(&part("\"tint 1s\"")), "lower-route-part", "`opacity`, `translate`, `scale` and `rotate`"),
         (route(&part("\"missing 1s\"")), "lower-animation-name", "no `keyframes missing`"),
-        // D4: a sheet's motion and a zoom are the platform's.
+        // D4: a sheet's, popover's, and zoom's motion are the platform's.
         (
             route(&format!("navigationPresentation=\"modal\"{}", part("\"fade-in 1s\""))),
             "lower-route-part",
             "sheet",
+        ),
+        (
+            route(&format!("navigationPresentation=\"popover\"{}", part("\"fade-in 1s\""))),
+            "lower-route-part",
+            "popover",
         ),
         (
             route(&format!("navigationSource=\"thumb\"{}", part("\"fade-in 1s\""))),
@@ -203,12 +201,41 @@ fn a_part_is_refused_where_it_cannot_play_and_names_what_to_write() {
             "syntax-duplicate-attr",
             "::view-transition-new",
         ),
+        // D4 (amended #2005): `-exact-exit-animation` is refused on routes (direct or via style).
+        (
+            route("-exact-exit-animation=\"fade-out 120ms ease-in\""),
+            "lower-route-part",
+            "::view-transition-old",
+        ),
+        (
+            route("navigationPresentation=\"modal\" -exact-exit-animation=\"fade-out 120ms\""),
+            "lower-route-part",
+            "navigationPresentation=\"modal\"",
+        ),
+        (
+            route("navigationSource=\"thumb\" -exact-exit-animation=\"fade-out 120ms\""),
+            "lower-route-part",
+            "navigationSource",
+        ),
+        (
+            screen(
+                "style Leaving\n  -exact-exit-animation=\"fade-out 120ms ease-in\"\n",
+                "class=Leaving",
+            ),
+            "lower-route-part",
+            "`-exact-exit-animation`",
+        ),
     ];
     for (source, refusal, says) in cases {
         let e = contract::compile(&source).unwrap_err();
         assert_eq!(e.id, refusal, "{source}: {}", e.message);
         assert!(e.message.contains(says), "{source}: {}", e.message);
     }
+    // Non-route children inside a route still accept `-exact-exit-animation`.
+    contract::compile(&route(
+        "\n          if still\n            text \"gone\" -exact-exit-animation=\"fade-out 120ms\"",
+    ))
+    .unwrap_or_else(|e| panic!("{e}"));
     // A computed `navigationSource` is the run time's to decide (D2).
     let computed = format!(
         "navigationSource=(still ? \"thumb\" : \"\"){}",

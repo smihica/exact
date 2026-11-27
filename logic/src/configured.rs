@@ -11,6 +11,12 @@ macro_rules! configured {
             }
         }
         impl $crate::exact_runner::DataSourceWrapper for $name {
+            fn queued_send_replacer(
+                &mut self,
+                source: Option<&str>,
+            ) -> Option<$crate::exact_runner::QueuedSendReplacer> {
+                $crate::exact_runner::DataSource::queued_send_replacer(&mut self.0, source)
+            }
             fn prepare_snapshot(
                 &mut self,
                 module: Option<$crate::exact_runner::SnapshotModule<'_>>,
@@ -74,6 +80,9 @@ macro_rules! configured {
             }
             fn preload(&self) -> Result<bool, $crate::exact_runner::DataError> {
                 $crate::exact_runner::DataSource::preload(&self.0)
+            }
+            fn ambient_taint(&self, source: &str) -> (bool, bool) {
+                $crate::exact_runner::DataSource::ambient_taint(&self.0, source)
             }
             fn when_preloaded(&self, wake: Box<dyn FnOnce() + Send>) {
                 $crate::exact_runner::DataSource::when_preloaded(&self.0, wake)

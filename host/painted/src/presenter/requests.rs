@@ -23,9 +23,26 @@ use exact_runner::orientation::Session;
 use exact_runner::share::Share;
 use exact_runner::ControlValue;
 
+#[cfg(target_os = "android")]
+pub(super) mod android;
+mod open_url;
 mod packages;
 #[cfg(test)]
 mod packages_tests;
+
+/// A package's synchronous form is installed even in an APK with no app module.
+#[cfg(any(target_os = "android", test))]
+fn install_android_handlers(
+    slot: &exact_runner::Native,
+    handler: &exact_runner::NativeHandler,
+    app: bool,
+    call: Option<exact_runner::NativeCall>,
+) {
+    if app {
+        slot.host(Some(handler.clone()));
+    }
+    slot.host_call(call);
+}
 
 /// What the presenter asks of its shell. The number is the kind on the wire.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +129,15 @@ pub enum Request {
     /// A node's drag out of the app (LLP 1094.000 D7): the reader starts the
     /// platform's drag with what it carries.
     Drag(super::drag_out::DragOut),
+    /// A live activity's send, `{"ticket", "command", "args"}` as the runner
+    /// wrote its `exact-activity:` body with the ticket added, or
+    /// `{"enumerate": true}`, the source's first demand (LLP 1126 D13).
+    /// Answered by `Native.activities` with the send's ticket, or with the
+    /// activities the reader shows, never by this request's id, as Apple's
+    /// arm answers (`host/apple/src/activities.rs`).
+    Activity(String),
+    /// Pin the activity for a video allocation, or expand it.
+    VideoPictureInPicture(Option<(ViewId, exact_kernel::NodeKey, u64)>),
 }
 
 /// What a picker is opened with, each value as HTML writes it and empty
@@ -133,6 +159,9 @@ pub struct Pick {
     /// Its `accent-color`, where it or an ancestor sets one: the picker's
     /// colours are made from it, as the author's word over the device's.
     pub accent: Option<[u8; 4]>,
+    /// The control's scheme, where it or an ancestor sets one or the app
+    /// chose one by `setScheme` (LLP 1034 §8); `None` follows the device's.
+    pub dark: Option<bool>,
 }
 
 impl Request {
@@ -161,6 +190,8 @@ impl Request {
             Request::FileDialog(_) => 21,
             Request::WindowTitle(_) => 22,
             Request::Drag(_) => 23,
+            Request::Activity(_) => 24,
+            Request::VideoPictureInPicture(_) => 25,
         }
     }
 }
@@ -224,6 +255,10 @@ impl Haptic {
 /// A request the shell took and has not answered.
 #[derive(Debug)]
 pub(super) enum Waiting {
+    Open {
+        element: Option<String>,
+        scheme: String,
+    },
     /// The share sheet: its outcome is a journal line (LLP 1069.003 D2).
     Share,
     Auth {
@@ -263,7 +298,10 @@ pub(super) struct State {
     pub(super) export_workers: BTreeMap<u32, std::thread::JoinHandle<()>>,
     /// What the shell was last told of Back, the kernel epoch that was read
     /// at, and what it was last told of the keyboard.
-    back: Option<bool>,
+    pub(super) back: Option<bool>,
+    pub(super) hosted_back: Option<fn(&[i32])>,
+    pub(super) back_layers: Option<super::back::BackLayers>,
+    pub(super) opening_back_layers: Vec<(i32, u32)>,
     back_epoch: Option<u64>,
     keyboard: Option<(u32, ViewId)>,
     pad_input: Option<bool>,
@@ -290,6 +328,8 @@ pub(super) struct State {
     packages: packages::Packages,
     /// Whether the native slot's handler is installed.
     handling: bool,
+    #[cfg(target_os = "android")]
+    pub(crate) app_module: android::Session,
     /// The target this host said and the extensions it bound (as in
     /// production, under the agent): what a replacement runner is told.
     target: Option<&'static str>,
@@ -322,12 +362,24 @@ fn encode(id: u32, request: &Request, out: &mut Vec<i32>) {
         | Request::Module(text)
         | Request::Presence(text)
         | Request::Sound(text)
+        | Request::Activity(text)
         | Request::Assets(text) => string(out, text),
         Request::Auth(url, callback, state, logout) => {
             string(out, url);
             string(out, callback);
             string(out, state);
             out.push(i32::from(*logout));
+        }
+        Request::VideoPictureInPicture(target) => {
+            if let Some((id, key, session)) = target {
+                out.extend([
+                    *id as i32,
+                    key.index as i32,
+                    key.generation as i32,
+                    *session as i32,
+                    (*session >> 32) as i32,
+                ]);
+            }
         }
         Request::AuthEnd(id) => out.push(*id as i32),
         Request::Haptic(haptic) => out.push(*haptic as i32),
@@ -398,6 +450,8 @@ fn encode(id: u32, request: &Request, out: &mut Vec<i32>) {
                 pick.accent
                     .map_or(0, |[r, g, b, _]| i32::from_be_bytes([0xff, r, g, b])),
             );
+            // 0 for the device's scheme, 1 light, 2 dark.
+            out.push(pick.dark.map_or(0, |dark| 1 + i32::from(dark)));
         }
     }
     out[at + 2] = (out.len() - at - 3) as i32;
@@ -408,13 +462,29 @@ fn encode(id: u32, request: &Request, out: &mut Vec<i32>) {
 pub type AgentTurn = Box<dyn FnMut(f64, Option<Vec<i32>>) -> Vec<Handed>>;
 
 /// What the reader queued for the owner thread while an agent operation held
-/// it, in the order it was queued: on the wire, `[id, answer]`, the topic,
-/// `{"picture", "revoked"}` or `{"journal"}`.
+/// it, in the order it was queued. An answer is a pair and a refusal is a
+/// record with its request ID and error name.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Handed {
     /// The answer to request `id`, or its cancellation.
     Answer(i32, Option<String>),
+    /// A reader's refusal of a module request. Package readers consume the same error record.
+    Refused {
+        /// The request number.
+        id: u32,
+        /// The error name.
+        error: String,
+        /// The reason, when the package supplies one.
+        message: Option<String>,
+    },
+    /// A Kotlin callback due at an absolute session time.
+    After {
+        /// The callback number.
+        timer: i32,
+        /// The deadline in milliseconds.
+        due: f64,
+    },
     /// A topic an extension announced ([`exact_runner::Native::changed`]).
     Changed(String),
     /// A picture an extension changed or revoked
@@ -474,6 +544,13 @@ impl<D: DataSource> Presenter<D> {
                 Handed::Answer(id, answer) => {
                     self.answer_request(id as u32, answer.as_deref());
                 }
+                Handed::Refused { id, error, message } => {
+                    self.refuse_module(id, &error, message.as_deref());
+                }
+                #[cfg(target_os = "android")]
+                Handed::After { timer, due } => self.module_after(timer, due),
+                #[cfg(not(target_os = "android"))]
+                Handed::After { .. } => {}
                 Handed::Changed(topic) => self.host.runner().native_slot().changed(&topic),
                 Handed::Picture { picture, revoked } => self.picture_changed(&picture, revoked),
                 Handed::Journal { journal } => self.host.runner_mut().log(journal),
@@ -500,20 +577,7 @@ impl<D: DataSource> Presenter<D> {
         // The shell's extensions answer the module calls the runner hands
         // the native slot, once their names are bound (`bind_extensions`).
         self.handle_modules();
-    }
-
-    /// The Android reader's share sheet: `exactPage()` says it shares text,
-    /// a link and `app:/` files (LLP 1094.000 D7), and no element's picture.
-    pub fn serve_share_sheet(&mut self) {
-        let page = self.host.runner().page();
-        let page = exact_runner::Page {
-            can_share: true,
-            can_share_files: true,
-            ..page
-        };
-        if let Some(e) = self.set_page(page) {
-            self.host.log(format!("page: {e}"));
-        }
+        self.link_activities();
     }
 
     /// The packages this binary composes (`crate::package`, LLP 1133.022
@@ -521,7 +585,8 @@ impl<D: DataSource> Presenter<D> {
     /// drive binds it (`--bind`), on the target this binary was built for.
     pub fn serve_packages(&mut self, table: Vec<crate::package::Entry>) {
         let agent = self.agent || std::env::var("EXACT_AGENT").as_deref() == Ok("1");
-        self.requests.packages.set(table, agent);
+        let development = !exact_runner::delivery::production(&self.compat);
+        self.requests.packages.set(table, agent, development);
         // Said with no package composed too: a substitute's per-target answer
         // is this target's, not that of the OS the binary was built on.
         let target = if cfg!(target_os = "windows") {
@@ -536,9 +601,16 @@ impl<D: DataSource> Presenter<D> {
         self.handle_modules();
         let native = self.host.runner().native_slot();
         self.requests.packages.slot(native);
+        self.packages_publish_to_images();
         let (real, under) = self.requests.packages.bound();
         let owned = |names: Vec<&str>| names.into_iter().map(str::to_owned).collect();
         self.bind_modules(owned(real), owned(under));
+    }
+
+    /// Packages publish written images to the session's images, again
+    /// whenever those are reset or replaced.
+    pub(super) fn packages_publish_to_images(&mut self) {
+        self.requests.packages.publish_to(&self.images.publisher);
     }
 
     /// The host's target, which a module's per-target words are read by.
@@ -587,6 +659,10 @@ impl<D: DataSource> Presenter<D> {
         if std::mem::replace(&mut self.requests.handling, true) {
             return;
         }
+        self.install_shell_handlers();
+    }
+
+    pub(crate) fn install_shell_handlers(&self) {
         let (inbox, wake) = (self.requests.inbox.clone(), self.executor.waker());
         let handler: exact_runner::NativeHandler = std::sync::Arc::new(move |body, reply| {
             inbox
@@ -595,7 +671,15 @@ impl<D: DataSource> Presenter<D> {
                 .push((body, reply));
             wake();
         });
-        self.host.runner().native_slot().host(Some(handler));
+        let slot = self.host.runner().native_slot();
+        #[cfg(target_os = "android")]
+        install_android_handlers(
+            &slot,
+            &handler,
+            self.requests.app_module.hosts(),
+            self.requests.app_module.call(),
+        );
+        slot.host_packages(Some(handler));
     }
 
     /// The module calls handed over since the last turn: a composed
@@ -605,6 +689,7 @@ impl<D: DataSource> Presenter<D> {
         for source in self.requests.packages.take_pictures() {
             self.picture_changed(&source, false);
         }
+        let ready = self.requests.packages.take_ready();
         let calls = std::mem::take(
             &mut *self
                 .requests
@@ -612,7 +697,7 @@ impl<D: DataSource> Presenter<D> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         );
-        if calls.is_empty() {
+        if calls.is_empty() && ready.is_empty() {
             return;
         }
         let mut queued = false;
@@ -622,8 +707,7 @@ impl<D: DataSource> Presenter<D> {
             if self.requests.packages.serves(&extension) {
                 crate::desktop::surface(self.viewport, self.brush.scale, self.pointer);
                 let now = self.host.now();
-                let inbox = self.requests.inbox.clone();
-                (self.requests.packages).dispatch(&body, reply, now, &inbox, &wake);
+                (self.requests.packages).dispatch(&body, reply, now, &wake);
             } else if self.requests.shell {
                 let id = self.queue(Request::Module(String::from_utf8_lossy(&body).into_owned()));
                 self.requests.modules.insert(id, reply);
@@ -634,6 +718,11 @@ impl<D: DataSource> Presenter<D> {
             } else {
                 crate::package::Reply::new(reply).error("NotSupportedError", None);
             }
+        }
+        if !ready.is_empty() {
+            crate::desktop::surface(self.viewport, self.brush.scale, self.pointer);
+            let now = self.host.now();
+            self.requests.packages.dispatch_admitted(ready, now, &wake);
         }
         self.package_lines();
         if queued {
@@ -769,10 +858,14 @@ impl<D: DataSource> Presenter<D> {
         let epoch = self.host.kernel().epoch();
         if self.requests.back_epoch != Some(epoch) {
             self.requests.back_epoch = Some(epoch);
-            let goes = self.back_goes();
-            if self.requests.back != Some(goes) {
-                self.requests.back = Some(goes);
-                self.queue(Request::Back(goes));
+            if self.requests.hosted_back.is_some() {
+                self.update_hosted_back();
+            } else {
+                let goes = self.back_goes();
+                if self.requests.back != Some(goes) {
+                    self.requests.back = Some(goes);
+                    self.queue(Request::Back(goes));
+                }
             }
         }
         let keyboard = (self.editing(), self.hosted_focus());
@@ -891,6 +984,7 @@ impl<D: DataSource> Presenter<D> {
     /// Whether Back has somewhere to go may have changed with no commit (a
     /// surface of the top layer opened or closed): it is read again.
     pub(super) fn back_changed(&mut self) {
+        self.update_hosted_back();
         self.requests.back_epoch = None;
     }
 
@@ -944,6 +1038,17 @@ impl<D: DataSource> Presenter<D> {
         Some(words)
     }
 
+    /// Reject a module request. The package protocol reads the error record and
+    /// `native.later` rejects on the HTTP status, as on Apple.
+    pub(crate) fn refuse_module(&mut self, id: u32, error: &str, message: Option<&str>) {
+        if let Some(reply) = self.requests.modules.remove(&id) {
+            self.requests.tells.remove(&id);
+            reply.send(exact_runner::Outcome::module_refusal(error, message));
+        } else {
+            self.picture_answered(id, Err(error.to_owned()));
+        }
+    }
+
     /// The shell's answer to request `id`, or its cancellation (`None`);
     /// whether a request waited under that id. An answer to an id that
     /// waits for none (answered already, or never asked) changes nothing.
@@ -987,6 +1092,15 @@ impl<D: DataSource> Presenter<D> {
             return false;
         };
         match waiting {
+            Waiting::Open { element, scheme } => {
+                let opened = answer == Some("opened");
+                if !opened {
+                    self.host.log(format!(
+                        "openURL {scheme}: the system could not open the URL"
+                    ));
+                }
+                self.answer_open(element.as_deref(), opened);
+            }
             // The outcome is a journal line, as on every host (LLP 1069.003 D2).
             Waiting::Share => self.host.log(match answer {
                 Some("shared") => "share: shared".to_string(),
@@ -1039,6 +1153,7 @@ impl<D: DataSource> Presenter<D> {
     /// belongs to the activity, which answers it as it closes (`Requests.destroy`);
     /// a reader made again over the same activity leaves it up.
     /// File pickers use the process-owned activity-result callback across recreation.
+    /// A URL is answered by the main thread, even with the activity detached.
     pub(super) fn requests_reset(&mut self) {
         (self.requests.back, self.requests.back_epoch) = (None, None);
         self.requests.keyboard = None;
@@ -1050,7 +1165,8 @@ impl<D: DataSource> Presenter<D> {
             .filter(|(_, w)| {
                 !matches!(
                     w,
-                    Waiting::Pick(_)
+                    Waiting::Open { .. }
+                        | Waiting::Pick(_)
                         | Waiting::Files(_)
                         | Waiting::Export(_)
                         | Waiting::Auth { opened: true, .. }
@@ -1172,7 +1288,8 @@ impl<D: DataSource> Presenter<D> {
             min: text(PropId::Min),
             max: text(PropId::Max),
             step: text(PropId::Step),
-            accent: crate::paint::control::accent(&node, self.brush.dark),
+            accent: crate::paint::control::accent(&node, self.dark_at(id)),
+            dark: self.scheme_of(id).or(self.scheme.0),
         };
         // Under the agent the picker is held for it, on every host (LLP
         // 1069.007 D4): `type @date 2026-10-23`, `tap @date clear` or
@@ -1268,98 +1385,6 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// `openURL(url)` on a host whose shell can leave the app: an absolute
-    /// `http`, `https`, `mailto` or `tel` URL, the one allowlist every host
-    /// opens (a path is a location in the app, which `navigate` takes).
-    /// `openURL(url, id)`: `change` at `id` hears `opened` or `failed`.
-    pub(super) fn open_url(&mut self, args: &[exact_plan::Value]) {
-        let opened = self.open_url_now(args);
-        self.answer_open(args, opened);
-    }
-
-    fn open_url_now(&mut self, args: &[exact_plan::Value]) -> bool {
-        let url = args.first().and_then(exact_plan::Value::as_str);
-        // The app's page in Settings (LLP 1133.002 D11), the shell's to open;
-        // under the agent, journaled only.
-        if url == Some("app-settings:") {
-            if !self.has_shell() {
-                self.host
-                    .log("openURL app-settings: unavailable on this host");
-                return false;
-            }
-            let agent = std::env::var("EXACT_AGENT").is_ok_and(|v| v == "1");
-            self.host.log(format!(
-                "openURL app-settings: opens the app's page in Settings{}",
-                if agent { " (not under the agent)" } else { "" }
-            ));
-            if !agent {
-                self.request(Request::Open("app-settings:".into()));
-            }
-            return true;
-        }
-        match url.and_then(|url| self.leave_for(url)) {
-            Some(opened) => opened,
-            None => {
-                self.host.log(format!(
-                    "openURL refused: {:?} is not an absolute http, https, mailto or tel URL",
-                    url.unwrap_or_default()
-                ));
-                false
-            }
-        }
-    }
-
-    /// `openURL(url, id)`'s answer, `opened` or `failed`, as `change` at
-    /// the element `id` names; the runner says in the journal when none does.
-    pub(super) fn answer_open(&mut self, args: &[exact_plan::Value], opened: bool) {
-        let Some(id) = args.get(1).and_then(exact_plan::Value::as_str) else {
-            return;
-        };
-        let request = serde_json::json!({ "command": "openURL", "id": id });
-        let ruling = exact_runner::commands::request(self.host.runner_mut(), &request.to_string());
-        let ruling: serde_json::Value = serde_json::from_str(&ruling).unwrap_or_default();
-        self.dirty = true;
-        let Some(view) = ruling["view"].as_u64() else {
-            return;
-        };
-        let answer = if opened { "opened" } else { "failed" };
-        let now = self.host.now();
-        let change = Event::Change(ControlValue::Text(answer.into()));
-        if let Some(e) = self.host.dispatch_at(view as ViewId, change, now) {
-            eprintln!("exact: {e}");
-        }
-        if let Some(e) = self.after_commit() {
-            eprintln!("exact: {e}");
-        }
-    }
-
-    /// Leave the app for `url`, where a shell can and `url` is one of the
-    /// four kinds that do; whether it was asked.
-    pub(super) fn leave(&mut self, url: &str) -> bool {
-        self.leave_for(url).is_some()
-    }
-
-    /// [`Self::leave`], and whether the open was taken: the opener's
-    /// answer, or the shell's request sent.
-    fn leave_for(&mut self, url: &str) -> Option<bool> {
-        let target =
-            crate::text::markup::target(url).filter(|t| !t.starts_with('/') && !t.contains('\0'));
-        if let (Some(target), Some(open)) = (target, self.url_opener.as_ref()) {
-            if let Err(error) = open(target) {
-                self.host.log(format!("openURL: {error}"));
-                return Some(false);
-            }
-            return Some(true);
-        }
-        match target.filter(|_| self.requests.shell) {
-            Some(target) => {
-                self.request(Request::Open(target.to_string()));
-                Some(true)
-            }
-            None => None,
-        }
-    }
-
     /// `share(…)`: the runner's rule, then the shell's sheet where there
     /// is one. Its outcome arrives by the request's id. The Android reader
     /// gives the sheet `app:/` files as content URIs of its own provider
@@ -1367,7 +1392,7 @@ impl<D: DataSource> Presenter<D> {
     pub(super) fn share(&mut self, args: &[exact_plan::Value], source: Option<ViewId>) {
         let share = Share::from_args(args);
         let (agent, shell) = (self.agent, self.requests.shell);
-        // What the sheet takes is what `exactPage()` says it does ([`Self::serve_share_sheet`]).
+        // What the sheet takes is what `exactPage()` says it does (the reader's boot, `canvas/boot.rs`).
         let page = self.host.runner().page();
         let reach = exact_runner::share::Reach {
             sheet: shell,

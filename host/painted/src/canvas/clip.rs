@@ -121,6 +121,11 @@ impl Recorder {
     ) {
         let bounds = self.on_page(shape.rect, ts);
         if self.culled(bounds) {
+            // A module view clipped out (an empty box is always) lives on,
+            // held, as iOS keeps a view outside its clip.
+            if kind == crate::paint::NativeKind::Module {
+                self.record_held(id, kind, props);
+            }
             return;
         }
         self.need(bounds);
@@ -138,7 +143,7 @@ impl Recorder {
                 && ts == Transform::identity()
                 && self.direct.isolation == 0
                 && self.row.is_none()
-                && self.group.is_none()
+                && self.groups.is_empty()
                 && self.layers.unlayered()
                 && self.slot.is_none()
                 && self.again.is_none()
@@ -150,6 +155,15 @@ impl Recorder {
             }
         }
         self.record_native(id, kind, shape, props);
+    }
+
+    /// An element alive and shown nowhere: op 28 at an empty box, flagged
+    /// held (bit 9 of its kind word).
+    pub(super) fn record_held(&mut self, id: ViewId, kind: crate::paint::NativeKind, props: &str) {
+        self.transform(Transform::identity());
+        let at = self.ops.len();
+        self.record_native(id, kind, &Shape::rect((0., 0., 0., 0.)), props);
+        self.ops[at + 2] |= 1 << 9;
     }
 
     pub(super) fn record_native(
@@ -309,24 +323,29 @@ impl Recorder {
         }
     }
 
-    /// The reader can move a retained layer past a clip around it. Only clips
-    /// recorded inside the layer can permanently hide its content.
-    fn recording_clips(&self) -> impl Iterator<Item = &Clip> {
-        self.clips.iter().skip(self.layers.clips_outside())
+    /// How many clips lie outside the innermost retained layer or scroll group:
+    /// the reader can move either past those clips, so only clips inside the
+    /// current rigid frame can permanently hide a drawing.
+    fn clips_outside(&self) -> usize {
+        self.layers
+            .clips_outside()
+            .max(self.groups.last().map_or(0, |&(_, depth)| depth))
     }
 
-    /// Whether the drawing's page bounds lie outside a recorded clip.
+    fn recording_clips(&self) -> impl Iterator<Item = &Clip> {
+        self.clips.iter().skip(self.clips_outside())
+    }
+
+    /// Whether the drawing's page bounds lie outside a clip in its rigid frame.
     pub(super) fn culled(&self, bounds: Option<Rect4>) -> bool {
         let Some(b) = bounds else { return false };
         self.recording_clips()
             .any(|c| c.page.is_some_and(|(r, _)| !overlaps(b, r)))
     }
 
-    /// Whether the clips leave nothing at all (two of them do not meet: a
-    /// scroller moved out of its page's view).
-    pub(super) fn clipped_out(&self) -> bool {
+    fn segment_clipped_out(clips: &[Clip]) -> bool {
         let mut left: Option<Rect4> = None;
-        for (r, _) in self.recording_clips().filter_map(|c| c.page) {
+        for (r, _) in clips.iter().filter_map(|c| c.page) {
             let meet = left.map_or(r, |l| intersect(l, r));
             if meet.2 <= 0.0 || meet.3 <= 0.0 {
                 return true;
@@ -334,6 +353,23 @@ impl Recorder {
             left = Some(meet);
         }
         false
+    }
+
+    /// Whether clips within any rigid frame leave nothing at all (two clips
+    /// that cannot move relative to each other do not meet: e.g. a scroller on
+    /// an offscreen route). Clips separated by a scroll group boundary can move
+    /// into view relative to one another, so each rigid segment is checked on
+    /// its own.
+    pub(super) fn clipped_out(&self) -> bool {
+        let mut from = self.layers.clips_outside();
+        for &(_, depth) in &self.groups {
+            let end = depth.min(self.clips.len());
+            if end > from && Self::segment_clipped_out(&self.clips[from..end]) {
+                return true;
+            }
+            from = from.max(end);
+        }
+        Self::segment_clipped_out(&self.clips[from..])
     }
 
     /// Before drawing within `bounds` (page space; `None` when unknown):
@@ -626,6 +662,31 @@ mod direct_tests {
         );
         assert_eq!(r.ops.len(), before);
     }
+    /// A module view is recorded wherever its box: inside its clip, an empty
+    /// one is shown there; on the clip's edge or outside it, it is held, made
+    /// and shown nowhere, as iOS keeps a view outside its clip
+    /// (expo/exact#1467).
+    #[test]
+    fn a_module_outside_its_clip_is_held() {
+        let ts = Transform::identity();
+        for (rect, held) in [
+            ((10., 10., 0., 0.), false),
+            ((0., 0., 0., 0.), true),
+            ((200., 200., 40., 40.), true),
+        ] {
+            let mut r = Recorder::new();
+            r.begin(300., 300., 1.);
+            r.push_clip(&Shape::rect((0., 0., 100., 100.)), ts);
+            let at = r.ops.len();
+            r.native(91, NativeKind::Module, &Shape::rect(rect), ts, "{}", false);
+            let native = (at..r.ops.len())
+                .find(|&i| r.ops[i] == NATIVE)
+                .expect("op 28");
+            let kind = NativeKind::Module as u32 | if held { 1 << 9 } else { 0 };
+            assert_eq!(r.ops[native + 2], kind, "{rect:?}");
+        }
+    }
+
     fn direct(r: &mut Recorder) -> bool {
         r.finish().unwrap();
         let ops = FINISHED.with(|f| f.borrow_mut().take().unwrap());
@@ -653,7 +714,7 @@ mod direct_tests {
                 4 => r.push_clip(&Shape::new(full.rect, [10.; 4]), ts),
                 5 => r.group_begin(7, (0., 0.)),
                 6 => {
-                    r.layer_begin(7, ts, (0., 0.), (0., 0.), [0., 0., 1., 0., 1., 0., 0.]);
+                    r.layer_begin(7, ts, (0., 0.), (0., 0.), [0., 0., 1., 0., 1., 0., 0., 1.]);
                 }
                 _ => (),
             }

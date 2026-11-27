@@ -240,8 +240,61 @@ impl crate::Module {
             self.error = e;
             return false;
         }
-        inst.dirty |= inst.surface.input_changed();
+        inst.input_dirty |= inst.surface.input_changed();
         true
+    }
+
+    /// Whether a canvas has something to render: inputs it has not shown.
+    pub fn dirty(&self, id: u32) -> bool {
+        self.has_device(id)
+            && self.instances.get(&id).is_some_and(|i| {
+                i.dirty || i.input_dirty || i.wake_dirty() || i.surface.preparing()
+            })
+    }
+
+    /// Whether canvas `id` has pending work aside from an asynchronous
+    /// [`SurfaceWaker::wake`](crate::SurfaceWaker::wake).
+    pub fn dirty_without_wake(&self, id: u32) -> bool {
+        self.has_device(id)
+            && self
+                .instances
+                .get(&id)
+                .is_some_and(|i| i.dirty || i.input_dirty || i.surface.preparing())
+    }
+
+    /// A painted display needs a callback for a requested frame, a change or
+    /// output from its last tick that the host still has to deliver.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn frame_pending(&self, id: u32) -> bool {
+        self.instances.get(&id).is_some_and(|i| {
+            #[cfg(windows)]
+            let unpresented = self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.canvas == id && w.rested.is_none());
+            #[cfg(not(windows))]
+            let unpresented = false;
+            i.dirty
+                || i.input_dirty
+                || i.wake_dirty()
+                || unpresented
+                || i.surface.preparing()
+                || !i.messages.is_empty()
+                || i.published.is_some()
+                || self.device_lost.load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
+    /// Whether a retained canvas needs a new frame after this callback's input.
+    /// A missing or lost device takes the normal rendering and recovery path.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn frame_dirty(&mut self, id: u32, now_ms: f64) -> bool {
+        if self.gpu().is_none() || self.seekable {
+            return true;
+        }
+        self.instances
+            .get_mut(&id)
+            .is_none_or(|i| i.frame_dirty(now_ms, self.period_ms, self.seekable))
     }
 
     /// Parse and deliver one ABI event; malformed input is refused by name.
@@ -250,6 +303,45 @@ impl crate::Module {
             Ok(event) => self.input(id, &event),
             Err(error) => self.fail::<()>(error).is_some(),
         }
+    }
+}
+
+impl crate::Instance {
+    pub(crate) fn invalidate(&mut self) {
+        self.dirty = true;
+        #[cfg(exact_android_draw_trace)]
+        {
+            self.draw_trace.invalidated = true;
+        }
+    }
+
+    pub(crate) fn wake_dirty(&self) -> bool {
+        self.bound && self.wake.is_woken()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn frame_dirty(&mut self, now_ms: f64, period_ms: f64, seekable: bool) -> bool {
+        if !self.dirty
+            && self.input_dirty
+            && !self.wake_dirty()
+            && !seekable
+            && !self.surface.preparing()
+        {
+            let decision = self.surface.redraw_for_input(now_ms, period_ms);
+            self.drain();
+            match decision {
+                std::task::Poll::Ready(draw) => {
+                    self.input_dirty = false;
+                    self.dirty = draw;
+                    #[cfg(exact_android_draw_trace)]
+                    {
+                        self.draw_trace.polled = draw;
+                    }
+                }
+                std::task::Poll::Pending => return false,
+            }
+        }
+        self.dirty || self.input_dirty || self.wake_dirty() || self.surface.preparing()
     }
 }
 
@@ -326,7 +418,7 @@ mod tests {
             assert!(m.bind(id, &[], None));
             m.instances.get_mut(&id).unwrap().dirty = false;
         }
-        let dirty = |m: &Module, id| m.instances[&id].dirty;
+        let dirty = |m: &Module, id| m.instances[&id].dirty || m.instances[&id].input_dirty;
 
         assert!(m.input(resting, &sample));
         assert!(!dirty(&m, resting), "an ignored sample draws nothing");
@@ -337,5 +429,30 @@ mod tests {
 
         assert!(m.input(plain, &sample));
         assert!(dirty(&m, plain), "by default every input draws");
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let retained = |m: &mut Module, id| {
+                m.instances
+                    .get_mut(&id)
+                    .unwrap()
+                    .frame_dirty(100., 16., false)
+            };
+            assert!(
+                retained(&mut m, plain),
+                "a default surface redraws in this callback"
+            );
+            assert!(retained(&mut m, plain), "it stays due until it renders");
+            m.instances.get_mut(&resting).unwrap().input_dirty = false;
+            assert!(
+                !retained(&mut m, resting),
+                "another canvas's input did not wake it"
+            );
+            m.instances.get_mut(&resting).unwrap().dirty = true;
+            assert!(m.input(resting, &sample));
+            assert!(
+                retained(&mut m, resting),
+                "input cannot cancel another owed frame"
+            );
+        }
     }
 }

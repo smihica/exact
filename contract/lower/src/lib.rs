@@ -15,12 +15,12 @@
 //!
 //! Row order is source order everywhere, so two compilations of one source
 //! are byte-identical.
-
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-
 mod alert_parts;
+mod alert_role;
 pub mod anatomy;
+mod aspect_fit;
 mod atoms;
 mod box_transform;
 mod bundled;
@@ -88,6 +88,7 @@ mod stmts;
 mod strings;
 mod style_hosts;
 pub mod style_names;
+mod surface;
 mod svg;
 mod swipe_rows;
 mod symbols;
@@ -114,12 +115,12 @@ pub use fields::Profile;
 pub use identity::compiler_identity;
 pub use lint::{lint, lint_unused};
 use lint::{unknown_attr, unknown_tag};
-pub use native::{is_module_tag, module_tags};
+pub use native::{is_module_tag, module_tags, CONTROL_PROPS};
 pub use native_typed::{DeclaredView, DeclaredViews, EVENT_MARKER};
-pub use sites::{ButtonSite, Declared, NodeSite, Origin, Sites, Written};
+pub use sites::{ButtonSite, Declared, NodeSite, Origin, Sites, SourceOutput, Written};
 pub use states::PRESS_OPACITY_TO;
 pub use swipe_rows::expand_row_deletes;
-pub use theme::vocab as forma_vocab;
+pub use theme::{names_tokens_outside_views, vocab as forma_vocab};
 
 /// The base scale's names (LLP 1121 stage 11, the lead's ruling 2).
 pub const BASE_SCALE: [&str; 9] = theme::packages::BASE;
@@ -234,14 +235,16 @@ pub(crate) fn prop_row(id: exact_kernel::PropId, expr: Code, written: bool) -> B
 
 pub(crate) struct Lowerer<'a> {
     pub b: PlanBuilder,
-    each_steps: &'a BTreeMap<u32, u32>,
+    source_places: Option<&'a contract_syntax::Expanded>,
     /// The app's theme, resolved (LLP 1095 D4).
     pub theme: Vec<theme::ThemeEntry>,
+    var_tokens: var_tokens::FileTokens<'a>,
     sites: Option<Sites>,
     text_styles: Option<&'a mut warnings::TextStyles>,
     pub types: &'a Types,
     sharing: sharing::Sharing,
     pub root: &'a contract_syntax::Component,
+    picture_ids: std::cell::OnceCell<stmts::PictureIds<'a>>,
     pub canvas_targets: std::collections::BTreeSet<String>,
     pub ty_ids: BTreeMap<String, TypesId>,
     pub slots: Vec<exact_plan::SlotsId>,
@@ -262,8 +265,7 @@ pub(crate) struct Lowerer<'a> {
     /// Literal decoration rows and the aliases visible to each source file.
     pub decorations: BTreeMap<String, serde_json::Value>,
     pub decoration_scopes: BTreeMap<u32, Vec<(String, String)>>,
-    /// The `atom` declarations by name, and the aliases each source file sees
-    /// (LLP 1045.000 D3).
+    /// The `atom` declarations by name, and the aliases each source file sees (LLP 1045.000 D3).
     pub(crate) atoms: BTreeMap<String, atoms::Declared>,
     pub atom_scopes: BTreeMap<u32, Vec<(String, String)>>,
     /// The `keyframes` declarations, by name, with what each animates (LLP 1055 D5).
@@ -282,13 +284,12 @@ pub(crate) struct Lowerer<'a> {
     /// Each font file whose faces' weights `declare_fonts` read from it, as
     /// it was then (the design server's write check, `theme::rows`).
     font_files: Vec<theme::rows::FontFile>,
-    /// How many `fn` bodies are being expanded right now (a guard; the type
-    /// pass already refuses a cycle).
-    pub fn_depth: u32,
+    /// Inline `fn` expansion depth and work budget (the type pass refuses cycles).
+    pub fn_budget: expr::FnBudget,
+    panel_action: Option<exact_plan::ActionsId>,
     /// Tags' fixed row values already built (`Lowerer::fixed`).
     fixed: BTreeMap<(bool, &'static str), Code>,
-    /// Refusals so far: an element or attribute that fails is recorded and
-    /// its siblings are lowered anyway.
+    /// Refusals so far: an element or attribute that fails is recorded, its siblings lowered anyway.
     errors: Vec<LowerError>,
     /// The locale slot, once a `t` call made it (LLP 1060 D4).
     locale: Option<exact_plan::SlotsId>,
@@ -334,8 +335,13 @@ pub(crate) struct Lowerer<'a> {
     parent_horizontal_flex: Option<bool>,
     /// Where a native button may not be, from the nearest ancestor that says.
     pub(crate) button_context: Option<&'static str>,
-    /// Whether the element being lowered is a popover's direct child.
-    pub(crate) popover_child: bool,
+    pub(crate) guards: Vec<Expr>,
+    /// Enclosing view `match`/`for` bindings (`Some(subject)` for `match some(x)`, `None` for `for`).
+    pub(crate) view_bindings: Vec<(String, Option<Expr>)>,
+    /// Memoized `alertdialog` role evaluation for root `state`s/`derive`s and state assigners.
+    pub(crate) role_cache: alert_role::RoleCache<'a>,
+    /// Which menu container, if any, supplies the element being lowered as a row.
+    menu_parent: Option<menu_rows::Parent>,
     /// Where the element being lowered sits relative to a navigation root.
     nav_place: routes::NavPlace,
     host_transforms: std::collections::BTreeSet<(Span, u32)>,
@@ -344,8 +350,7 @@ pub(crate) struct Lowerer<'a> {
 #[derive(Debug, Clone, PartialEq)]
 struct DeclaredFont {
     stack: StacksId,
-    /// Each face's heaviest weight (a variable face's range reaches it) and
-    /// whether it is italic.
+    /// Each face's heaviest weight (a variable face's range reaches it) and whether it is italic.
     faces: Vec<(u16, bool)>,
 }
 
@@ -377,43 +382,44 @@ pub fn lower_all(
     checked: &Checked<'_>,
     analysis: &Analysis,
     asset_root: Option<&Path>,
-    mapped: bool,
+    output: impl Into<SourceOutput>,
     profile: Profile,
     warned: Option<(&WarningSelection, &mut Vec<LowerError>)>,
 ) -> Result<(Plan, Option<Sites>), Vec<LowerError>> {
     exact_kernel::style::link_all();
-    if mapped && checked.expanded.instances.is_empty() {
+    let output = output.into();
+    if output == SourceOutput::Mapped && checked.expanded.instances.is_empty() {
         return Err(vec![LowerError {
             id: "lower-source-sites",
             message: "mapped lowering needs source provenance from `check_all(file, true)`".into(),
             span: checked.expanded.root.span,
         }]);
     }
-    let (mut asset_errors, asset_warnings) = asset_root
+    let (mut asset_errors, mut notes) = asset_root
         .filter(|_| !theme::retained::stops_at_retention())
         .map(|root| {
             let checking = contract_checking::Checking::new(checked);
             bundled::check(&checking.expanded(), root)
         })
         .unwrap_or_default();
-    asset_errors.extend(routes::tab_accessory::check(checked));
+    asset_errors.extend(tags::id_refusals(checked));
     let mut text_styles = warnings::TextStyles::new();
     let result = lower_with_sites(
         checked,
         analysis,
         asset_root,
-        mapped,
+        output,
         profile,
         warned.as_ref().map(|_| &mut text_styles),
     );
+    asset_errors.extend(routes::placed(checked, &mut notes));
     if let Some((selection, out)) = warned {
-        out.extend(warnings::with_text_styles(
-            checked,
-            &text_styles,
-            asset_warnings,
-            selection,
-        ));
+        // Lowering's refusals hold the placement warning (`warnings::with_text_styles`)
+        let refused = result.is_err();
+        let earned = warnings::with_text_styles(checked, &text_styles, refused, notes, selection);
+        out.extend(earned);
     }
+    asset_errors.extend(warnings::header_bar::refused(checked, profile));
     let result = match result {
         Ok(built) if asset_errors.is_empty() => Ok(built),
         Ok(_) => {
@@ -433,14 +439,12 @@ fn lower_with_sites(
     checked: &Checked<'_>,
     _analysis: &Analysis,
     asset_root: Option<&Path>,
-    capture_sites: bool,
+    output: SourceOutput,
     profile: Profile,
     text_styles: Option<&mut warnings::TextStyles>,
 ) -> Result<(Plan, Option<Sites>), Vec<LowerError>> {
-    // An earlier compile's targets and roles go first: lowering may stop
-    // before the design is read, and the warnings still run.
+    // Warnings can run even if lowering stops before the design is read.
     control_roles::unlowered();
-    // Keep the exact expansion whose root and row slots inference checked.
     let Checked {
         file,
         types,
@@ -453,15 +457,18 @@ fn lower_with_sites(
         .iter()
         .map(|f| contract_syntax::share_calls(&f.body, &is_fn))
         .collect();
+    let source_places = (output != SourceOutput::Comparison).then_some(ex);
     let mut l = Lowerer {
-        b: nodes::builder(ex),
-        each_steps: &ex.each_steps,
+        b: nodes::builder(source_places),
+        source_places,
         theme: Vec::new(),
-        sites: capture_sites.then(|| Sites::declared(ex)),
+        var_tokens: var_tokens::FileTokens::new(file),
+        sites: (output == SourceOutput::Mapped).then(|| Sites::declared(ex)),
         text_styles,
         types,
         sharing: sharing::Sharing::new(ex),
         root,
+        picture_ids: Default::default(),
         canvas_targets: file
             .components
             .iter()
@@ -489,7 +496,7 @@ fn lower_with_sites(
             .zip(&shared)
             .map(|(f, body)| (f.name.as_str(), (f, body)))
             .collect(),
-        fn_depth: 0,
+        fn_budget: expr::FnBudget::default(),
         svg_depth: 0,
         in_dl_group: false,
         element_children: false,
@@ -500,13 +507,17 @@ fn lower_with_sites(
         parent_stacks: true,
         parent_horizontal_flex: Some(false),
         button_context: None,
-        popover_child: false,
+        guards: Vec::new(),
+        view_bindings: Vec::new(),
+        role_cache: alert_role::RoleCache::default(),
+        menu_parent: None,
         nav_place: Default::default(),
         host_transforms: Default::default(),
         arm_scopes: BTreeMap::new(),
         font_stacks: BTreeMap::new(),
         declared_fonts: BTreeMap::new(),
         font_files: Vec::new(),
+        panel_action: None,
         fixed: BTreeMap::new(),
         errors: Vec::new(),
         locale: None,
@@ -519,8 +530,7 @@ fn lower_with_sites(
         library_nodes: Vec::new(),
     };
     // A refusal that stops lowering is said after those collected before it
-    // (a refused token, then a statement no plan can hold), never in their
-    // place.
+    // (a refused token, then a statement no plan can hold), never in their place.
     match lower_body(&mut l, checked, asset_root) {
         Ok(()) => {
             let mut plan = l.b.finish().map_err(|e| LowerError {
@@ -539,14 +549,13 @@ fn lower_with_sites(
         Err(fatal) => {
             let mut all = std::mem::take(&mut l.errors);
             for e in fatal {
-                if !all
-                    .iter()
-                    .any(|o| o.id == e.id && o.span == e.span && o.message == e.message)
-                {
+                if !all.contains(&e) {
                     all.push(e);
                 }
             }
+            handlers::swipe::supersede(&mut all);
             all.truncate(MAX_REFUSALS);
+            values::name_template_holes(checked, &mut all);
             Err(all)
         }
     }
@@ -642,7 +651,7 @@ fn lower_body(
             });
         }
     }
-    // Each component's parts and the rows its classes bring them (LLP 1139 D2).
+    lint::action_targets(checked, &mut l.errors);
     l.check_anatomy(file);
     l.errors.extend(provenance::check(checked));
     let refused = l.declare_keyframes(file);
@@ -996,7 +1005,7 @@ impl<'a> Lowerer<'a> {
                 let new_button_context = step.button_context.or(self.button_context);
                 let button_context =
                     std::mem::replace(&mut self.button_context, new_button_context);
-                let popover_child = std::mem::replace(&mut self.popover_child, step.popover_child);
+                let menu_parent = std::mem::replace(&mut self.menu_parent, step.menu_parent);
                 let bounded = std::mem::replace(&mut self.parent_bounded_column, step.bounded);
                 let stacks = std::mem::replace(&mut self.parent_stacks, step.stacks);
                 let nav_place = std::mem::replace(&mut self.nav_place, step.nav_place);
@@ -1029,7 +1038,7 @@ impl<'a> Lowerer<'a> {
                 self.parent_bounded_column = bounded;
                 self.parent_stacks = stacks;
                 self.button_context = button_context;
-                self.popover_child = popover_child;
+                self.menu_parent = menu_parent;
                 self.parent_positioned = parent_positioned;
                 self.svg_depth -= step.enters as u32;
                 lowered
@@ -1063,7 +1072,9 @@ impl<'a> Lowerer<'a> {
                 inner.push_none();
                 self.arm_scopes.insert((*tag, 0), (arms[0], inner.clone()));
                 self.arm_scopes.insert((*tag, 1), (arms[1], inner.clone()));
-                self.nodes(then, None, Some(arms[0]), &inner, locals, parent_tag)?;
+                self.under_guard(cond, |l| {
+                    l.nodes(then, None, Some(arms[0]), &inner, locals, parent_tag)
+                })?;
                 self.nodes(otherwise, None, Some(arms[1]), &inner, locals, parent_tag)
             }
             Node::Each {
@@ -1082,7 +1093,7 @@ impl<'a> Lowerer<'a> {
                 let (region, arms) =
                     self.b
                         .region(RegionKind::Each, parent, arm, order, subject, key, 1);
-                if let Some(&step) = self.each_steps.get(tag) {
+                if let Some(&step) = self.source_places.and_then(|ex| ex.each_steps.get(tag)) {
                     self.b
                         .set_region_place(region, exact_plan::PlaceStepsId(step));
                 }
@@ -1090,12 +1101,22 @@ impl<'a> Lowerer<'a> {
                     sites.region(*tag);
                 }
                 self.arm_scopes.insert((*tag, 0), (arms[0], inner.clone()));
-                self.nodes(body, None, Some(arms[0]), &inner, locals, parent_tag)
+                self.under_view_binding(var, None, |l| {
+                    let shadow = |l: &mut Self| {
+                        l.under_repeat(n.scoped_child_lists()[0].1, |l| {
+                            l.nodes(body, None, Some(arms[0]), &inner, locals, parent_tag)
+                        })
+                    };
+                    match index.as_deref() {
+                        Some(idx) => l.under_view_binding(idx, None, shadow),
+                        None => shadow(l),
+                    }
+                })
             }
             Node::Match {
                 tag,
                 subject,
-                some,
+                some: (name, body),
                 none,
                 ..
             } => {
@@ -1107,18 +1128,14 @@ impl<'a> Lowerer<'a> {
                 if let Some(sites) = &mut self.sites {
                     sites.region(*tag);
                 }
-                let mut some_scope = scope.clone();
-                some_scope.push_some_of(&some.0, subject_ty);
-                self.arm_scopes
-                    .insert((*tag, 0), (arms[0], some_scope.clone()));
-                self.nodes(
-                    &some.1,
-                    None,
-                    Some(arms[0]),
-                    &some_scope,
-                    locals,
-                    parent_tag,
-                )?;
+                let mut inner = scope.clone();
+                inner.push_some_of(name, subject_ty);
+                self.arm_scopes.insert((*tag, 0), (arms[0], inner.clone()));
+                self.under_view_binding(name, Some(subject), |l| {
+                    l.under_bindings(n.scoped_child_lists()[0].1, |l| {
+                        l.nodes(body, None, Some(arms[0]), &inner, locals, parent_tag)
+                    })
+                })?;
                 let mut none_scope = scope.clone();
                 none_scope.push_none();
                 self.arm_scopes
@@ -1148,14 +1165,14 @@ impl<'a> Lowerer<'a> {
             "keep-mounted" => return self.bind_keep_mounted(a, scope, locals, bindings),
             _ => {}
         }
-        let Some(mut target) = tags::attr_valued(&a.name, &a.value) else {
+        let Some(mut target) = handlers::swipe::attr_valued(tag, a) else {
             return Err(unknown_attr(tag, a));
         };
         // A reset that writes no row (`tags::attr_valued`).
         if matches!(target, tags::AttrTarget::Styles([])) {
             return Ok(());
         }
-        crate::var_tokens::carried(a)?;
+        crate::var_tokens::carried(a, &self.var_tokens)?;
         // @ref LLP 1021 §5.3, LLP 1133.025 D11 item 4 — stable menu ids,
         // never localized titles.
         if a.name == "-exact-menu" {
@@ -1392,6 +1409,7 @@ impl<'a> Lowerer<'a> {
             }
             tags::AttrTarget::Prop(prop) => {
                 let glass;
+                values::check_numeric_prop(a, prop, scope, &self.types.shapes)?;
                 let aria_bool = values::aria_bool_literal(&a.name, prop, &a.value);
                 let value = if prop == exact_kernel::PropId::GlassGroup {
                     glass = values::glass_group(&a.value)?;
@@ -1399,8 +1417,8 @@ impl<'a> Lowerer<'a> {
                 } else if prop == exact_kernel::PropId::IntersectMargin {
                     glass = crate::intersect::margin(&a.value, a.span)?;
                     &glass
-                } else if let Some(width) = values::split_width(prop, &a.value) {
-                    glass = width;
+                } else if let Some(text) = values::split_literal(prop, &a.value) {
+                    glass = text;
                     &glass
                 // @ref LLP 1116.007 D3.1 — a symbol by another spelling is its role.
                 } else if let Some(role) = matches!(
@@ -1462,15 +1480,7 @@ impl<'a> Lowerer<'a> {
                         )
                     }
                 };
-                let mut codes = Vec::new();
-                for arg in args {
-                    let (name, value) = match arg {
-                        Expr::NamedArg(name, value, _) => (name.as_str(), value.as_ref()),
-                        _ => ("", arg),
-                    };
-                    codes.push((name, self.expr_code(value, scope, locals)?));
-                }
-                *surface = Some(self.b.surface(name, &codes));
+                *surface = Some(self.lower_surface(name, args, scope, locals)?);
             }
             tags::AttrTarget::Handler(event) => {
                 self.handler(tag, event, control, a, scope, locals, handlers)?;
@@ -1480,21 +1490,4 @@ impl<'a> Lowerer<'a> {
         }
         Ok(())
     }
-}
-
-/// @ref LLP 1121 D7, D12 — whether an app can name a design token outside its
-/// views, so its plan keeps every token (or its design's `exports`) for the
-/// bindings: the one test for "an app with generated bindings". It has a
-/// data module (an `app.ts` or a Rust data crate beside it, or a source of
-/// the seam it reads, not one the runner answers) or a native module (a
-/// custom element its views show, or modules or hatches its `app.json`
-/// declares). The driver finds what is on disk (`DesignSource::bindable`).
-pub fn names_tokens_outside_views(file: &File, root: &contract_types::ComponentTypes) -> bool {
-    file.design.as_ref().is_some_and(|d| d.bindable)
-        || file.package_designs.iter().any(|d| d.bindable)
-        || root
-            .sources
-            .keys()
-            .any(|s| !exact_plan::runner_owned_source(s))
-        || !native::module_tags(file).is_empty()
 }

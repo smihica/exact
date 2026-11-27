@@ -54,17 +54,15 @@ impl Ink {
         i: Instance,
         reach: f32,
     ) -> Result<(Instance, Bindings)> {
+        if !self.shadows.enabled || self.error.is_some() {
+            return Ok((i, Bindings::default()));
+        }
         let scale = i.xform[0];
         let sigma = i.param[0];
         let blur = sigma * scale;
         let size = [i.rect[2], i.rect[3]].map(|n| (n * scale).ceil());
         let limit = self.device.max_texture_dimension() as f32;
-        if !self.shadows.enabled
-            || self.error.is_some()
-            || !blur.is_finite()
-            || blur < MIN_SIGMA
-            || !size.iter().all(|n| *n <= limit)
-        {
+        if !blur.is_finite() || blur < MIN_SIGMA || !size.iter().all(|n| *n >= 1. && *n <= limit) {
             return Ok((i, Bindings::default()));
         }
         let size = size.map(|n| n as u32);
@@ -191,7 +189,7 @@ impl Ink {
         .map_err(|_| Error::Invalid("shadow raster clip".into()))?;
         let mut e = Encoder::new(size[0], size[1]);
         e.push(r, Bindings::default())
-            .map_err(|_| Error::Invalid("shadow raster clip".into()))?;
+            .map_err(|_| Error::Invalid("shadow raster push".into()))?;
         let target = self.device.create_target(size[0], size[1])?;
         let rendered = self.device.render(&e.finish(), target, Some([0.; 4]));
         if rendered.is_err() {

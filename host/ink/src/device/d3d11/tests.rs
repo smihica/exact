@@ -46,6 +46,24 @@ fn device_startup_phases() {
     }
 }
 
+/// @ref LLP 1172.023.006 M2.
+#[test]
+fn only_a_gpu_span_issues_timing_queries() {
+    let mut d = D3d11::new().unwrap();
+    let target = d.create_target(8, 8).unwrap();
+    let pass = |d: &mut D3d11| d.render(&Frame::default(), target, Some([0.; 4])).unwrap();
+    pass(&mut d);
+    assert_eq!(d.timing.issued, 0);
+    d.begin_gpu_span().unwrap();
+    pass(&mut d);
+    pass(&mut d);
+    d.end_gpu_span().unwrap();
+    // The disjoint query, and a timestamp before and after each pass.
+    assert_eq!(d.timing.issued, 5);
+    pass(&mut d);
+    assert_eq!(d.timing.issued, 5);
+}
+
 #[test]
 fn failed_and_disconnected_device_workers_are_reported() {
     let (send, receive) = std::sync::mpsc::channel();
@@ -347,4 +365,54 @@ fn windowless_field_edit_and_scale() {
             editor.caret()
         );
     }
+}
+
+#[test]
+fn a_kept_hardware_device_draws_again_after_its_painter_is_dropped() {
+    let Ok(mut device) = D3d11::open(false) else {
+        eprintln!("no hardware D3D11 device");
+        return;
+    };
+    let target = device.create_target(64, 64).unwrap();
+    device
+        .render(&Frame::default(), target, Some([0., 0., 1., 1.]))
+        .unwrap();
+    let kept = device.keep_hidden().expect("hardware is kept");
+    drop(device);
+    kept.trim();
+    let raw = kept.0.device.clone();
+    let mut device = kept.reopen().unwrap();
+    assert_eq!(device.device, raw, "no new device");
+    assert_eq!(device.info().device_ms, 0.);
+    let target = device.create_target(1, 1).unwrap();
+    device
+        .render(&Frame::default(), target, Some([1., 0., 0., 1.]))
+        .unwrap();
+    assert_eq!(device.readback(target).unwrap(), [255, 0, 0, 255]);
+    assert!(
+        D3d11::open(true).unwrap().keep_hidden().is_none(),
+        "WARP reopens"
+    );
+}
+
+#[test]
+fn a_large_upload_reaches_its_region() {
+    let mut device = D3d11::open(true).unwrap();
+    let target = device.create_target(1024, 400).unwrap();
+    device
+        .render(&Frame::default(), target, Some([0., 0., 0., 1.]))
+        .unwrap();
+    let (w, h) = (1000u32, 300u32);
+    let data: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w) as u8, (i / w) as u8, 7, 255])
+        .collect();
+    assert!(data.len() >= STAGED_UPLOAD_BYTES);
+    device
+        .upload_texture(target, [10, 20], [w, h], &data)
+        .unwrap();
+    let pixels = device.readback(target).unwrap();
+    let at = |x: u32, y: u32| &pixels[((y * 1024 + x) * 4) as usize..][..4];
+    assert_eq!(at(9, 20), [0, 0, 0, 255]);
+    assert_eq!(at(10, 20), [0, 0, 7, 255]);
+    assert_eq!(at(10 + 300, 20 + 299), [44, 43, 7, 255]);
 }

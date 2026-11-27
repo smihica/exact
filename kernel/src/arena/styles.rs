@@ -33,6 +33,11 @@ impl NodeArena {
 
     fn set_shared_style(&mut self, slot: u32, style: Rc<StyleProps>) {
         self.relative.update(slot, !style.relative.is_empty());
+        if style.scale.x != 1. || style.scale.y != 1. {
+            self.scaled.insert(slot);
+        } else {
+            self.scaled.remove(slot);
+        }
         if crate::fragment::is_multicol(&style) {
             self.frag.containers.insert(slot);
         } else {
@@ -94,7 +99,7 @@ impl NodeArena {
 
 impl NodeArena {
     /// Mark the colours its styles hold: the shared table's, which every
-    /// node's style is one of, and the control and document styles.
+    /// node's style is one of, and the control, document and state look styles.
     pub(crate) fn wide_colors(&mut self, m: &mut crate::style::wide::WideMark) {
         use crate::style::wide::Colors;
         self.shared.wide_colors(m);
@@ -102,6 +107,11 @@ impl NodeArena {
             control.colors(m);
         }
         self.document_style.colors(m);
+        for entries in self.looks.values() {
+            for (_, patch) in entries.iter() {
+                patch.colors(m);
+            }
+        }
     }
 
     /// The same, visiting every style (for a clone, once).
@@ -112,5 +122,10 @@ impl NodeArena {
             control.colors(m);
         }
         self.document_style.colors(m);
+        for entries in self.looks.values() {
+            for (_, patch) in entries.iter() {
+                patch.colors(m);
+            }
+        }
     }
 }

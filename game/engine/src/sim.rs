@@ -124,7 +124,8 @@ pub trait Game: 'static {
     /// `Needs::ANIMATE` wakes it. Queued input and a pending hold or tap keep
     /// it drawing. The idle time never runs as ticks: the first frame after a
     /// wake advances one display period. The agent's clock ignores it.
-    /// Read after each drawn frame; never saved or hashed.
+    /// Painted hosts also read this after ticking input at rest, before drawing.
+    /// The result is never saved or hashed.
     fn render_idle(_world: &World, _args: &Self::Args) -> bool {
         false
     }
@@ -203,7 +204,7 @@ struct Saved {
     journal_next: u64,
     overflow_logged: bool,
     published: std::collections::BTreeMap<String, crate::values::Stored>,
-    // The least privileged origin posted into the world, 0 for the app's (`origin.rs`).
+    // The set of origins posted into the world, 0 for the app's (`origin.rs`).
     origin: u8,
 }
 // Host-only phase: one tick is 1_000_000 units. Only the bounded remainder is
@@ -290,6 +291,7 @@ pub struct Sim<G: Game> {
     last_epoch: std::cell::Cell<u64>,
     pub(crate) args_json: String,
     pub(crate) input: Input,
+    consumed_sensor_samples: Option<u64>,
     queue: VecDeque<Queued>,
     overflow_logged: bool,
     // Posts a full input queue refused; reported in agent state, never saved.
@@ -326,7 +328,7 @@ pub struct Sim<G: Game> {
     present_owed: bool,
     pub(crate) development_edits: bool,
     pub(crate) edits_admitted: bool,
-    // The least privileged origin posted since the fresh start (`origin.rs`).
+    // The set of origins posted since the fresh start (`origin.rs`).
     origin: u8,
     game: PhantomData<G>,
 }
@@ -513,6 +515,7 @@ impl<G: Game> Sim<G> {
             restored_from: None,
             settle_delay: std::cell::Cell::new(100),
             input,
+            consumed_sensor_samples: None,
             queue,
             overflow_logged: false,
             refused_posts: 0,
@@ -1300,11 +1303,40 @@ impl<G: Game> Sim<G> {
     /// says so, and no input waits for a tick, no hold or tap matures on world
     /// time and no table edit is pending.
     pub fn render_idle(&self) -> bool {
-        !self.setup_pending
-            && self.queue.is_empty()
-            && self.input.next_deadline().is_none()
-            && self.world.table_pending_tick().is_none()
-            && G::render_idle(&self.world, &self.args)
+        !self.input_pending() && self.world_render_idle()
+    }
+
+    /// Device events or posts still waiting for a simulation tick.
+    pub fn input_pending(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Whether the game and its timers are idle after the last tick. A painted
+    /// host checks queued input separately so it can tick without drawing.
+    pub fn world_render_idle(&self) -> bool {
+        self.render_demand().is_none()
+    }
+
+    /// The first outstanding reason the simulation asks for another live frame.
+    pub fn render_demand(&self) -> Option<&'static str> {
+        if self.setup_pending {
+            Some("setup")
+        } else if self.input.next_deadline().is_some() {
+            Some("input-timer")
+        } else if self.world.table_pending_tick().is_some() {
+            Some("table-timer")
+        } else {
+            (!G::render_idle(&self.world, &self.args)).then_some("game-active")
+        }
+    }
+
+    /// Start counting applied sensor samples for a development-trust Android canvas.
+    pub fn count_draw_samples(&mut self) {
+        self.consumed_sensor_samples.get_or_insert(0);
+    }
+    /// Sensor samples applied since the preceding draw, when counting is enabled.
+    pub fn take_consumed_sensor_samples(&mut self) -> Option<u64> {
+        self.consumed_sensor_samples.as_mut().map(std::mem::take)
     }
     /// The display drew nothing since [`Sim::render_idle`] and draws again at
     /// `now_ms`: the next live advance resumes as if the last frame were one

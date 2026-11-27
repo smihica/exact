@@ -481,3 +481,95 @@ fn boot_shared(program: &crate::Program) -> Runner<NoData> {
     )
     .unwrap()
 }
+
+#[test]
+fn a_refused_retheme_restores_rows_and_looks_before_retry() {
+    use exact_kernel::StyleId;
+
+    let mut r = boot(plan(
+        "refused-retheme",
+        r#"style Painted
+  color = "ink"
+  :hover
+    background-color = "ink"
+
+component App
+  state dim = false
+  state count = 0
+  action change(newCount: number)
+    dim = true
+    count = newCount
+  view
+    column -exact-mode=(dim ? "dark-style=dim" : "dark-style=black")
+      row role="button" class=Painted testId="painted"
+        text "Painted"
+      if dim
+        Candidate(count=count)
+component Candidate
+  props
+    count: number
+  state ticks = 0
+  task tick when true key=(1 / (count - 1))
+    every(10, bump)
+  action bump
+    ticks = ticks + 1
+  view
+    text `${ticks}`
+"#,
+    ));
+    assert!(r.transactional_render());
+    let id = view(&r, "painted").unwrap();
+    let before = r.tuple_at(id);
+    let tuples = |r: &Runner<NoData>| {
+        (
+            r.ids.theme.row(id, StyleId::TextColor).unwrap().tuple,
+            r.ids.theme.look(id).unwrap().tuple,
+        )
+    };
+    assert_eq!(tuples(&r), (before, before));
+
+    assert!(r.act("change", vec![Value::Number(1.)]).is_err());
+    assert!(!r.is_poisoned());
+    assert_eq!(r.tuple_at(id), before);
+    assert_eq!(tuples(&r), (before, before));
+
+    r.act("change", vec![Value::Number(2.)]).unwrap();
+    assert_eq!(view(&r, "painted"), Some(id));
+    let after = r.tuple_at(id);
+    assert_ne!(after, before);
+    assert_eq!(tuples(&r), (after, after));
+}
+
+#[test]
+fn an_unresolved_surface_retries_at_the_same_place() {
+    let mut runner = boot(plan(
+        "surface-colour-retry",
+        "component App\n  view\n    canvas surface=board(color(\"brand\"))\n",
+    ));
+    let initial = runner.take_surface_updates();
+    assert_eq!(initial.len(), 1);
+    runner.set_token("brand", "not-a-colour", &[]).unwrap();
+    assert!(runner.take_surface_updates().is_empty());
+    runner.refresh_surface_colors();
+    assert!(crate::bridge::edit_token(
+        &runner.plan,
+        "brand",
+        "#c8102e",
+        &[]
+    ));
+    runner.refresh_surface_colors();
+    let recovered = runner.take_surface_updates();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].arguments_json(), initial[0].arguments_json());
+    assert_eq!(
+        runner
+            .journal()
+            .filter(|line| line.contains("board")
+                && line.contains("brand")
+                && line.contains("refused"))
+            .count(),
+        1
+    );
+    runner.refresh_surface_colors();
+    assert!(runner.take_surface_updates().is_empty());
+}

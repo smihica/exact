@@ -28,6 +28,7 @@ struct Identity {
     allows_ahead: bool,
 }
 struct Witness {
+    epoch: u64,
     origin: Rc<()>,
     /// Each painted node's key, parent and (a box's) scroll bounds: one
     /// table, sized once per paint.
@@ -81,7 +82,7 @@ impl SubmittedFrame {
         &self.pixels
     }
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl AsRef<Pixmap> for SubmittedFrame {
     fn as_ref(&self) -> &Pixmap {
         &self.pixels
@@ -178,6 +179,10 @@ impl State {
         }
         true
     }
+    /// A layout fact for a box the picture omitted must belong to that picture.
+    pub(super) fn shows_epoch(&self, epoch: u64) -> bool {
+        !self.active || self.witness().is_some_and(|w| w.epoch == epoch)
+    }
     /// The node the acknowledged picture painted at `id`, if it painted one.
     pub(super) fn painted_key(&self, id: ViewId) -> Option<NodeKey> {
         self.witness().and_then(|a| a.nodes.get(&id)).map(|s| s.key)
@@ -201,6 +206,7 @@ impl State {
                 .and_then(|a| a.nodes.get(&id).and_then(|s| s.scroll))
                 .unwrap_or(ScrollBounds {
                     axes: (Overflow::Hidden, Overflow::Hidden),
+                    min: (0., 0.),
                     max: (0., 0.),
                 }),
         )
@@ -286,9 +292,11 @@ impl<D: DataSource> Presenter<D> {
             || self.reveal_waits_for_picture()
             // The pending picture's ACK can still clamp to its older field width.
             || self.field_reveal
-            // Sync can complete a capture and create a hold, revoking admission.
-            // Do not spend a canvas FRAME on a picture that may then be refused.
+            // Sync can complete a capture or surface request and create a hold,
+            // revoking admission. Keep captures and surface requests on single-flight
+            // so no outcome is published for a refused ahead picture.
             || self.host.canvas_wants_frame()
+            || self.surfaces.has_pending_requests()
         {
             return false;
         }
@@ -409,6 +417,7 @@ impl<D: DataSource> Presenter<D> {
         let limits = self.collection_scroll_limits();
         let kernel = self.host.kernel();
         let mut witness = Witness {
+            epoch: kernel.epoch(),
             origin: self.display.origin.clone(),
             nodes: IdMap::default(),
             document: self.live_document(),
@@ -425,6 +434,8 @@ impl<D: DataSource> Presenter<D> {
                         self.host.content_region(),
                         &n,
                         limits.get(&b.id).copied(),
+                        &|id| self.host.presented(id),
+                        self.host.scaled_presented(),
                     ));
                     witness.nodes.insert(
                         b.id,
@@ -608,6 +619,8 @@ impl<D: DataSource> Presenter<D> {
         }
         // Something shows the session from here on.
         self.unshown = false;
+        // A lift cuts its picture from the pixels whose boxes it reads
+        self.shown = None;
         // Consume once, even after reload. A retained pixel handle never pins
         // an old native paragraph/picture after this acknowledgement.
         let picture = frame.identity.picture.borrow_mut().take();
@@ -620,6 +633,7 @@ impl<D: DataSource> Presenter<D> {
                 let model_scroll = std::mem::take(&mut picture.witness.model_scroll);
                 self.brush.replace_presentation(picture.paint);
                 self.boxes = picture.boxes;
+                self.keep_shown(pixels, f32::from_bits(scale));
                 self.boxes_page = picture.page;
                 self.boxes_serial += 1;
                 self.ranges.shown.set(picture.session);
@@ -683,6 +697,8 @@ impl<D: DataSource> Presenter<D> {
     }
 
     pub(super) fn activate_first_pixel(&mut self) {
+        #[cfg(target_os = "android")]
+        self.open_android_module();
         self.painted = true;
         let activating = self.host.data_pending();
         match self.host.activate_data() {

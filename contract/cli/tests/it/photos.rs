@@ -5,6 +5,7 @@
 //! choice, the selection ticket, the narrowest permission an add asks,
 //! pictures admitted only while the read is granted, and the origin rule.
 
+use crate::source::{boxed, Source};
 use exact_runner::{CallOrigin, Dispatch, Outcome, Reply, Response, Runner, Work};
 use serde_json::{json, Value as Json};
 #[cfg(unix)]
@@ -84,13 +85,13 @@ type Calls = Arc<Mutex<Vec<Json>>>;
 
 /// A runner over the app, the implementation bound under the agent and
 /// played by the native slot.
-fn boot(name: &str, grants: &'static str, recents: bool) -> (App, Runner<Grants>, Calls) {
+fn boot(name: &str, grants: &'static str, recents: bool) -> (App, Runner<Source>, Calls) {
     let app = App::new(name, recents);
     let (plan, _) = contract::compile_path_all(&app.0.join("app.contract"), false)
         .unwrap_or_else(|e| panic!("{e:?}"));
     let mut r = Runner::boot(
         plan,
-        Grants(grants),
+        boxed(Grants(grants)),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -121,7 +122,7 @@ fn boot(name: &str, grants: &'static str, recents: bool) -> (App, Runner<Grants>
 
 /// The host's part: each request dispatched, released work run, each
 /// outcome fulfilled, until nothing is left to do.
-fn pump(r: &mut Runner<Grants>, parked: &mut Vec<(u64, u64)>) {
+fn pump(r: &mut Runner<Source>, parked: &mut Vec<(u64, u64)>) {
     for _ in 0..8 {
         let outs = r.take_requests();
         let released = r.release_work();
@@ -145,7 +146,7 @@ fn pump(r: &mut Runner<Grants>, parked: &mut Vec<(u64, u64)>) {
     }
 }
 
-fn run(r: &mut Runner<Grants>, ticket: u64, dispatch: Dispatch) {
+fn run(r: &mut Runner<Source>, ticket: u64, dispatch: Dispatch) {
     let outcome = match dispatch {
         Dispatch::Run(Work::Now(work)) => work(),
         Dispatch::Run(Work::Later(work)) => {
@@ -164,18 +165,18 @@ fn sent(calls: &Calls, name: &str) -> usize {
         .count()
 }
 
-fn logs(r: &Runner<Grants>) -> String {
+fn logs(r: &Runner<Source>) -> String {
     exact_runner::agent::handle(r, r#"{"op":"logs"}"#)
 }
 
-fn state(r: &Runner<Grants>) -> Json {
+fn state(r: &Runner<Source>) -> Json {
     serde_json::from_str(&r.extensions_json().unwrap()).unwrap()
 }
 
 /// The one ticket held, answered with `op` (`tap` and a choice, or `type`
 /// and a text): its capability and choices.
 fn answer(
-    r: &mut Runner<Grants>,
+    r: &mut Runner<Source>,
     parked: &mut Vec<(u64, u64)>,
     op: &str,
     word: &str,
@@ -409,7 +410,7 @@ fn a_picture_with_no_implementation_is_refused() {
     let (plan, _) = contract::compile_path_all(&app.0.join("app.contract"), false).unwrap();
     let mut r = Runner::boot(
         plan,
-        Grants(BOTH),
+        boxed(Grants(BOTH)),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -417,4 +418,37 @@ fn a_picture_with_no_implementation_is_refused() {
     .unwrap();
     let refused = r.admit_picture("photos:agent-1", "macos").unwrap();
     assert_eq!(refused["message"], "no implementation bound");
+}
+
+/// `photoChanges` (LLP 1133.019.000 D1, D5) is the implementation's own,
+/// under the read grant, its limit 1 to 500 with 500 unsaid, and the web's
+/// substitute refuses it.
+#[test]
+fn photo_changes_is_declared_as_the_list_is() {
+    let app = App::new("changes", false);
+    std::fs::write(
+        app.0.join("app.contract"),
+        APP.replace("photoAssets,", "photoAssets, photoChanges, PhotoChanges,")
+            .replace(
+                "  mutation added",
+                "  resource changes = photoChanges(since=\"\") as shape PhotoChanges\n  mutation added",
+            ),
+    )
+    .unwrap();
+    let (plan, _) = contract::compile_path_all(&app.0.join("app.contract"), false)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let row = plan
+        .modules
+        .iter()
+        .find(|m| plan.str(m.declared) == "photoChanges")
+        .unwrap();
+    let sub: Json = serde_json::from_str(plan.str(row.substitute)).unwrap();
+    assert_eq!(sub["implementation"], true, "{sub}");
+    assert_eq!(sub["nameGrants"], json!(["device.photos"]), "{sub}");
+    assert_eq!(
+        sub["bounds"]["limit"],
+        json!({ "default": 500, "max": 500, "min": 1 }),
+        "{sub}"
+    );
+    assert_eq!(sub["unsupported"], json!(["web"]), "{sub}");
 }

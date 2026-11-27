@@ -30,6 +30,8 @@ mod memory_tests;
 mod ordered_tests;
 mod rows;
 mod shadows;
+#[cfg(all(test, not(windows)))]
+mod stream_tests;
 mod svg;
 #[cfg(test)]
 mod tests;
@@ -88,7 +90,7 @@ impl Ink {
             glyphs: Default::default(),
             text_sigma: 0.,
             ramps: Atlas::ramps(),
-            images: images::Images::new(std::env::var("KIOSK_BITMAP_CACHE").as_deref() == Ok("1")),
+            images: images::Images::default(),
             pool: exact_ink::layer::Pool::default(),
             groups: Vec::new(),
             clips: Vec::new(),
@@ -423,6 +425,13 @@ impl Backend for Ink {
                 .map_err(|e| e.to_string());
         }
         Ok(None)
+    }
+    #[cfg(windows)]
+    fn keep_hidden_device(&self) -> Option<exact_ink::device::d3d11::Hidden> {
+        match &self.device {
+            Selected::D3d11(device) if !self.device_lost => device.keep_hidden(),
+            _ => None,
+        }
     }
     #[cfg(windows)]
     fn attach_window(
@@ -876,7 +885,7 @@ impl Backend for Ink {
         Some(
             self.finish_output(rotation, readback)
                 .and_then(|(target, pixels)| {
-                    let Selected::Wgpu(device) = &self.device;
+                    let Selected::Wgpu(device) = &mut self.device;
                     let view = device.scanout_view(target);
                     self.accept(view)
                         .map(|view| (view, pixels))
@@ -1007,12 +1016,12 @@ impl Backend for Ink {
         ts: Transform,
         pivot: (f32, f32),
         _reference: (f32, f32),
-        base: [f32; 7],
+        base: [f32; 8],
     ) -> bool {
         self.observe_transform(ts);
         // Transforming a rasterized group would move the stationary outer clips.
         // @ref LLP 1149 D4: let the walk apply motion before clipping.
-        if base[0] != 0. || base[1] != 0. || base[2] != 1. || base[3] != 0. {
+        if base[0] != 0. || base[1] != 0. || base[2] != 1. || base[7] != 1. || base[3] != 0. {
             return false;
         }
         self.record_layer(key, ts, pivot, base);

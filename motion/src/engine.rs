@@ -329,6 +329,9 @@ pub struct Engine {
     // Each `filter` a transition covers, and its transition's ends (LLP
     // 1003.002 D6); the progress is the node's `Property::Filter` slot.
     filters: BTreeMap<u64, path::Track<crate::filter::FilterValue>>,
+    // Each box's `path()` clip, and its transition's ends (LLP 1003.003 D5);
+    // the progress is the node's `Property::ClipPath` slot.
+    clips: BTreeMap<u64, path::Track<crate::clip::ClipValue>>,
     // What plays: every animation, or nothing but settled values (LLP
     // 1047.001 D3), chosen once when the engine is made.
     links: &'static links::EngineLinks,
@@ -461,6 +464,7 @@ impl Engine {
             && !self.animating.contains(&node)
             && !self.paths.contains_key(&node)
             && !self.filters.contains_key(&node)
+            && !self.clips.contains_key(&node)
             && !self.timelines.names(node)
             && !self.clocks.names(node)
             && none(&self.running)
@@ -480,6 +484,11 @@ impl Engine {
         self.forget_clock(node);
         self.paths.remove(&node);
         self.filters.remove(&node);
+        self.clips.remove(&node);
+        // A forgotten node's lists present no row ([`Engine::frame`])
+        for p in Property::TRANSITION_ONLY {
+            self.dirty.remove(&(node, p));
+        }
         // Removing a list must not scan every other node once per row, nor
         // probe every table once per property: a list row's retirement
         // removes a node per box. Its running, pending and played curves are
@@ -509,6 +518,9 @@ impl Engine {
         }
         if property == Property::Filter {
             self.filters.remove(&node);
+        }
+        if property == Property::ClipPath {
+            self.clips.remove(&node);
         }
         self.dirty.remove(&(node, property));
         self.running.remove(&(node, property));
@@ -658,37 +670,16 @@ impl Engine {
                     self.dirty.insert(key);
                     return Ok(());
                 };
-                let is_easing = matches!(
-                    declaration.timing,
-                    crate::transition::TimingFunction::Easing(_)
+                let (adjusted, factor) = running.reversal(&declaration, current.value, after, now);
+                let mut next = Running::start(
+                    &declaration,
+                    change.property,
+                    (current.value, after),
+                    inherited,
+                    now,
+                    adjusted,
+                    factor,
                 );
-                let mut next = if is_easing && after.same(running.reversing_adjusted_start) {
-                    // CSS §3.2, the reversing case.
-                    let progress = running.easing_progress(now);
-                    let factor = (progress * running.reversing_shortening
-                        + (1.0 - running.reversing_shortening))
-                        .abs()
-                        .clamp(0.0, 1.0);
-                    Running::start(
-                        &declaration,
-                        change.property,
-                        (current.value, after),
-                        inherited,
-                        now,
-                        running.to,
-                        factor,
-                    )
-                } else {
-                    Running::start(
-                        &declaration,
-                        change.property,
-                        (current.value, after),
-                        inherited,
-                        now,
-                        current.value,
-                        1.0,
-                    )
-                };
                 next.pending = pend;
                 let presented = next.sample(now).value;
                 slot.set_running(Some(next));
@@ -749,6 +740,7 @@ impl Engine {
             if sample.done {
                 slot.set_running(None);
                 slot.set_owner(None);
+                self.pending.remove(key);
             }
             self.dirty.insert(*key);
             !sample.done
@@ -791,7 +783,11 @@ impl Engine {
                         self.animated(key.0, key.1, base)
                     })
                     .flatten();
-                animated.or(underlying).map(|value| Presentation {
+                // A list's slot gone presents its row, the end of its
+                // progress: the host draws what the row says
+                let row = (slot.is_none() && Property::TRANSITION_ONLY.contains(&key.1))
+                    .then(|| Value::scalar(1.0));
+                animated.or(underlying).or(row).map(|value| Presentation {
                     node: key.0,
                     property: key.1,
                     value: presentation(key.1, value),

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Seek, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 #[cfg(test)]
 use std::time::Duration;
@@ -24,9 +25,13 @@ pub(super) enum Prepared {
 pub(super) struct SourceOwner {
     pub id: u64,
     generation: u64,
+    pub(super) canvas: std::sync::atomic::AtomicBool,
     name: String,
     assets: Weak<Assets>,
     prepared: Mutex<Prepared>,
+    /// What its readers will ask for once its header is read: a worker that
+    /// reads it asks at once, with no turn of the presentation thread.
+    wants: Mutex<Vec<Want>>,
     /// A URL's download: the body a worker reads once it is settled.
     remote: Option<Arc<remote::Load>>,
     /// Its download failed in a way asking again may mend (`Failure::transient`):
@@ -94,6 +99,17 @@ impl SourceOwner {
         *self.message.lock().unwrap() = Some(message);
     }
 }
+/// A reader's ask, made by a worker once the header is read.
+pub(super) struct Want {
+    /// The reader is still there; cleared as it goes.
+    pub alive: Arc<AtomicBool>,
+    /// Its demand from the header, and whether it is a canvas's
+    /// ([`Backend::request`]).
+    pub demand: Box<
+        dyn Fn(&Backend, png_decode::Header) -> Result<(exact_raster::Demand, bool), Refusal>
+            + Send,
+    >,
+}
 struct State {
     sources: BTreeMap<u64, Weak<SourceOwner>>,
     next_source: u64,
@@ -101,6 +117,7 @@ struct State {
 }
 pub(super) struct Backend {
     pub session: RasterSession,
+    pub(super) published: super::published::Files,
     /// Where a URL's body comes from.
     pub downloads: Option<Arc<remote::Downloads>>,
     /// This backend, for a download to wake its workers when it lands.
@@ -112,10 +129,6 @@ pub(super) struct Backend {
     budget_notice: Mutex<Option<(u64, u64, u64)>>,
     wake_read: Mutex<UnixStream>,
     wake_write: Mutex<UnixStream>,
-    /// The device scale each SVG picture was asked at, by source and
-    /// pixels: with the key's pixels it gives the CSS size the scene
-    /// resolves at (LLP 1011.001 D3), which the key does not carry.
-    scales: Mutex<BTreeMap<(u64, exact_raster::PixelSize), f32>>,
     /// SVG pictures with text, resolved on a worker and waiting for the
     /// paint thread ([`Backend::finish_pictures`]).
     pictures: Mutex<Vec<svg_picture::Pending>>,
@@ -140,6 +153,7 @@ impl Backend {
         wake_write.set_nonblocking(true).unwrap();
         let backend = Arc::new_cyclic(|me| Self {
             session: workers.gate.session(),
+            published: Default::default(),
             downloads,
             me: me.clone(),
             state: Mutex::new(State {
@@ -153,7 +167,6 @@ impl Backend {
             budget_notice: Mutex::new(None),
             wake_read: Mutex::new(wake_read),
             wake_write: Mutex::new(wake_write),
-            scales: Mutex::new(BTreeMap::new()),
             pictures: Mutex::new(Vec::new()),
             #[cfg(test)]
             hook: Mutex::new(None),
@@ -238,7 +251,9 @@ impl Backend {
                     generation,
                     name: name.to_owned(),
                     assets: Arc::downgrade(assets),
+                    canvas: Default::default(),
                     prepared: Mutex::new(Prepared::Queued),
+                    wants: Default::default(),
                     remote,
                     transient: Default::default(),
                     message: Default::default(),
@@ -259,15 +274,22 @@ impl Backend {
         }
         result
     }
+    /// The file `name` was replaced: no ask reaches its source again, so
+    /// neither do the pictures decoded from it.
     pub fn forget_source(&self, generation: u64, name: &str) {
         let mut state = self.state.lock().unwrap();
         let owners: Vec<_> = state.sources.values().filter_map(Weak::upgrade).collect();
+        let mut forgotten = Vec::new();
         for source in &owners {
             if source.generation == generation && source.name == name {
                 state.sources.remove(&source.id);
+                forgotten.push(source.id);
             }
         }
         drop(state);
+        for id in forgotten {
+            self.session.forget_source(id, generation);
+        }
     }
 
     fn owners(&self) -> Vec<Arc<SourceOwner>> {
@@ -322,22 +344,42 @@ impl Backend {
         state.sources.retain(|_, source| source.strong_count() > 0);
         state.sources.len()
     }
+    /// Ask for `demand`, served by a package's pixels for the file when they
+    /// are cached, still match it, and are not much larger than asked for
+    /// (as `covering` shares a decode). `canvas`: any size will do, since a
+    /// canvas shrinks its ask only to fit a decode in the budget, and the
+    /// picture is the canvas's alone (`RasterSession::request_held`): the
+    /// canvas keeps what its draws name, and Apple's canvas frees the rest.
     pub fn request(
         &self,
         demand: exact_raster::Demand,
+        canvas: bool,
     ) -> Result<exact_raster::RequestId, Refusal> {
         Workers::process().start();
-        let id = self.session.request(demand)?;
+        let source =
+            (self.state.lock().unwrap().sources.get(&demand.key.source)).and_then(Weak::upgrade);
+        let area = |p: exact_raster::PixelSize| u64::from(p.width) * u64::from(p.height);
+        let published = source
+            .as_ref()
+            .and_then(|s| super::published::current(&self.published, s.generation, &s.name))
+            .filter(|p| canvas || area(p.key.pixels) <= area(demand.key.pixels) * 5 / 2);
+        drop(source);
+        let cached = published.and_then(|p| {
+            self.session
+                .request_cached(exact_raster::Demand {
+                    view: demand.view,
+                    priority: demand.priority,
+                    ..p
+                })
+                .ok()
+        });
+        let id = match cached {
+            Some(request) => request,
+            None if canvas => self.session.request_held(demand)?,
+            None => self.session.request(demand)?,
+        };
         self.requests.lock().unwrap().insert(id);
         Ok(id)
-    }
-    /// The device scale an SVG picture of `source` at `pixels` is asked at.
-    pub fn note_scale(&self, source: u64, pixels: exact_raster::PixelSize, scale: f32) {
-        let mut scales = self.scales.lock().unwrap();
-        if scales.len() >= 4 * (SUBSCRIPTIONS + COLD_ENTRIES) {
-            scales.clear();
-        }
-        scales.insert((source, pixels), scale);
     }
     /// Paint the SVG pictures waiting for the paint thread with `text`,
     /// completing their permits as a worker completes a raster's.
@@ -428,12 +470,59 @@ impl Backend {
                 .and_then(|(mut input, bytes)| png_decode::inspect(&mut input, bytes))
                 .inspect_err(|e| source.release(*e, self.downloads.as_deref())),
         };
-        *source.prepared.lock().unwrap() = match result {
-            Ok(header) => Prepared::Ready(header),
-            Err(e) => Prepared::Failed(e),
+        // Taken under the same lock a reader registers under: none is missed.
+        let wants = {
+            let mut prepared = source.prepared.lock().unwrap();
+            *prepared = match result {
+                Ok(header) => Prepared::Ready(header),
+                Err(e) => Prepared::Failed(e),
+            };
+            std::mem::take(&mut *source.wants.lock().unwrap())
         };
+        if let Ok(header) = result {
+            self.ask_wants(wants, header);
+        }
         self.notify();
         true
+    }
+    /// Ask for what readers registered (`want`), as each would on its next
+    /// turn. A reader that left meanwhile cancels what was asked.
+    fn ask_wants(&self, wants: Vec<Want>, header: png_decode::Header) {
+        for want in wants {
+            if !want.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            let Ok((demand, canvas)) = (want.demand)(self, header) else {
+                continue;
+            };
+            let Ok(id) = self.request(demand, canvas) else {
+                continue;
+            };
+            // Gone after the check: its retirement may have preceded the ask.
+            if !want.alive.load(Ordering::Acquire) {
+                self.cancel(id);
+            }
+        }
+    }
+    /// What a reader of `source` will ask for once its header is read, while
+    /// `alive` holds (LLP 1178 D3: the decode starts at the header, not at
+    /// the reader's next turn). Asked again by the reader, it is the same
+    /// request.
+    /// Whether it was registered: not once the header has been read.
+    pub(super) fn want(&self, source: &SourceOwner, want: Want) -> bool {
+        let prepared = source.prepared.lock().unwrap();
+        if !matches!(*prepared, Prepared::Queued | Prepared::Reading) {
+            return false;
+        }
+        let mut wants = source.wants.lock().unwrap();
+        wants.retain(|w| w.alive.load(Ordering::Acquire) && !Arc::ptr_eq(&w.alive, &want.alive));
+        wants.push(want);
+        true
+    }
+    /// The cached pixels a package published for `name`, while its file is
+    /// the one written ([`super::published::current`]).
+    pub(super) fn published(&self, generation: u64, name: &str) -> Option<exact_raster::Demand> {
+        super::published::current(&self.published, generation, name)
     }
     fn decode(&self, permit: DecodePermit) {
         let key = permit.key();
@@ -468,13 +557,7 @@ impl Backend {
                 // The parse and the scene precede the charge: the picture is
                 // allocated by the painter, after it (as `charge` precedes
                 // a raster's output).
-                let scale = self
-                    .scales
-                    .lock()
-                    .unwrap()
-                    .get(&(key.source, key.pixels))
-                    .copied()
-                    .unwrap_or(1.0);
+                let scale = svg_picture::scale_from_crop(key.crop);
                 let mut text = Vec::with_capacity(bytes as usize);
                 input
                     .read_to_end(&mut text)
@@ -502,7 +585,9 @@ impl Backend {
             // This charge precedes the decoder and output allocations. On an
             // error decode_rows destroys both before the permit can retire.
             let charge = permit.allocation_charge();
-            let pixels = super::jpeg_decode::decode_pixels(input, &plan, || permit.is_cancelled())?;
+            let pixels = super::jpeg_decode::decode_pixels(input, &plan, key.variant, || {
+                permit.is_cancelled()
+            })?;
             let bitmap = Arc::new(Bitmap::from_source(
                 pixels,
                 plan.natural(),
@@ -634,6 +719,8 @@ impl Workers {
                     .spawn(move || {
                         #[cfg(target_os = "android")]
                         crate::android::background_priority();
+                        #[cfg(windows)]
+                        let _wic = super::jpeg_decode::Worker::enter();
                         owner.run()
                     })
                     .expect("PNG worker");
@@ -699,6 +786,13 @@ impl Workers {
             *metadata_turn = true;
             self.complete(permit);
         }
+    }
+}
+
+impl super::Images {
+    #[cfg(unix)]
+    pub(crate) fn wake_fd(&self) -> std::os::fd::RawFd {
+        self.backend.wake_fd()
     }
 }
 

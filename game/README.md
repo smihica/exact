@@ -323,9 +323,10 @@ it while the world runs.
 drawing. Return true when nothing it shows is changing (the dice lie still). The
 canvas draws until both ticks it interpolates between are idle, then asks the
 host for no frame until input, a bind, an asset, a resize or a render hook's
-`Needs::ANIMATE` or `Needs::PENDING` wakes it; queued input and a pending hold or
-tap keep it drawing. The idle time never runs as ticks: the first frame after a
-wake advances one display period, and input that arrived meanwhile lands on its
+`Needs::ANIMATE` or `Needs::PENDING` wakes it. Painted hosts tick queued input
+before drawing a resting canvas. Input that wakes the world draws on that
+callback, and a pending hold or tap keeps it drawing. The first frame after a
+wake advances one display period. Input from the idle interval lands on its
 first tick. The agent's clock ignores it, so a seeked run ticks every
 millisecond as before. `Game::max_fps(world, args)` caps the drawn frames per
 second (0, the default, for the display's rate), changeable at any frame: 60 at
@@ -334,8 +335,8 @@ hook's `Hooks::max_fps` can cap lower (a budget or a thermal cap), and the lower
 non-zero cap stands. `Game::samples(args)` chooses scene sampling (by default
 `Game::SAMPLES`); a change makes the renderer again under the same world, as a
 "smooth edges" setting needs. None of the three is saved or hashed. The web, iOS,
-macOS and Android hosts rest and cap a canvas; the Linux and Windows desktop
-hosts draw a mounted world every display frame and take no cap
+macOS and Android hosts rest and cap a canvas. The Linux and Windows desktop
+hosts keep a resting canvas’s picture between window frames and take no cap
 ([GPU module ABI](../gpu/README.md#frame-pacing-and-timing)).
 
 `Game::quality(args)` picks the renderer's rung of the quality ladder, read once,
@@ -638,10 +639,10 @@ arguments for settings, messages for things that happen once. A paused world hol
 a message for its first tick after the pause.
 
 A message carries who posted it (LLP 1133.022 D6). One from a tool's commit, or
-a wake's, arrives marked with that origin; the world keeps the least privileged
-origin it has heard until a fresh start (and saves it), and marks each string it
-`emit`s with it, so the `message=` handler runs as that origin and a tool cannot
-start a device through the world. A person's or the app's own post leaves no mark;
+a wake's, arrives marked with its origins; the world keeps every origin it has
+heard until a fresh start (and saves them), and marks each string it `emit`s
+with that set, so the `message=` handler runs under each one's rules and a tool
+cannot start a device through the world. A person's or the app's own post leaves no mark;
 `state` shows `origin` only for a marked world. The runner and the engine carry the
 mark; a game never sees it.
 
@@ -662,6 +663,23 @@ inside saves and hashes. Read delivered records with `state world events [Type]`
 String `emit` is the presentation path to Contract `message=`, outside the hash;
 typed events do not deliver a second Contract message. Same-tick effects are function calls.
 See the [tick admission contract](engine/README.md#tick-admission).
+
+### Android canvas draws
+
+Open the installed game normally. Run the command below and move the game during the five-second capture. Check for a draw from the foreground game, then repeat at rest. A default `bun exact.mjs android --release` build allows shell profiling and has development trust. A production-trust bake omits these markers.
+
+```sh
+adb shell 'set -- $(dumpsys activity activities | grep topResumedActivity=); atrace -a "${3%/*}" -b 32768 -t 5 view' | grep -E 'exact canvas|exact replay'
+```
+
+Each `exact canvas` line identifies the canvas instance and surface. It means the GPU module recorded a complete draw for submission. A still canvas prints no draw markers. `exact replay` marks the Android view replaying its display list, including when it reuses the canvas image. SurfaceFlinger can present a retained buffer without either marker. If the moving control works and a still capture is empty, compare `dumpsys gfxinfo` with SurfaceFlinger’s app-layer frame count for the same interval. Set `ANDROID_SERIAL` when several devices are connected.
+
+- `samples=N` counts sensor samples the game consumed since its previous draw or the creation of its world, including ticks that drew nothing. Long labels continue on `exact canvas … detail` lines.
+- `input-poll` means the painted host ticked queued device input and the result requested a draw. `device-input` means device input was still marked dirty, and `input-queued` means events were still waiting for a simulation tick.
+- `world:Transform`, for example, means the renderer saw a revision change in that storage. A mutable lease can advance a revision even when the final value is equal. `hook:<type>` and `hook:tick` identify reads that changed at the input poll admitting this draw.
+- `setup`, `game-active`, `input-timer`, `table-timer`, `hook-animation`, `hook-pending` and `settling` describe simulation, hook and interpolation work. `continuation` means the preceding render requested another callback. `retry` means an earlier attempt produced no complete draw.
+- `surface` marks a new drawable, `resize` a changed extent, and `invalidation` a dirty canvas. `preparation` means the surface has work pending. `host-request` means the host called render without a pending module flag. `driver-clock` identifies a seekable frame.
+
 
 ## Proof pins
 

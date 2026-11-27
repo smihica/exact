@@ -4,6 +4,7 @@
 //! `FrameUserPrompt`
 //! reach an action as its record, and the frame commands reach the host by
 //! position.
+use crate::source::{boxed, Source};
 use exact_kernel::{Kernel, NodeType, PropId};
 use exact_plan::{EventKind, Plan, Value};
 use exact_runner::{DataError, DataSource, Event, Runner};
@@ -26,7 +27,7 @@ fn the_browser_shell_fixture_lowers_and_hears_its_guest() {
     let plan = Plan::decode(&plan.encode()).unwrap();
     let mut r = Runner::boot(
         plan,
-        Schedule,
+        boxed(Schedule),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -127,13 +128,13 @@ fn frame_commands_reach_the_host_by_position() {
     let plan = Plan::decode(&plan.encode()).unwrap();
     let mut r = Runner::boot(
         plan,
-        Schedule,
+        boxed(Schedule),
         Kernel::with_monospace(),
         Default::default(),
         "/",
     )
     .unwrap();
-    let press = |r: &mut Runner<Schedule>, label: &str| {
+    let press = |r: &mut Runner<Source>, label: &str| {
         let key = r.kernel().find_by_test_id(label)[0];
         let id = r.kernel().node_by_key(key).unwrap().id;
         r.dispatch(id, Event::Press).unwrap();
@@ -203,6 +204,12 @@ fn a_partition_refuses_what_would_reach_the_app_and_the_words_are_an_iframes() {
         "lower-iframe-partition-sandbox"
     );
     assert_eq!(refused("column zoom=1.5"), "lower-attr-tag");
+    for word in ["-1", "0", "0.00099", "256.000000001"] {
+        assert_eq!(
+            refused(&format!("iframe apple.magnification={word}")),
+            "lower-attr-value"
+        );
+    }
     let e = contract::compile(
         "component A\n  state n = 0\n  action go\n    n = 1\n  view\n    column newwindow=go\n",
     )
@@ -265,7 +272,7 @@ fn a_guests_requests_are_held_for_the_agent_on_its_frame() {
     let plan = Plan::decode(&plan.encode()).unwrap();
     let mut r = Runner::boot(
         plan,
-        Schedule,
+        boxed(Schedule),
         Kernel::with_monospace(),
         Default::default(),
         "/",

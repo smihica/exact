@@ -21,8 +21,18 @@ import {
   clockSlices,
   padOp,
   postInto,
+  swipeDrag,
 } from './agent-keys.mjs';
 import { appShareTarget, driverShare, webShareLocation } from './share-target.mjs';
+
+/** A timed move's sample spacing under the agent's clock: a 60 Hz frame, as each carrier spaces one. */
+const FRAME_MS = 16;
+/** The longest timed move the driver steps; past it the carrier's own bound answers, as a drag's `over` is bounded. */
+const MOVE_MS = 2000;
+/** A host's refusal of a plain press whose target, scrolled in by the reveal before it, is no longer hit at its middle
+ * (`addressed_tap.rs`). */
+const MOVED_SINCE_REVEAL = /is covered or not hit at its projected center/;
+
 /** The input methods of session `s` over `carrier`, which `open` adds to `s`. */
 export function sessionInput(s, { carrier, host, timing, touch, app }) {
   return {
@@ -39,7 +49,7 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
             hold: true,
             delivery: kind =>
               (kind === 'drag' && carrier.touches) ||
-              (['press', 'down', 'hold', 'up', 'cancel'].includes(kind) && carrier.touch === 'platform')
+              (['press', 'down', 'hold', 'up', 'cancel', 'fingers'].includes(kind) && carrier.touch === 'platform')
                 ? 'platform'
                 : [
                       'contextmenu',
@@ -54,7 +64,7 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
                       'cancel',
                     ].includes(kind)
                   ? 'recognized'
-                  : kind === 'drag'
+                  : kind === 'drag' || kind === 'fingers'
                     ? 'unsupported'
                     : 'activation',
           }
@@ -63,9 +73,8 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
               contact: true,
               hold: true,
               delivery: kind =>
-                ['down', 'move', 'hold', 'up', 'cancel', 'contextmenu', 'mouse'].includes(kind)
-                  ? 'presenter'
-                  : 'platform',
+                host === 'android' && kind === 'press' ? 'activation'
+                : ['down', 'move', 'hold', 'up', 'cancel', 'contextmenu', 'mouse'].includes(kind) ? 'presenter' : 'platform',
             }
           : { contact: true, hold: true, delivery: () => 'platform' },
     /** The contact this session holds, `{x, y}` in the viewport's space, or null. */
@@ -79,6 +88,17 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
     // {contextmenu:true,at:[x,y]} is secondary. Points are target-relative; plain
     // canvas taps and held down/move/up contacts remain fingers (LLP 1015.000).
     async tap(target, opts = {}) {
+      // @ref LLP 1057.001 §8.3 — a swipe is a real flick, a fast straight drag the platform's recognizer reads (the drag
+      // refuses one it would make the scroll view's own). Only a real touch reaches UIKit's recognizer, so another carrier
+      // refuses it, having sent nothing, as it does one aimed at a held request.
+      if (opts.swipe !== undefined) {
+        tapArguments(opts);
+        if (opts.at?.some(v => v < 0)) throw new Error('swipe: at is an offset into the target\'s box from its top-left corner, never negative');
+        if (holdOf(target)) throw new Error(`swipe: ${target} is a held request, which takes a choice, not a swipe; a swipe is on a view`);
+        // `--touch drag`, a test file's, makes a drag a real touch too, and a swipe is one
+        if (!['ios', 'host-ios'].includes(host) || !['platform', 'drag'].includes(touch)) throw new Error(`swipe: a swipe is the platform's recognizer's, which only a real touch on a view reaches; drive iOS with --touch platform, or the effect through the control the app gives it; a node that follows the finger (\`swipe-follow\`) is driven with \`drag\` on every host`);
+        return s.tap(target, { drag: { ...swipeDrag(opts), flick: true } });
+      }
       if (holdOf(target)) {
         if (s.held) throw new Error(`a drag's finger is down (${s.held}): only reads and the clock until it lifts`);
         return s.answer('tap', target, opts.choice);
@@ -151,6 +171,13 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
         if (!['web', 'linux', 'android', 'windows', 'macos', 'mac'].includes(host))
           throw new Error(`${host} does not carry explicit mouse clicks`);
         if (node.entity !== undefined) throw new Error('mouse cannot be combined with an entity target');
+      }
+      // Several fingers at once are the iOS touch runner's alone (touches.mjs `realFingers`): refused before any other
+      // input reaches the app and before anything scrolls.
+      if (opts.fingers !== undefined) {
+        if (node.entity !== undefined) throw new Error(`fingers: ${target} is a world entity, which one finger taps`);
+        const reason = pointerGap(host, carrier.browser, opts) ?? (carrier.touches && touch === 'platform' ? null : 'several fingers at once are real touches: drive with --touch platform');
+        if (reason) return s.tagged({ tapped: node.id, target, fingers: opts.fingers, delivery: 'unsupported', reason, carrier: host, mode: timing });
       }
       if (node.entity !== undefined) {
         if (opts.drag) throw new Error(`drag: ${target} is a world entity; a drag starts on a view`);
@@ -230,6 +257,7 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
         !opts.wheel &&
         opts.down !== true &&
         opts.pinch === undefined &&
+        opts.fingers === undefined &&
         !opts.drag &&
         opts.at !== undefined;
       const form =
@@ -306,6 +334,8 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
           ? 'history'
           : opts.pinch !== undefined
             ? 'pinch'
+            : opts.fingers !== undefined
+            ? 'fingers'
             : opts.down
               ? 'down'
               : opts.drop
@@ -336,11 +366,22 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
           carrier: host,
           mode: timing,
         });
-      let r;
+      let r, again = null;
+      const press = () => carrier.input(node.id, kind, { ...opts, ...at });
       try {
-        r = await carrier.input(node.id, kind, { ...opts, ...at });
+        r = await press();
       } catch (error) {
-        throw await tapRefusal(s, target, await s.named(error));
+        // The window can change between the reveal and the press: on Android a keyboard that leaves gives the page
+        // its height back and the navigation bar its room, which can park the revealed target under the bar. A plain
+        // press refused as covered is revealed again and pressed once more when that reveal moved it; one that
+        // stays covered (nothing scrolls it clear) is refused as before.
+        again = kind === 'press' && !explicit && MOVED_SINCE_REVEAL.test(error?.message ?? '') ? await s.reveal(node.id).catch(() => null) : null;
+        if (!again) throw await tapRefusal(s, target, await s.named(error));
+        try {
+          r = await press();
+        } catch (retried) {
+          throw await tapRefusal(s, target, await s.named(retried));
+        }
       }
       if (r.error) r.error = (await tapRefusal(s, target, await s.named(new Error(r.error)))).message;
       if (kind === 'down' && r.delivery !== 'unsupported') {
@@ -352,6 +393,7 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
         tapped: node.id,
         target,
         ...(scrolled ? { scrolled } : {}),
+        ...(again ? { revealedAgain: again } : {}),
         delivery: r.delivery ?? s.input.delivery(kind),
         carrier: host,
         mode: r.mode ?? timing,
@@ -373,11 +415,35 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
       return r.scrolled ? { from: r.from, to: r.to } : null;
     },
     /** The held contact's next phase (LLP 1035.003 D1): `move` to `{x, y}` in the viewport or `by` `{dx, dy}`,
-     * over `ms` of real time on platform carriers or event timestamps on Linux, without seeking its runner; `hold` for
-     * `ms`; `up`; `cancel`.
+     * over `ms`; `hold` for `ms`; `up`; `cancel`. Under platform timing a move's samples are spaced on real time (event
+     * timestamps on Linux); under the agent's they are one a frame, the clock moved to each sample's time before it, so
+     * the app reads the move as lasting `ms` (#1333).
      * The platform owns hit-testing, recognition, scrolling and animation: the app receives whatever it delivers,
      * and a carrier that cannot hold a contact answers `delivery: "unsupported"` rather than faking one. */
     async pointer(phase, opts = {}) {
+      // One sample at most each `FRAME_MS`, as the carriers space a timed move; a sample refused partway, or a contact
+      // the carrier ended, answers as the move. A clock the display holds (live frame capture, `--live`) refuses the
+      // first step, and the move is then the carrier's own, on real time.
+      const clockedMove = async (opts) => {
+        const { x, y, dx = 0, dy = 0, ms, ...rest } = opts;
+        const from = s.contact, to = [x ?? from.x + dx, y ?? from.y + dy], steps = Math.ceil(ms / FRAME_MS);
+        let r, at, delivered = 0;
+        for (let i = 1, done = 0; i <= steps; i++) {
+          // Whole milliseconds until the last, so the clock's sum is exact; each sample at most `FRAME_MS` on.
+          const t = i === steps ? ms : Math.floor((ms * i) / steps), f = i / steps;
+          try { await s.clock(`+${t - done}`); } catch (error) {
+            if (i === 1 && /display's clock|--live/.test(error.message)) return carrier.input(null, 'move', opts);
+            throw error;
+          }
+          r = await carrier.input(null, 'move', { ...(i === 1 ? rest : {}), x: from.x + (to[0] - from.x) * f, y: from.y + (to[1] - from.y) * f, ms: t - done });
+          done = t;
+          if (r.error || r.delivery === 'unsupported' || r.contact === false) break;
+          delivered++;
+          at = Array.isArray(r.at) ? r.at : [from.x + (to[0] - from.x) * f, from.y + (to[1] - from.y) * f];
+        }
+        // Where the delivered samples left the contact, when a later one was refused without saying.
+        return r.error && !Array.isArray(r.at) && delivered ? { ...r, at } : r;
+      };
       pointerArguments(phase, opts);
       if (s.held) throw new Error(`a drag's finger is down (${s.held}): only reads and the clock until it lifts`);
       // the clock's, as a drag's; real time under --timing platform, for UIKit's recognizers
@@ -419,7 +485,7 @@ export function sessionInput(s, { carrier, host, timing, touch, app }) {
           mode: timing,
         }); // one real touch, played at the lift (agent-drag.mjs)
       const before = s.now,
-        r = await carrier.input(null, phase, opts);
+        r = phase === 'move' && timing !== 'platform' && opts.ms > 0 && opts.ms <= MOVE_MS ? await clockedMove(opts) : await carrier.input(null, phase, opts);
       if (r.delivery !== 'unsupported') {
         if (Number.isFinite(r.clock)) s.now = r.clock;
         if (r.contact === false || phase === 'up' || phase === 'cancel') s.contact = null;

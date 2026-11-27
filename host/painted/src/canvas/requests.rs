@@ -68,11 +68,22 @@ impl<D: DataSource + Default> CanvasHost<D> {
         self.p.take_requests()
     }
 
+    /// A Kotlin module callback, registered between host turns.
+    pub fn module_after(&mut self, timer: i32, due: f64) {
+        self.p.module_after(timer, due);
+    }
+
     /// What the reader's hatches ask (`hatches::reader::act`), run at once,
     /// between turns: its answer, -1 when refused. A view hosted or let go
     /// paints again.
     pub fn hatch_act(&mut self, node: u32, kind: i32, text: Option<&str>) -> i64 {
-        self.p.reader_hatch_act(node, kind, text)
+        let now = self.now();
+        self.p.reader_hatch_act(node, kind, text, now)
+    }
+
+    /// Preferred content sizes the reader collected during a display frame (LLP 1024).
+    pub fn module_sizes(&mut self, reports: &str) {
+        self.force |= self.p.reader_module_sizes(reports);
     }
 
     /// An app module's event, only for the session and allocation whose view the reader still holds.
@@ -93,6 +104,43 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// The reader's iframe finished a document (LLP 1020 §10).
     pub fn frame_loaded(&mut self, id: u32, key: exact_kernel::NodeKey, session: u64) {
         self.force |= self.p.reader_frame_loaded(id, key, session);
+    }
+
+    /// The reader's iframe took the platform's focus or lost it.
+    pub fn frame_focused(
+        &mut self,
+        id: u32,
+        key: exact_kernel::NodeKey,
+        session: u64,
+        focused: bool,
+    ) {
+        self.p.reader_frame_focused(id, key, session, focused);
+    }
+
+    /// An unpartitioned iframe's `window.postMessage` string (LLP 1156.008.001 B1).
+    pub fn frame_message(&mut self, id: u32, key: exact_kernel::NodeKey, session: u64, text: &str) {
+        self.force |= self.p.reader_frame_message(id, key, session, text);
+    }
+
+    /// Immutable boot-time media grants (`device.camera` bit 0, `device.microphone` bit 1)
+    /// for Android-only grant-gated `WebChromeClient.onPermissionRequest` (LLP 1156.008.001 B1b).
+    pub fn frame_media_grants(&self) -> i32 {
+        let grants = self.p.host.runner().data().grants();
+        let cam = i32::from(exact_runner::device::granted(grants, "camera"));
+        let mic = i32::from(exact_runner::device::granted(grants, "microphone"));
+        cam | (mic << 1)
+    }
+
+    /// The reader's iframe's `FrameNavigation` record (LLP 1020.002 D2).
+    pub fn frame_event(
+        &mut self,
+        id: u32,
+        key: exact_kernel::NodeKey,
+        session: u64,
+        event: &str,
+        record: &str,
+    ) {
+        self.force |= self.p.reader_frame_event(id, key, session, event, record);
     }
 
     /// A media element's event or state (LLP 1042.001 D7), only for the
@@ -131,12 +179,26 @@ impl<D: DataSource + Default> CanvasHost<D> {
         self.p.answer_request(id, answer);
     }
 
+    /// The reader refused a module call.
+    pub fn refuse_module(&mut self, id: u32, error: &str, message: Option<&str>) {
+        self.p.refuse_module(id, error, message);
+    }
+
     /// How a presence check the reader made ended (LLP 1133.010 D13).
     pub fn presence_reply(&mut self, answer: &str) {
         self.p
             .host_mut()
             .runner_mut()
             .presence_reply(answer.as_bytes());
+        self.force = true;
+    }
+
+    /// What the reader reported of the live activities it shows
+    /// (`Activities.kt`, LLP 1126 D13): a send's answer, or the list.
+    pub fn activities(&mut self, json: &str) {
+        if let Some(error) = self.p.activities(json) {
+            self.p.host_mut().log(&error);
+        }
         self.force = true;
     }
 
@@ -222,6 +284,53 @@ impl<D: DataSource + Default> CanvasHost<D> {
             runner.log(e);
         }
         self.force = true;
+    }
+
+    /// A person's press of the compiled control `kind`, installed with
+    /// `digest`: a Quick Settings tile's, or with `foreground` the app's in
+    /// front that the tile opened (`Native.press`, LLP 1126.004 D2, D5).
+    /// `{"call": id}`, or `{"error"}`.
+    pub fn press_control(
+        &mut self,
+        kind: &str,
+        digest: &str,
+        foreground: bool,
+        cold: bool,
+        hidden: bool,
+    ) -> String {
+        let how = exact_runner::CallHow {
+            door: "android".into(),
+            cold,
+            hidden,
+            digest: None,
+            foreground,
+        };
+        let runner = self.p.host_mut().runner_mut();
+        let reply = match runner.press_control(kind, digest, how) {
+            Ok(id) => serde_json::json!({ "call": id }),
+            Err(e) => {
+                runner.log(format!("control:{kind}: {e}"));
+                serde_json::json!({ "error": e })
+            }
+        };
+        self.force = true;
+        reply.to_string()
+    }
+
+    /// Press `id` ends: the tile that started it was superseded, the app it
+    /// opened left the front, or the phone locked (`Native.cancelPress`).
+    pub fn cancel_press(&mut self, id: u64) {
+        let request = serde_json::json!({ "op": "cancel", "id": id }).to_string();
+        let runner = self.p.host_mut().runner_mut();
+        if let Some(Err(e)) = runner.call_agent("cancel", &request) {
+            runner.log(format!("control: press {id}: {e}"));
+        }
+        self.force = true;
+    }
+
+    /// Whether press `id` still runs (`Native.pressLive`).
+    pub fn press_live(&mut self, id: u64) -> bool {
+        self.p.host_mut().runner_mut().press_live(id)
     }
 
     /// A line the reader journals (`Native.journal`).

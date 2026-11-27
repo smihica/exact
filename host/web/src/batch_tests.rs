@@ -15,7 +15,9 @@ fn one(op: impl FnOnce(&mut Batch)) -> String {
     batch.finish(None, false, 0.0, None)
 }
 
-fn request(ticket: u64, request: Request, forced: bool) -> RequestOut {
+/// The app's own request, whose op names no origin (`batch.rs`).
+fn request(ticket: u64, mut request: Request, forced: bool) -> RequestOut {
+    request.reach.origin = exact_runner::CallOrigin::App;
     RequestOut {
         completion: None,
         class: exact_runner::RequestClass::Ordered,
@@ -72,6 +74,8 @@ fn cases() -> Vec<(&'static str, String)> {
             Value::list(vec![Value::Number(1.5), Value::Number(-2.0)]),
             Value::str("a\"b"),
         ],
+        colors: vec![],
+        types: vec![None, None],
     };
     vec![
         (
@@ -85,8 +89,15 @@ fn cases() -> Vec<(&'static str, String)> {
                     activation: 3,
                     removed: vec![],
                     visits: vec![(1, "/".into()), (5, "/tag/\"x\"?q=1".into())],
+                    roots: vec![1],
+                    tab: "home".into(),
+                    chain: vec![
+                        destination("/", "home"),
+                        destination("/tag/\"x\"?q=1", "home"),
+                    ],
                     pattern: String::new(),
                     params: vec![],
+                    due: false,
                 })
             }),
         ),
@@ -101,8 +112,12 @@ fn cases() -> Vec<(&'static str, String)> {
                     activation: 0,
                     removed: vec![1, 22, 333],
                     visits: vec![(18_446_744_073_709_551_615, "/".into())],
+                    roots: vec![18_446_744_073_709_551_615],
+                    tab: String::new(),
+                    chain: vec![destination("/", "")],
                     pattern: String::new(),
                     params: vec![],
+                    due: false,
                 })
             }),
         ),
@@ -275,6 +290,7 @@ fn cases() -> Vec<(&'static str, String)> {
             one(|b| b.request(&request(47, mixed, false))),
         ),
         ("destroy", one(|b| b.destroy(13))),
+        ("hold", one(|b| b.hold(&[(7, Some(3)), (9, None)]))),
         (
             "at",
             one(|b| {
@@ -324,11 +340,11 @@ fn cases() -> Vec<(&'static str, String)> {
 const GOLDEN: &[(&str, &str)] = &[
     (
         "router",
-        r#"{"ops":[{"op":"router","top":5,"url":"/tag/\"x\"?q=1#moves","fragment":"moves","scroll":true,"activation":3,"removed":[],"visits":[[1,"/"],[5,"/tag/\"x\"?q=1"]]}],"timers":false,"clock":0,"error":null}"#,
+        r#"{"ops":[{"op":"router","top":5,"url":"/tag/\"x\"?q=1#moves","fragment":"moves","scroll":true,"activation":3,"removed":[],"visits":[[1,"/"],[5,"/tag/\"x\"?q=1"]],"roots":[1],"tab":"home","chain":[["/","home"],["/tag/\"x\"?q=1","home"]]}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
         "router-removed",
-        r#"{"ops":[{"op":"router","top":18446744073709551615,"url":"/","fragment":"","scroll":false,"activation":0,"removed":[1,22,333],"visits":[[18446744073709551615,"/"]]}],"timers":false,"clock":0,"error":null}"#,
+        r#"{"ops":[{"op":"router","top":18446744073709551615,"url":"/","fragment":"","scroll":false,"activation":0,"removed":[1,22,333],"visits":[[18446744073709551615,"/"]],"roots":[18446744073709551615],"tab":"","chain":[["/",""]]}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
         "collections",
@@ -465,6 +481,10 @@ const GOLDEN: &[(&str, &str)] = &[
     (
         "destroy",
         r#"{"ops":[{"op":"destroy","id":13}],"timers":false,"clock":0,"error":null}"#,
+    ),
+    (
+        "hold",
+        r#"{"ops":[{"op":"hold","movers":[[7,3],[9,null]]}],"timers":false,"clock":0,"error":null}"#,
     ),
     (
         "at",
@@ -685,5 +705,14 @@ fn prefetch_is_ignored_for_web_reads_and_refused_for_sends_and_other_work() {
             batch["ops"][0]["message"],
             "exactPrefetch requires a plain HTTP read"
         );
+    }
+}
+
+fn destination(url: &str, tab: &str) -> exact_route::Destination {
+    exact_route::Destination {
+        name: String::new(),
+        url: url.into(),
+        tab: tab.into(),
+        params: Default::default(),
     }
 }

@@ -77,8 +77,13 @@ impl<D: DataSource> Runner<D> {
         let (mut ops, mut surfaces, _) = self.update_ops(settled, update)?;
         let mut settled = settled;
         for _ in 0..super::owned::RENDERS {
-            if !self.reconcile_owned()? {
-                self.reconcile_tasks(&self.tree.as_ref().expect("booted").owners())?;
+            let owners = self.tree.as_ref().expect("booted").owners();
+            let changed = self.reconcile_owned(&owners)?;
+            if !changed {
+                self.reconcile_tasks(&owners)?;
+            }
+            drop(owners);
+            if !changed {
                 return self.publish_render(ops, surfaces, settled);
             }
             let (next, next_surfaces, _) = self.update_ops(true, |tree, u| tree.update(u))?;
@@ -106,6 +111,7 @@ impl<D: DataSource> Runner<D> {
     pub(super) fn arm_task(&mut self, i: usize, on: bool, key: Option<String>) {
         let row = self.timer_row(i);
         let (frame, interval) = (row.frame, row.interval_ms);
+        let cause = self.cause();
         let t = &mut self.timers[i];
         if !on {
             t.armed = false;
@@ -114,6 +120,7 @@ impl<D: DataSource> Runner<D> {
             t.completion = Default::default();
         } else if !t.armed || t.key != key {
             t.armed = true;
+            t.cause = cause;
             t.generation = t.generation.wrapping_add(1);
             t.completion = Default::default();
             t.key = key;
@@ -203,7 +210,9 @@ impl<D: DataSource> Runner<D> {
         Ok(())
     }
 
-    pub(super) fn task_action(&mut self, i: usize) -> Result<CommitReceipt, RunnerError> {
+    /// Fire task `i`: its commit, or `None` for an idle firing
+    /// ([`Runner::run_task`]).
+    pub(super) fn task_action(&mut self, i: usize) -> Result<Option<CommitReceipt>, RunnerError> {
         let frames = match &self.timers[i].owner {
             None => Vec::new(),
             Some(weak) => {
@@ -226,7 +235,13 @@ impl<D: DataSource> Runner<D> {
             .iter()
             .map(|a| self.eval(self.plan.arg(a).expr, &[], &frames))
             .collect::<Result<Vec<_>, _>>()?;
-        self.traced_action("task", row.action, args, &frames)
+        let action = row.action;
+        self.as_cause(self.timers[i].cause, |r| {
+            let was_poisoned = r.poisoned;
+            let result = r.run_task(action, &args, &frames);
+            r.record_ran("task", r.plan.action(action).name, was_poisoned, &result);
+            result
+        })
     }
 }
 

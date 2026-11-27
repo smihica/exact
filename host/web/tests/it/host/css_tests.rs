@@ -271,7 +271,7 @@ fn style_rows_lower_to_css_by_their_names() {
 
 #[test]
 #[allow(clippy::field_reassign_with_default)]
-fn the_transition_row_lowers_to_css_transition_and_springs_are_named() {
+fn the_transition_row_delegates_springs_without_reporting_them_as_skipped() {
     use exact_motion::{
         Easing, LinearStop, SpringConfig, StepPosition, TimingFunction, Transition,
         TransitionProperty, Transitions,
@@ -304,7 +304,7 @@ fn the_transition_row_lowers_to_css_transition_and_springs_are_named() {
         css,
         "opacity 0.25s ease-in-out 0s,all 0.5s cubic-bezier(0.4,0,0.2,1) 0s,translate 0s ease 0s"
     );
-    assert!(spring, "the spring is reported, not silently dropped");
+    assert!(spring, "the host must play the spring");
     assert_eq!(
         easing_css(&Easing::Steps {
             count: 4,
@@ -335,8 +335,7 @@ fn the_transition_row_lowers_to_css_transition_and_springs_are_named() {
     s.mask.set(exact_kernel::StyleId::Transition);
     let (css, skipped) = css_text(&s, &[]);
     assert!(css.starts_with("transition:opacity 0.25s"));
-    assert_eq!(skipped.len(), 1);
-    assert!(skipped[0].reason.contains("spring"));
+    assert!(skipped.is_empty(), "{skipped:?}");
 }
 
 #[test]
@@ -703,6 +702,35 @@ fn press_haptic_is_the_glues_property_and_a_rotation_skips_nothing() {
     assert_eq!(css, "rotate:3deg;--exact-press-haptic:impact-medium;");
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(declared(&[(StyleId::PressHaptic, text("none"))]), "");
+}
+
+/// `-exact-symbol-effect` is the custom property navigation/symbol.js plays
+/// for the three effects the web stands in for, and nothing for the rest
+/// (LLP 1077 D12).
+#[test]
+fn a_symbol_effect_is_the_stand_ins_property() {
+    use exact_kernel::StyleId;
+    for effect in ["bounce", "pulse", "scale"] {
+        let css = declared(&[(StyleId::SymbolEffect, text(effect))]);
+        assert_eq!(css, format!("--exact-symbol-effect:{effect};"));
+    }
+    for effect in ["none", "wiggle", "rotate", "replace"] {
+        assert_eq!(declared(&[(StyleId::SymbolEffect, text(effect))]), "");
+    }
+}
+
+#[test]
+fn accent_color_auto_resets_authored_spinner_accent() {
+    use exact_kernel::StyleId;
+    assert_eq!(
+        declared(&[(StyleId::AccentColor, text("auto"))]),
+        "accent-color:auto;--exact-accent:AccentColor;--exact-accent-said:var(--exact-accent-design);"
+    );
+    let authored = declared(&[(StyleId::AccentColor, text("#ff0000"))]);
+    assert_eq!(
+        authored,
+        "accent-color:rgba(255,0,0,1);--exact-accent:rgba(255,0,0,1);--exact-accent-said:rgba(255,0,0,1);"
+    );
 }
 
 /// The pressed paint is three custom properties input-glue.js reads from

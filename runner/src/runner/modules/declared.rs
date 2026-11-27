@@ -33,7 +33,8 @@
 //! Outside the agent a bound implementation takes the call, and journals
 //! its own outcome; a data-code call settles from its reply.
 
-use super::super::{DataSource, Runner};
+use super::super::provenance::Cause;
+use super::super::{CommitReceipt, DataSource, Runner, RunnerError};
 use super::{error_code, response, CallOrigin, Json, ModulesRow, Pending, Waits};
 use crate::request::{Dispatch, Outcome, Reply, Work};
 use crate::HoldAnswer;
@@ -46,6 +47,7 @@ mod app_icon;
 mod app_list;
 mod desktop;
 mod handed;
+mod notification_group;
 mod reach;
 mod region_list;
 mod update;
@@ -58,8 +60,14 @@ pub type AppState = Arc<Mutex<BTreeMap<String, Json>>>;
 
 #[derive(Default)]
 pub(in crate::runner) struct Declared {
+    /// The shortcut installations each compiled read could have made. A
+    /// native event can identify its registrar only where these agree.
+    shortcut_sites: Vec<Option<Box<desktop::Registration>>>,
+    held_shortcuts: std::collections::BTreeSet<u64>,
     /// Each keyed list, by its state name, oldest first.
     lists: BTreeMap<String, Vec<Listed>>,
+    /// Pending presentations in reverse deadline order. The oldest due entry is last.
+    shows: Vec<ListShow>,
     /// The session's values, by state name.
     values: BTreeMap<String, Json>,
     /// The app's values; a session the host shares none with keeps its own.
@@ -86,11 +94,22 @@ pub(in crate::runner) struct Declared {
 /// One entry of a keyed list.
 #[derive(Clone)]
 struct Listed {
+    /// The work that registered this session-local shortcut.
+    registered_by: Option<Cause>,
     reference: u64,
     /// The send that listed it, by its source's name in the plan.
     source: String,
     /// Its options as the call wrote them, `null` for one left out.
     fields: Map<String, Json>,
+}
+
+struct ListShow {
+    state: String,
+    at: f64,
+    reference: u64,
+    extension: String,
+    event: String,
+    args: Vec<Json>,
 }
 
 struct HeldEffect {
@@ -99,7 +118,7 @@ struct HeldEffect {
     args: Json,
     /// The permission its ticket asks: its own, or one its own requires.
     permission: String,
-    origin: CallOrigin,
+    cause: Cause,
     /// A data-code call's reply, settled when the ticket is answered.
     reply: Option<Arc<Mutex<Pending>>>,
 }
@@ -152,12 +171,12 @@ impl<D: DataSource> Runner<D> {
 
     /// Run the effects a commit stated, in order, once it stands.
     pub(super) fn run_module_effects_linked(&mut self, effects: Vec<(ModulesRow, Vec<Value>)>) {
-        let origin = self.call_origin();
+        let cause = self.cause();
         for (row, args) in effects {
             let mut args = self.args_json(&row, &args);
             self.clamp_bounds(&row, &mut args);
             self.resolve_of(&row, &mut args);
-            let _ = self.module_effect(&row, args, None, origin);
+            let _ = self.module_effect(&row, args, None, cause);
         }
     }
 
@@ -168,7 +187,7 @@ impl<D: DataSource> Runner<D> {
         row: &ModulesRow,
         args: Json,
         reply: Option<Arc<Mutex<Pending>>>,
-        origin: CallOrigin,
+        cause: Cause,
     ) -> Effect {
         let declared = self.plan.str(row.declared).to_owned();
         // The grants, origin and foreground every call is held to (LLP
@@ -181,12 +200,21 @@ impl<D: DataSource> Runner<D> {
         if let Some(refused) = self.undeclared(row, &args) {
             return Effect::Now(refused);
         }
-        if let Err(why) = self.admit(row, &args, origin) {
+        if let Err(why) = self.admit(row, &args, cause) {
             self.log(format!("{}: refused, {why}", self.key(row)));
             let message = why
                 .starts_with("person-required")
                 .then_some("person-required");
             return Effect::Now(json!({ "error": "NotAllowedError", "message": message }));
+        }
+        if self.host_target() == "android" && self.substitute(row)["list"]["androidGroups"] == true
+        {
+            if let Some(message) =
+                notification_group::invalid(&self.plan, row, &args["android"], reply.is_some())
+            {
+                self.log(format!("{declared}: refused: TypeError: {message}"));
+                return Effect::Now(json!({ "error": "TypeError", "message": message }));
+            }
         }
         if let Some(refusal) = self.effect_refusal(row, &args) {
             self.log(format!(
@@ -198,7 +226,10 @@ impl<D: DataSource> Runner<D> {
         // The implementation answers: bound as in production, or, for an
         // interface that is its own substitute, told it runs under the agent.
         if self.route(row) != super::Route::Substitute {
-            let request = self.as_origin(origin, |r| r.bound_request(row, args, None));
+            let mut request = self.as_cause(cause, |r| r.bound_request(row, args, None));
+            if row.send {
+                request.body = super::bound::with_authority(&request.body, self.module_grants());
+            }
             let lines = self.extensions.declared.lines.clone();
             let slot = self.native_slot();
             let Some(handler) = slot.extension_handler() else {
@@ -206,10 +237,9 @@ impl<D: DataSource> Runner<D> {
             };
             // A background action owns a native statement until its reply;
             // ordinary wakes keep fire-and-forget statements (LLP 1133.004 stage 2).
-            let owner = if reply.is_none() && origin == CallOrigin::Action {
-                self.invocation_id()
-            } else {
-                0
+            let owner = match reply.is_none() && self.action_owns(cause.owner()) {
+                true => cause.owner(),
+                false => 0,
             };
             let statements = self.extensions.declared.statements.clone();
             if owner != 0 {
@@ -257,7 +287,7 @@ impl<D: DataSource> Runner<D> {
                 None => Effect::Now(Json::Null),
             };
         }
-        let said = self.say_person_required(row, true, origin);
+        let said = self.say_person_required(row, true, cause);
         // The permission that settles the call: its own, or one it requires.
         let sub = self.substitute_for(row, &args);
         let permission = &sub["permission"];
@@ -281,13 +311,13 @@ impl<D: DataSource> Runner<D> {
                     .to_owned();
                 let permission = self.permission_name(row, &args);
                 let hold =
-                    self.device_hold(row, declared, Waits::Permission, origin, &permission, &args);
+                    self.device_hold(row, declared, Waits::Permission, cause, &permission, &args);
                 self.extensions.declared.held.push(HeldEffect {
                     hold,
                     source,
                     args,
                     permission,
-                    origin,
+                    cause,
                     reply,
                 });
                 Effect::Held
@@ -297,7 +327,7 @@ impl<D: DataSource> Runner<D> {
                 .map_or_else(|| self.apply_effect(row, &args), Err)
             {
                 Ok(()) => {
-                    self.effect_played(row, &args, origin);
+                    self.effect_played(row, &args, cause);
                     Effect::Now(self.effect_answer(row, &args))
                 }
                 Err(refusal) => {
@@ -349,14 +379,9 @@ impl<D: DataSource> Runner<D> {
 
     /// A data-code call of a send that answers nothing, substituted: it
     /// settles once the effect is done or refused.
-    pub(super) fn effect_call(
-        &mut self,
-        row: &ModulesRow,
-        args: Json,
-        origin: CallOrigin,
-    ) -> Dispatch {
+    pub(super) fn effect_call(&mut self, row: &ModulesRow, args: Json, cause: Cause) -> Dispatch {
         let slot = Arc::new(Mutex::new(Pending::default()));
-        if let Effect::Now(answer) = self.module_effect(row, args, Some(slot.clone()), origin) {
+        if let Effect::Now(answer) = self.module_effect(row, args, Some(slot.clone()), cause) {
             return Dispatch::Run(Work::Now(Box::new(move || response(&answer))));
         }
         Dispatch::Run(Work::Later(Box::new(move |reply| {
@@ -401,6 +426,11 @@ impl<D: DataSource> Runner<D> {
             self.apply_update(row, args)?;
         }
         if let Some(list) = sub["list"].as_object() {
+            let android_groups =
+                self.host_target() == "android" && sub["list"]["androidGroups"] == true;
+            if android_groups {
+                fields.insert("android".into(), notification_group::listed(args));
+            }
             if let Err(code) = self.listing(&extension, list, &mut fields) {
                 self.log(format!("{declared}: refused: {code}"));
                 return Err(json!({ "error": code }));
@@ -408,6 +438,10 @@ impl<D: DataSource> Runner<D> {
             let state = list["state"].as_str().unwrap_or("listed").to_owned();
             let key = list["key"].as_str().unwrap_or_default().to_owned();
             let value = fields.get(&key).cloned().unwrap_or(Json::Null);
+            // Notifications read an empty tag as no tag; other lists can name an entry "".
+            let keyed = !value.is_null()
+                && !(list.get("launch").and_then(Json::as_str) == Some("notification")
+                    && value == "");
             // A registration's kind keys it beside its key (LLP 1133.017 §10).
             let kind = list.get("kind").cloned();
             if let Some(kind) = &kind {
@@ -435,17 +469,32 @@ impl<D: DataSource> Runner<D> {
                 .plan
                 .str(self.plan.sources[row.source.0 as usize].name)
                 .to_owned();
+            let now = self.time.epoch_at_zero + self.now_ms;
+            let presentation = sub["list"]["show"]["event"].as_str().map(|event| {
+                let at = list
+                    .get("at")
+                    .and_then(Json::as_str)
+                    .and_then(|key| fields.get(key))
+                    .and_then(Json::as_f64)
+                    .unwrap_or(now);
+                fields.insert("delivered".into(), json!(at <= now));
+                (event, at)
+            });
             let entry = Listed {
+                registered_by: None,
                 reference,
                 source,
                 fields: fields.clone(),
             };
             let replaced = self.with_list(&extension, &state, |entries| {
+                if android_groups {
+                    return (notification_group::post(entries, entry), true);
+                }
                 let same = |e: &Listed| {
                     e.fields.get(&key) == Some(&value) && e.fields.get("kind") == kind.as_ref()
                 };
                 let replaced = entries.iter().find(|e| same(e)).map(|e| e.reference);
-                if !value.is_null() {
+                if keyed {
                     entries.retain(|e| !same(e));
                 }
                 entries.push(entry);
@@ -457,9 +506,41 @@ impl<D: DataSource> Runner<D> {
                 .unwrap_or_default();
             self.log(format!("{declared}: listed{named} @{reference}"));
             if kind.is_some() {
-                self.registered(reference, replaced.filter(|_| !value.is_null()));
+                self.registered(reference, replaced.filter(|_| keyed));
             }
             self.announce_listed(&state);
+            if let Some(old) = replaced.filter(|_| keyed) {
+                self.extensions
+                    .declared
+                    .shows
+                    .retain(|show| show.reference != old);
+            }
+            if let Some((event, at)) = presentation {
+                let args = keyed_args(
+                    &sub["list"],
+                    &sub["list"]["show"],
+                    Json::Object(fields.clone()),
+                );
+                if at <= now {
+                    if !self.page.hidden {
+                        self.emit_list_show(&extension, event, args);
+                    }
+                } else {
+                    let shows = &mut self.extensions.declared.shows;
+                    let index = shows.partition_point(|entry| entry.at > at);
+                    shows.insert(
+                        index,
+                        ListShow {
+                            state,
+                            at,
+                            reference,
+                            extension: extension.clone(),
+                            event: event.into(),
+                            args,
+                        },
+                    );
+                }
+            }
         }
         // `"unlist": key`, or `{"key", "kind"}` for the entries of one kind.
         let (unlist, unkind) = match &sub["unlist"] {
@@ -470,14 +551,36 @@ impl<D: DataSource> Runner<D> {
             let value = fields.get(key).cloned().unwrap_or(Json::Null);
             let lists = self.lists_of(row);
             for state in lists {
-                self.with_list(&extension, &state, |entries| {
-                    let before = entries.len();
+                let list = self.list_decl(&extension, &state);
+                if list["launch"] == "notification" && value == "" {
+                    continue;
+                }
+                let android_groups =
+                    self.host_target() == "android" && list["androidGroups"] == true;
+                let removed = self.with_list(&extension, &state, |entries| {
+                    if android_groups {
+                        let removed = notification_group::close(entries, &value);
+                        let changed = !removed.is_empty();
+                        return (removed, changed);
+                    }
+                    let mut removed = Vec::new();
                     entries.retain(|e| {
-                        e.fields.get(key) != Some(&value)
-                            || unkind.is_some_and(|k| e.fields.get("kind") != Some(k))
+                        let keep = e.fields.get(key) != Some(&value)
+                            || unkind.is_some_and(|k| e.fields.get("kind") != Some(k));
+                        if !keep {
+                            removed.push(e.reference);
+                        }
+                        keep
                     });
-                    ((), entries.len() != before)
+                    let changed = !removed.is_empty();
+                    (removed, changed)
                 });
+                for reference in removed {
+                    self.extensions
+                        .declared
+                        .shows
+                        .retain(|show| show.reference != reference);
+                }
                 self.announce_listed(&state);
             }
             self.log(format!("{declared}: unlisted"));
@@ -591,7 +694,7 @@ impl<D: DataSource> Runner<D> {
                         &row,
                         declared,
                         Waits::Permission,
-                        h.origin,
+                        h.cause,
                         &next_name,
                         &h.args,
                     );
@@ -687,6 +790,56 @@ impl<D: DataSource> Runner<D> {
         match at.and_then(|f| e.fields.get(&f).and_then(Json::as_f64)) {
             Some(t) => t <= now,
             None => true,
+        }
+    }
+
+    pub(super) fn next_list_show(&self) -> Option<f64> {
+        // A queued handler can start a request before the clock reaches the next deadline.
+        if self.has_module_event()
+            && (!self.extensions.declared.shows.is_empty() || self.has_queued_presentation())
+        {
+            return Some(self.now_ms);
+        }
+        self.extensions
+            .declared
+            .shows
+            .last()
+            .map(|show| show.at - self.time.epoch_at_zero)
+    }
+
+    pub(super) fn show_listed(&mut self) -> Result<Option<CommitReceipt>, RunnerError> {
+        // Earlier raised events have the first commits. The clock can stop on each one's request.
+        if !self.has_module_event() {
+            if let Some(show) = self.extensions.declared.shows.pop() {
+                let android_groups = self.host_target() == "android"
+                    && self.list_decl(&show.extension, &show.state)["androidGroups"] == true;
+                let listed = self.with_list(&show.extension, &show.state, |entries| {
+                    let Some(i) = entries
+                        .iter()
+                        .position(|entry| entry.reference == show.reference)
+                    else {
+                        return (false, false);
+                    };
+                    entries[i].fields.insert("delivered".into(), json!(true));
+                    if android_groups {
+                        let due = entries.remove(i);
+                        notification_group::post(entries, due);
+                    }
+                    (true, true)
+                });
+                if listed && !self.page.hidden {
+                    self.emit_list_show(&show.extension, &show.event, show.args);
+                }
+            }
+        }
+        self.hear_module_event()
+    }
+
+    fn emit_list_show(&mut self, extension: &str, event: &str, args: Vec<Json>) {
+        if let Err(why) =
+            self.queue_module_event(extension, event, args, CallOrigin::Device, true, None)
+        {
+            self.log(why);
         }
     }
 
@@ -794,7 +947,7 @@ impl<D: DataSource> Runner<D> {
         let row = self.module_row(&entry.source);
         if self.substitute(&row)["list"]["tap"]["keep"] == true {
             let entry = entry.clone();
-            return self.tap_registration(&row, &entry);
+            return self.tap_registration(&row, &entry, choice);
         }
         if self.substitute(&row)["list"]["tap"]["as"] == "wake" {
             return self.tap_wake(&state, at);
@@ -804,16 +957,25 @@ impl<D: DataSource> Runner<D> {
         {
             return self.tap_action(&row, &state, at, choice);
         }
-        let entry = self
+        let entry = self.take_tapped(&row, &state, at);
+        self.log(format!("{state} @{reference}: tapped"));
+        self.activate_entry(&row, &Json::Object(entry.fields), reference, None)
+    }
+
+    fn take_tapped(&mut self, row: &ModulesRow, state: &str, at: usize) -> Listed {
+        let android_groups = self.host_target() == "android"
+            && self.substitute(row)["list"]["androidGroups"] == true;
+        let entries = self
             .extensions
             .declared
             .lists
-            .get_mut(&state)
-            .expect("found above")
-            .remove(at);
-        let row = self.module_row(&entry.source);
-        self.log(format!("{state} @{reference}: tapped"));
-        self.activate_entry(&row, &Json::Object(entry.fields), reference)
+            .get_mut(state)
+            .expect("found above");
+        if android_groups {
+            notification_group::take(entries, at, None)
+        } else {
+            entries.remove(at)
+        }
     }
 
     /// `tap @ref <action>[=<reply>]` on an entry that shows actions (LLP
@@ -855,20 +1017,13 @@ impl<D: DataSource> Runner<D> {
             (false, Some(_)) => return Err(format!("@{reference}: `{name}` takes no typed reply")),
         };
         let foreground = action["foreground"] != false;
-        let mut fields = self
-            .extensions
-            .declared
-            .lists
-            .get_mut(state)
-            .expect("found above")
-            .remove(at)
-            .fields;
+        let mut fields = self.take_tapped(row, state, at).fields;
         fields.remove("navigate");
         fields.insert("action".into(), json!(name));
         fields.insert("reply".into(), reply);
         self.log(format!("{state} @{reference}: {name} chosen"));
         if foreground {
-            return self.activate_entry(row, &Json::Object(fields), reference);
+            return self.activate_entry(row, &Json::Object(fields), reference, None);
         }
         let Some(event) = tap["event"].as_str() else {
             return Err(format!("@{reference}: its list raises no event"));
@@ -913,7 +1068,7 @@ impl<D: DataSource> Runner<D> {
             ));
         };
         self.log(format!("launch --{launch}"));
-        self.activate_entry(&row, &entry, 0)
+        self.activate_entry(&row, &entry, 0, None)
     }
 
     /// An entry's click: its `navigate` field opened, else its event raised.
@@ -922,6 +1077,7 @@ impl<D: DataSource> Runner<D> {
         row: &ModulesRow,
         entry: &Json,
         reference: u64,
+        registered_by: Option<Cause>,
     ) -> Result<String, String> {
         let tap = self.substitute(row)["list"]["tap"].clone();
         if let Some(location) = (tap["navigate"].as_str())
@@ -936,24 +1092,28 @@ impl<D: DataSource> Runner<D> {
         let Some(event) = tap["event"].as_str() else {
             return Ok(json!({ "ref": reference, "delivery": "substituted" }).to_string());
         };
-        // In every keyed list, an entry posted without its key is tapped
-        // with "" for it (the Notifications API's untagged `tag`).
-        let mut entry = entry.clone();
-        if let Some(key) = self.substitute(row)["list"]["key"].as_str() {
-            if entry.is_object() && entry.get(key).is_none_or(Json::is_null) {
-                entry[key] = json!("");
-            }
-        }
-        let args = entry_args(&tap, &entry);
+        let args = keyed_args(&self.substitute(row)["list"], &tap, entry.clone());
         let extension = self.plan.str(row.extension).to_owned();
-        self.raise_module_event(
+        self.queue_module_event(
             &extension,
             event,
-            &Json::Array(args).to_string(),
+            args,
             CallOrigin::App,
+            false,
+            registered_by,
         )?;
         Ok(json!({ "ref": reference, "event": event, "delivery": "substituted" }).to_string())
     }
+}
+
+/// A presentation or tap carries the empty string for an untagged post.
+fn keyed_args(list: &Json, event: &Json, mut entry: Json) -> Vec<Json> {
+    if let Some(key) = list["key"].as_str() {
+        if entry.is_object() && entry.get(key).is_none_or(Json::is_null) {
+            entry[key] = json!("");
+        }
+    }
+    entry_args(event, &entry)
 }
 
 /// The event's arguments a listed entry's tap declares: each a field of the

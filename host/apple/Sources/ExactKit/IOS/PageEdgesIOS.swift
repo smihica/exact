@@ -51,15 +51,14 @@ extension Presenter {
         #else
         if #unavailable(iOS 26.0) { judge = nil }
         #endif
-        var bars: [(bar: NodeView, scroller: NodeView, edge: UIRectEdge)] = []
+        var bars: [(bar: NodeView, scroller: NodeView, over: NodeView, edge: UIRectEdge)] = []
         var routes: [ObjectIdentifier: (top: UIScrollView?, bottom: UIScrollView?)] = [:]
         for id in scrollers {
             guard let v = views[id] else { continue }
-            var found = Bands(), own = UIEdgeInsets.zero
+            var found = Bands(), own = UIEdgeInsets.zero, sides = UIEdgeInsets.zero
             if let sv = v.scrollView, (sv as? ScrollView)?.scrollsY ?? true, v.window != nil {
-                let edgeEffect = v.style["scroll_edge_effect"]?.string != "none"
                 if let route = ViewPresentation.controllers(for: v, layout: true).lazy.compactMap({ $0 as? any RouteSurface }).first(where: { $0.hosting === navigation && v.isDescendant(of: $0.node) }) {
-                    if let judge, edgeEffect { found = routeBands(of: v, sv, in: route, judge) }
+                    if let judge { found = routeBands(of: v, sv, in: route, judge) }
                     #if os(iOS)
                     if route.edgeScroll === v, let top = keyboardTop,
                        abs(route.node.convert(route.node.bounds, to: nil).maxY - top) < 1 {
@@ -76,10 +75,12 @@ extension Presenter {
                     if !found.top.isEmpty || found.band.top > 0.5, navigation.automaticContentScroller(of: route) === v { r.top = sv }
                     if !found.bottom.isEmpty || found.band.bottom > 0.5 { r.bottom = sv }
                     routes[ObjectIdentifier(route)] = r
-                } else { found = pageBands(of: v, sv, margins: m, area: area, edgeEffect ? judge : nil); own = found.band }
+                    sides = sideReach(of: v, in: route.node)
+                } else { found = pageBands(of: v, sv, margins: m, area: area, judge); own = found.band }
             }
             if v.pageBand != found.band || v.bandInset != own { v.setPageBand(found.band, inset: own) }
-            bars += found.top.map { ($0, v, .top) } + found.bottom.map { ($0, v, .bottom) }
+            v.setSideReach(sides)
+            bars += found.topLifts.map { ($0.bar, v, $0.over, .top) } + found.bottomLifts.map { ($0.bar, v, $0.over, .bottom) }
         }
         #if os(iOS)
         // The bar's and the bottom bar's own edge effects follow a banded scroller (D2).
@@ -91,9 +92,15 @@ extension Presenter {
         ControlBars.sync(bars, in: self)
     }
 
-    /// A scroller's bands, and the control bars it is drawn through on each edge.
-    package struct Bands { package var band = UIEdgeInsets.zero, top: [NodeView] = [], bottom: [NodeView] = []
-        package init(band: UIEdgeInsets = .zero, top: [NodeView] = [], bottom: [NodeView] = []) { (self.band, self.top, self.bottom) = (band, top, bottom) }
+    /// A scroller's bands, and the control bars it is drawn through on each
+    /// edge, each with the sibling it is lifted over (`ControlBars.lifts`).
+    package struct Bands {
+        package var band = UIEdgeInsets.zero
+        var topLifts: [ControlBars.Lift] = [], bottomLifts: [ControlBars.Lift] = []
+        package var top: [NodeView] { topLifts.map(\.bar) }
+        package var bottom: [NodeView] { bottomLifts.map(\.bar) }
+        package init(band: UIEdgeInsets = .zero) { self.band = band }
+        init(band: UIEdgeInsets, top: [ControlBars.Lift], bottom: [ControlBars.Lift]) { (self.band, topLifts, bottomLifts) = (band, top, bottom) }
     }
 
     /// A page's scroller, laid out in the document with nothing between them
@@ -104,26 +111,35 @@ extension Presenter {
     /// reaches the area's edge and the margin, provided the other edge is
     /// banded or open too.
     private func pageBands(of v: NodeView, _ sv: UIScrollView, margins m: UIEdgeInsets, area: CGSize, _ judge: ControlBars?) -> Bands {
-        var at: UIView? = v, page: NodeView?
-        while let c = at, c !== root {
+        var page: NodeView?
+        guard Self.climb(from: v, to: root, { c, node in
             // The scroller's own clip gives way to its band where its scroll view holds what it draws (`clipsItself`)
             let clips = c === v ? c.clipsToBounds && !v.scrollHoldsContent : c.clipsToBounds || c is UIScrollView
-            if c.isHidden || !c.transform.isIdentity || clips { return Bands() }
-            if let n = c as? NodeView, c.superview === root { page = n }
-            at = c.superview
-        }
-        guard at === root, !root.clipsToBounds, let page else { return Bands() }
+            page = node
+            return !c.isHidden && c.transform.isIdentity && !clips
+        }), !root.clipsToBounds, let page else { return Bands() }
         let r = v.convert(v.bounds, to: root), fits = root.bounds.height <= area.height + 0.5
         let atTop = r.minY <= 0.5, atFoot = r.maxY >= area.height - 0.5 && fits
         let margins = Bands(band: UIEdgeInsets(top: atTop ? m.top : 0, left: 0, bottom: atFoot ? m.bottom : 0, right: 0))
-        guard let judge else { return margins }
-        guard let top = atTop ? [] : judge.bars(of: v, in: page, top: true), let bottom = atFoot ? [] : judge.bars(of: v, in: page, top: false),
+        // Bands only with both edges' effects shown: a hidden edge is neither banded nor open, at the area's edge too (LLP 1131 D2)
+        guard let judge, !v.edgeEffectHidden(.top), !v.edgeEffectHidden(.bottom) else { return margins }
+        guard let top = atTop ? [] : judge.lifts(of: v, in: page, top: true), let bottom = atFoot ? [] : judge.lifts(of: v, in: page, top: false),
               !top.isEmpty || !bottom.isEmpty, page.frame.minY <= 0.5, page.frame.maxY >= area.height - 0.5, fits,
-              Self.over(top, v), Self.over(bottom, v) else { return margins }
+              Self.over(top), Self.over(bottom) else { return margins }
         // Both edges reach the page's: an open one through the root's padding too (D2).
         let band = UIEdgeInsets(top: max(0, r.minY) + m.top, left: 0, bottom: max(0, area.height - r.maxY) + m.bottom, right: 0)
         guard Self.drawn(band, v, sv) else { return margins }
         return Bands(band: band, top: top, bottom: bottom)
+    }
+
+    /// Visits `v` and the views above it, below `top`, innermost first, while `visit` answers true; whether it came to `top`.
+    static func climb(from v: UIView, to top: UIView, _ visit: (UIView, NodeView?) -> Bool) -> Bool {
+        var at: UIView? = v
+        while let c = at, c !== top {
+            guard visit(c, c as? NodeView) else { return false }
+            at = c.superview
+        }
+        return at === top
     }
 
     /// A route's scroller (LLP 1131 D2): with its top banded or open, an edge
@@ -131,14 +147,20 @@ extension Presenter {
     /// reaches the route's edge, the covers included, when either edge has
     /// bars or the open top is under the bar (`controlBands`); an edge the
     /// bar's collapse or the bottom edge already took is there already, so
-    /// the collapse scroller is judged as its title's riders are. None under
-    /// a large title unless the eligible top bars ride its safe area.
+    /// the collapse scroller is judged as its title's riders are. Under a
+    /// large title whose eligible top bars do not ride its safe area, the top
+    /// keeps its place, as a hand-built table's under a fixed header does, and
+    /// an open foot is still reached (`openFoot`), as it takes no part in the
+    /// title. None is reached while riders leave the route a top cover.
     private func routeBands(of v: NodeView, _ sv: UIScrollView, in c: any RouteSurface, _ judge: ControlBars) -> Bands {
+        let apart = c.collapseScroll !== v
         #if os(iOS)
-        if let nav = c.navigationController, navigation.routeShowsBar(c, in: nav), c.navigationItem.largeTitleDisplayMode == .always, c.ridingBars.isEmpty { return Bands() }
+        if let nav = c.navigationController, navigation.routeShowsBar(c, in: nav), c.navigationItem.largeTitleDisplayMode == .always, c.ridingBars.isEmpty {
+            return openFoot(of: v, sv, in: c.node, judge, apart: apart) ?? Bands()
+        }
         #endif
         if !c.ridingBars.isEmpty, case .edges(let edges)? = navigation.covers[c.node.id], edges.top > 0.5 { return Bands() }
-        return controlBands(of: v, in: c.node, judge, apart: c.collapseScroll !== v)
+        return controlBands(of: v, in: c.node, judge, apart: apart)
     }
 
     /// Collapse adoption and banding must agree about both edges and paint
@@ -148,37 +170,42 @@ extension Presenter {
     /// bars or the bar, as a hand-built table runs under its navigation bar
     /// whatever is pinned under it; an open top under the route's cover (the
     /// bar) is reached with no bars at all, as a thread in a box with its
-    /// floating button is. An open foot over the route's bottom cover (a tab
-    /// bar, kept under `viewport-fit=cover`, where `reachBottom` gives UIKit no
-    /// scroller) is reached with no bars too, as a hand-built table runs under
-    /// its tab bar (#223). A top with more than bars over the scroller keeps
+    /// floating button is. A separate scroller with an open foot over the route's
+    /// bottom cover draws under the tab bar the same way (#223).
+    /// A top with more than bars over the scroller keeps
     /// both edges where they are (a footer under it keeps the bottom cover).
     package func controlBands(of v: NodeView, in route: NodeView, _ judge: ControlBars, apart: Bool = false) -> Bands {
         guard let sv = v.scrollView else { return Bands() }
         let r = v.convert(v.bounds, to: route)
-        let top = judge.bars(of: v, in: route, top: true), bottom = judge.bars(of: v, in: route, top: false)
-        // More than bars over the scroller keeps its top where it is; an open
-        // foot over the route's bottom cover (a tab bar), apart from a title's
-        // collapse, still reaches it, as a hand-built table under a fixed
-        // header runs under its tab bar. Bars under it keep both edges.
-        if top == nil, apart, bottom?.isEmpty == true, case .edges(let e)? = navigation.covers[route.id],
-           e.bottom > 0.5, route.bounds.height - r.maxY > 0.5 {
-            let band = UIEdgeInsets(top: 0, left: 0, bottom: route.bounds.height - r.maxY, right: 0)
-            return Self.drawn(band, v, sv) ? Bands(band: band) : Bands()
-        }
+        let top = judge.lifts(of: v, in: route, top: true), bottom = judge.lifts(of: v, in: route, top: false)
+        // More than bars over the scroller keeps its top where it is; an open foot still reaches the route's bottom
+        if top == nil, let foot = openFoot(of: v, sv, in: route, judge, apart: apart) { return foot }
         guard let top, apart || bottom != nil else { return Bands() }
         let underBar = apart && top.isEmpty && r.minY > 0.5
         var overCover = false
         if apart, bottom?.isEmpty == true, case .edges(let e)? = navigation.covers[route.id] { overCover = e.bottom > 0.5 && route.bounds.height - r.maxY > 0.5 }
         guard !top.isEmpty || bottom?.isEmpty == false || underBar || overCover,
-              Self.over(top, v), Self.over(bottom ?? [], v) else { return Bands() }
+              Self.over(top), Self.over(bottom ?? []) else { return Bands() }
         let band = UIEdgeInsets(top: max(0, r.minY), left: 0, bottom: bottom == nil ? 0 : max(0, route.bounds.height - r.maxY), right: 0)
         return Self.drawn(band, v, sv) ? Bands(band: band, top: top, bottom: bottom ?? []) : Bands()
     }
 
-    /// A bar the author ranks under the scroller (a `z-index`) cannot be over it (D3).
-    private static func over(_ bars: [NodeView], _ v: NodeView) -> Bool {
-        bars.allSatisfy { $0.paintRank >= v.paintRank || !$0.wrote("z_index") && !v.wrote("z_index") }
+    /// The band at a scroller's open foot over its route's bottom cover, apart from a title's collapse
+    /// (`apart`), as a hand-built table below a fixed header runs under its tab bar (#223).
+    private func openFoot(of v: NodeView, _ sv: UIScrollView, in route: NodeView, _ judge: ControlBars, apart: Bool) -> Bands? {
+        let r = v.convert(v.bounds, to: route)
+        guard apart, judge.lifts(of: v, in: route, top: false)?.isEmpty == true, case .edges(let e)? = navigation.covers[route.id],
+              e.bottom > 0.5, route.bounds.height - r.maxY > 0.5 else { return nil }
+        let band = UIEdgeInsets(top: 0, left: 0, bottom: route.bounds.height - r.maxY, right: 0)
+        return Self.drawn(band, v, sv) ? Bands(band: band) : Bands()
+    }
+
+    /// A bar ranked under the sibling it is lifted over by a nonzero `z-index`
+    /// written on either cannot be over it (D3). A scroller inside that sibling
+    /// is ranked only among its own siblings.
+    private static func over(_ lifts: [ControlBars.Lift]) -> Bool {
+        let orders = { (n: NodeView) in n.wrote("z_index") && (n.style["z_index"]?.number ?? 0) != 0 }
+        return lifts.allSatisfy { $0.bar.paintRank >= $0.over.paintRank || !orders($0.bar) && !orders($0.over) }
     }
 
     /// A virtualized list draws rows a port past its own (D5): a longer band is not taken. Its port is its box, past it
@@ -186,7 +213,7 @@ extension Presenter {
     /// (`ListHosting.drawnThrough`).
     private static func drawn(_ band: UIEdgeInsets, _ v: NodeView, _ sv: UIScrollView) -> Bool {
         guard let lists = v.presenter?.collections, lists.owns(v.id) else { return true }
-        let i = sv.adjustedContentInset, o = v.reach == .zero ? .zero : v.scrollOutset
+        let i = sv.adjustedContentInset, o = v.reachesDown ? v.scrollOutset : .zero
         let through = lists.drawnThrough(v.id) ?? v.scrollDrawnThrough(sv)
         let port = v.bounds.height + o.top + o.bottom - (i.top - through.top) - (i.bottom - through.bottom)
         return band.top <= port + 0.5 && band.bottom <= port + 0.5
@@ -208,22 +235,32 @@ extension NodeView {
     /// the content back where layout put it, and clamps the offset to the range they make; so
     /// activation applies reach first and the writer after it, as reach grows and as it shrinks.
     package func setReach(_ reach: UIEdgeInsets) {
+        guard scrollView != nil else { reachBox(reach); return }
         let changed = !reachGiven || reach != self.reach
+        setSideReach(.zero) // the kernel's takes its place
         if !reachGiven { more.reachGiven = true }
         // The scroller's frame and offset move as one: inside an animation UIKit has open, only if the last frame showed it
         moveOrPlace { reachScroll(reach) }
         // A grouped list's geometry, its cards' margins and side safe area among it, follows a new answer now, not at its next batch
         if changed, groupedOwner { presenter?.groupedLists?.geometryChanged(id) }
     }
-    private func reachScroll(_ reach: UIEdgeInsets) {
+    /// The scroll view's move, its `contentInset` with it where that holds the reach (`sideInset`).
+    func reachScroll(_ reach: UIEdgeInsets) {
         guard let sv = scrollView, reach != self.reach else { return }
-        let top = sv.contentOffset.y + scrollTopInset(sv), left = sv.contentOffset.x + scrollLeftInset(sv), height = sv.bounds.height
+        let top = sv.contentOffset.y + scrollTopInset(sv), left = sv.contentOffset.x + scrollLeftInset(sv), height = sv.bounds.height, held = sideInset
         let mark = presenter?.collections.portMark(id)
         defer { if let mark { presenter?.collections.portMoved(id, since: mark) } }
         more.reach = reach
+        if sideInset != held {
+            let moved = sideInset.less(held)
+            sv.contentInset = sv.contentInset.adding(moved)
+            // The horizontal indicator's track keeps inside them, and the vertical indicator takes no side (D14)
+            sv.horizontalScrollIndicatorInsets = sv.horizontalScrollIndicatorInsets.adding(moved)
+        }
         // A layout transition's surface that took the clip over keeps it until it ends (`endSurface`)
         if surface?.clippedSelf != true, clipsToBounds != clipsItself { clipsToBounds = clipsItself }
         sv.frame = scrollFrame
+        syncScrollCorner()
         // A list that keeps its end judges it, for the writer next, as it did before reach moved the frame
         (sv as? ScrollView)?.boundsGrew(by: sv.bounds.height - height)
         fitScroll()
@@ -246,11 +283,17 @@ extension NodeView {
         // A layout transition's surface that took the clip over keeps it until it ends (`endSurface`)
         if surface?.clippedSelf != true, clipsToBounds != clipsItself { clipsToBounds = clipsItself }
         sv.frame = scrollFrame
+        syncScrollCorner()
         var inset = sv.contentInset, bars = sv.verticalScrollIndicatorInsets
         inset.top += own.top - oldOwn.top; inset.bottom += own.bottom - oldOwn.bottom
         bars.top += own.top - oldOwn.top; bars.bottom += own.bottom - oldOwn.bottom
         sv.contentInset = inset
         sv.verticalScrollIndicatorInsets = bars
+        // UIKit's indicator adjustment would add its own top and bottom to the band; the scroll view adds its safe area
+        // instead while it is off (`SafeIndicatorTerm`)
+        if let scroll = sv as? any SafeIndicators, scroll.automaticallyAdjustsScrollIndicatorInsets != (own == .zero) {
+            scroll.automaticallyAdjustsScrollIndicatorInsets = own == .zero
+        }
         fitScroll()
         if atEnd { sv.layoutIfNeeded() }
         sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: atEnd ? end() : top - scrollTopInset(sv)), in: sv, clamped: !sv.isTracking && !sv.isDragging && !sv.isDecelerating)

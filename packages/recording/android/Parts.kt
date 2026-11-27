@@ -28,8 +28,26 @@ private val PROCESS = java.util.UUID.randomUUID().toString()
 /** Held while a writer claims a path and while recovery reads and converts one, so neither sees the other half done. */
 private val LEDGER = Any()
 
+/** A press can expire while the codec or muxer starts. Publish its open file only while it is still admitted. */
+internal fun <T> openRecordingFile(file: File, admit: (() -> Unit)?, open: (File) -> T, close: (T) -> Unit): T {
+    if (admit == null) { file.delete(); return open(file) }
+    val pending = File.createTempFile(".recording-", ".tmp", file.parentFile)
+    try {
+        val output = open(pending)
+        try {
+            admit()
+            java.nio.file.Files.move(pending.toPath(), file.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            return output
+        } catch (e: Exception) {
+            close(output)
+            throw e
+        }
+    } finally { pending.delete() }
+}
+
 /** The ADTS stream of one take ([Encoder]'s writer under the line). On the recorder's thread. */
-internal class PartWriter(app: Context, val file: File) {
+internal class PartWriter(app: Context, val file: File, admit: (() -> Unit)? = null) {
     val part = File(file.path + ".part")
     private val ledger = ledger(app)
     private val out: FileOutputStream
@@ -39,9 +57,8 @@ internal class PartWriter(app: Context, val file: File) {
     init {
         file.parentFile?.mkdirs()
         synchronized(LEDGER) {
-            part.delete()
+            out = openRecordingFile(part, admit, ::FileOutputStream, FileOutputStream::close)
             ledger.edit().putString(file.path, PROCESS).commit()
-            out = FileOutputStream(part)
         }
     }
 
@@ -73,16 +90,38 @@ internal class PartWriter(app: Context, val file: File) {
     /** The take ended: its frames made an MP4 at `<path>`, the part deleted. */
     fun finish() {
         out.close()
-        mux(part, file)
-        ledger.edit().remove(file.path).commit()
+        val ok = mux(part, file)
+        if (ok || !part.exists()) ledger.edit().remove(file.path).commit()
+        if (!ok) throw java.io.IOException("the take could not be muxed to ${file.path}")
     }
 
     /** The take failed before [finish]: the part stays in the ledger for a later process to recover. */
     fun close() = out.close()
 }
 
+/** Muxer operations [mux] drives, so tests can inject write, stop and release failures. */
+internal interface SampleMuxer {
+    fun addTrack(format: MediaFormat): Int
+    fun start()
+    fun writeSampleData(trackIndex: Int, byteBuf: ByteBuffer, bufferInfo: MediaCodec.BufferInfo)
+    fun stop()
+    fun release()
+}
+
+private fun mp4Muxer(path: String): SampleMuxer {
+    val muxer = MediaMuxer(path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    return object : SampleMuxer {
+        override fun addTrack(format: MediaFormat) = muxer.addTrack(format)
+        override fun start() = muxer.start()
+        override fun writeSampleData(trackIndex: Int, byteBuf: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) =
+            muxer.writeSampleData(trackIndex, byteBuf, bufferInfo)
+        override fun stop() = muxer.stop()
+        override fun release() = muxer.release()
+    }
+}
+
 /** Make [part]'s ADTS frames the MP4 [file], through `<file>.mp4.tmp`; a part with no whole frame makes none. */
-internal fun mux(part: File, file: File): Boolean {
+internal fun mux(part: File, file: File, openMuxer: (String) -> SampleMuxer = ::mp4Muxer): Boolean {
     val bytes = part.readBytes()
     val frames = ArrayList<IntArray>()
     var at = 0
@@ -107,21 +146,34 @@ internal fun mux(part: File, file: File): Boolean {
     format.setByteBuffer("csd-0", csd)
     val tmp = File(file.path + ".mp4.tmp")
     tmp.delete()
-    val muxer = MediaMuxer(tmp.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    val muxer = openMuxer(tmp.path)
+    var muxed = false
     try {
         val track = muxer.addTrack(format)
         muxer.start()
         val info = MediaCodec.BufferInfo()
+        // The whole array, each frame at its offset: the muxer reads a heap buffer from its array's start plus the
+        // info's offset, and not from a slice's own offset.
+        val all = ByteBuffer.wrap(bytes)
         frames.forEachIndexed { i, (start, size) ->
             // 1,024 samples a frame (AAC-LC): the times are rebuilt from the count.
-            info.set(0, size, i * 1024L * 1_000_000L / rate, MediaCodec.BUFFER_FLAG_KEY_FRAME)
-            muxer.writeSampleData(track, ByteBuffer.wrap(bytes, start, size).slice(), info)
+            info.set(start, size, i * 1024L * 1_000_000L / rate, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+            muxer.writeSampleData(track, all, info)
         }
         muxer.stop()
+        muxed = true
     } finally {
-        muxer.release()
+        try {
+            // A muxer that was not stopped stops as it is released, which can fail too: the first failure is the answer.
+            try { muxer.release() } catch (e: IllegalStateException) {}
+        } finally {
+            if (!muxed) tmp.delete()
+        }
     }
-    if (!tmp.renameTo(file)) return false
+    if (!tmp.renameTo(file)) {
+        tmp.delete()
+        return false
+    }
     part.delete()
     return true
 }

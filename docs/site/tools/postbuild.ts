@@ -1,32 +1,16 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { sections } from '../constants/navigation.ts';
-import { redirects } from '../constants/redirects.ts';
+import { nonPageRules, redirects } from '../constants/redirects.ts';
 import { site } from '../constants/site.ts';
+import { bySection } from './page-lists.ts';
 
 const SITE = resolve(import.meta.dir, '..');
 const DIST = resolve(SITE, process.argv[2] ?? 'dist');
 const ORIGIN = site.origin;
 
-type Page = { path: string; route: string; title: string; description: string; source: string; section: string; updated: string };
+type Page = { path: string; route: string; title: string; description: string; source: string; section: string; updated: string; breadcrumbs: { name: string; path: string }[] };
 const pages: Page[] = JSON.parse(readFileSync(join(SITE, 'content/pages.json'), 'utf8'));
 if (!existsSync(join(DIST, 'routes.json'))) throw new Error(`${DIST} has no routes.json: run web-build first`);
-
-const hidden = sections.flatMap(s => s.pages).filter(p => p.hidden);
-const isHidden = (pattern: string) => hidden.some(h => pattern === h.path || pattern.startsWith(`${h.path}/`));
-const table = JSON.parse(readFileSync(join(DIST, 'routes.json'), 'utf8'));
-table.routes = table.routes.filter((r: { pattern: string }) => !isHidden(r.pattern));
-writeFileSync(join(DIST, 'routes.json'), `${JSON.stringify(table, null, 2)}\n`);
-for (const h of hidden) {
-  rmSync(join(DIST, h.path.slice(1)), { recursive: true, force: true });
-  rmSync(join(DIST, 'assets/markdown', `${h.route}.md`), { force: true });
-  for (const chunk of readdirSync(DIST).filter(f => new RegExp(`^${h.route}-[\\w-]{8}\\.js$`).test(f))) {
-    rmSync(join(DIST, chunk));
-    // Its row in the table of files named by content goes too (LLP 1153.004).
-    delete table.files?.[chunk];
-  }
-}
-writeFileSync(join(DIST, 'routes.json'), `${JSON.stringify(table, null, 2)}\n`);
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const withSlash = (p: string) => (p === '/' ? p : `${p}/`);
@@ -37,6 +21,8 @@ const rules = [
   ...Object.entries(redirects).flatMap(([from, to]) => [`${from} ${to} 301`, `${withSlash(from)} ${to} 301`]),
   '# A page reached with a trailing slash goes to its path: the router matches no route that ends in "/".',
   ...pages.filter(p => p.path !== '/').map(p => `${withSlash(p.path)} ${p.path} 301`),
+  '# The paths that are not pages.',
+  ...nonPageRules.map(({ from, to, status }) => `${from} ${to} ${status}`),
 ];
 writeFileSync(join(DIST, '_redirects'), `${rules.join('\n')}\n`);
 
@@ -92,9 +78,17 @@ const BASE = '<base href="/">';
 const PREPAINT = `${BASE}<script>try{let g=k=>JSON.parse(localStorage.getItem("exact.state."+k)),t=g("theme"),e=document.documentElement;if(t=="light"||t=="dark")e.style.colorScheme=t;if(g("sidebar")===false)e.dataset.sidebar="hidden"}catch{}</script><style>[data-sidebar=hidden] #exact-root:not([data-boot-ms]) [data-testid=sidebar-shown]{width:0!important;visibility:hidden}[data-sidebar=hidden] #exact-root:not([data-boot-ms]) [data-testid=sidebar-rail]{width:calc(48px - clamp(0px,(960px - 100vw)*1000,48px))!important}</style>`;
 
 const json = (value: unknown) => JSON.stringify(value).replace(/</g, '\\u003c');
+const EXPO = {
+  '@type': 'Organization',
+  '@id': 'https://expo.dev/#organization',
+  name: 'Expo',
+  url: 'https://expo.dev',
+  logo: { '@type': 'ImageObject', url: 'https://docs.expo.dev/static/images/expo-logo.svg' },
+};
+const byExpo = { '@id': EXPO['@id'] };
 function structuredData(p: Page): object {
   const url = ORIGIN ? { url: ORIGIN + p.path } : {};
-  if (p.path === '/') return { '@context': 'https://schema.org', '@type': 'WebSite', name: site.name, description: site.description, inLanguage: 'en', ...url };
+  if (p.path === '/') return { '@context': 'https://schema.org', '@graph': [{ '@type': 'WebSite', name: site.name, description: site.description, inLanguage: 'en', publisher: byExpo, ...url }, EXPO] };
   const article = {
     '@type': 'TechArticle',
     headline: p.title,
@@ -102,21 +96,30 @@ function structuredData(p: Page): object {
     inLanguage: 'en',
     ...(p.updated ? { dateModified: p.updated } : {}),
     ...(p.section ? { articleSection: p.section } : {}),
+    ...(ORIGIN ? { image: ORIGIN + site.shareImage } : {}),
+    author: byExpo,
+    publisher: byExpo,
     isPartOf: { '@type': 'WebSite', name: site.name, ...(ORIGIN ? { url: `${ORIGIN}/` } : {}) },
     ...url,
   };
-  if (!ORIGIN) return { '@context': 'https://schema.org', ...article };
+  if (!ORIGIN || !p.breadcrumbs.length) return { '@context': 'https://schema.org', '@graph': [article, EXPO] };
   const breadcrumb = {
     '@type': 'BreadcrumbList',
-    itemListElement: [
-      { '@type': 'ListItem', position: 1, name: site.name, item: `${ORIGIN}/` },
-      { '@type': 'ListItem', position: 2, name: p.title, item: ORIGIN + p.path },
-    ],
+    itemListElement: [...p.breadcrumbs, { name: p.title, path: p.path }].map(({ name, path }, i) => ({ '@type': 'ListItem', position: i + 1, name, item: ORIGIN + path })),
   };
-  return { '@context': 'https://schema.org', '@graph': [article, breadcrumb] };
+  return { '@context': 'https://schema.org', '@graph': [article, breadcrumb, EXPO] };
 }
 const headFor = (p: Page | undefined) =>
-  p ? `${ORIGIN ? `<link rel="canonical" href="${esc(ORIGIN + p.path)}">` : ''}<link rel="alternate" type="text/markdown" href="${esc(ORIGIN + (p.path === '/' ? '/index' : p.path))}.md"><meta property="og:locale" content="${site.locale}"><script type="application/ld+json">${json(structuredData(p))}</script>` : '';
+  p ? `${ORIGIN ? `<link rel="canonical" href="${esc(ORIGIN + p.path)}">` : ''}<link rel="alternate" type="text/markdown" href="${esc(ORIGIN + (p.path === '/' ? '/index' : p.path))}.md"><link rel="llms-txt" href="/llms.txt"><meta property="og:locale" content="${site.locale}"><meta name="twitter:site" content="${site.twitterSite}"><script type="application/ld+json">${json(structuredData(p))}</script>` : '';
+
+const SHARED_TITLE_TAGS = [/<meta property="og:title" content="[^"]*">/, /<meta name="twitter:title" content="[^"]*">/];
+function withSharedTitles(html: string, p: Page | undefined): string {
+  if (!p) return html;
+  return SHARED_TITLE_TAGS.reduce((text, tag) => {
+    if (!tag.test(text)) throw new Error(`postbuild: ${p.path} has no tag matching ${tag.source}`);
+    return text.replace(tag, found => found.replace(/content="[^"]*"/, () => `content="${esc(p.title)}"`));
+  }, html);
+}
 
 const byFile = new Map(pages.map(p => [htmlOf(p.path), p]));
 let prepainted = 0;
@@ -124,7 +127,7 @@ for (const f of readdirSync(DIST, { recursive: true, encoding: 'utf8' }).filter(
   const text = readFileSync(join(DIST, f), 'utf8');
   if (!text.includes(BASE) || text.includes(PREPAINT)) continue;
   const page = byFile.get(f.split('\\').join('/'));
-  writeFileSync(join(DIST, f), text.replace(/<link rel="icon" href="[^"]*">/, FAVICON).replace(BASE, PREPAINT + headFor(page)));
+  writeFileSync(join(DIST, f), withSharedTitles(text, page).replace(/<link rel="icon" href="[^"]*">/, FAVICON).replace(BASE, PREPAINT + headFor(page)));
   prepainted++;
 }
 
@@ -147,32 +150,26 @@ writeFileSync(
   ].join('\n'),
 );
 
-writeFileSync(
-  join(DIST, 'llms.txt'),
-  `# ${site.name}\n\n> ${site.description}\n\n[sitemap.md](${ORIGIN}/sitemap.md) lists the same pages with each one's type, last change and prerequisites.\n\n## Pages\n\n${pages.map(p => `- [${p.title}](${ORIGIN}${p.path === '/' ? '/index' : p.path}.md): ${p.description}`).join('\n')}\n`
-);
-
 const TYPES: Record<string, string> = { Home: 'Overview', 'Get started': 'Tutorial', Learn: 'Guide', Recipes: 'How-to', Reference: 'Reference', 'For AI agents': 'Reference' };
 const mdUrl = (p: Page) => `${ORIGIN}${p.path === '/' ? '/index' : p.path}.md`;
 const parentOf = (p: Page) => pages.filter(q => q.path !== '/' && p.path.startsWith(`${q.path}/`)).sort((a, b) => b.path.length - a.path.length)[0];
 const start = pages.find(p => p.path === '/start');
+const startSite = pages.find(p => p.path === '/start-site');
 function prerequisites(p: Page): string {
   const parent = parentOf(p);
   if (parent) return `[${parent.title}](${mdUrl(parent)})`;
-  if (p.path === '/recipes/website') return 'start-here-site.md in the Exact checkout (a website reads it in place of Start here)';
+  if (startSite && (p.path === '/recipes/website' || p.path === '/recipes/website-hosting')) return `[${startSite.title}](${mdUrl(startSite)})`;
   if (!start || ['Home', 'Get started', 'For AI agents'].includes(p.section)) return 'None';
   return `[${start.title}](${mdUrl(start)})`;
 }
-const depth = (p: Page): number => (parentOf(p) ? depth(parentOf(p)) + 1 : 0);
-const sitemapSections = [...new Set(pages.map(p => p.section))].map(section => [
-  `## ${section}`,
-  '',
-  ...pages.filter(p => p.section === section).map(p =>
-    `${'    '.repeat(depth(p))}- [${p.title}](${mdUrl(p)}) | Type: ${TYPES[section] ?? 'Reference'} | Lastmod: ${p.updated || 'unknown'} | Summary: ${p.description} | Prerequisites: ${prerequisites(p)}`),
-].join('\n'));
+const WHEN_TO_USE = `Use Exact when a person wants one app, written once, for the web, iOS, macOS, Android, Linux, Windows, tvOS, watchOS, Android TV or the terminal, or a website. [Agent resources](${ORIGIN}/agents.md) says how to start.`;
+const SOURCE = 'The source is the [expo/exact](https://github.com/expo/exact) repository. Its [AGENTS.md](https://github.com/expo/exact/blob/main/AGENTS.md) has the instructions for coding agents.';
+const llms = `# ${site.name}\n\n> ${site.description}\n\n${WHEN_TO_USE}\n\n${SOURCE}\n\n[sitemap.md](${ORIGIN}/sitemap.md) lists the same pages with each one's type, last change and prerequisites.\n\n${bySection(pages, mdUrl, p => `: ${p.description}`)}\n`;
+for (const file of ['llms.txt', 'assets/llms.txt']) writeFileSync(join(DIST, file), llms);
+const SITEMAP_SUMMARY = "A page index for agents: each page's Markdown URL, its type, the date it last changed, a summary, and what to read before it.";
 writeFileSync(
   join(DIST, 'sitemap.md'),
-  `# ${site.name} sitemap\n\nA page index for agents: each page's Markdown URL, its type, the date it last changed, a summary, and what to read before it. [llms.txt](${ORIGIN}/llms.txt) lists the same pages without the extra fields.\n\n${sitemapSections.join('\n\n')}\n`
+  `# ${site.name} sitemap\n\n${SITEMAP_SUMMARY} [llms.txt](${ORIGIN}/llms.txt) lists the same pages without the extra fields.\n\n${bySection(pages, mdUrl, p => ` | Type: ${TYPES[p.section] ?? 'Reference'} | Lastmod: ${p.updated || 'unknown'} | Summary: ${p.description} | Prerequisites: ${prerequisites(p)}`)}\n`
 );
 
 writeFileSync(
@@ -184,12 +181,16 @@ writeFileSync(
   join(DIST, '_headers'),
   [
     '# Generated by tools/postbuild.ts. Do not edit.',
-    '# Every page names the Markdown index, for an agent that fetches the HTML.',
+    '# Every page names the Markdown index, and the sitemap when the build wrote one, for an agent that fetches the HTML.',
     '/*',
-    '  Link: </llms.txt>; rel="llms-txt"',
+    `  Link: </llms.txt>; rel="llms-txt"${ORIGIN ? ', </sitemap.xml>; rel="sitemap"' : ''}`,
     '  X-Llms-Txt: /llms.txt',
     '/*.md',
     '  Content-Type: text/markdown; charset=utf-8',
+    "# A font the browser must revalidate is requested again when the runtime replaces the page's sheet, and the text falls back when that answer is late.",
+    '/assets/fonts/*',
+    '  Cache-Control: public, max-age=604800',
+    ...(ORIGIN ? ['/.well-known/ard.json', '/.well-known/ai-catalog.json'].flatMap(path => [path, '  Content-Type: application/ai-catalog+json']) : []),
     '# A page by its path only: a pattern matching every path would retype the scripts, styles and fonts too.',
     ...pages.flatMap(p => [p.path, '  Content-Type: text/html; charset=utf-8']),
   ].join('\n') + '\n'
@@ -200,7 +201,23 @@ if (ORIGIN) {
     join(DIST, 'sitemap.xml'),
     `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${pages.map(p => `  <url><loc>${esc(ORIGIN + p.path)}</loc>${p.updated ? `<lastmod>${p.updated}</lastmod>` : ''}</url>`).join('\n')}\n</urlset>\n`
   );
+
+  const host = new URL(ORIGIN).host;
+  const entry = (name: string, displayName: string, type: string, url: string, description: string, representativeQueries: string[]) =>
+    ({ identifier: `urn:air:${host}:docs:${name}`, displayName, type, url, description, representativeQueries });
+  const agents = pages.find(p => p.path === '/agents');
+  const catalog = {
+    specVersion: '1.0',
+    host: { displayName: site.name },
+    entries: [
+      entry('llms-txt', `${site.name} index`, 'text/plain', `${ORIGIN}/llms.txt`, site.description, ['How do I build a website with Exact?', 'What is Contract?', 'Which platforms does Exact run on?']),
+      entry('sitemap', `${site.name} sitemap`, 'text/markdown', `${ORIGIN}/sitemap.md`, SITEMAP_SUMMARY, ['Which page do I read before writing the data module?', 'Which docs pages changed recently?']),
+      ...(agents ? [entry('agents', agents.title, 'text/markdown', mdUrl(agents), agents.description, ['How do I give my coding agent the Exact docs?', 'How can an agent read a docs page as Markdown?'])] : []),
+    ],
+  };
+  mkdirSync(join(DIST, '.well-known'), { recursive: true });
+  for (const file of ['ard.json', 'ai-catalog.json']) writeFileSync(join(DIST, '.well-known', file), `${JSON.stringify(catalog, null, 2)}\n`);
 }
 
-console.log(`${DIST}: head (favicon, stored choices, Markdown link, JSON-LD${ORIGIN ? ', canonical' : ''}) on ${prepainted} pages, _redirects (${rules.length - 2} rules), _headers, ${pages.length} .md pages and 404.md, ${Object.keys(redirects).length} moved-page fallbacks, robots.txt, llms.txt, sitemap.md${ORIGIN ? ', sitemap.xml' : ''}`);
-if (!ORIGIN) console.log('  no origin: set it in constants/site.ts (or SITE_ORIGIN) for sitemap.xml, canonical links and JSON-LD URLs');
+console.log(`${DIST}: head (favicon, stored choices, Markdown link, JSON-LD${ORIGIN ? ', canonical' : ''}) on ${prepainted} pages, _redirects (${rules.filter(rule => !rule.startsWith('#')).length} rules), _headers, ${pages.length} .md pages and 404.md, ${Object.keys(redirects).length} moved-page fallbacks, robots.txt, llms.txt, sitemap.md${ORIGIN ? ', sitemap.xml, .well-known/ard.json and .well-known/ai-catalog.json' : ''}`);
+if (!ORIGIN) console.log('  no origin: set it in constants/site.ts (or SITE_ORIGIN) for sitemap.xml, the agent catalog, canonical links and JSON-LD URLs');

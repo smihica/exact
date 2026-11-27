@@ -89,10 +89,15 @@ mod placement;
 // The Linux desktop portal; Windows uses its window's common item dialogs.
 #[cfg_attr(any(not(unix), target_os = "android"), allow(dead_code))]
 mod portal;
+/// The document portal's file transfer, across a Flatpak sandbox's edge.
+#[cfg(target_os = "linux")]
+pub use portal::transfer as file_transfer;
 pub mod presence_secrets;
 pub mod presenter;
 pub mod raster;
+mod safe_area;
 mod scroll_anchor;
+mod snap_changes;
 pub mod snapshot;
 mod sound;
 mod surface_haptics;
@@ -110,15 +115,19 @@ mod zone;
 
 /// Install the window event-loop wake for native work, images and text results.
 /// Removing it at shutdown releases the event loop without stopping shared workers.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn set_event_waker(waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
     wake::install(waker);
 }
 
 pub use app::Composed;
+/// A dropped file a Flatpak sandbox's host checked off the interface's
+/// thread, its folder held (LLP 1094.001 D8).
+#[cfg(target_os = "linux")]
+pub use exact_data::documents::Checked;
 pub use hatches::Hatches;
 pub use host::{Host, HostError};
-pub use presenter::Presenter;
+pub use presenter::{Dropped, Presenter};
 
 /// Run `f` inside an atrace section on Android (Perfetto shows it on this
 /// thread); elsewhere just `f`.

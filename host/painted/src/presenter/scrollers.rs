@@ -44,6 +44,8 @@ pub struct Scroller {
     /// Whether it scrolls sideways, and up and down: the axis overflows and
     /// has somewhere to go.
     pub axes: (bool, bool),
+    /// The least offset on each axis (negative x only for RTL overflow; 0 otherwise).
+    pub min: (f32, f32),
     /// The farthest offset on each axis.
     pub max: (f32, f32),
     /// Where it is, measured from the right on x when `from_right` is true.
@@ -68,6 +70,10 @@ pub struct Under {
     /// The axes (sideways; up and down) a gesture of the presenter's own
     /// there would take.
     pub claims: (bool, bool),
+    /// The axes claimed by an exclusive Exact gesture (`Swipe`, `Height`,
+    /// `Transform`, `Group`/`Lift`, a `pan` on the hit node itself, or a modal
+    /// scrim) that a hosted view's `dragAxes` cannot override (LLP 1133.008 D8 item 6).
+    pub hard_claims: (bool, bool),
     /// Whether the claim on up and down is the top sheet's drag and no
     /// gesture's. The sheet takes a drag as a parent intercepts one: a
     /// shell leaves it with a hosted view that asked its parents not to
@@ -89,9 +95,19 @@ pub struct Under {
 /// revision it knows and where its own moves left the offset.
 #[derive(Default)]
 pub(super) struct Reader {
+    pub(super) lifting_touch: bool,
+    pub(super) pending_height_end: Option<exact_kernel::NodeKey>,
+    pub(super) height_scroll_release: Option<(exact_kernel::NodeKey, f32)>,
     tracked: BTreeMap<ViewId, (u32, (f32, f32))>,
     /// The last statement [`Presenter::reader_scrollers`] returned.
+    #[cfg(any(target_os = "android", test))]
     last: Vec<i32>,
+    #[cfg(any(target_os = "android", test))]
+    last_scale: f32,
+    /// A move since the last statement did not land as the reader sent it
+    /// (dropped, or stopped at an end): the reader draws it as sent until
+    /// a stream acknowledges it.
+    missed: bool,
 }
 
 impl Reader {
@@ -114,6 +130,8 @@ const NODE: i32 = 4;
 const BARLESS: i32 = 8;
 /// Bits 6 and 7: what a drag of it does to the keyboard, its authored
 /// `keyboardDismissMode`; unsaid, Android's: nothing (LLP 1115.001 D12).
+/// Android shows no accessory bar over its keyboard, so UIKit's accessory
+/// modes are the plain ones (LLP 1123 D7).
 const DISMISS_ON_DRAG: i32 = 64;
 const DISMISS_INTERACTIVE: i32 = 128;
 /// Bits 4 and 5: it hears `refresh`, and its `refreshing` is true: the
@@ -125,6 +143,17 @@ const REFRESHING: i32 = 32;
 /// there zooms it (D5).
 const ZOOM: i32 = 256;
 const DOUBLE_TAP: i32 = 512;
+/// Bit 10, in a statement only: a claimed scroller (LLP 1123 D14), whose
+/// statement carries six more words, its claim's record.
+#[cfg(any(target_os = "android", test))]
+const CLAIMED: i32 = 1024;
+#[cfg(any(target_os = "android", test))]
+const STATEMENT_WORDS: usize = 10;
+/// A claimed scroller's record: the displacement its content is painted at
+/// past its offset, in points, x then y, and its reached port in pixels, x,
+/// y, width and height.
+#[cfg(any(target_os = "android", test))]
+const CLAIM_WORDS: usize = 6;
 
 fn scrolls(o: Overflow) -> bool {
     matches!(o, Overflow::Scroll | Overflow::Auto)
@@ -144,6 +173,11 @@ fn gives(action: exact_kernel::TouchAction) -> (bool, bool) {
 }
 
 impl<D: DataSource> Presenter<D> {
+    /// A scroll container's offset.
+    pub fn scroll_of(&self, id: ViewId) -> (f32, f32) {
+        self.scroll.get(&id).copied().unwrap_or((0.0, 0.0))
+    }
+
     /// The page as a scroller: the document past the viewport.
     pub(super) fn page_scroller(&self) -> Scroller {
         let doc = self.document();
@@ -152,6 +186,7 @@ impl<D: DataSource> Presenter<D> {
         Scroller {
             id: PAGE,
             axes: (max.0 > 0.0, max.1 > 0.0),
+            min: (0.0, 0.0),
             max,
             offset: self.page,
             from_right: false,
@@ -171,10 +206,15 @@ impl<D: DataSource> Presenter<D> {
         if !scrolls(ox) && !scrolls(oy) {
             return None;
         }
+        let min = (bounds.min.0.min(0.0), bounds.min.1.min(0.0));
         let max = (bounds.max.0.max(0.0), bounds.max.1.max(0.0));
         Some(Scroller {
             id,
-            axes: (scrolls(ox) && max.0 > 0.0, scrolls(oy) && max.1 > 0.0),
+            axes: (
+                scrolls(ox) && (min.0 < 0.0 || max.0 > 0.0),
+                scrolls(oy) && (min.1 < 0.0 || max.1 > 0.0),
+            ),
+            min,
             max,
             offset: self.scroll.get(&id).copied().unwrap_or((0.0, 0.0)),
             from_right: self
@@ -201,6 +241,8 @@ impl<D: DataSource> Presenter<D> {
                 self.host.content_region(),
                 &node,
                 limits.get(&id).copied(),
+                &|id| self.host.presented(id),
+                self.host.scaled_presented(),
             )
         }))
     }
@@ -253,8 +295,10 @@ impl<D: DataSource> Presenter<D> {
                 s.axes = (s.axes.0 && open.0, s.axes.1 && open.1);
                 open = (open.0 && !cut.0, open.1 && !cut.1);
                 if s.axes.0 || s.axes.1 || zooms {
+                    // A claimed scroller's port is its reached frame, which takes its hits (LLP 1123 D13)
                     if let Some(b) = self.box_of(id) {
-                        s.port = shown(b.rect, b.clip);
+                        let claimed = self.host.presented(id).scroll.is_some();
+                        s.port = shown(if claimed { b.for_hit().rect } else { b.rect }, b.clip);
                     }
                     chain.push(s);
                 }
@@ -266,7 +310,7 @@ impl<D: DataSource> Presenter<D> {
         if page.axes.0 || page.axes.1 {
             chain.push(page);
         }
-        let mut claims = self.claims_at(hit);
+        let (mut claims, hard_claims) = self.claims_at(hit);
         let mut sheet = false;
         let mut sheet_directions = (false, false);
         let mut nested_sheet = None;
@@ -277,6 +321,7 @@ impl<D: DataSource> Presenter<D> {
                 return Under {
                     chain: Vec::new(),
                     claims: (true, true),
+                    hard_claims: (true, true),
                     sheet: false,
                     sheet_directions,
                     nested_sheet,
@@ -300,6 +345,7 @@ impl<D: DataSource> Presenter<D> {
         Under {
             chain,
             claims,
+            hard_claims,
             sheet,
             sheet_directions,
             nested_sheet,
@@ -308,31 +354,72 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// The axes a contact on `hit` would be the presenter's own gesture
-    /// along: what its candidates accept (`contact.rs`).
-    fn claims_at(&self, hit: ViewId) -> (bool, bool) {
+    /// along: what its candidates accept (`contact.rs`), alongside the subset
+    /// (`hard_claims`) that comes from an exclusive Exact gesture rather than
+    /// a strict ancestor `pan` or CSS `touch-action` (LLP 1133.008 D8 item 6).
+    fn claims_at(&self, hit: ViewId) -> ((bool, bool), (bool, bool)) {
         let kernel = self.host.kernel();
         let Some(key) = kernel.node(hit).map(|n| n.key) else {
-            return (false, false);
+            return ((false, false), (false, false));
         };
+        if !self.input_allowed(key) {
+            return ((false, false), (false, false));
+        }
         if !self.input_live(key) {
-            return (false, false);
+            let Some(Candidate::Pan(pan_key)) = self.pan_candidate(key) else {
+                return ((false, false), (false, false));
+            };
+            let claims = kernel.node_by_key(pan_key).map_or((false, false), |n| {
+                let gives = gives(n.style.touch_action);
+                (!gives.0, !gives.1)
+            });
+            return (claims, (false, false));
         }
         let mut claims = self.touch_kept(key);
+        let mut hard = (false, false);
         for candidate in self.candidates(key) {
-            let (x, y) = match candidate {
-                Candidate::Arrange(_) | Candidate::Height { .. } => (false, true),
-                Candidate::Swipe(_) => (true, false),
-                Candidate::Transform(_) | Candidate::Group(_) => (true, true),
+            let ((x, y), exclusive) = match candidate {
+                // An ordinary grip takes a finger on the platform's long press.
+                // Before then only touch-action keeps the list from scrolling.
+                Candidate::Arrange(_) => ((false, false), false),
+                Candidate::Height { .. } => ((false, true), true),
+                Candidate::Swipe(_) => ((true, false), true),
+                Candidate::Transform(b) => (
+                    kernel.node_by_key(b.handle).map_or((false, false), |n| {
+                        let action = n.style.touch_action;
+                        if matches!(
+                            action,
+                            exact_kernel::TouchAction::Auto
+                                | exact_kernel::TouchAction::Manipulation
+                        ) {
+                            (true, true)
+                        } else {
+                            let (x, y) = gives(action);
+                            (!x, !y)
+                        }
+                    }),
+                    true,
+                ),
+                // A mouse's lift takes a drag in any direction (LLP 1094.000 D13).
+                Candidate::Group(_) | Candidate::Lift { .. } => ((true, true), true),
                 // A `pan` hears what its `touch-action` does not give to
                 // scrolling, as a browser cancels a pointer it pans with.
-                Candidate::Pan(key) => kernel.node_by_key(key).map_or((false, false), |n| {
-                    let gives = gives(n.style.touch_action);
-                    (!gives.0, !gives.1)
-                }),
+                // Only a `pan` on the hit node itself is exclusive over a hosted
+                // view's `dragAxes`; a strict ancestor `pan` yields (LLP 1133.008 D8 item 6).
+                Candidate::Pan(pan_key) => (
+                    kernel.node_by_key(pan_key).map_or((false, false), |n| {
+                        let gives = gives(n.style.touch_action);
+                        (!gives.0, !gives.1)
+                    }),
+                    pan_key == key,
+                ),
             };
             claims = (claims.0 || x, claims.1 || y);
+            if exclusive {
+                hard = (hard.0 || x, hard.1 || y);
+            }
         }
-        claims
+        (claims, hard)
     }
 
     /// The axes a finger on `hit` keeps from the platform's panning: those
@@ -397,12 +484,12 @@ impl<D: DataSource> Presenter<D> {
         let s = self.scroller(id, &limits)?;
         let next = (
             if s.axes.0 {
-                to.0.clamp(0.0, s.max.0)
+                to.0.clamp(s.min.0, s.max.0)
             } else {
                 s.offset.0
             },
             if s.axes.1 {
-                to.1.clamp(0.0, s.max.1)
+                to.1.clamp(s.min.1, s.max.1)
             } else {
                 s.offset.1
             },
@@ -423,19 +510,30 @@ impl<D: DataSource> Presenter<D> {
         if completion == Completion::Reader {
             self.keep_own_position(id);
         }
+        self.set_scroll_offset(id, s.offset, next, completion);
+        Some((next, movement))
+    }
+
+    /// Publish an offset already constrained to the range of the picture it belongs to.
+    pub(super) fn set_scroll_offset(
+        &mut self,
+        id: ViewId,
+        from: (f32, f32),
+        next: (f32, f32),
+        completion: Completion,
+    ) {
         if id == PAGE {
             self.page = next;
         } else {
             self.scroll.insert(id, next);
-            self.scroll_end_input(id, s.offset, completion);
-            self.collection_scroll_input(id, s.offset);
+            self.scroll_end_input(id, from, completion);
+            self.collection_scroll_input(id, from);
         }
         self.scroll_timelines();
         self.dirty = true;
         if let Some(error) = self.refresh_transform_geometry() {
             self.host.log(error);
         }
-        Some((next, movement))
     }
 
     /// The reader moved scroller `id` by `by`, knowing revision `rev` of
@@ -474,6 +572,8 @@ impl<D: DataSource> Presenter<D> {
         rev: u32,
     ) -> Option<((f32, f32), (f32, f32))> {
         self.restore_scroll_anchors();
+        // Missed unless it lands where it was sent.
+        let missed = std::mem::replace(&mut self.reader.missed, true);
         if !self.reader.tracked.contains_key(&id) {
             return None;
         }
@@ -484,13 +584,16 @@ impl<D: DataSource> Presenter<D> {
         if self.reader_revision(&s) != rev {
             return None;
         }
+        if by.0 != 0. {
+            self.use_touch_snap(id, false);
+        }
+        if by.1 != 0. {
+            self.use_touch_snap(id, true);
+        }
         let from = s.offset;
-        let (to, movement) = self.scroll_to_completion(
-            id,
-            (from.0 + by.0, from.1 + by.1),
-            Completion::Reader,
-            Some(by),
-        )?;
+        let sent = (from.0 + by.0, from.1 + by.1);
+        let (to, movement) = self.scroll_to_completion(id, sent, Completion::Reader, Some(by))?;
+        self.reader.missed = missed || to != sent;
         let moved = (to.0 - from.0, to.1 - from.1);
         // Only a sample that moves counts as the person's scroll: a dropped
         // one must not cancel a fragment scroll or a load's hold.
@@ -502,7 +605,7 @@ impl<D: DataSource> Presenter<D> {
 
     /// An agent's phased wheel supplies one reader sample on the existing clock.
     pub(crate) fn reader_wheel(&mut self, id: ViewId, dx: f32, dy: f32) -> Result<String, String> {
-        if self.host.route_visibility(id).1 || self.box_of(id).is_none() {
+        if id != PAGE && (self.host.route_visibility(id).1 || self.box_of(id).is_none()) {
             return Err(format!("view {id} is hidden or inert"));
         }
         let limits = self.collection_scroll_limits();
@@ -529,6 +632,30 @@ impl<D: DataSource> Presenter<D> {
     /// Whether the reader was told of scroller `id`, and so may drag it.
     pub(super) fn reader_knows(&self, id: ViewId) -> bool {
         self.reader.tracked.contains_key(&id)
+    }
+
+    /// Whether each scroller the reader knows is where its own moves left
+    /// it, each landed as sent: no revision would move on, so a statement
+    /// would tell it only those moves.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn reader_moves_stand(&self) -> bool {
+        !self.reader.missed
+            && self.reader.tracked.iter().all(|(id, (_, at))| {
+                *at == if *id == PAGE {
+                    self.page
+                } else {
+                    self.scroll.get(id).copied().unwrap_or_default()
+                }
+            })
+    }
+
+    /// The reader has the exact starting offset and recording scale its
+    /// pending samples need to place these rows on the painter's pixels.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn reader_places_group(&self, id: ViewId, scale: f32) -> bool {
+        self.reader.last_scale == scale
+            && self.reader_knows(id)
+            && statements(&self.reader.last).any(|s| s[0] as ViewId == id && s[1] & NODE != 0)
     }
 
     /// The scrollers the clamp leaves alone: each a list kept while its route is hidden (a
@@ -565,9 +692,14 @@ impl<D: DataSource> Presenter<D> {
                 let kernel = self.host.kernel();
                 let node = kernel.node(id).unwrap();
                 let region = self.host.content_region();
-                let bounds =
-                    self.brush
-                        .scroll_bounds(kernel, region, &node, limits.get(&id).copied());
+                let bounds = self.brush.scroll_bounds(
+                    kernel,
+                    region,
+                    &node,
+                    limits.get(&id).copied(),
+                    &|id| self.host.presented(id),
+                    self.host.scaled_presented(),
+                );
                 self.stage_shown(id, key, bounds);
             }
             held.insert(id);
@@ -588,7 +720,10 @@ impl<D: DataSource> Presenter<D> {
     /// [`Presenter::scrollers_at`] for a reader, in its pixels (`scale` to a
     /// point): the claims (bit 0 sideways, bit 1 up and down, bit 2 the
     /// latter is a sheet's drag alone: [`Under::sheet`], bits 3 and 4 its
-    /// upward and downward claims over a list), a count, the
+    /// upward and downward claims over a list, bit 5 nested sheet follows,
+    /// bit 6 a lifted reorder row, bit 7 sideways claim yields to a hosted
+    /// view's `dragAxes`, bit 8 non-sheet vertical claim yields to a hosted
+    /// view's `dragAxes`), a count, the
     /// hosted text field the touch is for (0: none; LLP 1115.001 D8), and
     /// eleven words a scroller: id, flags (bit 0 it takes a sideways drag
     /// from here, bit 1 one up or down, bit 2 it has rows the reader can
@@ -606,16 +741,32 @@ impl<D: DataSource> Presenter<D> {
                 | i32::from(under.claims.1) << 1
                 | i32::from(under.sheet) << 2
                 | i32::from(under.sheet_directions.0 && !under.sheet) << 3
-                | i32::from(under.sheet_directions.1 && !under.sheet) << 4,
+                | i32::from(under.sheet_directions.1 && !under.sheet) << 4
+                | i32::from(under.claims.0 && !under.hard_claims.0) << 7
+                | i32::from(under.claims.1 && !under.hard_claims.1 && !under.sheet) << 8,
             under.chain.len() as i32,
             under.field.unwrap_or(0) as i32,
         ];
-        let tapped =
-            (self.hit(x / scale, y / scale)).and_then(|hit| self.double_tap_container(hit));
+        if self
+            .contact
+            .as_ref()
+            .and_then(|c| c.hold.as_ref())
+            .is_some_and(|h| matches!(h.kind, super::contact::HeldKind::Arrange(_)))
+        {
+            out[0] |= 64;
+        }
+        let hit = self.hit(x / scale, y / scale);
+        let tapped = hit.and_then(|hit| self.double_tap_container(hit));
         for s in &under.chain {
+            let allows_pinch = hit.is_some_and(|hit| self.allows_touch_zoom(hit, Some(s.id)));
             let rev = self.reader_revision(s);
             let tap = if tapped == Some(s.id) { DOUBLE_TAP } else { 0 };
-            out.extend([s.id as i32, self.reader_flags(s) | tap, rev as i32]);
+            let flags = self.reader_flags(s);
+            out.extend([
+                s.id as i32,
+                (if allows_pinch { flags } else { flags & !ZOOM }) | tap,
+                rev as i32,
+            ]);
             let px = [s.offset.0, s.offset.1, s.max.0, s.max.1];
             out.extend(px.iter().chain(&s.port).map(|v| bits(v * scale)));
         }
@@ -627,43 +778,65 @@ impl<D: DataSource> Presenter<D> {
         out
     }
 
-    /// What the reader is told after a frame of the scrollers it knows, when
-    /// that is not what it was last told (`None`): nine words a scroller:
-    /// id, flags (as [`Presenter::reader_under`]'s, for any drag), revision,
-    /// then as float bits where it is (x, y), the offset its rows were last
-    /// painted at (x, y; `drawn` names them for a scroller that has rows)
-    /// and its farthest offset (x, y), in the reader's pixels. A scroller the
-    /// reader knew that is not in a statement is gone (its node went, or a
-    /// driver took it over): the reader forgets it.
+    /// The scrollers the reader knows, sent when they change or a rejected
+    /// move needs acknowledging. Nine words per scroller.
+    /// Id, flags, revision, then pairs of float bits for the current logical
+    /// offset in points, recorded offset in pixels, and logical maximum in
+    /// points. A claimed scroller (flag [`CLAIMED`]) has its claim's record
+    /// after them: the displacement its content is painted at past its offset
+    /// in points, its recording's offset being that displaced one, and its
+    /// reached port in pixels, so the reader places its rows and its edges
+    /// as the claim moves them (LLP 1123 D14). An omitted scroller is gone:
+    /// the reader forgets it.
+    #[cfg(any(target_os = "android", test))]
     pub fn reader_scrollers(
         &mut self,
         drawn: &[(ViewId, (f32, f32))],
         scale: f32,
     ) -> Option<Vec<i32>> {
+        let missed = std::mem::take(&mut self.reader.missed);
         if self.reader.tracked.is_empty() {
-            // The last scroller it knew went: said once, with nothing in it.
-            return (!std::mem::take(&mut self.reader.last).is_empty()).then(Vec::new);
+            let removed = !std::mem::take(&mut self.reader.last).is_empty();
+            return (removed || missed).then(Vec::new);
         }
         let limits = self.collection_scroll_limits();
         let ids: Vec<ViewId> = self.reader.tracked.keys().copied().collect();
-        let mut out = Vec::with_capacity(ids.len() * 9);
+        let mut out = Vec::with_capacity(ids.len() * STATEMENT_WORDS);
         for id in ids {
             let Some(mut s) = self.scroller(id, &limits) else {
                 self.reader.tracked.remove(&id);
                 continue;
             };
             let rev = self.reader_revision(&s);
-            let painted = drawn.iter().find(|g| g.0 == id).map(|g| g.1);
+            let painted = drawn.iter().find(|(owner, _)| *owner == id);
             s.node = painted.is_some();
-            let at = painted.unwrap_or(s.offset);
-            out.extend([id as i32, self.reader_flags(&s), rev as i32]);
-            let px = [s.offset.0, s.offset.1, at.0, at.1, s.max.0, s.max.1];
-            out.extend(px.iter().map(|v| bits(v * scale)));
+            let at = painted.map_or((s.offset.0 * scale, s.offset.1 * scale), |(_, at)| {
+                let pixel = |v| crate::paint::grid::device_pixel(v, scale) as f32;
+                (pixel(at.0), pixel(at.1))
+            });
+            let claim = self.host.presented(id).scroll;
+            let flags = self.reader_flags(&s) | if claim.is_some() { CLAIMED } else { 0 };
+            out.extend([id as i32, flags, rev as i32]);
+            out.extend(
+                [
+                    s.offset.0, s.offset.1, at.0, at.1, s.max.0, s.max.1, s.min.0,
+                ]
+                .map(bits),
+            );
+            if let Some(c) = claim {
+                let displaced = c.displacement((0., 0.));
+                let port = self
+                    .box_of(id)
+                    .map_or([0.; 4], |b| shown(b.for_hit().rect, b.clip));
+                out.extend([displaced.0, displaced.1].map(bits));
+                out.extend(port.map(|v| bits(v * scale)));
+            }
         }
-        if out == self.reader.last {
+        if !missed && out == self.reader.last && scale == self.reader.last_scale {
             return None;
         }
         self.reader.last.clone_from(&out);
+        self.reader.last_scale = scale;
         Some(out)
     }
 
@@ -683,8 +856,8 @@ impl<D: DataSource> Presenter<D> {
             .filter(|_| s.id != PAGE)
             .and_then(|n| n.props.str(exact_kernel::PropId::KeyboardDismissMode))
         {
-            Some("on-drag") => DISMISS_ON_DRAG,
-            Some("interactive") => DISMISS_INTERACTIVE,
+            Some("on-drag" | "on-drag-with-accessory") => DISMISS_ON_DRAG,
+            Some("interactive" | "interactive-with-accessory") => DISMISS_INTERACTIVE,
             _ => 0,
         };
         let refresh = if s.id == PAGE
@@ -719,6 +892,23 @@ impl<D: DataSource> Presenter<D> {
 }
 
 /// A box within its clip: x, y, width, height.
+/// Each statement of `words`, a claimed one with its claim's record.
+#[cfg(any(target_os = "android", test))]
+fn statements(words: &[i32]) -> impl Iterator<Item = &[i32]> {
+    let mut rest = words;
+    std::iter::from_fn(move || {
+        let len = STATEMENT_WORDS
+            + if rest.get(1)? & CLAIMED != 0 {
+                CLAIM_WORDS
+            } else {
+                0
+            };
+        let (one, after) = rest.split_at_checked(len)?;
+        rest = after;
+        Some(one)
+    })
+}
+
 fn shown(r: Rect4, clip: Option<Rect4>) -> [f32; 4] {
     let Some(c) = clip else {
         return [r.0, r.1, r.2, r.3];
@@ -734,17 +924,99 @@ fn bits(v: f32) -> i32 {
 }
 
 impl<D: DataSource> Presenter<D> {
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn module_ancestor(&self, mut id: ViewId) -> Option<ViewId> {
+        loop {
+            let node = self.host.kernel().node(id)?;
+            if node.node_type == NodeType::NativeView {
+                return Some(id);
+            }
+            id = node.parent?;
+        }
+    }
+
+    /// Resolve an addressed finger to the allocation the reader must actually touch.
+    /// The reader answers after Android dispatch. Other inputs stay with the presenter.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn reader_agent_tap(
+        &mut self,
+        request: &serde_json::Value,
+        scale: f32,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let args = request.as_object()?;
+        if request["op"] != "tap"
+            || !args.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "op" | "id" | "at" | "phase" | "x" | "y" | "session" | "modifiers"
+                )
+            })
+            || args.contains_key("phase") && request["phase"] != "down"
+        {
+            return None;
+        }
+        let id = u32::try_from(request["id"].as_u64()?).ok()?;
+        let module = self.module_ancestor(id)?;
+        let mut aim = || -> Result<_, String> {
+            if self.contact_position().is_some() {
+                return Err("a contact is already down".into());
+            }
+            let b = self
+                .box_of(id)
+                .ok_or_else(|| format!("view {id} has no painted box"))?;
+            let coord = |v: &serde_json::Value| {
+                v.as_f64()
+                    .map(|n| n as f32)
+                    .ok_or("invalid tap coordinates")
+            };
+            let (x, y) = if let Some(at) = args.get("at") {
+                if at.as_array().map(Vec::len) != Some(2) {
+                    return Err("tap at needs two coordinates".into());
+                }
+                (b.rect.0 + coord(&at[0])?, b.rect.1 + coord(&at[1])?)
+            } else if args.contains_key("x") || args.contains_key("y") {
+                (coord(&request["x"])?, coord(&request["y"])?)
+            } else {
+                b.center()
+            };
+            let hit = self.hit(x, y);
+            if !b.contains(x, y)
+                || !self.alert_allows(id)
+                || self.host.route_visibility(id).1
+                || self.placement_hidden(id)
+                || !hit.is_some_and(|h| h == id || self.is_inside(h, id))
+            {
+                return Err(format!(
+                    "view {id} is covered or not hittable at ({x}, {y})"
+                ));
+            }
+            let under = self.reader_module(x * scale, y * scale, scale);
+            if under[0] as u32 != module {
+                return Err(format!("module view {module} is not hittable"));
+            }
+            if args.contains_key("modifiers") {
+                return Err("Android module touches with modifiers are unsupported".into());
+            }
+            Ok(
+                serde_json::json!({"moduleContact":{"id":module,"slot":under[5],"generation":under[6],
+                "session":self.brush.native_session}, "at":[x,y]}),
+            )
+        };
+        Some(aim())
+    }
+
     /// The module view under a point of the Android reader (pixels), for
     /// its hit reply (`Native.under` in `host/android/canvas` has the
     /// words): its id, border box, allocation slot and generation, the
     /// long-press count, the painter's session token, the painted origin of
-    /// its content box and the node a long press there would give to.
+    /// its content box and the node a long press there would give to. A
+    /// frame's WebView is offered its contacts as a module's view is.
     #[cfg(any(target_os = "android", test))]
     pub(crate) fn reader_module(&mut self, x: f32, y: f32, scale: f32) -> [i32; 13] {
         let module = self.hit(x / scale, y / scale).filter(|id| {
             // A video with `controls` takes its gestures as a module's view does (LLP 1042.001 D4).
             self.host.kernel().node(*id).is_some_and(|node| {
-                (node.node_type == NodeType::NativeView
+                (matches!(node.node_type, NodeType::NativeView | NodeType::WebView)
                     || (node.node_type == NodeType::Video
                         && node.props.bool(PropId::Controls) == Some(true)))
                     && self.host.retained_action_eligible(node.key)
@@ -776,6 +1048,10 @@ impl<D: DataSource> Presenter<D> {
             origin(content.1),
             (self.context_menu_at(x / scale, y / scale).map(|v| v.0))
                 .or_else(|| self.lift_source_at(x / scale, y / scale))
+                .or_else(|| {
+                    self.arrange_hold_at(x / scale, y / scale)
+                        .and_then(|b| self.host.kernel().node_by_key(b.handle).map(|n| n.id))
+                })
                 .map_or(0, |id| id as i32),
         ]
     }

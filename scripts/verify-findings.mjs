@@ -47,12 +47,14 @@ function placeOf(line) {
   return at < 0 ? body : body.slice(0, at);
 }
 
-/** `lines` (each indented two) by rule, the commonest first: a rule's one finding as it is; several as the rule and
- *  their count, the first in full, then where the next PLACES are and how many more. */
+/** `lines` (each indented two) by rule and the page their remedy names (`contract vocab <page>`), the commonest first: a
+ *  group's one finding as it is; several as the rule and their count, the first in full, then where the next PLACES are
+ *  and how many more. */
 export function byRule(lines) {
-  const rules = new Map();
-  for (const l of lines) rules.set(ruleOf(l), [...(rules.get(ruleOf(l)) ?? []), l]);
-  return [...rules].sort((a, b) => b[1].length - a[1].length).flatMap(([rule, all]) => {
+  const rules = new Map(), key = (l) => `${ruleOf(l)} ${/\(contract vocab ([\w-]+)\)$/.exec(l.trimEnd())?.[1] ?? ''}`;
+  for (const l of lines) rules.set(key(l), [...(rules.get(key(l)) ?? []), l]);
+  return [...rules].sort((a, b) => b[1].length - a[1].length).flatMap(([group, all]) => {
+    const rule = group.split(' ')[0];
     if (all.length === 1) return all;
     const rest = all.slice(1), more = rest.length - PLACES;
     return [`  ${rule} ×${all.length}`, `    ${all[0].trim()}`, `    also ${rest.slice(0, PLACES).map(placeOf).join('; ')}${more > 0 ? ` and ${more} more` : ''}`];
@@ -305,6 +307,7 @@ export function largeRemedy(f, { inRow = false } = {}) {
   if (f.kind === 'clipped') return f.detail?.edge ? 'let the page scroll there (a scroll with flex=1 min-height=0)'
     : wide && f.detail?.need ? `give it room (no px width on its box), or ${WRAP}; ${oneWord ? 'a word longer than any line breaks between syllables with `hyphens="auto"`, as a UILabel breaks it' : 'not `hyphens="auto"`, which breaks words a UILabel wraps whole'}`
     : f.detail?.need ? 'let its box grow with its text: no px height on it (a rem size, or none)' : `give the box that cuts it room (no px width or height on it), or ${WRAP}`;
+  if (f.kind === 'squeezed' && f.detail?.axis) return f.hint;
   if (f.kind === 'squeezed') return `let it keep its words (no min-width: 0 or px width beside it), or ${WRAP}`;
   // Overlapping cells of a row that stays one line (a week's days) wrap nowhere: UIKit's calendar caps its day numbers, which
   // grow to 31 points and no further (iOS 27), never shrinking them.

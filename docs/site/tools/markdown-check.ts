@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { marked } from 'marked';
 import { site } from '../constants/site.ts';
+import { proseLines } from '../markdown-fences.ts';
 
 // Checks the Markdown that tools/postbuild.ts wrote into dist, as an agent reads it: one .md file for each
 // page and nothing else, each with its frontmatter, the llms.txt pointer, an H1 with the feedback block
@@ -18,7 +20,6 @@ const problems: string[] = [];
 const fail = (where: string, what: string) => problems.push(`${where}: ${what}`);
 const markdownPath = (path: string) => `${path === '/' ? '/index' : path}.md`;
 
-const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const LEAKED_HTML = /<\/?(div|span|p|a|img|br|section|details|summary|table|tr|td|pre|code|button)\b[^>]*>/i;
 const LEAKED_CSS = /\b(class|className|style)="[^"]*"/;
 // A code span may wrap onto the next line of its paragraph, but not past a blank line.
@@ -26,22 +27,10 @@ const CODE_SPAN = /(`+)(?:(?!\n\s*\n)[\s\S])*?\1/g;
 const LINK = /!?\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
 function prose(where: string, body: string): string[] {
-  const lines: string[] = [];
-  let open: { char: string; length: number; line: number } | null = null;
-  body.split('\n').forEach((line, i) => {
-    const fence = line.match(FENCE);
-    if (open) {
-      if (fence && fence[1][0] === open.char && fence[1].length >= open.length && !fence[2].trim()) open = null;
-      return;
-    }
-    if (fence && !(fence[1][0] === '`' && fence[2].includes('`'))) {
-      open = { char: fence[1][0], length: fence[1].length, line: i + 1 };
-      return;
-    }
-    lines.push(line);
-  });
-  if (open) fail(where, `the code fence opened on body line ${(open as { line: number }).line} is never closed`);
-  return lines.join('\n').replace(CODE_SPAN, 'code').split('\n');
+  const lines = body.split('\n');
+  const { indices, unclosed } = proseLines(lines);
+  if (unclosed !== null) fail(where, `the code fence opened on body line ${unclosed} is never closed`);
+  return indices.map(i => lines[i]).join('\n').replace(CODE_SPAN, 'code').split('\n');
 }
 
 function reaches(href: string): boolean {
@@ -66,9 +55,26 @@ for (const p of pages) {
   const body = text.slice(front[0].length);
   if (!body.includes(`> Fetch the complete documentation index at: ${ORIGIN}/llms.txt`)) fail(where, 'no llms.txt pointer');
   const lines = prose(where, body);
-  if (!lines.some(line => /^# \S/.test(line))) fail(where, 'no H1');
-  const feedback = body.match(/^# .*\n\n<AgentInstructions>\n([\s\S]*?)\n<\/AgentInstructions>\n/m)?.[1];
-  if (!feedback?.includes(`Exact docs: ${ORIGIN + p.path}:`) || !feedback.includes('bun exact.mjs feedback status') || !feedback.includes('bun exact.mjs feedback note') || !feedback.includes('never')) fail(where, 'no policy-aware feedback block naming this page below the H1');
+  // The generated index and feedback headings sit outside the article's outline.
+  const article = body.replace(/^\n*> ## Documentation index\n> Fetch the complete documentation index at: .*\n(?:> .*\n)*/, '');
+  const feedbackBlock = /^(\n*# .*\n)(?<gap>\n?)<AgentInstructions>\n(?<instructions>[\s\S]*?)\n<\/AgentInstructions>\n/;
+  const feedback = article.match(feedbackBlock)?.groups;
+  const instructions = feedback?.gap ? feedback.instructions : undefined;
+  const tokens = marked.lexer(article.replace(feedbackBlock, '$1\n'), { gfm: true });
+  if (!tokens.some(token => token.type === 'heading' && token.depth === 1 && token.text.trim())) fail(where, 'no H1');
+  let above = 0;
+  marked.walkTokens(tokens, token => {
+    if (token.type !== 'heading') return;
+    const heading = token.raw.split('\n', 1)[0].slice(0, 80);
+    if (!token.text.trim()) {
+      fail(where, `an empty heading: ${heading}`);
+      return;
+    }
+    const level = token.depth;
+    if (level > above + 1) fail(where, `a level ${level} heading below a level ${above} heading: ${heading}`);
+    above = level;
+  });
+  if (!instructions?.includes(`Exact docs: ${ORIGIN + p.path}:`) || !instructions.includes('bun exact.mjs feedback status') || !instructions.includes('bun exact.mjs feedback note') || !instructions.includes('never')) fail(where, 'no policy-aware feedback block naming this page below the H1');
   if (lines.filter(line => line.trim()).length < 3) fail(where, 'nothing below the pointer and the H1');
   lines.forEach(line => {
     const html = line.match(LEAKED_HTML);

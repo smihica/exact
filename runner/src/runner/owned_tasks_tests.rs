@@ -8,13 +8,18 @@ struct Data {
     serial: u64,
     live: Vec<u64>,
     detector: Option<u64>,
+    mirrors: Vec<Value>,
 }
 
 impl DataSource for Data {
     fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
         unreachable!()
     }
-    fn answer(&mut self, _: &mut Store, source: &str, _: &[Value]) -> Result<Answer, DataError> {
+    fn answer(&mut self, _: &mut Store, source: &str, args: &[Value]) -> Result<Answer, DataError> {
+        if source == "mirror" {
+            self.mirrors.push(args[0].clone());
+            return Ok(Answer::Now(args[0].clone()));
+        }
         if source == "immediate" {
             return Ok(Answer::Now(Value::Number(1.)));
         }
@@ -77,14 +82,15 @@ component App
           text "A"
         button press=pick("b") role="tab" aria-controls="panel-b" aria-selected=(nav.tab == "b")
           text "B"
-      Unsent(replace=replace)
+      if !replacing
+        Unsent(replace=replace)
       text (replacing ? "attempted" : "committed")
 component Unsent
   props
     replace: action
-  mutation saved as shape number
+  mutation firstSaved as shape number
   action save
-    send saved = held()
+    send firstSaved = held()
     replace()
   view
     button press=save testId="first-send"
@@ -204,6 +210,14 @@ fn ownership(r: &Runner<Data>) -> Ownership {
 #[test]
 fn every_reconcile_refusal_restores_ownership() {
     let plan = contract::compile(SOURCE).unwrap();
+    let first_send_owner = plan
+        .mutations
+        .iter()
+        .find(|m| crate::agent::declared_name(plan.str(m.name)) == "firstSaved")
+        .unwrap()
+        .owner
+        .expect("first-send mutation has an owner");
+    let first_send_region = plan.arm(first_send_owner).region.0;
     for refusal in [
         "key",
         "key-trap",
@@ -266,7 +280,20 @@ fn every_reconcile_refusal_restores_ownership() {
             let panels = r.unopened_tabs().to_vec();
             let result = match entry {
                 "replace" => r.act("replace", vec![]),
-                "first-send" => press(&mut r, "first-send"),
+                "first-send" => {
+                    let kernel = r.kernel();
+                    let button = kernel.find_first_by_test_id("first-send").unwrap();
+                    let view = kernel.node_by_key(button).unwrap().id;
+                    let (_, frames) = r.find(view).unwrap();
+                    let storage = Frame::row_of(&frames, first_send_region).unwrap();
+                    assert!(storage.borrow().sends.is_empty());
+                    let result = r.dispatch(view, crate::Event::Press);
+                    assert!(
+                        storage.borrow().sends.is_empty(),
+                        "{refusal}: {entry}: instance sends"
+                    );
+                    result
+                }
                 "tab" => r.build_tabs(&panels),
                 _ => r.build_every_tab(),
             };
@@ -290,4 +317,390 @@ fn every_reconcile_refusal_restores_ownership() {
             );
         }
     }
+}
+
+#[test]
+fn a_sleeping_owned_resource_skips_arguments_without_resettling() {
+    let plan = contract::compile(
+        r#"component App
+  state show = true
+  state number = -1
+  view
+    column
+      if show
+        Sleeping(number=number)
+component Sleeping
+  props
+    number: number
+  resource answer = mirror(range(number).length) when false as shape number
+  view
+    text `${answer}`
+"#,
+    )
+    .unwrap();
+    let number = plan
+        .slots
+        .iter()
+        .position(|slot| plan.str(slot.name) == "number")
+        .unwrap();
+    let mut r = Runner::boot(
+        plan,
+        Data::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let owners = r.tree.as_ref().unwrap().owners();
+    let row = owners[0].storage.borrow().requests[0].row.unwrap();
+    assert!(r.resources[row].state.as_ref().unwrap().asleep);
+    assert!(r.owned_row(row).unwrap().want.args.is_empty());
+
+    r.slots[number] = Value::Number(2.);
+    assert!(!r.reconcile_owned(&owners).unwrap());
+    assert!(r.owned_row(row).unwrap().want.args.is_empty());
+}
+
+#[test]
+fn a_sleeping_owned_resource_boots_from_a_checkpoint_without_its_answer() {
+    let plan = contract::compile(
+        r#"routes nav
+  tab home "/"
+  tab discover "/discover"
+
+component App
+  view
+    main
+      for tab in nav.tabs key=tab.name
+        Sleeping(name=tab.name, number=(tab.name == "home" ? -1 : 1), awake=(tab.name == "discover" && nav.tab == "discover"))
+component Sleeping
+  props
+    name: string
+    number: number
+    awake: bool
+  resource answer = mirror(range(number).length) when awake as shape number
+  view
+    text `${answer}:${current(answer)}` testId=`answer-${name}`
+"#,
+    )
+    .unwrap();
+    for (location, answer_count) in [("/", 0), ("/discover", 1)] {
+        let rendered = Runner::boot(
+            plan.clone(),
+            Data::default(),
+            Kernel::with_monospace(),
+            Default::default(),
+            location,
+        )
+        .unwrap();
+        let checkpoint = rendered.document_checkpoint(location);
+        assert_eq!(checkpoint.answers.len(), answer_count);
+        let booted = Runner::boot_checkpoint(
+            plan.clone(),
+            Data::default(),
+            Kernel::with_monospace(),
+            &checkpoint,
+            vec![],
+            Default::default(),
+            Default::default(),
+            location,
+        )
+        .unwrap();
+        for runner in [&rendered, &booted] {
+            let kernel = runner.kernel();
+            let key = kernel.find_first_by_test_id("answer-home").unwrap();
+            let node = kernel.node_by_key(key).unwrap();
+            assert_eq!(node.props.str(exact_kernel::PropId::Text), Some("0:false"));
+        }
+        assert!(booted.data.mirrors.is_empty());
+    }
+}
+
+#[test]
+fn a_sleeping_owned_resource_boots_before_its_dependency_answers() {
+    let plan = contract::compile(
+        r#"component App
+  state show = true
+  view
+    column
+      if show
+        Chain()
+component Chain
+  resource first = immediate() as shape number
+  resource second = mirror(range(first - 1).length + 7) when first > 0 as shape number
+  view
+    text `${first}:${second}` testId="answer"
+"#,
+    )
+    .unwrap();
+    let rendered = Runner::boot(
+        plan.clone(),
+        Data::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let checkpoint = rendered.document_checkpoint("/");
+    assert_eq!(checkpoint.instances.len(), 2);
+    assert_eq!(checkpoint.instances[0].1, checkpoint.instances[1].1);
+    assert_eq!(owned_answer_text(&rendered), "1:7");
+
+    let booted = Runner::boot_checkpoint(
+        plan,
+        Data::default(),
+        Kernel::with_monospace(),
+        &checkpoint,
+        vec![],
+        Default::default(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert_eq!(owned_answer_text(&booted), "1:7");
+}
+
+#[test]
+fn a_sleeping_owned_resource_discards_an_answer_when_persisted_state_breaks_its_arguments() {
+    let plan = contract::compile(
+        r#"component App
+  state show = true
+  state number = 1 persist
+  state forced = false
+  action wake
+    forced = true
+  action repair
+    number = 2
+  view
+    column
+      if show
+        Sleeping(number=number, awake=(number > 0 || forced))
+component Sleeping
+  props
+    number: number
+    awake: bool
+  resource answer = mirror(range(number).length) when awake as shape number
+  view
+    text `${answer}:${current(answer)}` testId="answer"
+"#,
+    )
+    .unwrap();
+    let rendered = Runner::boot(
+        plan.clone(),
+        Data::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let checkpoint = rendered.document_checkpoint("/");
+    assert_eq!(checkpoint.instances.len(), 1);
+    assert_eq!(owned_answer_text(&rendered), "1:true");
+
+    let mut booted = Runner::boot_checkpoint(
+        plan,
+        Data::default(),
+        Kernel::with_monospace(),
+        &checkpoint,
+        vec![("exact.state.number".into(), b"-1".to_vec())],
+        Default::default(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert_eq!(owned_answer_text(&booted), "0:false");
+    let err = booted.act("wake", vec![]).unwrap_err();
+    assert!(format!("{err:?}").contains("RangeCount"), "{err:?}");
+    assert_eq!(owned_answer_text(&booted), "0:false");
+    assert!(booted.data.mirrors.is_empty());
+    booted.act("repair", vec![]).unwrap();
+    assert_eq!(owned_answer_text(&booted), "2:true");
+    assert_eq!(booted.data.mirrors, [Value::Number(2.)]);
+}
+
+fn owned_answer_text(r: &Runner<Data>) -> String {
+    let kernel = r.kernel();
+    let key = kernel.find_first_by_test_id("answer").unwrap();
+    kernel
+        .node_by_key(key)
+        .unwrap()
+        .props
+        .str(exact_kernel::PropId::Text)
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn a_sleeping_owned_resource_uses_changed_arguments_only_after_wake() {
+    let plan = contract::compile(
+        r#"component App
+  state show = true
+  state awake = false
+  state number = 1
+  action put(n: number)
+    number = n
+  action wake
+    awake = true
+  view
+    column
+      if show
+        Sleeping(awake=awake, number=number)
+component Sleeping
+  props
+    awake: bool
+    number: number
+  resource answer = mirror(range(number).length) when awake as shape number
+  view
+    text `${number}:${answer}:${current(answer)}` testId="answer"
+"#,
+    )
+    .unwrap();
+    let source = plan
+        .resources
+        .iter()
+        .find(|resource| plan.str(resource.source) == "mirror")
+        .unwrap();
+    assert!(source.owner.is_some());
+    // The instance's path, by which the boot's instance takes the page's
+    // answer (LLP 1035.005.004 D8).
+    let rendered = Runner::boot(
+        plan.clone(),
+        Data::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let path = (0..rendered.resources.len())
+        .find_map(|i| rendered.owned_row(i))
+        .unwrap()
+        .path
+        .clone();
+    let seed = Checkpoint {
+        answers: vec![(
+            plan.str(source.name).into(),
+            "mirror".into(),
+            vec![Value::Number(1.)],
+            Value::Number(91.),
+        )],
+        instances: vec![(0, path)],
+        ..Default::default()
+    };
+    let mut r = Runner::boot_checkpoint(
+        plan,
+        Data::default(),
+        Kernel::with_monospace(),
+        &seed,
+        vec![],
+        Default::default(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert_eq!(owned_answer_text(&r), "1:91:false");
+    r.act("put", vec![Value::Number(-1.)]).unwrap();
+    assert_eq!(owned_answer_text(&r), "-1:91:false");
+
+    r.act("put", vec![Value::Number(2.)]).unwrap();
+    assert_eq!(owned_answer_text(&r), "2:91:false");
+
+    r.act("put", vec![Value::Number(3.)]).unwrap();
+    assert_eq!(owned_answer_text(&r), "3:91:false");
+
+    assert!(r.data.mirrors.is_empty());
+
+    r.act("wake", vec![]).unwrap();
+    assert_eq!(r.data.mirrors, [Value::Number(3.)]);
+    assert_eq!(owned_answer_text(&r), "3:3:true");
+}
+
+#[test]
+fn a_refused_render_preserves_a_pinned_row_in_a_nested_collection() {
+    let plan = contract::compile(
+        r#"component App
+  state count = 0
+  action change(nextCount: number)
+    count = nextCount
+  view
+    column
+      list testId="outer" virtualized=true estimated-item-height=120 height=120
+        for groupKey in ["a"] key=groupKey
+          column height=120
+            list testId="inner" virtualized=true estimated-item-height=20 height=100
+              for item in range(count == 0 ? 80 : 81) key=item
+                row testId=`item-${item}` height=20
+                  text groupKey
+      if count != 0
+        Candidate(count=count)
+component Candidate
+  props
+    count: number
+  state ticks = 0
+  task tick when true key=(1 / (count - 1))
+    every(10, bump)
+  action bump
+    ticks = ticks + 1
+  view
+    text `${ticks}`
+"#,
+    )
+    .unwrap();
+    let mut r = Runner::boot(
+        plan,
+        Data::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert!(r.transactional_render());
+    let view = |r: &Runner<Data>, name| {
+        let kernel = r.kernel();
+        kernel
+            .node_by_key(kernel.find_by_test_id(name)[0])
+            .unwrap()
+            .id
+    };
+    let report = |r: &mut Runner<Data>, list, offset, port, interaction_view| {
+        let previous = r.collection(list).unwrap();
+        r.collection_feedback(crate::CollectionFeedback {
+            view: list,
+            revision: previous.revision,
+            scroll_sequence: previous.scroll_sequence + 1,
+            offset,
+            port_main: port,
+            port_cross: 320.,
+            cross: 320.,
+            padding: [0.; 2],
+            measurements: Vec::new(),
+            focus_view: None,
+            interaction_view,
+        })
+        .unwrap();
+    };
+
+    let outer = view(&r, "outer");
+    report(&mut r, outer, 0., 120., None);
+    let inner = view(&r, "inner");
+    report(&mut r, inner, 0., 100., None);
+    let pinned = view(&r, "item-0");
+    report(&mut r, inner, 600., 100., Some(pinned));
+    let before = r.collection(inner).unwrap();
+    assert_eq!(before.count, 80);
+    assert!(before.rows.iter().any(|row| row.root == pinned));
+    assert!(before.rows.iter().any(|row| row.index > 20));
+
+    assert!(r.act("change", vec![Value::Number(1.)]).is_err());
+    assert!(!r.is_poisoned());
+    assert_eq!(r.collection(inner).as_ref(), Some(&before));
+    assert_eq!(view(&r, "item-0"), pinned);
+
+    r.act("change", vec![Value::Number(2.)]).unwrap();
+    assert_eq!(view(&r, "inner"), inner);
+    let after = r.collection(inner).unwrap();
+    assert_eq!(after.count, 81);
+    assert!(after.revision > before.revision);
+    assert_eq!(view(&r, "item-0"), pinned);
+    report(&mut r, inner, 640., 100., None);
+    assert!(r.kernel().node(pinned).is_none());
 }

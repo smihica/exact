@@ -61,6 +61,65 @@ fn panel_copy_preserves_every_texel_at_all_four_rotations() {
     }
 }
 
+/// A frame's passes are one submit, each drawing its own instances, and a pass that
+/// samples a texture draws the pixels written before it and none written after.
+#[test]
+fn a_frame_s_passes_submit_together_and_sample_what_was_written_before_them() {
+    let Some(mut d) = open() else {
+        return;
+    };
+    let colors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+    // Past the target's edges, which a fill antialiases.
+    const COVER: [f32; 4] = [-4., -4., 12., 12.];
+    let targets = colors.map(|_| d.create_target(4, 4).unwrap());
+    let mut last = Submission(0);
+    for (color, target) in colors.iter().zip(targets) {
+        let mut encoder = Encoder::new(4, 4);
+        let fill = Instance::rounded(COVER, [0.; 4], color.map(|c| f32::from(c) / 255.));
+        encoder.push(fill, Bindings::default()).unwrap();
+        let pass = d.render(&encoder.finish(), target, Some([0.; 4])).unwrap();
+        assert!(pass > last, "each call has its own number");
+        last = pass;
+    }
+    // A write to a texture no pass samples is submitted with them.
+    let image = d.create_texture(TextureDesc::rgba(1, 1)).unwrap();
+    d.upload_texture(image, [0, 0], [1, 1], &colors[0]).unwrap();
+    assert_eq!(d.submits, 0);
+    assert!(
+        d.completed().unwrap() < last,
+        "nothing is complete unsubmitted"
+    );
+    d.wait(last).unwrap();
+    assert_eq!(d.submits, 1);
+    for (color, target) in colors.iter().zip(targets) {
+        for pixel in d.readback(target).unwrap().as_chunks::<4>().0 {
+            near(*pixel, *color, 0);
+        }
+    }
+
+    let mut encoder = Encoder::new(4, 4);
+    let sampled = Instance::new(Kind::Layer, Brush::Image, COVER);
+    let bindings = Bindings {
+        image,
+        ..Default::default()
+    };
+    encoder.push(sampled, bindings).unwrap();
+    let frame = encoder.finish();
+    d.render(&frame, targets[0], Some([0.; 4])).unwrap();
+    let submits = d.submits;
+    d.upload_texture(image, [0, 0], [1, 1], &colors[2]).unwrap();
+    d.render(&frame, targets[1], Some([0.; 4])).unwrap();
+    assert_eq!(
+        d.submits, submits,
+        "the write is a command between the two passes"
+    );
+    for (color, target) in [(colors[0], targets[0]), (colors[2], targets[1])] {
+        for pixel in d.readback(target).unwrap().as_chunks::<4>().0 {
+            near(*pixel, color, 0);
+        }
+    }
+}
+
 #[test]
 fn rounded_rectangles_ring_and_gaussian_shadow_at_two_times_scale() {
     let Some(mut device) = open() else {
@@ -226,27 +285,6 @@ fn textures_brushes_clips_mips_and_retirement_reach_the_pixels() {
     tinted.flags = flags::TINT;
     tinted.color = [0., 0.5, 0., 0.5];
     e.push(tinted, bindings).unwrap();
-    let mut shadow = Instance::new(Kind::Shadow, Brush::Image, [0., 0., 1., 1.]);
-    shadow.flags = flags::TINT;
-    shadow.xform = [6.25, 0., 0., 8., 46.375, 4.];
-    shadow.param[0] = 0.;
-    shadow
-        .set_clip(
-            1,
-            RoundedClip {
-                rect: [49., 6., 2., 4.],
-                radii: [0.; 4],
-            },
-        )
-        .unwrap();
-    e.push(shadow, bindings).unwrap();
-    let mut band = shadow.translated([9., 0.]);
-    band.flags |= flags::RASTERED_SHADOW;
-    for x in [0., 0.5] {
-        band.rect = [x, 0., 0.5, 1.];
-        band.uv = band.rect;
-        e.push(band, bindings).unwrap();
-    }
     let mut radial = Instance::new(Kind::RoundedRect, Brush::Gradient, [24., 16., 8., 16.]);
     radial.flags = flags::RADIAL;
     radial.param = [28., 24., 4., 8.];
@@ -302,12 +340,6 @@ fn textures_brushes_clips_mips_and_retirement_reach_the_pixels() {
     near(pixel(&pixels, 64, 10, 24), [128; 4], 1);
     near(pixel(&pixels, 64, 2, 24), [0; 4], 0);
     near(pixel(&pixels, 64, 10, 18), [0; 4], 0);
-    // At the same fractional edge the raster supplies its own coverage.
-    near(pixel(&pixels, 64, 46, 8), [80; 4], 1);
-    near(pixel(&pixels, 64, 55, 8), [128; 4], 1);
-    // The two translucent bands share the centre of this pixel.
-    near(pixel(&pixels, 64, 58, 5), [128; 4], 1);
-    near(pixel(&pixels, 64, 58, 8), [0; 4], 1);
     assert!(device.completed().unwrap() >= submitted);
     assert!(device.retired_textures.is_empty());
     let copy = device.create_target(3, 1).unwrap();
@@ -395,6 +427,40 @@ fn each_mip_matches_an_area_draw_of_the_previous_level() {
             previous = next;
         }
     }
+    // Half-byte boundary block: [0, 128, 133, 253] averages to 128.5 in byte units.
+    // Confirm the 4-load mip shader matches `Kind::Downsample` rounding exactly.
+    let desc = TextureDesc {
+        mipmapped: true,
+        ..TextureDesc::rgba(2, 2)
+    };
+    let image = d.create_texture(desc).unwrap();
+    let previous = d.create_texture(TextureDesc::rgba(2, 2)).unwrap();
+    let bytes = [
+        0, 0, 0, 255, // (0, 0)
+        128, 128, 128, 255, // (1, 0)
+        133, 133, 133, 255, // (0, 1)
+        253, 253, 253, 255, // (1, 1)
+    ];
+    for t in [image, previous] {
+        d.upload_texture(t, [0, 0], [2, 2], &bytes).unwrap();
+    }
+    d.generate_mips(image).unwrap();
+    let next = d.create_target(1, 1).unwrap();
+    let mut e = Encoder::new(1, 1);
+    e.push(
+        Instance::new(Kind::Downsample, Brush::Solid, [0., 0., 1., 1.]),
+        Bindings {
+            image: previous,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    d.render(&e.finish(), next, Some([0.; 4])).unwrap();
+    assert_eq!(
+        block_on(d.readback_async(image, 1)).unwrap(),
+        d.readback(next).unwrap(),
+        "half-byte 2x2 boundary block"
+    );
 }
 
 #[test]

@@ -298,6 +298,13 @@ impl<D: DataSource> Swappable<D> {
 }
 
 impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
+    fn queued_send_replacer(
+        &mut self,
+        source: Option<&str>,
+    ) -> Option<exact_runner::QueuedSendReplacer> {
+        self.embedded.as_mut()?.queued_send_replacer(source)
+    }
+
     fn prepare_snapshot(
         &mut self,
         module: Option<exact_runner::SnapshotModule<'_>>,
@@ -341,6 +348,11 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
             (Some(preload), Some(bytes)) => preload(bytes).map_err(DataError::Unavailable),
             _ => Ok(true),
         }
+    }
+    fn ambient_taint(&self, source: &str) -> (bool, bool) {
+        self.embedded
+            .as_ref()
+            .map_or((false, false), |embedded| embedded.ambient_taint(source))
     }
     fn when_preloaded(&self, wake: Box<dyn FnOnce() + Send>) {
         if let Some(embedded) = &self.embedded {

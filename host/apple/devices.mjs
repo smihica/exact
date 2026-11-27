@@ -8,6 +8,54 @@ import { createServer as createTCPServer } from 'node:net';
 import { basename, dirname, resolve } from 'node:path';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { decodePng, encodePng, pngDimensions } from '../../scripts/png.mjs';
+
+/** Parse a CoreSimulator runtime identifier into an integer tuple `[major, minor, patch]`. */
+export function parseRuntimeVersion(runtime) {
+  const m = /(?:iOS|tvOS|watchOS)-(\d+)-(\d+)(?:-(\d+))?/.exec(String(runtime ?? ''));
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)] : [0, 0, 0];
+}
+
+/** Descending comparator for runtime version tuples (`17.10` sorts ahead of `17.9`). */
+export function compareRuntimeVersionDesc(a, b) {
+  const va = parseRuntimeVersion(a), vb = parseRuntimeVersion(b);
+  for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return vb[i] - va[i];
+  return 0;
+}
+
+/** Human-readable OS label from a CoreSimulator runtime identifier, e.g. `iOS 27.0`. */
+export function formatRuntime(runtime) {
+  const m = /(iOS|tvOS|watchOS)-(\d+)-(\d+)(?:-(\d+))?/.exec(String(runtime ?? ''));
+  if (!m) return String(runtime ?? '');
+  return `${m[1]} ${m[2]}.${m[3]}${m[4] ? `.${m[4]}` : ''}`;
+}
+
+export function isTargetPlatformRuntime(runtime, tv = false) {
+  return tv ? /SimRuntime\.tvOS/.test(String(runtime ?? '')) : /SimRuntime\.iOS/.test(String(runtime ?? ''));
+}
+
+/** Resolve an explicit `--sim` / `EXACT_SIM` query: exact UDID, exact name, else
+ * unambiguous case-insensitive substring strictly within the target platform's runtimes. */
+export function matchSimulatorQuery(all, pick, { tv = false, exactUdid = false } = {}) {
+  if (!pick) return null;
+  const byUdid = all.find((d) => d.udid === pick);
+  if (byUdid) return { dev: byUdid, matchedBySubstring: false };
+  if (exactUdid) throw new Error(`no ${tv ? 'tvOS' : 'iOS'} simulator with udid "${pick}" (xcrun simctl list devices available)`);
+  const byName = all.find((d) => d.name === pick);
+  if (byName) return { dev: byName, matchedBySubstring: false };
+  const query = String(pick).trim().toLowerCase();
+  const scoped = all.filter((d) => isTargetPlatformRuntime(d.runtime, tv));
+  const matches = scoped.filter((d) => d.name.toLowerCase().includes(query) || d.udid.toLowerCase().startsWith(query));
+  if (!matches.length) throw new Error(`no ${tv ? 'tvOS' : 'iOS'} simulator matching "${pick}" (xcrun simctl list devices available)`);
+  const sorted = [...matches].sort((a, b) =>
+    Number(b.state === 'Booted') - Number(a.state === 'Booted')
+    || compareRuntimeVersionDesc(a.runtime, b.runtime)
+    || a.name.localeCompare(b.name));
+  if (new Set(sorted.map((d) => d.name)).size > 1) {
+    const listed = sorted.map((d) => `${d.name} (${formatRuntime(d.runtime)}, ${d.udid})`).join(', ');
+    throw new Error(`multiple ${tv ? 'tvOS' : 'iOS'} simulators match "${pick}": ${listed}. Name one more specifically with --sim`);
+  }
+  return { dev: sorted[0], matchedBySubstring: true };
+}
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -136,7 +184,10 @@ export async function withDisplay(r, path, udid, appTop = 0, { own = false, prob
   let why = own ? 'asked for the app\'s own drawing' : r.unshown?.length > 0 ? 'header nodes are struck through in it'
     : r.moving ? 'UIKit\'s motion had not settled' : null;
   if (why && !(bar > 0) && !keyboard) return keep(why);
-  const reads = displayReads(udid, gap);
+  const header = Buffer.alloc(24), fd = openSync(path, 'r');
+  try { readSync(fd, header); } finally { closeSync(fd); }
+  const appPixels = pngDimensions(header);
+  const reads = displayReads(udid, gap, { pixels: appPixels });
   try {
     const [display, again, last] = await Promise.all(reads.reads), app = decodePng(readFileSync(path));
     if (app.width !== display.width || app.height !== display.height) return keep(`the display is ${display.width}x${display.height}, the capture ${app.width}x${app.height}`);
@@ -180,32 +231,99 @@ export async function withDisplay(r, path, udid, appTop = 0, { own = false, prob
  *  is drawn in, with room for its edge. */
 const INDICATOR = 80;
 
+/** Multi-display simulators (such as iPhone Duo) refuse `simctl io screenshot` without `--display`, naming each
+ *  available display and its pixel dimensions on stderr. Parse those choices and pick the one matching `want`. */
+const simulatorDisplays = new Map();
+export function parseSimulatorDisplays(stderr) {
+  const out = [];
+  for (const m of String(stderr || '').matchAll(/--display=(\S+)\s+[^\n]*?\b(\d+)x(\d+)\b/g)) {
+    out.push({ display: m[1], width: Number(m[2]), height: Number(m[3]) });
+  }
+  return out;
+}
+function pickSimulatorDisplay(displays, want) {
+  if (!displays?.length) return null;
+  if (want?.pixels?.width > 0 && want?.pixels?.height > 0) {
+    const { width, height } = want.pixels;
+    const hit = displays.find((d) => (d.width === width && d.height === height) || (d.width === height && d.height === width));
+    if (hit) return hit.display;
+  }
+  if (want?.screen?.w > 0 && want?.screen?.h > 0) {
+    const { w, h } = want.screen;
+    const fit = (sw, sh, d) => displayScale({ w: sw, h: sh }, d) !== undefined ? Math.abs(d.width / sw - d.height / sh) : Infinity;
+    let best = null, bestErr = Infinity;
+    for (const d of displays) {
+      const err = Math.min(fit(w, h, d), fit(h, w, d));
+      if (err < bestErr) { bestErr = err; best = d; }
+    }
+    if (best) return best.display;
+  }
+  return displays[0].display;
+}
+function screenshotArgs(udid, path, { type, display } = {}) {
+  return ['simctl', 'io', udid, 'screenshot', ...(display ? [`--display=${display}`] : []), ...(type ? [`--type=${type}`] : []), path];
+}
+/** Capture the simulator's display into `path`, automatically resolving `--display=<id>` on multi-display simulators
+ *  such as iPhone Duo by matching `pixels` or `screen` dimensions. Returns the `spawnSync` result. */
+export function simulatorScreenshot(udid, path, { type, pixels, screen, timeout = 20000, run = read } = {}) {
+  const want = { pixels, screen };
+  const cached = simulatorDisplays.get(udid);
+  const firstDisplay = cached ? pickSimulatorDisplay(cached, want) : null;
+  let r = run('xcrun', screenshotArgs(udid, path, { type, display: firstDisplay }), { timeout });
+  if (r.status === 0) return r;
+  if (firstDisplay) {
+    simulatorDisplays.delete(udid);
+    r = run('xcrun', screenshotArgs(udid, path, { type }), { timeout });
+    if (r.status === 0) return r;
+  }
+  const displays = parseSimulatorDisplays(r.stderr);
+  if (!displays.length) return r;
+  simulatorDisplays.set(udid, displays);
+  const chosen = pickSimulatorDisplay(displays, want);
+  return run('xcrun', screenshotArgs(udid, path, { type, display: chosen }), { timeout });
+}
+
 /** The simulator's display read three times for `withDisplay`, started now: the second 150 ms after the first, not
  *  after it ends (each `simctl io` read is ~0.4 s, most of it the tool's own start), and the third `gap` ms after both
  *  have ended, so it is that far from either whenever their pictures were taken. `reads` are their pictures, decoded;
  *  `cancel()` stops what is still reading and removes the files. */
-function displayReads(udid, gap = 400) {
+function displayReads(udid, gap = 400, want = {}) {
   useXcode();
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-display-')), children = new Set(), timers = new Set();
   let cancelled = false;
   const later = (ms, fn) => { const timer = setTimeout(() => { timers.delete(timer); fn(); }, ms); timers.add(timer); };
-  const read = (name) => new Promise((done, fail) => {
+  const runOne = (shot, display) => new Promise((done, fail) => {
     if (cancelled) return fail(new Error('the display reads were cancelled'));
-    const shot = resolve(dir, name);
     let said = '';
-    const child = spawn('xcrun', ['simctl', 'io', udid, 'screenshot', '--type=png', shot], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn('xcrun', screenshotArgs(udid, shot, { type: 'png', display }), { stdio: ['ignore', 'ignore', 'pipe'] });
     children.add(child);
     const bound = setTimeout(() => child.kill('SIGKILL'), 20000);
     child.stderr.on('data', (d) => { said += d; });
     child.on('error', (e) => { clearTimeout(bound); children.delete(child); fail(e); });
     child.on('close', (status) => {
       clearTimeout(bound); children.delete(child);
-      try {
-        if (status !== 0 || !existsSync(shot)) throw new Error(`simctl io screenshot: ${said.trim().split('\n').pop() || 'failed'}`);
-        done(decodePng(readFileSync(shot)));
-      } catch (e) { fail(e); }
+      done({ status, stderr: said });
     });
   });
+  const read = async (name) => {
+    const shot = resolve(dir, name);
+    const cached = simulatorDisplays.get(udid);
+    const firstDisplay = cached ? pickSimulatorDisplay(cached, want) : null;
+    let res = await runOne(shot, firstDisplay);
+    if (res.status !== 0 && firstDisplay) {
+      simulatorDisplays.delete(udid);
+      res = await runOne(shot, null);
+    }
+    if (res.status !== 0) {
+      const displays = parseSimulatorDisplays(res.stderr);
+      if (displays.length) {
+        simulatorDisplays.set(udid, displays);
+        res = await runOne(shot, pickSimulatorDisplay(displays, want));
+      }
+    }
+    if (res.status !== 0 || !existsSync(shot)) throw new Error(`simctl io screenshot: ${res.stderr.trim().split('\n').pop() || 'failed'}`);
+    return decodePng(readFileSync(shot));
+  };
   const first = read('display.png'), second = new Promise((done) => later(150, done)).then(() => read('again.png'));
   const third = Promise.allSettled([first, second]).then(() => new Promise((done) => later(gap, done))).then(() => read('last.png'));
   const reads = [first, second, third];
@@ -322,7 +440,7 @@ export async function displayPictureReply(ask, r, path, { keepPixels = false } =
 export async function displayAsIs(ask, path, udid, { skipMotion } = {}) {
   const r = await ask({ op: 'screenshot', window: 'display', ...(skipMotion ? { skipMotion } : {}) });
   if (r.error) throw new Error(r.error);
-  const taken = read('xcrun', ['simctl', 'io', udid, 'screenshot', '--type=png', path], { timeout: 20000 });
+  const taken = simulatorScreenshot(udid, path, { type: 'png', screen: r.screen, timeout: 20000 });
   if (taken.status !== 0) throw new Error(`simctl io screenshot: ${(taken.stderr || '').trim().split('\n').pop() || 'failed'}`);
   const reply = await displayPictureReply(ask, r, path);
   return { ...reply, pixelsWhy: 'the display as it is, asked for' };
@@ -371,25 +489,78 @@ export function simulators(set) {
 
 /** The simulator to use — `pick` (a udid or a name; EXACT_SIM by default), else the one booted iPhone, else the iPhone Pro on the newest iOS — booted and waited for. When several are booted, the one `app` (a bundle id) is installed on, and of several so, the one the app in `dir` last used (its `.exact/simulator`, written when a simulator is named or chosen so), said on stderr; refused when that is none or several, naming how to choose: `hint`, the caller's own way. With `tv`, the same choice among Apple TVs on tvOS. An iPhone is one by its device type, not its name: a simulator renamed `work-phone` is still one. */
 const saidSimulator = new Set(); // a verify opens a dozen sessions: the choice is said once
-export function simulator(pick = process.env.EXACT_SIM, options = {}) { return bootSimulator(chooseSimulator(pick, options)); }
+export function simulator(pick = process.env.EXACT_SIM, options = {}) {
+  const dev = chooseSimulator(pick, options);
+  const retryBoot = options.cached && evictedBoots.delete(dev.udid);
+  try {
+    const booted = bootSimulator(dev, retryBoot);
+    if (options.cached) dev.state = 'Booted';
+    return { ...booted };
+  } catch (error) {
+    if (options.cached) forgetSimulator(dev.udid);
+    throw error;
+  }
+}
+
+/** Async counterpart to [simulator]: runs `simctl boot` and `bootstatus` asynchronously so SIGINT/SIGTERM
+ *  cancels a stalled boot immediately, and invokes `onBooted` / `onShutdown` as ownership changes. */
+export async function simulatorAsync(pick = process.env.EXACT_SIM, options = {}) {
+  const dev = chooseSimulator(pick, options);
+  const retryBoot = options.cached && evictedBoots.delete(dev.udid);
+  try {
+    const booted = await bootSimulatorAsync(dev, retryBoot, options);
+    if (options.cached) dev.state = 'Booted';
+    return { ...booted };
+  } catch (error) {
+    if (options.cached) forgetSimulator(dev.udid);
+    throw error;
+  }
+}
+const driveSimulators = new Map();
+const evictedBoots = new Set();
+/** A failed launch may mean the device shut down. The next launch must ask simctl again. */
+export function forgetSimulator(udid, { retryBoot = false } = {}) {
+  for (const [key, dev] of driveSimulators) if (dev.udid === udid) driveSimulators.delete(key);
+  simulatorDisplays.delete(udid);
+  if (retryBoot) evictedBoots.add(udid);
+  chosenFrom = null;
+  for (const record of keyboardNotes.keys()) if (basename(record) === `${udid}.json`) keyboardNotes.delete(record);
+  saidKeyboard.delete(udid);
+}
+let simulatorTemp;
+/** CoreSimulator is shared by processes with different TMPDIRs. Keep its display and accessibility locks together. */
+export function simulatorTempDirectory() {
+  return simulatorTemp ??= (process.platform === 'darwin' && spawnSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout?.trim()) || tmpdir();
+}
 /** `simulators()` as it was a moment ago in this process: a drive chooses its simulator before it takes the store's
  *  lock and again when it launches, a fraction of a second apart. A boot here forgets it; a shutdown by another process
  *  in between fails the launch, where a fresh list would have booted it. */
 let chosenFrom = null;
 const recentSimulators = () => (chosenFrom && Date.now() - chosenFrom.at < 5000 ? chosenFrom : chosenFrom = { at: Date.now(), all: simulators() }).all;
-/** `simulator`'s choice, booting nothing: what a drive locks before it launches (agent.mjs `resolveDevice`). */
-export function chooseSimulator(pick = process.env.EXACT_SIM, { tv = false, hint = 'EXACT_SIM=<udid|name>', app, dir } = {}) {
+/** `simulator`'s choice, booting nothing: what a drive locks before it launches (agent.mjs `resolveDevice`).
+ * `cached` keeps that choice for the runner's later launches, including a test's reloads. */
+export function chooseSimulator(pick = process.env.EXACT_SIM, { tv = false, hint = 'EXACT_SIM=<udid|name>', app, dir, cached = false, rememberChoice = true, exactUdid = false } = {}) {
+  const key = pick => JSON.stringify([pick, tv, app, dir, exactUdid]);
+  const used = dir ? resolve(dir, '.exact', tv ? 'simulator-tv' : 'simulator') : null;
+  const lastUsed = () => { try { return used && readFileSync(used, 'utf8').trim(); } catch { return null; } };
+  const remember = (dev, last) => {
+    if (rememberChoice && !process.env.EXACT_SIM_NO_REMEMBER && used && dev.udid !== last) try { mkdirSync(dirname(used), { recursive: true }); writeFileSync(used, `${dev.udid}\n`); } catch { /* remembered next time, if it can be */ }
+  };
+  const kept = cached && driveSimulators.get(key(pick));
+  if (kept) {
+    if (pick) remember(kept, lastUsed());
+    return kept.state === 'Booted' ? { ...kept, cachedBooted: true } : kept;
+  }
   const all = recentSimulators();
-  const version = (d) => Number(/(?:iOS|tvOS)-(\d+)-(\d+)/.exec(d.runtime)?.slice(1).join('.') ?? 0);
   const kind = (d) => d.type || d.name.replaceAll(' ', '-');
-  const iphones = all.filter((d) => (tv ? /SimRuntime\.tvOS/.test(d.runtime) && /^Apple-TV/.test(kind(d)) : /SimRuntime\.iOS/.test(d.runtime) && /^iPhone/.test(kind(d)))).sort((a, b) => version(b) - version(a) || a.name.localeCompare(b.name));
-  let dev = pick ? all.find((d) => d.udid === pick || d.name === pick) : null;
-  if (pick && !dev) throw new Error(`no simulator ${pick} (xcrun simctl list devices available)`);
+  const iphones = all.filter((d) => (tv ? /SimRuntime\.tvOS/.test(d.runtime) && /^Apple-TV/.test(kind(d)) : /SimRuntime\.iOS/.test(d.runtime) && /^iPhone/.test(kind(d)))).sort((a, b) => compareRuntimeVersionDesc(a.runtime, b.runtime) || a.name.localeCompare(b.name));
+  const matched = pick ? matchSimulatorQuery(all, pick, { tv, exactUdid }) : null;
+  let dev = matched?.dev ?? null;
+  if (matched?.matchedBySubstring) console.error(`simulator: "${pick}" matched ${dev.name} (${formatRuntime(dev.runtime)}, ${dev.udid})`);
   // Several booted: whose is which is not this process's to guess (an install onto another drive's simulator,
   // 2026-10-09: build.mjs --ios takes --sim, not --phone, for a simulator). One booted, or none, is still chosen.
   const booted = iphones.filter((d) => d.state === 'Booted');
-  const used = dir ? resolve(dir, '.exact', tv ? 'simulator-tv' : 'simulator') : null;
-  let last = null; try { last = used && readFileSync(used, 'utf8').trim(); } catch { /* none chosen yet */ }
+  const last = lastUsed();
   // What `used` remembers: a simulator named, or one the installed-app check chose.
   let chosen = Boolean(pick);
   if (!pick && booted.length > 1) {
@@ -400,25 +571,83 @@ export function chooseSimulator(pick = process.env.EXACT_SIM, { tv = false, hint
       if (!saidSimulator.has(dev.udid)) { saidSimulator.add(dev.udid); console.error(`${booted.length} ${tv ? 'Apple TV' : 'iPhone'} simulators are booted; using ${dev.name} ${dev.udid}, ${mine ? `the one this app last used of those with ${app} installed` : `the one with ${app} installed`}; name another with ${hint}`); }
     } else {
       const named = (d) => `${d.name} ${d.udid}${has.includes(d) ? ` (has ${app})` : ''}`;
-      throw new Error(`${booted.length} ${tv ? 'Apple TV' : 'iPhone'} simulators are booted (${booted.map(named).join(', ')})${app ? `, ${has.length ? 'several' : 'none'} with ${app} installed` : ''}: name one with ${hint}`);
+      throw Object.assign(new Error(`${booted.length} ${tv ? 'Apple TV' : 'iPhone'} simulators are booted (${booted.map(named).join(', ')})${app ? `, ${has.length ? 'several' : 'none'} with ${app} installed` : ''}: name one with ${hint}`), { code: 'EXACT_SIMULATOR_AMBIGUOUS', candidates: booted });
     }
   }
   dev ??= booted[0] ?? iphones.find((d) => /^iPhone-\d+-Pro$/.test(kind(d))) ?? iphones[0];
   if (!dev) throw new Error(`no ${tv ? 'Apple TV' : 'iPhone'} simulator on ${tv ? 'tvOS' : 'iOS'}; add one in Xcode, or name any simulator by udid or name with EXACT_SIM (or --sim)`);
-  if (used && chosen && dev.udid !== last) try { mkdirSync(dirname(used), { recursive: true }); writeFileSync(used, `${dev.udid}\n`); } catch { /* remembered next time, if it can be */ }
+  if (chosen) remember(dev, last);
+  if (cached) { driveSimulators.set(key(pick), dev); driveSimulators.set(key(dev.udid), dev); }
   return dev;
 }
 /** `dev` booted and waited for; `bootedHere` when this call booted it, not when another process had just done so. */
-function bootSimulator(dev) {
+function bootSimulator(dev, retryBoot) {
   // Booted is a boot finished (Booting is its own state): only another waits, which costs a booted one 0.2–0.5 s.
   if (dev.state === 'Booted') return dev;
   chosenFrom = null;
-  const b = read('xcrun', ['simctl', 'boot', dev.udid]);
-  if (b.status !== 0 && !/current state: Booted/.test(b.stderr)) throw new Error('simctl boot: ' + b.stderr);
-  const s = read('xcrun', ['simctl', 'bootstatus', dev.udid, '-b']);
+  const b = read('xcrun', ['simctl', 'boot', dev.udid], { timeout: 120_000 });
+  if (b.status !== 0 && !/current state: Booted/.test(b.stderr)) {
+    const error = new Error('simctl boot: ' + (b.stderr || b.error?.message || 'failed'));
+    if (retryBoot) error.retrySimulator = true;
+    throw error;
+  }
+  const s = read('xcrun', ['simctl', 'bootstatus', dev.udid, '-b'], { timeout: 120_000 });
   // A simulator this call booted is not left running when its boot does not finish.
-  if (s.status !== 0) { if (b.status === 0) read('xcrun', ['simctl', 'shutdown', dev.udid]); throw new Error('simctl bootstatus: ' + s.stderr); }
+  if (s.status !== 0) { if (b.status === 0) read('xcrun', ['simctl', 'shutdown', dev.udid], { timeout: 15_000 }); throw new Error('simctl bootstatus: ' + (s.stderr || s.error?.message || 'failed')); }
   return b.status === 0 ? { ...dev, bootedHere: true } : dev;
+}
+
+function runCommandAsync(cmd, args, { timeoutMs = 120_000, signal } = {}) {
+  useXcode();
+  return new Promise((done) => {
+    if (signal?.aborted) return done({ status: null, stdout: '', stderr: 'aborted' });
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', finished = false;
+    const settle = (result) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      done(result);
+    };
+    const kill = (why, immediate = false) => {
+      stderr = stderr || why;
+      try { child.kill(immediate ? 'SIGKILL' : 'SIGTERM'); } catch {}
+      if (!immediate) setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 500).unref();
+    };
+    const onAbort = () => kill('aborted', signal?.reason === 'exit');
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(() => kill(`timed out after ${timeoutMs} ms`), timeoutMs);
+    timer.unref?.();
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (e) => settle({ status: null, stdout, stderr: e.message }));
+    child.on('close', (status) => settle({ status, stdout, stderr }));
+  });
+}
+
+async function bootSimulatorAsync(dev, retryBoot, { timeoutMs = 120_000, onBootStart, onBootCleared, onBooted, onShutdown, signal } = {}) {
+  if (dev.state === 'Booted') return dev;
+  chosenFrom = null;
+  onBootStart?.();
+  const b = await runCommandAsync('xcrun', ['simctl', 'boot', dev.udid], { timeoutMs, signal });
+  if (b.status !== 0 && !/current state: Booted/.test(b.stderr)) {
+    if (!signal?.aborted) onBootCleared?.();
+    const error = new Error('simctl boot: ' + (b.stderr || 'failed'));
+    if (retryBoot) error.retrySimulator = true;
+    throw error;
+  }
+  const bootedHere = b.status === 0;
+  if (bootedHere) onBooted?.(); else onBootCleared?.();
+  const s = await runCommandAsync('xcrun', ['simctl', 'bootstatus', dev.udid, '-b'], { timeoutMs, signal });
+  if (s.status !== 0) {
+    if (bootedHere) {
+      const down = read('xcrun', ['simctl', 'shutdown', dev.udid], { timeout: 15_000 });
+      if (down.status === 0) onShutdown?.();
+    }
+    throw new Error('simctl bootstatus: ' + (s.stderr || 'failed'));
+  }
+  return bootedHere ? { ...dev, bootedHere: true } : dev;
 }
 
 /** Bring Simulator.app up showing `dev`, so a person watching sees what is
@@ -440,7 +669,10 @@ export function showSimulator(dev, background = false) {
  *  the same size and time (simctl install keeps both). A drive then skips the install, 0.3–0.5 s of each launch. The
  *  bundle's container is looked in first where `simctl get_app_container` last said it was (~0.1 s, each drive): a
  *  reinstall or a removal takes that directory away, and any other answer asks simctl again. */
-export function installedAlready(udid, id, bundle, executable, { records = resolve(homedir(), '.cache/exact/simulator-installs') } = {}) {
+export function installedAlready(udid, id, bundle, executable, options) {
+  return !!matchingInstall(udid, id, bundle, executable, options);
+}
+function matchingInstall(udid, id, bundle, executable, { records = resolve(homedir(), '.cache/exact/simulator-installs'), container } = {}) {
   const same = (installed) => {
     try {
       return [executable, 'receipt.json', '_CodeSignature/CodeResources'].every((file) => {
@@ -449,13 +681,14 @@ export function installedAlready(udid, id, bundle, executable, { records = resol
       });
     } catch { return false; }
   };
+  if (container && same(container)) return container;
   const record = resolve(records, `${udid}-${id}`);
-  try { if (same(readFileSync(record, 'utf8'))) return true; } catch { /* none remembered */ }
+  try { const installed = readFileSync(record, 'utf8'); if (same(installed)) return installed; } catch { /* none remembered */ }
   const r = read('xcrun', ['simctl', 'get_app_container', udid, id, 'app']);
-  if (r.status !== 0) return false;
+  if (r.status !== 0) return null;
   const installed = r.stdout.trim();
   try { mkdirSync(records, { recursive: true }); writeFileSync(record, installed); } catch { /* asked again next time */ }
-  return same(installed);
+  return same(installed) ? installed : null;
 }
 
 /** The build of `id` installed on a simulator: its bundle's path, its receipt's `build.trust` (`unreceipted` with
@@ -484,8 +717,9 @@ export function replacedNote(udid, app, replaced, release) {
  *  Both share the bundle id, so a later benchmark or person would otherwise find the development build with no way
  *  back (euxy port). Nothing is reinstalled for the drive: that is the person's call. A clone that cannot be made
  *  throws, and nothing is installed. A drive's later sessions find the development build and copy nothing. */
-export function keepInstalledRelease(udid, id, bundle, executable, { records = resolve(homedir(), '.cache/exact/simulator-releases') } = {}) {
-  if (installedAlready(udid, id, bundle, executable)) return { install: false };
+export function keepInstalledRelease(udid, id, bundle, executable, { records = resolve(homedir(), '.cache/exact/simulator-releases'), installRecords, container } = {}) {
+  const matching = matchingInstall(udid, id, bundle, executable, { records: installRecords, container });
+  if (matching) return { install: false, container: matching };
   const { installed, trust, what } = installedBuild(udid, id) ?? {};
   if (!installed || trust === 'development') return { install: true };
   // Copied beside the older copy first, which a failed copy leaves in place.
@@ -501,6 +735,7 @@ export function keepInstalledRelease(udid, id, bundle, executable, { records = r
   return { install: true, note: `the simulator had ${id}'s ${what} installed; this drive installed its development build over it (one bundle id). Put it back with: xcrun simctl install ${udid} ${shellQuote(copy)}` };
 }
 
+const keyboardNotes = new Map();
 /** A simulator's software keyboard for a drive: shown for a focused field, as a person's iPhone shows it. Once a Device
  *  Hub has attached the Mac's keyboard, the device keeps `com.apple.keyboard.preferences` `AutomaticMinimizationEnabled
  *  = 1` and minimizes its software keyboard behind it (LLP 1078, "The pushed route's keyboard, found"). Read and
@@ -531,17 +766,19 @@ export function softwareKeyboard(udid, { owned = false, records = resolve(homedi
   writeFileSync(record, JSON.stringify({ pid: process.pid, value: 1 }));
   if (defaults('delete').status !== 0) { rmSync(record, { force: true }); return { cleared: false, note: 'the simulator\'s software keyboard is minimized and could not be shown (simctl spawn defaults delete failed)', restore() {} }; }
   let restored = false;
-  return { cleared: true, note: null, restore() { if (!restored) restored = putBack(); } };
+  return { cleared: true, note: null, restore() { if (!restored) restored = putBack(); return restored; } };
 }
 const saidKeyboard = new Set(); // the hidden keyboard's note, once a process: a smoke or verify opens many sessions
 /** `open()`'s carrier with the software keyboard shown for a focused field on a simulator this drive booted
  *  (`softwareKeyboard`), its setting put back when the drive closes, fails to open, or the driver exits (a killed
  *  drive's, by the next drive on that simulator); on any other simulator, the note that the keyboard may be hidden. */
-export async function withSoftwareKeyboard(dev, open, { records = resolve(homedir(), '.cache/exact/simulator-keyboard') } = {}) {
+export async function withSoftwareKeyboard(dev, open, { records = resolve(homedir(), '.cache/exact/simulator-keyboard'), strictRestore = false } = {}) {
   // On a simulator another booted the setting is only read, for the note: beside the launch, not before it (~0.2 s).
   if (!dev.bootedHere) {
-    keyboardLeft(dev.udid, resolve(records, `${dev.udid}.json`), (verb) => read('xcrun', keyboardArgs(dev.udid, verb), { timeout: 20000 }));
-    const said = saidKeyboard.has(dev.udid) ? null : new Promise((done) => {
+    const record = resolve(records, `${dev.udid}.json`);
+    if (existsSync(record)) keyboardNotes.delete(record);
+    keyboardLeft(dev.udid, record, (verb) => read('xcrun', keyboardArgs(dev.udid, verb), { timeout: 20000 }));
+    const said = keyboardNotes.get(record) ?? new Promise((done) => {
       useXcode();
       let out = '';
       const child = spawn('xcrun', keyboardArgs(dev.udid, 'read'), { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -554,6 +791,7 @@ export async function withSoftwareKeyboard(dev, open, { records = resolve(homedi
         done();
       });
     });
+    keyboardNotes.set(record, said);
     let carrier;
     try { carrier = await open(); } finally { if (!carrier) await said; }
     const close = carrier.close.bind(carrier);
@@ -564,12 +802,18 @@ export async function withSoftwareKeyboard(dev, open, { records = resolve(homedi
   if (keyboard.note && !saidKeyboard.has(dev.udid)) { saidKeyboard.add(dev.udid); console.error(`note: ${keyboard.note}`); }
   const restore = () => keyboard.restore();
   process.once('exit', restore);
-  const done = () => { restore(); process.off('exit', restore); };
+  const done = () => { const ok = restore(); process.off('exit', restore); return ok; };
   let carrier;
   try { carrier = await open(); } catch (e) { done(); throw e; }
   if (!keyboard.cleared) { done(); return carrier; }
   const close = carrier.close.bind(carrier);
-  carrier.close = async (...args) => { try { return await close(...args); } finally { done(); } };
+  carrier.restoreSync = done;
+  carrier.close = async (...args) => {
+    let failed = false;
+    try { return await close(...args); }
+    catch (e) { failed = true; throw e; }
+    finally { const ok = done(); if (strictRestore && !ok && !failed) throw new Error('simctl spawn defaults write failed'); }
+  };
   return carrier;
 }
 const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };

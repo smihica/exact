@@ -72,6 +72,9 @@ pub(super) struct Clock {
     fixtures: Vec<fixture_replies::Delayed>,
     /// Inputs waiting on the work due by their arrival (`inputs.rs`)
     held: std::collections::VecDeque<inputs::Held>,
+    /// Work that fell due is running, not an input's own action
+    /// (`RouterChange::due`)
+    pub(super) due: bool,
 }
 
 impl<D: DataSource> Runner<D> {
@@ -316,10 +319,10 @@ impl<D: DataSource> Runner<D> {
             let action = self.timer_row(i).action;
             let was_poisoned = self.poisoned;
             match self.scheduled(at, |r| r.task_action(i)) {
-                Ok(receipt) => a.receipts.push(Timed {
+                Ok(receipt) => a.receipts.extend(receipt.map(|receipt| Timed {
                     at_ms: self.now_ms,
                     receipt,
-                }),
+                })),
                 Err(e) => {
                     let what = format!(
                         "frame {} ({})",
@@ -436,6 +439,13 @@ impl<D: DataSource> Runner<D> {
 
     /// [`Self::advance_within`] with no input held.
     fn advance_due(&mut self, now_ms: f64, until_request: bool, timers: bool) -> Advanced {
+        let outer = std::mem::replace(&mut self.clock.due, true);
+        let a = self.run_due(now_ms, until_request, timers);
+        self.clock.due = outer;
+        a
+    }
+
+    fn run_due(&mut self, now_ms: f64, until_request: bool, timers: bool) -> Advanced {
         if self.poisoned {
             return Advanced {
                 receipts: Vec::new(),
@@ -491,6 +501,8 @@ impl<D: DataSource> Runner<D> {
         // their virtual frames are timers (LLP 1073 D3).
         let frames = !self.clock.presenting;
         let mut receipts = Vec::new();
+        // Timer firings that committed nothing: they count toward the limit.
+        let mut idle = 0;
         if !now_ms.is_finite() {
             return Advanced {
                 receipts,
@@ -534,6 +546,10 @@ impl<D: DataSource> Runner<D> {
         }
         let mut work_spent = None;
         loop {
+            let modules = self.seams.modules;
+            let show = modules.next_list_show(self).filter(|at| *at <= now_ms);
+            // Finish what is already due through the presentation instant before its handler runs.
+            let now_ms = show.map_or(now_ms, |at| at.max(self.now_ms));
             // Ties follow declaration order, then instance creation order.
             let due = self
                 .timers
@@ -748,17 +764,15 @@ impl<D: DataSource> Runner<D> {
                 // A child's runs in its instance's frames, with the
                 // arguments read there; a gone instance's does not run
                 // (LLP 1035.005.004 D6).
-                // A `then` runs under its answer's origin (LLP 1133.002 D12),
-                // invocation (LLP 1133.023 D7) and causes (LLP 1133.035 D16
-                // item 6).
-                let (origin, id, causes) = self.then_origin(m);
+                // A `then` runs under its answer's cause (LLP 1133.023 D7a).
+                let cause = self.then_cause(m);
                 let call = match self.then_call(m) {
                     Ok(Some(call)) => Ok(call),
                     Ok(None) => continue,
                     Err(e) => Err(e),
                 };
                 let result = call.and_then(|(args, frames)| {
-                    self.as_invocation_caused(origin, id, causes, |r| {
+                    self.as_cause(cause, |r| {
                         r.scheduled(at, |r| r.traced_action("then", action, args, &frames))
                     })
                 });
@@ -877,12 +891,15 @@ impl<D: DataSource> Runner<D> {
                     self.seek_cutoff(at)
                 };
                 let audio = self.seams.audio;
-                let Some(action) = audio.transport_end(self) else {
+                let Some((action, cause)) = audio.transport_end(self) else {
                     continue;
                 };
                 let was_poisoned = self.poisoned;
                 let ticket = self.next_ticket;
-                match self.scheduled(at, |r| r.run_action(action, Vec::new(), &[])) {
+                // It runs under the cause of the commit that started the
+                // sequence (LLP 1133.023 D7a).
+                let ended = |r: &mut Self| r.run_action(action, Vec::new(), &[]);
+                match self.scheduled(at, |r| r.as_cause(cause, ended)) {
                     Ok(receipt) => receipts.push(Timed {
                         at_ms: self.now_ms,
                         receipt,
@@ -943,6 +960,43 @@ impl<D: DataSource> Runner<D> {
                     audio.transport_wake(self, now);
                     continue;
                 }
+                if let Some(at) = show {
+                    if receipts.len() == TIMER_FIRE_LIMIT {
+                        return Advanced {
+                            receipts,
+                            now_ms: self.now_ms,
+                            error: Some(RunnerError::TimerFireLimit {
+                                limit: TIMER_FIRE_LIMIT,
+                            }),
+                            stopped_on_request: false,
+                            needs_apply: false,
+                        };
+                    }
+                    self.now_ms = self.now_ms.max(at);
+                    let ticket = self.next_ticket;
+                    match modules.show_listed(self) {
+                        Ok(Some(receipt)) => receipts.push(Timed {
+                            at_ms: self.now_ms,
+                            receipt,
+                        }),
+                        Ok(None) => (),
+                        Err(error) => {
+                            return Advanced {
+                                receipts,
+                                now_ms: self.now_ms,
+                                error: Some(error),
+                                stopped_on_request: false,
+                                needs_apply: false,
+                            }
+                        }
+                    }
+                    if until_request && self.next_ticket != ticket {
+                        landed = self.now_ms;
+                        stopped_on_request = true;
+                        break;
+                    }
+                    continue;
+                }
                 break;
             };
             // A change action may read the host's layout or issue commands.
@@ -958,7 +1012,7 @@ impl<D: DataSource> Runner<D> {
                     needs_apply: true,
                 };
             }
-            if receipts.len() == TIMER_FIRE_LIMIT {
+            if receipts.len() + idle >= TIMER_FIRE_LIMIT {
                 return Advanced {
                     receipts,
                     now_ms: self.now_ms,
@@ -975,10 +1029,11 @@ impl<D: DataSource> Runner<D> {
             let action = self.timer_row(i).action;
             let result = self.fire_timer(i, nominal, at, if live { now_ms } else { at }, false);
             match result {
-                Ok(receipt) => receipts.push(Timed {
+                Ok(Some(receipt)) => receipts.push(Timed {
                     at_ms: self.now_ms,
                     receipt,
                 }),
+                Ok(None) => idle += 1,
                 Err(e) => {
                     let what = format!(
                         "timer {} ({})",
@@ -1075,7 +1130,7 @@ impl<D: DataSource> Runner<D> {
         }
         if !receipts.is_empty() {
             let line = super::lines::advanced(
-                receipts.len(),
+                receipts.len() + idle,
                 receipts.last().map_or(0, |t| t.receipt.epoch),
             );
             self.log(line);

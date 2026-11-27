@@ -39,7 +39,7 @@ pub(crate) const LOWERED: [Property; 7] = [
 /// A box's transform and background colour too (LLP 1055.001):
 /// both presenters anchor an animated box at its centre, CSS's initial
 /// `transform-origin`, and Core Animation's `transform.translation`,
-/// `transform.rotation.z` and `transform.scale` key paths replace one
+/// `transform.rotation.z` and `transform.scale.x`/`.y` key paths replace one
 /// component of the layer's transform and keep the others, composed
 /// translate, rotate, scale: CSS's individual transform properties.
 pub(crate) const BOX_LOWERED: [Property; 4] = [
@@ -385,7 +385,7 @@ impl SvgState {
                     engine.target(key, p).unwrap_or(Value::ZERO),
                     std::f64::consts::PI / 180.0,
                 ),
-                Property::Scale => (engine.target(key, p).unwrap_or(Value::scalar(1.0)), 1.0),
+                Property::Scale => (engine.target(key, p).unwrap_or(Value::new(1.0, 1.0)), 1.0),
                 _ => (engine.target(key, p).unwrap_or(Value::ZERO), 1.0),
             };
             let props: &[Property] = if self.box_motion {
@@ -760,7 +760,7 @@ fn element(
                             .unwrap_or(Value::scalar(t.rotate as f64)),
                         std::f64::consts::PI / 180.0,
                     ),
-                    Property::Scale => (Value::scalar(t.scale as f64), 1.0),
+                    Property::Scale => (Value::new(t.scale.0 as f64, t.scale.1 as f64), 1.0),
                     _ => (Value::ZERO, 1.0),
                 };
                 let specs = specs(engine, key, &turns, &underlying);
@@ -1038,8 +1038,9 @@ fn shape_json(
 
 /// A `d` transition Core Animation plays (LLP 1115.003 D4,
 /// `svg_lower::hand_over_paths`): a `path` spec between the paths at its ends,
-/// in the shape's own space, held at its start through any delay (fill both).
-/// An easing that is no cubic, and a spring's frames, become linear keys.
+/// in the shape's own space, held at its start through any delay (backwards
+/// fill: the model's path shows once it ends), on the track
+/// [`super::clip_handover::PathKeys::track`] makes.
 fn path_spec(engine: &Engine, key: u64) -> Option<String> {
     let (from, to, start, curve) = engine.played_path(key)?;
     let at = |t: f64| {
@@ -1050,36 +1051,11 @@ fn path_spec(engine: &Engine, key: u64) -> Option<String> {
         );
         out
     };
-    let (duration, keys, cubic): (f64, Vec<(f64, f64)>, Option<[f64; 4]>) = match &curve {
-        exact_motion::PlayedCurve::Easing { easing, duration } => {
-            match super::svg_lower::bezier(easing) {
-                Some(c) => (*duration, vec![(0.0, 0.0), (1.0, 1.0)], Some(c)),
-                None => {
-                    let xs: Vec<f64> = (0..=32).map(|j| j as f64 / 32.0).collect();
-                    (
-                        *duration,
-                        xs.iter().map(|x| (*x, easing.progress(*x))).collect(),
-                        None,
-                    )
-                }
-            }
-        }
-        exact_motion::PlayedCurve::Frames { duration, values } => {
-            let last = values.len().saturating_sub(1).max(1) as f64;
-            let keys = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as f64 / last, v.x))
-                .collect();
-            (*duration, keys, None)
-        }
-    };
-    if duration <= 0.0 || keys.len() < 2 {
-        return None;
-    }
-    let times: Vec<String> = keys.iter().map(|(t, _)| num(*t as f32)).collect();
-    let values: Vec<String> = keys.iter().map(|(_, p)| at(*p)).collect();
-    let curves = cubic.map_or(String::new(), |c| {
+    let keys = super::clip_handover::path_keys(&curve)?;
+    let (times, progress) = keys.track();
+    let times: Vec<String> = times.into_iter().map(|t| num(t as f32)).collect();
+    let values: Vec<String> = progress.into_iter().map(at).collect();
+    let curves = keys.cubic.map_or(String::new(), |c| {
         format!(
             "[{},{},{},{}]",
             num(c[0] as f32),
@@ -1089,9 +1065,11 @@ fn path_spec(engine: &Engine, key: u64) -> Option<String> {
         )
     });
     Some(format!(
-        "{{\"id\":\"d#{start}#path\",\"k\":\"path\",\"s\":{start},\"dl\":0,\"d\":{duration},\"n\":1,\"t\":[{}],\"v\":[{}],\"c\":[{curves}],\"fill\":3,\"h\":null}}",
+        "{{\"id\":\"d#{start}#path\",\"k\":\"path\",\"s\":{start},\"dl\":0,\"d\":{},\"n\":1,\"t\":[{}],\"v\":[{}],\"c\":[{curves}],\"fill\":2,\"m\":{},\"h\":null}}",
+        keys.duration,
         times.join(","),
-        values.join(",")
+        values.join(","),
+        u8::from(keys.discrete)
     ))
 }
 
@@ -1250,7 +1228,7 @@ fn clip_json(clip: &Clip, s: &mut String) {
     s.push('}');
 }
 
-fn path_json(path: Option<&Path>, s: &mut String) {
+pub(crate) fn path_json(path: Option<&Path>, s: &mut String) {
     s.push('[');
     let mut first = true;
     let mut push = |s: &mut String, vals: &[f32]| {

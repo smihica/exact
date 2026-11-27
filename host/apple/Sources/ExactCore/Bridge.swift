@@ -46,6 +46,9 @@ public struct Batch {
     public var canvas = false
     /// A frame task wants every display frame (LLP 1073 D5).
     public var frames = false
+    /// The lists whose rows a runner commit moved: each of their rows
+    /// moves from where it showed, as a collection view's batch update.
+    public var rides: [UInt32] = []
     /// The display link runs only for the present of the page's first picture, on a page with no canvas: its tick sets
     /// the page's `presented` fact as the page's other facts are set (LLP 1069.000 D2 r7), and enters as they do
     public var presentOnly = false
@@ -84,8 +87,9 @@ public struct Batch {
     public var routeInspectors: [RouteInspector]? = nil
     /// The kernel transactions it carries, while the runner measures (LLP 1079 D3).
     public var seq: (UInt64, UInt64)?
-    /// When `ExactSession.applyInput` marked it as a person's input: on iOS
-    /// a glass it adds to a group in the window materializes.
+    /// When `ExactSession.applyInput` took it as a person's input: a
+    /// navigation it makes is the person's (`NavigationMarks`), and on iOS a
+    /// glass it adds to a group in the window materializes.
     public var input: Double? = nil
     /// Failure lines the session writes to the unified log, each once (LLP 1142 D4).
     public var alerts: [String] = []
@@ -107,6 +111,20 @@ public struct Batch {
     /// runtime holds later (LLP 1072 §3.5). Nil for a batch the runtime did
     /// not make: what it may change is read again from the runtime.
     package var controlReads: [UInt32: ControlRead]?
+    /// The split rule of the stack main last asked about, read on the owner
+    /// as the runtime made this batch, which can change it (`Runtime.splitAsked`).
+    package var split: SplitRead?
+    /// The press of a row of the split's list that made this batch, which
+    /// travels with it through a stage to its reveal (`SplitPress`).
+    package var splitPress: SplitPress?
+    /// Whether `split` differs from what the last batch read carried for the
+    /// same stack: a layout-only change (such as a list's direction) can leave
+    /// wire ops empty while changing whether the stack splits.
+    package var splitChanged = false
+    /// With a router op, its top visit and the location of the visit beneath
+    /// it (`exact_location_beneath`, empty at a stack's root), read on the
+    /// owner as the runtime made this batch.
+    package var beneath: (visit: UInt64, location: String)?
     package enum ClockWork { case tick, advance }
     package func made(by clock: ClockWork) -> Batch {
         var batch = self
@@ -117,7 +135,7 @@ public struct Batch {
     /// viewless contents, page facts, the native control state it carries or
     /// the navigation roots' tabs, whose placement the views may not carry.
     /// The presenter resolves an orientation request separately.
-    package var changesScreen: Bool { !ops.isEmpty || controls || facts || rootTabs != nil || routeInspectors != nil || controlReads?.isEmpty == false }
+    package var changesScreen: Bool { !ops.isEmpty || controls || facts || rootTabs != nil || routeInspectors != nil || controlReads?.isEmpty == false || splitChanged }
     package init(ops: [BatchOp], timers: Bool, motion: Bool, clock: Double?, error: String?, timerDueMs: Double? = nil, pending: Bool = false, busy: Bool = false) {
         self.ops = ops; self.timers = timers; self.motion = motion; self.clock = clock
         self.error = error; self.timerDueMs = timerDueMs; self.pending = pending
@@ -150,6 +168,29 @@ package struct ControlRead: Equatable {
     package var parts: Set<String> { Set([face.map { _ in "face" }, select.map { _ in "select" }, radio.map { _ in "radio" }].compactMap { $0 }) }
 }
 
+/// The runner's split rule for one navigation stack (`exact_stack_split`,
+/// LLP 1127 D2) as the owner read it: the stack's root route, the list the
+/// host retains (0 for none), the answer's JSON (`null` for a stack that
+/// pushes), and the newest batch the runtime had made when it was read.
+package struct SplitRead {
+    package let view: UInt32, retained: UInt32, json: Data, sequence: UInt64
+    package init(view: UInt32, retained: UInt32, json: Data, sequence: UInt64) {
+        (self.view, self.retained, self.json, self.sequence) = (view, retained, json, sequence)
+    }
+}
+
+/// A press of a row of a split's list (LLP 1127 D16), carried on the batch the
+/// press made: the pressed view, the list it was a row of, and whether its press
+/// writes the router. An action's press reads that on the owner before it is
+/// dispatched (`exact_press_writes_router`; nil for a view that hears no press),
+/// so a press that removes or recycles its row still answers for it; a link the
+/// row follows in the window attaches its row to the navigation batch it makes,
+/// as a press that writes the router.
+package struct SplitPress: Equatable {
+    package let row: UInt32, list: UInt32, writesRouter: Bool?
+    package init(row: UInt32, list: UInt32, writesRouter: Bool?) { (self.row, self.list, self.writesRouter) = (row, list, writesRouter) }
+}
+
 /// Immutable composition services, installed before the runtime can serve a turn.
 package struct RuntimeHooks {
     package let decodeBatch: (UnsafeBufferPointer<UInt8>, AssetResolver?) -> Batch
@@ -172,6 +213,10 @@ package typealias TopLayerFrame = (UInt32, CGRect, CGRect?)
 /// A modal backdrop's view, viewport bounds and optional excluded rectangle.
 package typealias TopLayerBackdrop = (UInt32, CGRect, CGRect?)
 package typealias TopLayerGeometry = (frames: [TopLayerFrame], modal: Int?, backdrop: TopLayerBackdrop?)
+
+/// A swipe's host kind, with no payload: `swiperight` (12) and `swipeleft` (61), and `swipe` (66), the platform's
+/// discrete swipe in the node's `swipe-flick` direction (LLP 1057.001 §8).
+package enum SwipeKind: UInt32 { case right = 12, left = 61, discrete = 66 }
 
 /// A runtime handle and its calls. `destroy` is idempotent at this layer and
 /// one-shot at the C boundary; a call after it is refused by the library by
@@ -199,6 +244,11 @@ package final class Runtime {
     /// On the owner, each native control's `type` and its state as the last
     /// batch read gave it (`Batch.controlReads`): a batch carries what changed.
     package var controlTypes: [UInt32: String] = [:], controlsRead: [UInt32: ControlRead] = [:]
+    /// On the owner, the stack whose split rule a batch that can change it
+    /// carries (`Batch.split`): the one main last asked the runtime about, and
+    /// the last JSON read for it (`Batch.splitChanged`).
+    package var splitAsked: (view: UInt32, retained: UInt32)?
+    package var splitReadJson: (view: UInt32, json: Data)?
     package init(hooks: RuntimeHooks = .headless) {
         self.hooks = hooks
         rt = Owner.shared.sync {
@@ -273,6 +323,14 @@ package final class Runtime {
             installTopLayer(open, modal: modal, backdrop: backdrop)
             return body()
         }, busy: Runtime.busy)
+    }
+    package func postWithTopLayer(caller: String = #function, layout: Bool = false,
+                                  done: @escaping (RuntimeCompletion) -> Void, _ body: @escaping () -> Batch) {
+        var top: TopLayerGeometry = ([], nil, nil)
+        post(caller: caller, layout: layout, prepare: { top = self.topLayer?() ?? ([], nil, nil) }, done: done) { [self] _ in
+            installTopLayer(top.frames, modal: top.modal, backdrop: top.backdrop)
+            return body()
+        }
     }
     private func installTopLayer(_ open: [TopLayerFrame], modal: Int?, backdrop: TopLayerBackdrop?) {
         let ids = open.map(\.0)
@@ -467,7 +525,11 @@ package final class Runtime {
     package func dataReady() -> Batch { on { read(exact_data_ready(rt)) } }
     package func storeChanged(retryOnly: Bool = false) -> Batch { on { read(exact_store_changed(rt, retryOnly ? 1 : 0)) } }
     package func discardPlan() { on { exact_discard_plan(rt) } }
-    package func trim() { on { exact_trim(rt) } }
+    /// Gives back the tree's cold storage, after the jobs queued before it
+    /// and never waited for: it changes nothing shown, so main does not wait
+    /// out a long owner job for it (LLP 1072 T3). A runtime destroyed
+    /// meanwhile refuses it by name.
+    package func trim() { Owner.shared.post { [rt] in exact_trim(rt) } }
 
     /// Every queued reply into the runner: the batch of their commits.
     package func pump(now: Double) -> Batch { on { read(exact_pump(rt, now)) } }
@@ -488,10 +550,19 @@ package final class Runtime {
     }
     /// A press, with the modifiers held as a chord prefix (`KeyCodes.held`),
     /// after a pointer's point from the viewport where it had one: its
-    /// `MouseEvent`'s `clientX`/`clientY` (LLP 1021 D2).
-    package func press(_ view: UInt32, held: String = "", at client: CGPoint? = nil, now: Double) -> Batch {
+    /// `MouseEvent`'s `clientX`/`clientY` (LLP 1021 D2). `splitRow`: the row of
+    /// a split's list this press is, which the batch carries (`SplitPress`).
+    package func press(_ view: UInt32, held: String = "", at client: CGPoint? = nil, splitRow: (row: UInt32, list: UInt32)? = nil, now: Double) -> Batch {
         let line = client.map { "\(Double($0.x)),\(Double($0.y)),\(held)" } ?? held
-        return on { read(exact_dispatch(rt, view, 0, write(line), now)) }
+        return on {
+            let press = splitRow.map { row -> SplitPress in
+                let writes = exact_press_writes_router(rt, row.row)
+                return SplitPress(row: row.row, list: row.list, writesRouter: writes == 2 ? nil : writes == 1)
+            }
+            var batch = read(exact_dispatch(rt, view, 0, write(line), now))
+            batch.splitPress = press
+            return batch
+        }
     }
     /// The pointer over the view (`true`) or gone from it.
     package func hover(_ view: UInt32, over: Bool, now: Double) -> Batch { on { read(exact_dispatch(rt, view, over ? 2 : 3, 0, now)) } }
@@ -506,14 +577,16 @@ package final class Runtime {
     /// DOM's `beforeunload` (36) at a node that hears it (studio diary R17).
     package func beforeunload(_ view: UInt32, now: Double) -> Batch { on { read(exact_dispatch(rt, view, 36, 0, now)) } }
 
-    package func heightDragUpdate(_ token: UInt64, height: Double, now: Double) -> Batch {
+    /// `at`: when the input was sampled, on its own timeline carried onto the
+    /// clock from where the drag began; the release velocity reads it.
+    package func heightDragUpdate(_ token: UInt64, height: Double, now: Double, at: Double) -> Batch {
         return on {
-            read(exact_height_drag_update(rt, token, height, now))
+            read(exact_height_drag_update(rt, token, height, now, at))
         }
     }
-    package func heightDragRelease(_ token: UInt64, height: Double, now: Double) -> Batch {
+    package func heightDragRelease(_ token: UInt64, height: Double, now: Double, at: Double) -> Batch {
         return on {
-            read(exact_height_drag_release(rt, token, height, now))
+            read(exact_height_drag_release(rt, token, height, now, at))
         }
     }
     package func reorderBegin(_ handle: UInt32, scrollTop: Double, now: Double) -> Batch {
@@ -538,19 +611,23 @@ package final class Runtime {
     package func timelineScrolled(_ view: UInt32?, left: Double, top: Double) -> Batch {
         on(layout: true) { read(exact_timeline_scrolled(rt, view == nil ? 1 : 0, view ?? 0, left, top)) }
     }
-    package func holdUpdate(_ token: UInt64, x: Double, y: Double, now: Double) -> Batch {
+    /// `at`: when the input was sampled, as for a height drag; the clock's
+    /// own time when the hold's velocity is never measured.
+    package func holdUpdate(_ token: UInt64, x: Double, y: Double, now: Double, at: Double? = nil) -> Batch {
         return on {
-            read(exact_hold_update(rt, token, x, y, now))
+            read(exact_hold_update(rt, token, x, y, now, at ?? now))
         }
     }
-    /// `measured`: release at the engine's own velocity estimate (LLP 1057.001 §3).
-    package func holdEnd(_ token: UInt64, cancel: Bool, measured: Bool = false, vx: Double = 0, vy: Double = 0, now: Double) -> Batch {
+    /// `measured`: release at the engine's own velocity estimate (LLP 1057.001 §3),
+    /// read `at` the release's input time.
+    package func holdEnd(_ token: UInt64, cancel: Bool, measured: Bool = false, vx: Double = 0, vy: Double = 0,
+                         now: Double, at: Double? = nil) -> Batch {
         return on {
-            read(exact_hold_end(rt, token, cancel ? 1 : measured ? 2 : 0, vx, vy, now))
+            read(exact_hold_end(rt, token, cancel ? 1 : measured ? 2 : 0, vx, vy, now, at ?? now))
         }
     }
-    package func swiperight(_ view: UInt32, now: Double) -> Batch { on { read(exact_dispatch(rt, view, 12, 0, now)) } }
-    package func swipeleft(_ view: UInt32, now: Double) -> Batch { on { read(exact_dispatch(rt, view, 61, 0, now)) } }
+    /// A swipe's action: `swiperight` or `swipeleft`, which the node followed, or `swipe`, the platform's discrete one.
+    package func swipe(_ view: UInt32, _ kind: SwipeKind, now: Double) -> Batch { on { read(exact_dispatch(rt, view, kind.rawValue, 0, now)) } }
     /// The history swipe the Mac tracks (LLP 1115.000 D5.5): its phase,
     /// `back` or `forward`, how far along that way (0 or more), and where
     /// the pointer was as it began, in the viewport.
@@ -684,7 +761,7 @@ package final class Runtime {
     /// The clipboard's `copy` (32), `cut` (33) or `paste` (34) with its
     /// plain text; a `contextmenu` (10) with its pointer line, a `wheel`
     /// (37), a `drop` (38), a file drag's `dragenter` (55) or `dragleave` (56), a
-    /// paste with files (57), or a popover `toggle` (50) with theirs (`Event::of_host_kind`).
+    /// paste with files (57), a popover `toggle` (50), or a reporting pinch (67, 68) with theirs (`Event::of_host_kind`).
     package func clipboard(_ view: UInt32, _ kind: UInt32, _ text: String, now: Double) -> Batch {
         on { read(exact_dispatch(rt, view, kind, write(text), now)) }
     }
@@ -1049,9 +1126,13 @@ package final class Runtime {
         package var size: CGSize? = nil
         package var segments: [CGRect]? = nil
         package var keyboard: CGFloat? = nil
+        /// The window's aspect-fit guide for the first root in the document's space (LLP 1123 D16); `nil` inside to give it back.
+        package var aspectFit: CGRect?? = nil
         /// Native block and placement records, as `exact_host_covers` takes them.
         package var blocks = Data()
-        package var isEmpty: Bool { screen == nil && insets == nil && regions == nil && size == nil && segments == nil && keyboard == nil && blocks.isEmpty }
+        package var isEmpty: Bool {
+            screen == nil && insets == nil && regions == nil && size == nil && segments == nil && keyboard == nil && aspectFit == nil && blocks.isEmpty
+        }
         package init(screen: CGSize?? = nil, insets: (top: CGFloat, right: CGFloat, bottom: CGFloat, left: CGFloat)? = nil,
                      regions: [CGFloat]?? = nil, size: CGSize? = nil) {
             self.screen = screen; self.insets = insets; self.regions = regions; self.size = size
@@ -1067,12 +1148,24 @@ package final class Runtime {
         if change.segments != nil { mask |= 16 }
         if change.keyboard != nil { mask |= 32 }
         if !change.blocks.isEmpty { mask |= 64 }
+        if change.aspectFit != nil { mask |= 128 }
         let screen = (change.screen ?? nil) ?? .zero, insets = change.insets ?? (0, 0, 0, 0), size = change.size ?? .zero
         let floats = [screen.width, screen.height, insets.top, insets.right, insets.bottom, insets.left, size.width, size.height]
         let rects = change.segments.map { rects in [UInt32(rects.count)] + rects.flatMap { [$0.minX, $0.minY, $0.width, $0.height].map { Float($0).bitPattern } } } ?? []
         let keyboard = change.keyboard.map { [Float($0).bitPattern] } ?? []
-        var bytes = Data(capacity: (11 + regions.count + rects.count) * 4)
-        for word in [mask] + floats.map({ Float($0).bitPattern }) + [UInt32(regions.count)] + regions.map({ Float($0).bitPattern }) + rects + keyboard {
+        // With 128, the guide's x, y, width and height; no size gives the root back
+        var fit: [UInt32] = []
+        if let given = change.aspectFit {
+            let rect: CGRect = given ?? .zero
+            fit = [rect.minX, rect.minY, rect.width, rect.height].map { Float($0).bitPattern }
+        }
+        var words: [UInt32] = [mask]
+        words += floats.map { Float($0).bitPattern }
+        words.append(UInt32(regions.count))
+        words += regions.map { Float($0).bitPattern }
+        words += rects + keyboard + fit
+        var bytes = Data(capacity: words.count * 4)
+        for word in words {
             withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
         }
         bytes.append(change.blocks)
@@ -1123,6 +1216,21 @@ package final class Runtime {
             let n = write(request)
             let len = export(rt, n)
             return String(decoding: Data(bytes: exact_out(rt), count: Int(len)), as: UTF8.self)
+        }
+    }
+    /// `ask`, read on the owner after the jobs queued before it and never
+    /// waited for (LLP 1072 T3): `answer` runs there with the reply, the
+    /// `hostMediaTime` it was read at and the owner's `jobsBegun` then;
+    /// the reply is nil for a runtime destroyed or replaced since. The read
+    /// begins no work, so it is not counted among the owner's jobs.
+    package func askLater(_ export: @escaping (ExactRuntime, Int) -> UInt32, _ request: String,
+                          answer: @escaping (_ reply: String?, _ at: Double, _ job: UInt64) -> Void) {
+        let lease = completionLease
+        Owner.shared.post(counted: false) { [self] in
+            let job = Owner.shared.jobsBegun
+            guard accepts(lease) else { return answer(nil, hostMediaTime(), job) }
+            let len = export(rt, write(request))
+            answer(String(decoding: Data(bytes: exact_out(rt), count: Int(len)), as: UTF8.self), hostMediaTime(), job)
         }
     }
     /// A command's ruling (`share`, LLP 1069.003; `saveFile`, LLP 1069.010):
@@ -1217,6 +1325,8 @@ public struct RootTabs: Equatable {
     /// route can show a header, which the platform shows as its navigation
     /// bar. One fixed route with no header is a plain view controller.
     public let navigation: [Bool]
+    /// Panels whose first route can request a split, including unopened panels.
+    public let possibleSplits: [UInt32]
     /// The app left the bar's placement unsaid, by the web's rule for its
     /// own sidebar (LLP 1116.004 D1.1; `host/web/navigation.js` `placeTabBar`):
     /// read from the kernel's layout rows, which do not cross to the views.
@@ -1229,9 +1339,14 @@ public struct RootTabs: Equatable {
     /// (`navigationTabAccessory`, LLP 1075.003 §9.17), and why it names none,
     /// for a development build's journal.
     public let accessory: UInt32?, accessoryNote: String?
+    /// The rows the author wrote between the panels and the tablist that the tab bar's room moves
+    /// above the bar (LLP 1083.000 D4).
+    public let rowsAbove: [UInt32]
 
-    public init(root: UInt32, tablist: UInt32, tabs: [UInt32], panels: [UInt32], footer: UInt32? = nil, navigation: [Bool] = [], unsaid: Bool, covered: Bool = false,
-                accessory: UInt32? = nil, accessoryNote: String? = nil) {
+    public init(root: UInt32, tablist: UInt32, tabs: [UInt32], panels: [UInt32], footer: UInt32? = nil, navigation: [Bool] = [], possibleSplits: [UInt32] = [], unsaid: Bool, covered: Bool = false,
+                accessory: UInt32? = nil, accessoryNote: String? = nil, rowsAbove: [UInt32] = []) {
+        self.possibleSplits = possibleSplits
+        self.rowsAbove = rowsAbove
         (self.footer, self.accessory, self.accessoryNote) = (footer, accessory, accessoryNote)
         (self.root, self.tablist, self.tabs, self.panels, self.navigation, self.unsaid, self.covered) = (root, tablist, tabs, panels, navigation, unsaid, covered)
     }
@@ -1241,13 +1356,13 @@ public struct RootTabs: Equatable {
         let ids = { (key: String) in (o[key]?.array ?? []).compactMap { $0.number.map { UInt32($0) } } }
         self.init(root: UInt32(root), tablist: UInt32(tablist), tabs: ids("tabs"), panels: ids("panels"),
                   footer: o["footer"]?.number.map { UInt32($0) }, navigation: (o["navigation"]?.array ?? []).map { $0 == .bool(true) },
-                  unsaid: o["unsaid"] == .bool(true), covered: o["covered"] == .bool(true),
-                  accessory: o["accessory"]?.number.map { UInt32($0) }, accessoryNote: o["accessoryNote"]?.string)
+                  possibleSplits: ids("possibleSplits"), unsaid: o["unsaid"] == .bool(true), covered: o["covered"] == .bool(true),
+                  accessory: o["accessory"]?.number.map { UInt32($0) }, accessoryNote: o["accessoryNote"]?.string, rowsAbove: ids("rowsAbove"))
     }
 }
 
 /// The pointer's three events and their ABI kinds (LLP 1005 §3).
-package enum PointerKind: UInt32 { case down = 29, up = 30, move = 31 }
+package enum PointerKind: UInt32 { case down = 29, up = 30, move = 31, cancel = 65 }
 
 /// DOM's `PointerEvent`, the subset the runner's record carries (LLP 1056 §3
 /// stage 3): the point from the node's content box in its own points, DOM's

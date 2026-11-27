@@ -38,6 +38,9 @@ pub struct Batch {
     /// A frame task wants each display frame (LLP 1073 D5): the display
     /// link runs and each tick is `exact_frame`.
     pub frames: bool,
+    /// The lists whose rows the layout after a runner commit moved, `"rides":[…]`:
+    /// each of their rows moves from where it showed (`Host::emit_rides`).
+    pub rides: Vec<u32>,
     /// The display link runs only for the present of the page's first
     /// picture, on a page with no canvas (`motion` with nothing animating or
     /// held for a frame, LLP 1069.000 D2 r7): that tick sets
@@ -424,7 +427,8 @@ impl Batch {
             s.push(':');
             quote(v, &mut s);
         }
-        s.push_str("}}");
+        // Work that fell due made it: the program's navigation, even in an input's batch.
+        s.push_str(if change.due { "},\"due\":true}" } else { "}}" });
         self.ops.push(s);
     }
 
@@ -1073,7 +1077,7 @@ impl Batch {
     }
 
     /// `{"op":"present","id":…,"property":…,"x":…,"y":…}` — a motion
-    /// property's presentation value this frame (`y` only for `translate`).
+    /// property's presentation value this frame (`y` for `translate` and `scale`).
     pub fn present(&mut self, id: u32, property: &'static str, x: f64, y: f64) {
         self.note_present(id, property);
         self.ops.push(format!(
@@ -1166,6 +1170,10 @@ impl Batch {
                 let _ = write!(s, "{value}");
             }
             s.push(']');
+        }
+        if !self.rides.is_empty() {
+            let ids: Vec<String> = self.rides.iter().map(u32::to_string).collect();
+            let _ = write!(s, ",\"rides\":[{}]", ids.join(","));
         }
         for (key, present) in [
             ("spatial", self.spatial),
@@ -1372,6 +1380,8 @@ mod finish_bytes_tests {
                                 mode: exact_plan::SurfaceArgsMode::Positional,
                                 names: vec![],
                                 values: vec![exact_plan::Value::str("日本語")],
+                                colors: vec![],
+                                types: vec![None],
                             });
                             batch.command("focus", &[exact_plan::Value::Number(1.)], None);
                             batch.destroy(3);

@@ -332,6 +332,8 @@ fn compiler_intrinsics_are_never_another_files_names() {
 
 // Round 3 (Astra, Grok, 2026-10-05).
 
+use contract::{compile_for_comparison, ComparisonInput::Path as ComparisonPath};
+
 #[test]
 fn a_whole_attribute_call_resolves_as_the_type_checker_reads_it() {
     let dir = Dir::new("attr-call");
@@ -343,14 +345,26 @@ fn a_whole_attribute_call_resolves_as_the_type_checker_reads_it() {
         "app.contract",
         "use length, Card from \"./ui.contract\"\ncomponent App\n  state length = 0\n  view\n    column\n      Card()\n      view width=\"hi\".length height=10\n",
     );
+    let ordinary = contract::compile_path(&root).unwrap();
+    assert!(ordinary.nodes.iter().filter_map(|n| n.place).any(|id| {
+        let step = &ordinary.place_steps[id.0 as usize];
+        ordinary.str(step.name) == "text"
+            && step.outer.is_some_and(|outer| {
+                ordinary.str(ordinary.place_steps[outer.0 as usize].name) == "Card"
+            })
+    }));
     // The same program with the library's `fn` spelled apart: one plan.
     let flat = dir.write(
         "flat.contract",
         "fn seven(s: string): number = 7\ncomponent App\n  state length = 0\n  view\n    column\n      text \"c\"\n      view width=seven(\"hi\") height=10\n",
     );
     assert_eq!(
-        contract::compile_path(&root).unwrap().encode(),
-        contract::compile_path(&flat).unwrap().encode()
+        compile_for_comparison(ComparisonPath(&root))
+            .unwrap()
+            .encode(),
+        compile_for_comparison(ComparisonPath(&flat))
+            .unwrap()
+            .encode()
     );
 }
 
@@ -1174,6 +1188,48 @@ fn a_bare_timeline_name_joins_the_missing_names() {
     let root = dir.write(
         "app.contract",
         "use Card from \"./ui.contract\"\nkeyframes p\n  to opacity=0\ncomponent App\n  view\n    column\n      Card()\n      view animation=\"p 1s\" animation-timeline=Pending\n",
+    );
+    let e = contract::compile_path(&root).unwrap_err();
+    assert_eq!(e.id, "contract-use-missing", "{e}");
+}
+
+#[test]
+fn resource_gate_respects_file_scope_aliases_and_isolation() {
+    let dir = Dir::new("resource-gate-scope");
+    // Colliding `fn ready` in `res.gate` binds to `panel.contract`'s `ready`,
+    // not `app.contract`'s.
+    dir.write(
+        "panel.contract",
+        "fn ready(x: string): bool = x == \"panel-only\"\ncomponent Panel\n  resource item = fetchItem() when ready(\"panel-only\") as shape string\n  view\n    text item\n",
+    );
+    let root = dir.write(
+        "app.contract",
+        "use Panel from \"./panel.contract\"\nfn ready(x: string): bool = x == \"app-only\"\ncomponent App\n  view\n    Panel()\n",
+    );
+    let text = plan(&root);
+    assert!(text.contains("\"panel-only\""), "{text}");
+    assert!(!text.contains("\"app-only\""), "{text}");
+
+    // `use ... as alias` is expanded inside `res.gate`.
+    dir.write(
+        "util.contract",
+        "fn check(x: string): bool = x == \"alias-ok\"\n",
+    );
+    dir.write(
+        "panel.contract",
+        "use check as ok from \"./util.contract\"\ncomponent Panel\n  resource item = fetchItem() when ok(\"alias-ok\") as shape string\n  view\n    text item\n",
+    );
+    let text = plan(&root);
+    assert!(text.contains("\"alias-ok\""), "{text}");
+
+    // Calling an unimported `fn` from `app.contract` inside `res.gate` is refused.
+    dir.write(
+        "panel.contract",
+        "component Panel\n  resource item = fetchItem() when appOnly(\"a\") as shape string\n  view\n    text item\n",
+    );
+    let root = dir.write(
+        "app.contract",
+        "use Panel from \"./panel.contract\"\nfn appOnly(x: string): bool = x != \"\"\ncomponent App\n  view\n    Panel()\n",
     );
     let e = contract::compile_path(&root).unwrap_err();
     assert_eq!(e.id, "contract-use-missing", "{e}");

@@ -14,6 +14,7 @@ import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from '
 import { fileURLToPath } from 'node:url';
 import { filesystem, filesystemRead, filesystemTree } from '../../scripts/filesystem.mjs';
 import { withLock } from './build-lock.mjs';
+import { linkedSourcesChanged } from '../../scripts/web-build.mjs';
 import { canonicalBytes, readAssetIndex } from '../../scripts/deploy-signing.mjs';
 import { copyShaders, developmentURLScheme, resolveApp, webDist, webHostFiles } from '../../scripts/app.mjs';
 import { settingChanges } from '../../js/bake/src/__exact_env.mjs';
@@ -40,7 +41,7 @@ const PUBLIC_FILES = new Set([
 // `/gpu/`: each declared GPU module's wasm and its glue (LLP 1009 D6).
 // `/stages/`: the core's staged capabilities, named by digest (LLP 1047.000).
 // `/modules/`: the app's native-module web executor (LLP 1024 D3), page code.
-const PUBLIC_TREES = ['/assets/', '/deck/', '/shaders/', '/rust/', '/gpu/', '/stages/', '/modules/', '/plans/', '/activities/'];
+const PUBLIC_TREES = ['/assets/', '/deck/', '/shaders/', '/rust/', '/gpu/', '/stages/', '/packages/', '/modules/', '/plans/', '/activities/'];
 const REQUIRED_BUILD_FILES = ['app.plan', 'app.wasm', 'exact.json', 'glue.js', 'navigation.js', 'index.html', 'manifest.json'];
 // An origin's update streams (LLP 1030.000 D7; `scripts/origin.mjs`):
 // `.exact/blobs/<sha256>` and `.exact/<channel>/<compatibility id>/…` — the
@@ -542,7 +543,7 @@ export function listPublicFiles(dist) {
     }
     out.push(asset.name);
   }
-  for (const tree of ['rust', 'gpu', 'stages']) if (existsSync(resolve(root, tree))) for (const name of listStaticFiles(resolve(root, tree))) out.push(`${tree}/${name}`);
+  for (const tree of ['rust', 'gpu', 'stages', 'packages']) if (existsSync(resolve(root, tree))) for (const name of listStaticFiles(resolve(root, tree))) out.push(`${tree}/${name}`);
   return out.sort();
 }
 
@@ -573,18 +574,20 @@ function planAppId(bytes) {
 // The schema is the wire authority; no table offsets or row sizes are mirrored here.
 const planFormat = JSON.parse(readFileSync(new URL('../../plan/tables/format.json', import.meta.url), 'utf8'));
 const planFormatDigest = createHash('sha256').update('EXACT.PLAN.FORMAT.SHA256.V1\0').update(canonicalBytes(planFormat)).digest().subarray(0, 8);
-const renderPolicies = planFormat.enums.RenderPolicy;
+
 const routeBuffers = new WeakMap();
 function planRoutes(bytes) {
-  if (routeBuffers.has(bytes)) return routeBuffers.get(bytes);
-  let routes;
-  try { routes = planRouteTable(bytes); } catch { routes = []; } // An absent or unfinished build admits no additional document paths.
-  routeBuffers.set(bytes, routes);
-  return routes;
+  if (!routeBuffers.has(bytes)) {
+    try { routeBuffers.set(bytes, planRouteTable(bytes)); } catch { routeBuffers.set(bytes, []); }
+  }
+  return routeBuffers.get(bytes);
 }
-/** The plan's route table, in its order: each route's name, pattern, render policy and whether it is the
- * `notfound` route (`routes.json`, LLP 1153 D3). Throws on a plan this format does not read. */
-export function planRouteTable(bytes) {
+/** The ordered routes for routes.json (LLP 1153 D3). An unknown plan format throws. */
+export const planRouteTable = bytes => planRows(bytes, 'routes', ['name', 'pattern', 'render', 'notfound']);
+/** The package views placed by this plan, including tags in conditional branches. */
+export const planViewTable = bytes => planRows(bytes, 'views', ['tag', 'extension', 'package', 'displayed', 'binds']);
+
+export function planRows(bytes, name, fields) {
   if (bytes.subarray(0, 4).toString() !== 'EXPL' || bytes.readUInt32LE(4) !== planFormat.formatVersion
     || !bytes.subarray(8, 16).equals(planFormatDigest)) throw new Error('unknown plan format');
   let at = 32;
@@ -592,26 +595,21 @@ export function planRouteTable(bytes) {
   const u32 = () => bytes.readUInt32LE(take(4));
   const decoder = new TextDecoder('utf-8', { fatal: true });
   const string = (length = u32()) => decoder.decode(bytes.subarray(take(length), at));
-  for (const field of planFormat.header) {
-    if (field.codec === 'string') string(); else take(4);
-  }
+  for (const { codec } of planFormat.header) if (codec === 'string') string(); else take(4);
   const count = u32(), strings = [], members = [], owners = [];
   for (let i = 0; i < count; i++) {
     const tag = u32();
     if (tag < 0x80000000) {
       strings.push(string(tag));
-      continue;
+    } else {
+      const owner = tag - 0x80000000, member = u32();
+      if (owner > owners.length || member > members.length) throw new Error('unknown qualified plan name');
+      if (member === members.length) members.push(string());
+      if (owner === owners.length) owners.push(bytes.subarray(take(32), at).toString('hex'));
+      strings.push(`${members[member]}#${owners[owner]}`);
     }
-    const owner = tag - 0x80000000, member = u32();
-    if (owner > owners.length || member > members.length) throw new Error('unknown qualified plan name');
-    if (member === members.length) members.push(string());
-    if (owner === owners.length) owners.push(bytes.subarray(take(32), at).toString('hex'));
-    strings.push({member, owner});
   }
-  const routeString = index => {
-    const ref = strings[index];
-    return typeof ref === 'object' ? `${members[ref.member]}#${owners[ref.owner]}` : ref;
-  };
+  if (!name) return strings;
   take(u32()); // code pool
   take(u32()); // data pool
   const width = codec => {
@@ -622,27 +620,30 @@ export function planRouteTable(bytes) {
     if (['f64', 'range', 'code', 'bytes'].includes(kind)) return 8;
     throw new Error('unknown plan codec');
   };
-  const routes = [];
+  const rows = [];
   for (const table of planFormat.tables) {
     const count = u32(), size = table.fields.reduce((n, field) => n + width(field.codec), 0);
     const start = take(count * size);
-    if (table.name !== 'routes') continue;
+    if (table.name !== name) continue;
     for (let i = 0; i < count; i++) {
       let offset = start + i * size;
       const row = {};
       for (const field of table.fields) {
-        if (field.name === 'name') row.name = routeString(bytes.readUInt32LE(offset));
-        if (field.name === 'pattern') row.pattern = routeString(bytes.readUInt32LE(offset));
-        if (field.name === 'render') { row.render = renderPolicies[bytes[offset]]; if (!row.render) throw new Error('invalid route render policy'); }
-        if (field.name === 'notfound') { const value = bytes[offset]; if (value > 1) throw new Error('invalid route'); row.notfound = !!value; }
+        if (fields.includes(field.name)) {
+          let value;
+          if (field.codec === 'str') value = strings[bytes.readUInt32LE(offset)];
+          else if (field.codec === 'bool') value = [false, true][bytes[offset]];
+          else value = planFormat.enums[field.codec.slice(5)][bytes[offset]];
+          if (value === undefined) throw new Error(`invalid ${name} ${field.name}`);
+          row[field.name] = value;
+        }
         offset += width(field.codec);
       }
-      if (typeof row.pattern !== 'string' || typeof row.name !== 'string') throw new Error('invalid route pattern');
-      routes.push(row);
+      rows.push(row);
     }
   }
   if (at !== bytes.length) throw new Error('trailing plan bytes');
-  return routes;
+  return rows;
 }
 const servedRoutePlans = new Map();
 function routeFileIdentity(dist, files) {
@@ -877,7 +878,8 @@ export function jsTargetBuild(dist) {
  * index.html (a page rendered at build); else, for an HTML navigation (`acceptsHTML`) whose path a route in the
  * build's `routes.json` matches, `shell.html`. With `miss`, a request the rule finds nothing for gets the build's
  * `404.html`, else, for a navigation to a page, the shell, whose client draws the notfound route; either marked
- * `status: 404`. The previous build answers during a rebuild's rename. */
+ * `status: 404`; and a navigation's other spelling of a page's path gets `status: 301` and the page's `location`. The
+ * previous build answers during a rebuild's rename. */
 export function buildTreeFile(dist, pathname, accept = '', { miss = false } = {}) { return runReads(treeFile(dist, pathname, accept, miss)); }
 export function buildTreeFileAsync(dist, pathname, accept = '', { miss = false } = {}) { return runReadsAsync(treeFile(dist, pathname, accept, miss)); }
 function* treeFile(dist, pathname, accept, miss) {
@@ -924,6 +926,9 @@ function* treeFile(dist, pathname, accept, miss) {
       // A route table that cannot be read is no answer yet (503 when serving), never "no route" (a 404 for a page).
       if (routes === null) return miss ? { status: 503 } : null;
       const at = appDocumentPath(pathname, true, routes) ? matchPattern(routes, canonical(pathname)) : -1;
+      // One URL per page: a path with an empty segment redirects to the page's (LLP 1048.000 D11), except a directory's own page.
+      const one = '/' + pathname.split('/').filter(Boolean).join('/'), own = routes[matchPattern(routes, canonical(one))];
+      if (miss && at < 0 && one !== pathname && own && (!index || own.render === 'build') && appDocumentPath(one, true, routes)) return { status: 301, location: one };
       const render = at >= 0 ? routes[at].render : null, shell = file('/shell.html'), served = (policy) => policy === 'request' || policy === 'cached';
       // The shell, with its route's render policy, which `serve` renders in its place (`render=request` or `cached`):
       // before a directory's index.html for such a route, since the root's is the shell too; a page built for its
@@ -976,12 +981,13 @@ export async function serveBuildTree(dist, req, res, { base = buildBase(dist), p
   // server rendering pages answers it; a route the client draws stays a browser's.
   if (pages && target && r !== markdown && asksPage(req, path) && !acceptsHTML(req.headers.accept)) {
     const page = await servedFile(dist, target.pathname, 'text/html', { pinned, base });
-    if (page.route === '/shell.html' && ['request', 'cached'].includes(page.render)) r = page;
+    if (page.status === 301 || page.route === '/shell.html' && ['request', 'cached'].includes(page.render)) r = page;
   }
   if (markdown && r.status === 404 && (await servedFile(dist, target.pathname, 'text/html', { pinned, base })).status === 404) {
     const missing = await servedFile(dist, `${prefix}/404.md`, req.headers.accept, { pinned, base });
     if (missing.status === 200 && missing.route === '/404.md') r = { ...missing, status: 404 };
   }
+  if (r.status === 301) { res.writeHead(...(['GET', 'HEAD'].includes(req.method) ? [301, { location: r.location + target.search, 'cache-control': 'no-store' }] : [404])); res.end(); return; }
   if (r.status === 410) { res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }); res.end(`build generation ${r.id} is no longer kept here: load the page again\n`); return; }
   if (pages && [200, 404].includes(r.status) && r.route === '/shell.html' && ['request', 'cached'].includes(r.render) && ['GET', 'HEAD'].includes(req.method)) {
     let page = null;
@@ -1331,7 +1337,9 @@ function settleBuild(dist) {
   let marker;
   try { marker = JSON.parse(readFileSync(resolve(dist, '.exact-build.json'), 'utf8')); } catch { return 0; }
   if (!marker.env) return 0;
-  const app = sourcesOf(dist, marker.app?.id), changed = settingChanges(marker.env, process.env, app);
+  const source = sourcesOf(dist, marker.app?.id), app = source?.dir;
+  const env = source ? rebuildEnvironment(source, dist, marker.release) : process.env;
+  const changed = settingChanges(marker.env, env, app);
   if (!changed.length) return 0;
   const said = (s) => (s ? `${JSON.stringify(s.value)} (${s.source})` : 'unset');
   const what = changed.map(({ name, built, now }) => `import.meta.env.${name} was built as ${said(built)} and is ${said(now)} here`).join('; ');
@@ -1351,7 +1359,7 @@ function settleBuild(dist) {
   // development build into its.
   const target = marker.target === 'js' ? [] : ['--wasm'], release = marker.release ? ['--out', dist] : [];
   const built = spawnSync(process.execPath, [fileURLToPath(new URL('./build.mjs', import.meta.url)), app, ...target, ...release],
-    { stdio: 'inherit', env: { ...process.env, EXACT_APP_DIR: app, ...(marker.release ? {} : { EXACT_WEB_DIST: dist }) } });
+    { stdio: 'inherit', env });
   return built.status === 0 ? 0 : built.status ?? 1;
 }
 
@@ -1387,13 +1395,14 @@ export function appSources(app, out) {
 export function rebuildOnChange(dist, build = null) {
   let marker;
   try { marker = JSON.parse(readFileSync(resolve(dist, '.exact-build.json'), 'utf8')); } catch { return null; }
-  const app = sourcesOf(dist, marker.app?.id);
+  const source = sourcesOf(dist, marker.app?.id), app = source?.dir;
   if (!app || (!marker.release && resolve(dist) !== webDist())) return null;
+  const env = rebuildEnvironment(source, dist, marker.release);
   const out = resolve(dist), receipt = () => { try { return statSync(resolve(dist, '.exact-build.json')).mtimeMs; } catch { return 0; } };
   const target = marker.target === 'js' ? [] : ['--wasm'], release = marker.release ? ['--out', dist] : [];
   build ??= () => new Promise((done) => {
     const child = spawn(process.execPath, [fileURLToPath(new URL('./build.mjs', import.meta.url)), app, ...target, ...release],
-      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, EXACT_APP_DIR: app, ...(marker.release ? {} : { EXACT_WEB_DIST: dist }) } });
+      { stdio: ['ignore', 'pipe', 'pipe'], env });
     let said = '';
     for (const stream of [child.stdout, child.stderr]) stream.on('data', (d) => { said += d; });
     child.on('close', (code) => done({ code, said }));
@@ -1402,12 +1411,16 @@ export function rebuildOnChange(dist, build = null) {
   // wrote, which tells a receipt another build wrote apart.
   let covered = receipt(), ours = null, checked = 0, running = null;
   const newer = (sources) => sources.newest > (receipt() === ours ? covered : Math.max(covered, receipt()));
+  const readMarker = () => {
+    try { return JSON.parse(readFileSync(resolve(out, '.exact-build.json'), 'utf8')); } catch { return null; }
+  };
+  const linkedChanged = card => !card || linkedSourcesChanged(app, out, card.linkedSources);
   const again = async () => {
     for (;;) {
       const basis = appSources(app, out).newest, { code, said } = await build();
       if (code !== 0) { console.error(said.trimEnd()); return said; }
       covered = basis; ours = receipt();
-      if (!newer(appSources(app, out))) return null;
+      if (!newer(appSources(app, out)) && !linkedChanged(readMarker())) return null;
       console.log(`${app}: a source changed while it built: building it again`);
     }
   };
@@ -1415,10 +1428,11 @@ export function rebuildOnChange(dist, build = null) {
     if (running) return running;
     if (Date.now() - checked < 300) return null;
     checked = Date.now();
-    let settings = [], built = null;
-    try { const now = JSON.parse(readFileSync(resolve(dist, '.exact-build.json'), 'utf8')); settings = settingChanges(now.env ?? {}, process.env, app); built = now.sources; } catch { /* being replaced */ }
+    const card = readMarker(), settings = settingChanges(card?.env ?? {}, env, app);
     const sources = appSources(app, out);
-    if (!settings.length && !newer(sources) && sources.digest === built) return null;
+    // Older local release receipts did not record their package imports.
+    const legacy = card?.release && card.target === 'js' && !('linkedSources' in card);
+    if (!legacy && !settings.length && !newer(sources) && sources.digest === card?.sources && !linkedChanged(card)) return null;
     console.log(`${app}: ${settings.length ? `the build has other settings than this server (${settings.map((c) => c.name).join(', ')})` : 'a source changed since the build'}: building it again`);
     running = again().finally(() => { running = null; });
     return running;
@@ -1429,13 +1443,29 @@ export function rebuildOnChange(dist, build = null) {
  * an `app.json` of that id, or of a variant with it (LLP 1030.008), above it, or the app whose own build directory it
  * is (an app of this checkout builds into host/web/dist); else null. */
 function sourcesOf(dist, id) {
-  const names = ({ app, variants }) => [app?.id, ...Object.values(variants ?? {}).map((v) => app?.id + v.idSuffix)];
+  if (!id) return null;
   for (let dir = dirname(dist); ; dir = dirname(dir)) {
-    try { if (names(JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8'))).includes(id)) return dir; } catch { /* none here */ }
+    try {
+      const { app, variants } = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8'));
+      if (app?.id === id) return { dir };
+      for (const [variant, row] of Object.entries(variants ?? {})) {
+        if (app.id + row.idSuffix === id) return { dir, variant };
+      }
+    } catch { /* no app manifest here */ }
     if (dirname(dir) === dir) break;
   }
-  try { const app = resolveApp(); if (app.id === id && webDist() === dist) return app.dir; } catch { /* no app resolves */ }
+  try {
+    const app = resolveApp();
+    if (app.id === id && webDist() === dist) return { dir: app.dir, variant: app.manifest.variant?.name };
+  } catch { /* no app resolves */ }
   return null;
+}
+
+/** A serve process can be started outside the build's shell. Its receipt selects the same
+ * identity and settings for both the change check and the child that rebuilds the site. */
+function rebuildEnvironment({ dir, variant }, dist, release) {
+  return { ...process.env, EXACT_APP_DIR: dir, EXACT_VARIANT: variant ?? '', EXACT_VARIANT_APP: variant ? dir : '',
+    ...(release ? {} : { EXACT_WEB_DIST: dist }) };
 }
 
 /** A development page's trace (LLP 1079 D5): ⌥⇧T posts its journal, frames and

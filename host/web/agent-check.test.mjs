@@ -435,6 +435,67 @@ test('judging: WCAG ratios, the floors, a clamp asked for, a reachable cover, th
 });
 
 // LLP 1115.000 D4: a role known only by its drawn value is read in what its host draws, as the page says it (`palette`).
+test('target counts the region a press reaches, including clipped and competing hit slop', async () => {
+  const session = await open({ host: 'web', url: await built('hit-slop', `component App
+  state taps = 0
+  action go
+    taps = taps + 1
+  view
+    column padding=24 gap=16 align-items="flex-start"
+      button press=go appearance="none" min-height=36 padding="0px 12px" border-radius=18 -exact-hit-slop="4px 0px" testId="pill"
+        text "Edit"
+      column press=go width=53 height=36 testId="bare"
+      column press=go width=53 height=36 -exact-hit-slop="3px 0px" testId="short"
+      column width=53 height=36 overflow="hidden"
+        column press=go width=53 height=36 -exact-hit-slop="4px 0px" testId="clipped"
+      column press=go width=53 height=36 overflow="hidden" -exact-hit-slop="4px 0px" testId="own-clip"
+      column press=go width=36 height=36 -exact-hit-slop="1px 6px 7px 2px" testId="asymmetric"
+      row gap=4
+        column press=go width=36 height=44 -exact-hit-slop-right="8px" testId="back"
+        column press=go width=36 height=44 -exact-hit-slop-left="8px" testId="front"
+`) });
+  try {
+    const obs = await session.op({ op: 'check' });
+    const names = new Map((await session.op({ op: 'tree' })).nodes.map(n => [n.id, n.props?.testId]));
+    // Use the phone minimum without the web's spacing exception to inspect the measured regions.
+    const sizes = Object.fromEntries(judge({ ...obs, target: 44 }, null, { host: 'ios' })
+      .filter(f => f.kind === 'target').map(f => [names.get(f.id), f.detail.tap]));
+    expect(sizes).toEqual({ bare: [53, 36], short: [53, 42], clipped: [53, 36], 'own-clip': [53, 36], back: [32, 44] });
+    expect(judge({ ...obs, target: 44 }, null).filter(f => f.kind === 'target').map(f => names.get(f.id))).toEqual(['back']);
+    // A transform scales the clipping ancestor's padding box too.
+    await session.carrier.evaluate(`(() => {
+      const child = document.querySelector('[data-testid="clipped"]');
+      child.parentElement.style.cssText = 'position:relative;overflow:hidden;width:10px;height:16px;box-sizing:content-box;border:solid transparent;border-width:0 5px 0 8px;scale:2;transform-origin:top left';
+      child.style.cssText = 'position:absolute;left:-8px;top:0;width:23px;height:16px';
+    })()`);
+    const scaled = await session.op({ op: 'check' });
+    expect(judge({ ...scaled, target: 44 }, null, { host: 'ios' })
+      .find(f => f.kind === 'target' && names.get(f.id) === 'clipped').detail.tap).toEqual([20, 32]);
+  } finally { await session.close(); }
+}, 120_000);
+
+test('an interrupted tap region must fit the minimum in one rectangle', () => {
+  const item = { id: 1, x: 10, y: 10, w: 36, h: 44, control: 'press', sized: 'author' };
+  const finding = reach => judge({ items: [{ ...item, reach }], viewport: { w: 200, h: 200 }, target: 44 },
+    null, { host: 'ios' }).find(f => f.kind === 'target');
+  // A front control has taken the top-right 10×10. Neither remaining rectangle fits 44×44.
+  expect(finding([[10, 10, 44, 20], [10, 20, 54, 54]]).detail.tap.sort((a, b) => a - b)).toEqual([34, 44]);
+  // A 44×44 square fits across both adjoining strips.
+  expect(finding([[10, 10, 64, 32], [20, 32, 64, 54]])).toBeUndefined();
+  expect(finding([]).detail.tap).toEqual([0, 0]);
+  const underKeyboard = { ...item, y: 100, vis: { h: 0 }, reach: [[10, 76, 46, 100]] };
+  expect(judge({ items: [underKeyboard], target: 44, viewport: { w: 200, h: 200 }, keyboard: 100 }, null, { host: 'ios' })
+    .find(f => f.kind === 'target').detail.tap).toEqual([36, 24]);
+  const partial = { ...item, w: 16, h: 16, reach: [[10, 10, 26, 20]], scrollGain: [0, 6] };
+  const obs = { items: [partial], viewport: { w: 200, h: 200 }, target: 24 };
+  expect(judge(obs, null, { host: 'ios' }).find(f => f.kind === 'target').detail.tap).toEqual([16, 10]);
+  const clippedPeer = { ...item, id: 2, x: 6, y: 68, w: 24, h: 24, reach: [[6, 68, 30, 70]], scrollGain: [0, 22] };
+  expect(judge({ ...obs, items: [{ ...item, x: 13, y: 50, w: 10, h: 10 }, clippedPeer] }, null)
+    .filter(f => f.kind === 'target')).toEqual([]);
+  const link = { ...item, id: 2, x: 27, w: 20, h: 16, inline: true };
+  expect(judge({ ...obs, items: [partial, link] }, null).filter(f => f.kind === 'target').map(f => f.id)).toEqual([1]);
+});
+
 test('an ink and a page\'s ground are known by what the page draws each role in', () => {
   const png = { width: 40, height: 20, data: new Uint8Array(40 * 20 * 4).fill(255) };
   const obs = (items, extra = {}) => ({ viewport: { w: 40, h: 20 }, scheme: 'light', target: 24, items, ...extra });
@@ -936,5 +997,140 @@ test("a row resting under a web sheet's foot buttons scrolls clear of them, so i
     const obs = await session.op({ op: 'check' }), ids = new Map(((await session.op({ op: 'tree' })).nodes ?? []).map((n) => [n.props?.testId, n.id]));
     const under = obs.items.find((it) => it.beneath && it.id === ids.get('row-15'));
     expect(under).toBeDefined();
+  } finally { await session.close(); }
+}, 900000);
+
+const SQUEEZED = `routes nav
+  home "/"
+    sheet "/sheet"
+component SqueezedFixture
+  action follow(url: string)
+    nav = go(nav, url)
+  view
+    main navigationKey=\`\${top(nav).id}\` navigate=follow width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        if e.name == "sheet"
+          column navigationKey=\`\${e.id}\` navigationPresentation="modal" navigationDetent="200 large" position="absolute" inset=0 display="flex" flex-direction="column"
+            text "Sheet heading" height=300 flex-shrink=0
+            list testId="sheet-list" flex=1 min-height=0
+              for i in range(40) key=i
+                text \`Row \${i}\` padding=16
+        else
+          scroll navigationKey=\`\${e.id}\` position="absolute" inset=0
+            column gap=4
+              link href=path("sheet") testId="open"
+                text "Open sheet"
+              column height=100 flex-shrink=0 display="flex" flex-direction="column"
+                text "Fixed" height=100 flex-shrink=0
+                scroll testId="sq-scroll" flex=1 min-height=0
+                  column
+                    for i in range(20) key=i
+                      text \`Row \${i}\` padding=16
+              column height=100 flex-shrink=0 display="flex" flex-direction="column"
+                text "Fixed" height=100 flex-shrink=0
+                list testId="sq-list" virtualized=true estimated-item-height=48 flex=1 min-height=0
+                  for i in range(20) key=i
+                    text \`Row \${i}\` padding=16
+              column height=100 flex-shrink=0 display="flex" flex-direction="column"
+                text "Fixed" height=100 flex-shrink=0
+                list testId="empty" virtualized=true estimated-item-height=48 flex=1 min-height=0
+                  for i in range(0) key=i
+                    text \`Row \${i}\`
+              column height=100 flex-shrink=0 display="flex" flex-direction="column"
+                text "Fixed" height=90 flex-shrink=0
+                scroll testId="fits" flex=1 min-height=0
+                  column height=5
+              column height=32 display="flex" flex-direction="column"
+                scroll testId="small-rows" flex=1 min-height=0
+                  for i in range(8) key=i
+                    text "A" height=8
+              scroll testId="chips" overflow-x="auto" overflow-y="hidden" height=36 flex-shrink=0
+                row gap=8
+                  for i in range(20) key=i
+                    text \`Chip \${i}\` padding=8 flex-shrink=0
+              row testId="tabs" gap=6 padding=4 overflow-x="scroll" flex-shrink=0
+                for i in range(20) key=i
+                  text \`Tab \${i}\` padding=4 flex-shrink=0
+              scroll testId="sized" height=20 flex-shrink=0
+                column
+                  for i in range(20) key=i
+                    text \`Row \${i}\` padding=16
+              column display="none"
+                column height=100 display="flex" flex-direction="column"
+                  text "Fixed" height=100 flex-shrink=0
+                  scroll testId="hidden" flex=1 min-height=0
+                    column
+                      for i in range(20) key=i
+                        text \`Row \${i}\` padding=16
+              row height=60 flex-shrink=0
+                text "Fixed" width="23.5rem" flex-shrink=0
+                scroll testId="sq-x" overflow-x="auto" overflow-y="hidden" flex=1 min-width=0
+                  row
+                    for i in range(20) key=i
+                      text \`Chip \${i}\` padding=8 flex-shrink=0
+              scroll testId="pager" overflow-x="scroll" overflow-y="hidden" height=100 flex-shrink=0
+                row
+                  column width="100vw" height=100 flex-shrink=0
+                    text "Page one"
+                  column width="100vw" height=100 flex-shrink=0 display="flex" flex-direction="column"
+                    text "Fixed" height=100 flex-shrink=0
+                    scroll testId="off" flex=1 min-height=0
+                      column
+                        for i in range(20) key=i
+                          text \`Row \${i}\` padding=16
+`;
+
+test('a scroller squeezed along its axis to less than a row is squeezed; one short on purpose or with nothing past its port is not', async () => {
+  const session = await open({ host: 'web', url: await built('squeezed', SQUEEZED), size: [402, 874] });
+  try {
+    const squeezed = (run) => run.findings.filter((f) => f.kind === 'squeezed').map((f) => f.node).sort();
+    const run = (await checkOp(session, ['light'])).check[0];
+    expect(squeezed(run)).toEqual(['sq-list', 'sq-scroll', 'sq-x']);
+    const list = run.findings.find((f) => f.node === 'sq-list');
+    expect(list.detail).toMatchObject({ axis: 'y', port: 0, unit: 'px' });
+    expect(list.detail.content).toBeGreaterThan(44);
+    expect(run.findings.find(f => f.node === 'sq-x').detail.axis).toBe('x');
+    const update = css => session.carrier.evaluate(`document.querySelector('[data-testid="sq-scroll"]').style.cssText = ${JSON.stringify(css)}`);
+    // An unrelated ceiling leaves a squeeze. An author-chosen flex basis gives a small port on purpose.
+    await update('max-height:600px');
+    expect(squeezed((await checkOp(session)).check[0])).toContain('sq-scroll');
+    await update('flex:0 0 20px');
+    expect(squeezed((await checkOp(session)).check[0])).not.toContain('sq-scroll');
+    await update('');
+    await session.carrier.evaluate(`(() => {
+      const e = document.querySelector('[data-testid="sq-scroll"]');
+      e.parentElement.style.cssText = 'width:10px;height:110px';
+      e.style.overflowX = 'auto';
+      e.firstElementChild.style.width = '800px';
+    })()`);
+    expect((await checkOp(session)).check[0].findings.filter(f => f.node === 'sq-scroll' && f.kind === 'squeezed').map(f => f.detail.axis).sort()).toEqual(['x', 'y']);
+    await session.carrier.evaluate(`(() => {
+      const e = document.querySelector('[data-testid="sq-scroll"]');
+      for (const node of [e, e.parentElement, e.firstElementChild]) node.style.cssText = '';
+    })()`);
+    // The same squeezed port disappears under an inert ancestor, a closed disclosure or a clipped, parked page.
+    for (const wrap of [
+      "const w = document.createElement('div'); w.inert = true",
+      "const w = document.createElement('details')",
+      "const w = document.createElement('div'); w.style.cssText = 'height:0;width:0;overflow:hidden'",
+    ]) {
+      await session.carrier.evaluate(`(() => {
+        const s = document.querySelector('[data-testid="sq-scroll"]'), group = s.parentElement;
+        ${wrap}; group.before(w); w.append(group);
+      })()`);
+      expect(squeezed((await checkOp(session)).check[0])).not.toContain('sq-scroll');
+      await session.carrier.evaluate(`(() => {
+        const group = document.querySelector('[data-testid="sq-scroll"]').parentElement;
+        group.parentElement.replaceWith(group);
+      })()`);
+    }
+    await session.prefer({ 'root-font-size': 53 });
+    await session.clock('settle');
+    expect(squeezed((await checkOp(session, ['light'])).check[0])).toEqual(['sq-list', 'sq-scroll']);
+    await session.prefer({ 'root-font-size': 16 });
+    await session.tap('open');
+    expect(squeezed((await checkOp(session)).check[0])).toEqual([]);
+    await session.clock('settle');
+    expect(squeezed((await checkOp(session, ['light'])).check[0])).toEqual([]);
   } finally { await session.close(); }
 }, 900000);

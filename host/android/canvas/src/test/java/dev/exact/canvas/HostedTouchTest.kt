@@ -55,6 +55,7 @@ class HostedTouchTest {
                 finally { flushing = false }
             }
             val touches = ArrayList<Int>()
+            val samples = ArrayList<Pair<Float, Long>>()
             val scrolls = ArrayList<Float>()
             val deltas = ArrayList<Triple<Int, Float, Float>>()
             val fingers = ArrayList<Pair<Int, Int>>()
@@ -65,18 +66,20 @@ class HostedTouchTest {
             @Implementation @JvmStatic fun under(x: Float, y: Float): IntArray {
                 asks++
                 val answer = reply.copyOf()
-                val at = 3 + 11 * answer[1]
+                val at = 3 + 11 * answer[1] + (if (answer[0] and 32 != 0) 5 else 0)
                 val left = Float.fromBits(answer[at + 1]); val top = Float.fromBits(answer[at + 2])
                 if (x < left || y < top || x >= left + Float.fromBits(answer[at + 3]) ||
                     y >= top + Float.fromBits(answer[at + 4])) answer[at] = 0
                 beforeReply?.also { beforeReply = null }?.invoke()
                 return answer
             }
-            @Implementation @JvmStatic fun touch(action: Int, x: Float, y: Float, tool: Int) {
+            @Implementation @JvmStatic fun touch(action: Int, x: Float, y: Float, tool: Int, at: Long): IntArray? {
                 touches.add(action)
+                samples.add(y to at)
                 if (action == 4 && takesLongPress) reply[3 + 11 * reply[1] + 7]++
+                return null
             }
-            @Implementation @JvmStatic fun finger(action: Int, id: Int, x: Float, y: Float) {
+            @Implementation @JvmStatic fun finger(action: Int, id: Int, x: Float, y: Float, tool: Int, at: Long, primaryX: Float, primaryY: Float) {
                 fingers.add(action to id); fingerPoints.add(x to y)
             }
             @Implementation @JvmStatic fun scrolled(id: Int, x: Float, y: Float, rev: Int) {
@@ -84,15 +87,18 @@ class HostedTouchTest {
             }
             @Implementation @JvmStatic fun scrollers(): IntArray? {
                 if (deltas.isEmpty()) return null
-                return (0 until reply[1]).flatMap { n ->
+                val scale = Device.scale(org.robolectric.RuntimeEnvironment.getApplication())
+                return intArrayOf(scale.toBits()) + (0 until reply[1]).flatMap { n ->
                     val i = 3 + 11 * n
                     val moved = deltas.filter { it.first == reply[i] }
                     listOf(reply[i], reply[i + 1], reply[i + 2],
-                        (Float.fromBits(reply[i + 3]) + moved.sumOf { it.second.toDouble() }.toFloat()).toBits(),
-                        (Float.fromBits(reply[i + 4]) + moved.sumOf { it.third.toDouble() }.toFloat()).toBits(),
-                        0, 0, reply[i + 5], reply[i + 6])
+                        ((Float.fromBits(reply[i + 3]) + moved.sumOf { it.second.toDouble() }.toFloat()) / scale).toBits(),
+                        ((Float.fromBits(reply[i + 4]) + moved.sumOf { it.third.toDouble() }.toFloat()) / scale).toBits(),
+                        0, 0, (Float.fromBits(reply[i + 5]) / scale).toBits(),
+                        (Float.fromBits(reply[i + 6]) / scale).toBits())
                 }.toIntArray()
             }
+            @Implementation @JvmStatic fun sheetDrag(index: Int, generation: Int, top: Float, ended: Boolean, velocity: Float) {}
             @Implementation @JvmStatic fun scrollDrag(id: Int, ended: Boolean, vx: Float, vy: Float, rest: Boolean, restX: Float, restY: Float, flings: Boolean) {}
             @Implementation @JvmStatic fun flingEnded(id: Int) {}
             @Implementation @JvmStatic fun refresh(id: Int) {}
@@ -103,6 +109,10 @@ class HostedTouchTest {
     private class Fixture(
         val accepts: Boolean = true, scroller: Boolean = false, claims: Int = 0, axis: Int = 2,
         longClickable: Boolean = false, clickable: Boolean = false, disallow: Boolean = false, nested: Boolean = false,
+        /** Which ways the view can scroll its content: (horizontal, direction). */
+        var canScroll: (Boolean, Int) -> Boolean = { _, _ -> false },
+        /** The view is a frame's WebView, which never asks its parent not to intercept. */
+        web: Boolean = false,
     ) {
         init {
             // ShadowVelocityTracker.clear leaves coordinates in its history, and hasPointer still reads them.
@@ -122,11 +132,17 @@ class HostedTouchTest {
         var longClicks = 0
         var clicks = 0
         val native = object : NativeModule {
-            override fun create(context: Context, props: JSONObject): View = object : View(context) {
+            override fun create(context: Context, props: JSONObject): View = if (web) object : android.webkit.WebView(context) {
+                override fun canScrollVertically(direction: Int) = canScroll(false, direction)
+                override fun canScrollHorizontally(direction: Int) = canScroll(true, direction)
+                override fun dispatchTouchEvent(e: MotionEvent): Boolean { events.add(e.actionMasked); return true }
+            } else object : View(context) {
                 init {
                     if (longClickable) setOnLongClickListener { longClicks++; true }
                     if (clickable) setOnClickListener { clicks++ }
                 }
+                override fun canScrollVertically(direction: Int) = canScroll(false, direction)
+                override fun canScrollHorizontally(direction: Int) = canScroll(true, direction)
                 override fun onTouchEvent(e: MotionEvent): Boolean {
                     if (disallow && e.actionMasked == MotionEvent.ACTION_DOWN) parent.requestDisallowInterceptTouchEvent(true)
                     events.add(e.actionMasked); points.add(e.x to e.y)
@@ -144,6 +160,7 @@ class HostedTouchTest {
         val view = ExactView(activity, false) {}.also { it.started = true; it.natives = natives }
         val parent = FrameLayout(activity).also { it.addView(natives); it.addView(view) }
         init {
+            Engine.samples.clear()
             Engine.touches.clear(); Engine.scrolls.clear(); Engine.deltas.clear(); Engine.fingers.clear(); Engine.takesLongPress = false; Engine.asks = 0; Engine.beforeReply = null
             Engine.fingerPoints.clear(); Engine.deferReplies = false; Engine.replies.clear(); Engine.asksPending.clear(); Engine.flushing = false
             natives.ensure(7, 2, 200, 300, "{\"module\":\"test-map\",\"slot\":2,\"generation\":3}", 0)
@@ -168,6 +185,66 @@ class HostedTouchTest {
         fun answer() { Engine.replies.removeFirst().invoke(); flush() }
     }
 
+    @Test fun agentAcknowledgesOnlyEdgesDeliveredToTheAddressedModule() {
+        val f = Fixture(scroller = true)
+        f.controller.setup()
+        f.activity.setContentView(f.parent)
+        f.controller.windowFocusChanged(true)
+        f.parent.measure(View.MeasureSpec.makeMeasureSpec(600, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(800, View.MeasureSpec.EXACTLY))
+        f.parent.layout(0, 0, 600, 800)
+        val target = f.natives.taker(7, 2, 3, 0L)!!
+        val scale = Device.scale(f.activity)
+        fun finger(x: Int, y: Int, plain: Boolean) = AgentModuleFinger(f.view, ModuleBinding(7, 2, 3, 0L),
+            target, org.json.JSONArray(listOf(x / scale, y / scale)), 7, plain)
+        val location = IntArray(2).also(f.view::getLocationOnScreen)
+        fun inject(command: JSONObject, action: Int) {
+            assertEquals(command.toString(), MotionEvent.actionToString(action).removePrefix("ACTION_"), command.optString("moduleMotion"))
+            f.touch(action, command.getDouble("x").toFloat() - location[0], command.getDouble("y").toFloat() - location[1])
+        }
+        for ((x, y, plain) in listOf(Triple(120, 80, true), Triple(30, 45, true), Triple(120, 80, false))) {
+            val contact = finger(x, y, plain)
+            inject(contact.start(), MotionEvent.ACTION_DOWN)
+            val down = contact.confirm("")
+            val up = if (plain) down else {
+                assertTrue(down.getBoolean("contact"))
+                assertTrue(finger(x, y, true).start().has("error"))
+                contact.phase("up", JSONObject())
+            }
+            inject(up, MotionEvent.ACTION_UP)
+            assertEquals("platform", contact.confirm("").getString("delivery"))
+            assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP), f.events)
+            assertEquals(List(2) { (x - 10f) to (y - 20f) }, f.points)
+            f.events.clear(); f.points.clear()
+        }
+        val drag = finger(100, 180, false)
+        inject(drag.start(), MotionEvent.ACTION_DOWN)
+        assertTrue(drag.confirm("").getBoolean("contact"))
+        val move = JSONObject().put("dx", 0).put("dy", -100f / scale)
+        inject(drag.phase("move", move), MotionEvent.ACTION_MOVE)
+        assertEquals("Android scroll", drag.confirm("").getString("native"))
+        inject(drag.phase("up", JSONObject()), MotionEvent.ACTION_UP)
+        assertFalse(drag.confirm("").getBoolean("contact"))
+        assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_CANCEL), f.events)
+        f.events.clear()
+        Engine.reply[Engine.reply.lastIndex] = 7
+        val deferred = finger(120, 80, false)
+        inject(deferred.start(), MotionEvent.ACTION_DOWN)
+        assertEquals("pending gesture arbitration", deferred.confirm("").getString("native"))
+        assertTrue(f.events.isEmpty())
+        inject(deferred.phase("up", JSONObject()), MotionEvent.ACTION_UP)
+        assertEquals("platform", deferred.confirm("").getString("delivery"))
+        assertEquals(listOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP), f.events)
+        f.events.clear()
+        val covered = finger(80, 80, true)
+        covered.start()
+        assertEquals("CANCEL", covered.confirm("").getString("moduleMotion"))
+        assertTrue(covered.confirm("").getString("error").contains("covered"))
+        assertTrue(f.events.isEmpty())
+        f.view.running(false, false)
+        f.controller.pause().stop().destroy()
+    }
+
     private fun field(f: Fixture, multiline: Boolean = false): Fields {
         val fields = Fields(f.activity).also { it.adopted(f.view); f.view.fields = it; f.parent.addView(it) }
         val value = (if (multiline) (1..40).joinToString("\n") { "line $it" } else "").toByteArray()
@@ -190,6 +267,19 @@ class HostedTouchTest {
             assertNull("Scrolling.$name must release the abandoned contact",
                 ReflectionHelpers.getField<Any?>(scrolling, name))
         }
+    }
+
+    @Test fun aBatchedMoveKeepsEachPositionAtItsInputTime() {
+        val f = Fixture(scroller = false)
+        val down = MotionEvent.obtain(100, 100, MotionEvent.ACTION_DOWN, 20f, 30f, 0)
+        val move = MotionEvent.obtain(100, 108, MotionEvent.ACTION_MOVE, 20f, 40f, 0)
+        move.addBatch(116, 20f, 50f, 1f, 1f, 0)
+        try {
+            f.view.fingers.began(down)
+            f.view.fingers.relay(down)
+            f.view.fingers.relay(move)
+            assertEquals(listOf(30f to 100_000_000L, 40f to 108_000_000L, 50f to 116_000_000L), Engine.samples)
+        } finally { down.recycle(); move.recycle() }
     }
 
     @Test fun verticalDragScrollsThePageWithoutScrollingMultilineText() {
@@ -322,7 +412,8 @@ class HostedTouchTest {
         player.replayAt(canvas, java.nio.IntBuffer.wrap(native), 0, native.size, 5f, 6f, layer)
         player.replay(canvas, java.nio.IntBuffer.wrap(intArrayOf(29, 11)), 0, 2, into = row)
         fun paint(x: Float, y: Float) {
-            val ops = intArrayOf(20, 9, 17, 22, x.toBits(), y.toBits(), 21)
+            val port = intArrayOf(4, 0, 0, 300f.toBits(), 550f.toBits()) + IntArray(8)
+            val ops = port + intArrayOf(20, 9, 17, 22, x.toBits(), y.toBits(), 21, 6)
             player.replay(canvas, java.nio.IntBuffer.wrap(ops), 0, ops.size)
         }
         paint(0f, 0f)
@@ -446,6 +537,61 @@ class HostedTouchTest {
             assertEquals(listOf(0, 3), Engine.touches)
             f.view.running(false, false)
         }
+    }
+
+    @Test fun aViewThatCanScrollTheWayTheFingerGoesKeepsTheDrag() {
+        for (late in listOf(false, true)) {
+            // A frame's page can scroll down: a finger moving up scrolls it, not the page around it.
+            val f = Fixture(scroller = true, web = true, canScroll = { horizontal, direction -> !horizontal && direction > 0 })
+            val moves = {
+                f.touch(2, y = 60f, time = 120)
+                f.touch(2, y = 20f, time = 140)
+                f.touch(1, y = 20f, time = 160)
+            }
+            if (late) Engine.beforeReply = moves
+            f.touch(0)
+            if (!late) moves()
+            assertEquals(listOf(0, 2, 2, 1), f.events)
+            assertTrue("late=$late", Engine.scrolls.isEmpty())
+            f.view.running(false, false)
+        }
+    }
+
+    @Test fun atItsEdgeAViewLeavesTheDragToThePage() {
+        // The page can scroll only up from here: a finger moving up is the page's, as at a browser frame's end.
+        val f = Fixture(scroller = true, web = true, canScroll = { horizontal, direction -> !horizontal && direction < 0 })
+        f.touch(0)
+        f.touch(2, y = 60f, time = 120)
+        f.touch(2, y = 20f, time = 140)
+        f.touch(1, y = 20f, time = 160)
+        assertEquals(listOf(0, 3), f.events)
+        assertEquals(listOf(40f - f.slop, 40f), Engine.scrolls)
+        f.view.running(false, false)
+    }
+
+    @Test fun aViewThatIsNoFrameMustAskToKeepADragItCouldScroll() {
+        // A clipped TextView answers that it can scroll, and scrolls nothing.
+        val f = Fixture(scroller = true, canScroll = { _, _ -> true })
+        f.touch(0)
+        f.touch(2, y = 60f, time = 120)
+        f.touch(2, y = 20f, time = 140)
+        f.touch(1, y = 20f, time = 160)
+        assertEquals(listOf(0, 3), f.events)
+        assertEquals(listOf(40f - f.slop, 40f), Engine.scrolls)
+        f.view.running(false, false)
+    }
+
+    @Test fun aViewThatReachesItsEdgeDuringTheDragKeepsIt() {
+        var room = true
+        val f = Fixture(scroller = true, web = true, canScroll = { horizontal, direction -> !horizontal && direction > 0 && room })
+        f.touch(0)
+        f.touch(2, y = 60f, time = 120)
+        room = false
+        f.touch(2, y = 20f, time = 140)
+        f.touch(1, y = 20f, time = 160)
+        assertEquals(listOf(0, 2, 2, 1), f.events)
+        assertTrue(Engine.scrolls.isEmpty())
+        f.view.running(false, false)
     }
 
     @Test fun aClickableHostedViewIsCancelledWhenThePageIntercepts() {
@@ -861,7 +1007,7 @@ class HostedTouchTest {
         val shown = requireNotNull(indicator.parent)
         assertNotSame("the indicator is in the root's overlay, not among its children", f.parent, shown)
         assertTrue(indicator.spinning)
-        scrolling.told(intArrayOf(9, 2 or 16 or 32, 0, 0, 0, 0, 0, 500f.toBits(), 500f.toBits()))
+        scrolling.told(intArrayOf(1f.toBits(), 9, 2 or 16 or 32, 0, 0, 0, 0, 0, 500f.toBits(), 500f.toBits()))
         Engine.reply[4] = 2 or 16 or 32
         Engine.reply[Engine.reply.lastIndex] = 7
         Engine.takesLongPress = true

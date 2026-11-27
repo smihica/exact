@@ -5,7 +5,7 @@
 
 use crate::tags::Tag;
 use crate::{err, LowerError, Lowerer};
-use contract_syntax::{Expr, Span};
+use contract_syntax::{Binds, Expr, Span};
 use exact_kernel::{NodeType, PropId, StyleId};
 use exact_plan::{BindingKind, BindingsRow, Value};
 
@@ -134,19 +134,23 @@ pub(crate) fn control(
     }
     // An author's: the grouped sheet sizes a row's switch by the platform's
     // metric (LLP 1115.002 D6), which is the compiler's row and not theirs.
+    // A segmented control, a tablist or a radiogroup, takes a size too (LLP
+    // 1069.011.001 D8).
+    let segmented = attrs.iter().any(|a| {
+        a.name == "role"
+            && matches!(&a.value, Expr::Str(v, _) if v == "tablist" || v == "radiogroup")
+    });
     if let Some(a) = attrs.iter().find(|a| {
         a.written
-            && matches!(
-                a.name.as_str(),
-                "-exact-control-size" | "-exact-corner-style"
-            )
+            && (a.name == "-exact-corner-style" || (a.name == "-exact-control-size" && !segmented))
     }) {
+        let owners = match a.name.as_str() {
+            "-exact-control-size" => "a native button, `button appearance=\"auto\"`, or a segmented control, `role=\"tablist\"` or `role=\"radiogroup\"`",
+            _ => "a native button: `button appearance=\"auto\"`",
+        };
         return err(
             "lower-button-style-attr",
-            format!(
-                "`{}` belongs to a native button: `button appearance=\"auto\"`",
-                a.name
-            ),
+            format!("`{}` belongs to {owners}", a.name),
             a.span,
         );
     }
@@ -193,6 +197,24 @@ pub(crate) fn control(
                 ),
                 a.span,
             );
+        }
+        // HTML's `textarea` takes none of `input`'s `type`, range or file picker.
+        if tag == "textarea" {
+            if let Some(a) = attrs.iter().find(|a| {
+                matches!(
+                    a.name.as_str(),
+                    "type" | "min" | "max" | "step" | "accept" | "multiple" | "capture"
+                )
+            }) {
+                return err(
+                    "lower-attr-tag",
+                    format!(
+                        "`textarea` takes no `{}`, which is `input`'s in HTML",
+                        a.name
+                    ),
+                    a.span,
+                );
+            }
         }
         return Ok(None);
     }
@@ -572,9 +594,8 @@ pub(crate) fn native_tag() -> Tag {
 
 /// What makes a place one a native button may not be (LLP 1069.011.000
 /// D9), for the children of the element being lowered; `None` when it adds
-/// nothing. `menu_row` is whether that element is a popover's direct child —
-/// a menu row, which may be a native button but whose own children are not
-/// rows (a host makes a menu item of a popover's direct children only).
+/// nothing. A menu row may itself be a native button. Its children form the
+/// item's face.
 pub(crate) fn button_context(
     tag: &str,
     control: Option<&str>,
@@ -592,17 +613,18 @@ pub(crate) fn button_context(
         return Some("a custom `button`");
     }
     if menu_row {
-        return Some("a menu row (a native button can be a popover's direct child, not below one)");
+        return Some("a menu row (put the button directly in the popover or its section)");
     }
     None
 }
 
 /// The style rows a native button's box may carry (LLP 1069.011 D6): where it
-/// sits and how big it is, whether it shows (`display` is checked to be its
-/// own `flex` or `none`), its opacity and transforms, its clip, its accent,
-/// and `outline: none`, which takes the platform's focus ring off (LLP 1104
-/// D6). Its semantic content rows are LLP 1069.011.001 D2–D9, D14–D17;
-/// chrome and arbitrary inner layout remain the platform's to draw.
+/// sits and how big it is, and the layout transition that moves it there (LLP
+/// 1063), whether it shows (`display` is checked to be its own `flex` or
+/// `none`), its opacity and transforms, its clip, its accent, and `outline:
+/// none`, which takes the platform's focus ring off (LLP 1104 D6). Its semantic
+/// content rows are LLP 1069.011.001 D2–D9, D14–D17; chrome and arbitrary inner
+/// layout remain the platform's to draw.
 const NATIVE_ROWS: &[StyleId] = &[
     StyleId::ControlSize,
     StyleId::ControlCornerStyle,
@@ -666,6 +688,7 @@ const NATIVE_ROWS: &[StyleId] = &[
     StyleId::OutlineStyle,
     StyleId::Appearance,
     StyleId::Transition,
+    StyleId::LayoutTransition,
     StyleId::Animation,
     StyleId::ExitAnimation,
     StyleId::PressScale,
@@ -692,12 +715,58 @@ fn native_motion(p: exact_motion::Property) -> bool {
 /// Whether a value can be empty: a blank literal, `none`, or an arm of a
 /// choice that is one.
 fn may_be_empty(e: &Expr) -> bool {
+    may_be_empty_unless(e, false)
+}
+
+pub(crate) fn without_ascriptions(mut e: &Expr) -> &Expr {
+    while let Expr::Typed(inner, _, _) = e {
+        e = inner;
+    }
+    e
+}
+
+/// The operands a view `if` requires to differ from `""`. In `"" != ""`,
+/// either side may be the inlined argument, so keep both.
+pub(crate) fn ruled_out(cond: &Expr) -> Vec<&Expr> {
+    let Expr::Binary(contract_syntax::BinOp::Ne, a, b, _) = cond else {
+        return Vec::new();
+    };
+    [(a, b), (b, a)]
+        .into_iter()
+        .filter_map(|(e, other)| {
+            matches!(without_ascriptions(other), Expr::Str(s, _) if s.is_empty()).then_some(&**e)
+        })
+        .collect()
+}
+
+/// Whether a matching guard rules out every blank result of `value`.
+/// Forwarding a prop can add ascriptions to the inlined argument. Its
+/// original span still distinguishes it from a separate blank literal.
+pub(crate) fn guarded<'e>(value: &Expr, mut guards: impl Iterator<Item = &'e Expr>) -> bool {
+    let value = without_ascriptions(value);
+    guards.any(|e| without_ascriptions(e) == value) && !may_be_empty_unless(value, true)
+}
+
+/// An inlined operand can keep its spelling and span under a shadowing binding.
+pub(crate) fn guard_survives(guard: &Expr, bindings: Binds<'_>) -> bool {
+    if bindings.is_empty() {
+        return true;
+    }
+    let mut reads = Vec::new();
+    crate::disabled_look::free_reads(guard, &mut Vec::new(), &mut reads);
+    !reads.iter().any(|name| bindings.contains(name))
+}
+
+fn may_be_empty_unless(e: &Expr, empty_ruled_out: bool) -> bool {
     match e {
-        Expr::Str(s, _) => s.trim().is_empty(),
+        Expr::Str(s, _) => s.trim().is_empty() && !(s.is_empty() && empty_ruled_out),
         Expr::None(_) => true,
-        Expr::Ternary(_, a, b, _) => may_be_empty(a) || may_be_empty(b),
-        Expr::Typed(x, _, _) | Expr::Let { body: x, .. } => may_be_empty(x),
-        _ => false,
+        Expr::Ternary(_, a, b, _) => {
+            may_be_empty_unless(a, empty_ruled_out) || may_be_empty_unless(b, empty_ruled_out)
+        }
+        Expr::Typed(x, _, _) | Expr::Let { body: x, .. } => may_be_empty_unless(x, empty_ruled_out),
+        // A guard exemption requires proof for every remaining arm.
+        _ => empty_ruled_out,
     }
 }
 
@@ -727,6 +796,46 @@ fn literals(e: &Expr) -> Option<Vec<&str>> {
 }
 
 impl Lowerer<'_> {
+    /// `lower`, with what a view `if`'s condition rules out held in `guards`.
+    pub(crate) fn under_guard<T>(&mut self, cond: &Expr, lower: impl FnOnce(&mut Self) -> T) -> T {
+        let held = self.guards.len();
+        self.guards.extend(ruled_out(cond).into_iter().cloned());
+        let lowered = lower(self);
+        self.guards.truncate(held);
+        lowered
+    }
+
+    pub(crate) fn under_bindings<T>(
+        &mut self,
+        bindings: Binds<'_>,
+        lower: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if self.guards.is_empty() || bindings.is_empty() {
+            return lower(self);
+        }
+        let held = std::mem::take(&mut self.guards);
+        self.guards = held
+            .iter()
+            .filter(|guard| guard_survives(guard, bindings))
+            .cloned()
+            .collect();
+        let lowered = lower(self);
+        self.guards = held;
+        lowered
+    }
+
+    /// `under_bindings` for a `for`'s body, where a route's own child is a row (`NavPlace::repeat`).
+    pub(crate) fn under_repeat<T>(
+        &mut self,
+        bindings: Binds<'_>,
+        lower: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let place = self.nav_place.repeat();
+        let lowered = self.under_bindings(bindings, lower);
+        self.nav_place = place;
+        lowered
+    }
+
     /// A native button's attributes, face and place (LLP 1069.011 D2, D5,
     /// D6, D11), after class merging.
     pub(crate) fn check_native_button(
@@ -898,9 +1007,10 @@ impl Lowerer<'_> {
                 _ => {}
             }
         }
-        let labelled = attrs
-            .iter()
-            .any(|a| a.name == "aria-label" && !may_be_empty(&a.value));
+        let labelled = attrs.iter().any(|a| {
+            a.name == "aria-label"
+                && (!may_be_empty(&a.value) || guarded(&a.value, self.guards.iter()))
+        });
         // A tab that names its panel may hold its badge beside its face (LLP 1075.003 §9.9).
         let panel_tab = attrs.iter().any(|a| a.name == "aria-controls")
             && attrs
@@ -1256,4 +1366,22 @@ pub(crate) fn check_zero_size(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract_syntax::BinOp;
+
+    #[test]
+    fn only_the_empty_string_produces_a_label_guard() {
+        let span = Span::default();
+        let label = Expr::Ident("label".into(), span);
+        let none = Expr::None(span);
+        let empty = Expr::Str(String::new(), span);
+        let unequal = |a, b| Expr::Binary(BinOp::Ne, Box::new(a), Box::new(b), span);
+        assert_eq!(ruled_out(&unequal(label.clone(), empty)), [&label]);
+        assert!(ruled_out(&unequal(label.clone(), none.clone())).is_empty());
+        assert!(ruled_out(&unequal(none, label)).is_empty());
+    }
 }

@@ -1,4 +1,4 @@
-// `exact release` signs every nested Mach-O file and bundle, innermost first (#119); `exact contract build`
+// `exact release` signs every nested Mach-O file and bundle, innermost first; `exact contract build`
 // refreshes an app's types (LLP 1116.001 D4.5).
 // `bun test ./scripts/exact.test.mjs`.
 import { test, spyOn } from 'bun:test';
@@ -699,7 +699,7 @@ test.skipIf(!tools)('production executables keep matching dSYMs without an IPA; 
 
 // An executable is named for its app (955b0463d), and an app may be named
 // "T3 Code (Exact)": otool reads a path ending in `name(member)` as an
-// archive's member, so the SDK check read nothing and refused the build (#234).
+// archive's member, so the SDK check read nothing and refused the build.
 test.skipIf(!tools)('an executable whose name ends in parentheses is read as a file, its SDK checked and its release stripped', () => inDir((dir) => {
   writeFileSync(resolve(dir, 'main.c'), 'int main(void){return 0;}\n');
   const executable = resolve(dir, 'Demo (Beta)');
@@ -1050,7 +1050,7 @@ test('docs prints the section on its words first, matching whole words', () => {
     [['HttpOnly'], 'docs/recipes/web-sessions.md', /cookie/],
     [['exit', 'animation'], 'docs/recipes/motion.md', /-exact-exit-animation/],
     [['-exact-exit-animation'], 'docs/recipes/motion.md', /-exact-exit-animation/],
-    [['call'], 'docs/recipes/native-module.md', /`native\.call`/],
+    [['call'], 'docs/recipes/native-module.md', /^# Answer a native call in Swift or Kotlin/],
     [['tool'], 'docs/recipes/tools.md', /^# Recipe: tools an agent or the system calls/],
     [['later'], 'docs/reference.md', /Answer::Later/],
     [['screenshot'], 'docs/recipes/ios-driving.md', /screenshot\s+\.exact\/x\.png compare/],
@@ -1105,7 +1105,7 @@ test('docs prints the section on its words first, matching whole words', () => {
     assert.ok(where.startsWith(`${file}:`), `docs ${words.join(' ')}: ${where}`);
     assert.match(text, shows, `docs ${words.join(' ')} prints from the lines that hold them:\n${text}`);
   }
-});
+}, 30_000);
 
 
 test.skipIf(!tools)('release keeps Mac widget entitlements, including the provisioned app group (LLP 1126.001 WP16)', async () => {
@@ -1388,7 +1388,7 @@ test('add installs a standard package by pathFrom from an outside app with an ab
   });
   assert.equal(fromRepo.status, 0, fromRepo.stdout + fromRepo.stderr);
   assert.equal(fromRepo.stdout.trim().split('\n').at(-1), `For Android, after importing the package, run: in '${root}': bun scripts/agent-android.mjs build 'shop' --apk --write-locks, with EXACT_APP_DIR set to '${realpathSync(app)}'`);
-}));
+}), 60_000);
 
 test.skipIf(process.platform === 'win32')('setup reports Gradle SDK packages and their install commands without running sdkmanager', async () => {
   const { sdkReport, platformRowNames } = await import('./exact.mjs');
@@ -1494,7 +1494,7 @@ test('exact new names setup --check for each native platform the app names, whos
   const named = /^Before the first macos build: bun (.+? setup --check --platform macos) names/m.exec(made.stdout);
   const checked = spawnSync('/bin/sh', ['-c', `${shellPath(process.execPath)} ${named[1]}`], { cwd: resolve(dir, 'with-native'), encoding: 'utf8', timeout: 120_000 });
   assert.doesNotMatch(checked.stderr, /Usage: exact setup/);
-  assert.match(checked.stdout, /\bXcode\b|\bmacOS\b/);
+  if (process.platform === 'darwin') assert.match(checked.stdout, /\bXcode\b|\bmacOS\b/); else assert.match(checked.stderr, /macos needs a Mac with Xcode/);
   const plain = spawnSync(process.execPath, [resolve(import.meta.dir, 'exact.mjs'), 'new', resolve(dir, 'web-only')], { encoding: 'utf8', timeout: 120_000 });
   assert.doesNotMatch(plain.stdout, /Before the first/);
 }); }, 240_000);

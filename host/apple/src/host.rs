@@ -120,6 +120,9 @@ mod box_motion_tests;
 #[path = "canvas_link_tests.rs"]
 mod canvas_link_tests;
 #[cfg(test)]
+#[path = "clip_motion_tests.rs"]
+mod clip_motion_tests;
+#[cfg(test)]
 #[path = "filter_motion_tests.rs"]
 mod filter_motion_tests;
 #[path = "layout.rs"]
@@ -137,6 +140,8 @@ mod share_in;
 #[path = "snapshot.rs"]
 pub(crate) mod snapshot;
 pub(crate) use scale::LaunchLayout;
+#[path = "clip_handover.rs"]
+mod clip_handover;
 #[cfg(test)]
 #[path = "spacing_tests.rs"]
 mod spacing_tests;
@@ -367,6 +372,8 @@ pub struct Host<D: DataSource> {
     holds_told: colors::Told,
     /// The top-layer boxes covered while closed (`closed.rs`).
     closed: layout::closed::Closed,
+    /// The `portal` movers and the `declaredParent` a batch last gave each (`Host::tell_declared_parents`).
+    declared_told: Vec<(ViewId, ViewId)>,
 }
 
 pub(crate) use crate::plan_bytes::PlanBytes;
@@ -619,6 +626,9 @@ impl<D: DataSource> Host<D> {
         // release build from the first ask (`Bridge::measure_work`).
         crate::abi::measure_at_boot(&mut runner, compat);
         runner.admit_live(compat);
+        if let Some(compat) = compat {
+            runner.place_controls(compat);
+        }
         if let Some(action) = region.and_then(|r| r.activate) {
             runner.act(action, Vec::new()).map_err(HostError::Runner)?;
         }
@@ -751,6 +761,7 @@ impl<D: DataSource> Host<D> {
             route_inspectors_told: Vec::new(),
             holds_told: Default::default(),
             closed: Default::default(),
+            declared_told: Vec::new(),
         };
         let mut batch = Batch::new();
         host.native_prepare_candidate().map_err(HostError::Layout)?;
@@ -759,6 +770,7 @@ impl<D: DataSource> Host<D> {
         host.cover_root_tablist();
         host.prepare_flat(&mut batch);
         host.present_first_tree(previous, &order, &mut batch);
+        host.declared_told = host.runner.declared_parents();
         host.emit_title(&mut batch);
         host.emit_language(&mut batch);
         colors::emit_roles(&mut batch);
@@ -939,7 +951,7 @@ impl<D: DataSource> Host<D> {
         };
         // An authored test's store starts empty every run (`agent --test`):
         // emptied at the boot that read it, so this is a no-op unless that failed.
-        crate::picker::empty_fresh_tree(source.app_id())?;
+        crate::picker::empty_fresh_tree(source.app_id(), source.grants())?;
         // What `app:/` names for the picker and an image's source (LLP
         // 1069.002 D4, D7); the last launch's picks go.
         crate::picker::set_roots(data.clone(), cache.clone(), temporary.clone());
@@ -1047,7 +1059,7 @@ impl<D: DataSource> Host<D> {
     }
 
     /// Admission failures remain on the runner's current tickets, not a queue.
-    pub fn refuse_request(&mut self, ticket: u64, reason: &'static str, ordered: bool) {
+    pub fn refuse_request(&mut self, ticket: u64, reason: impl Into<String>, ordered: bool) {
         self.runner.refuse_request(ticket, reason, ordered);
     }
 

@@ -52,10 +52,33 @@ const body = `
   navigation.project(root, () => {});
   window.drags = [];
   addEventListener('dragstart', event => drags.push(event.target.id + ':' + event.defaultPrevented));
-  window.drag = id => { document.getElementById(id).dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true })); return drags.splice(0); };
+  // An image drawn, with \`-webkit-user-drag\` set back to \`auto\` so Chrome takes the path of an engine without the property,
+  // and the point of its middle.
+  window.unstyled = async id => {
+    const img = document.getElementById(id), c = document.createElement('canvas');
+    c.width = c.height = 20; c.getContext('2d').fillRect(0, 0, 20, 20);
+    await new Promise(loaded => { img.onload = loaded; img.width = img.height = 20; img.src = c.toDataURL(); });
+    img.style.webkitUserDrag = 'auto';
+    const r = img.getBoundingClientRect();
+    return [r.x + r.width / 2, r.y + r.height / 2];
+  };
   window.css = (id, property, pseudo) => getComputedStyle(document.getElementById(id), pseudo)[property];
   window.ready = true;
 </script>`;
+
+/** A mouse drag from the middle of image `id`, left draggable by style, under Chrome's drag interception so nothing
+ * leaves the page, and the `dragstart`s the page heard. */
+async function mouseDrag(evaluate, call, id) {
+  const [x, y] = await evaluate(`unstyled(${JSON.stringify(id)})`);
+  await call('Input.setInterceptDrags', { enabled: true });
+  const mouse = (type, dy, buttons) => call('Input.dispatchMouseEvent', { type, x, y: y + dy, button: 'left', buttons, clickCount: 1 });
+  await mouse('mouseMoved', 0, 0);
+  await mouse('mousePressed', 0, 1);
+  for (let dy = 3; dy <= 30; dy += 3) await mouse('mouseMoved', dy, 1);
+  await call('Input.dispatchDragEvent', { type: 'dragCancel', x, y: y + 30, data: { items: [], dragOperationsMask: 1 } }).catch(() => {});
+  await mouse('mouseReleased', 30, 0);
+  return evaluate('drags.splice(0)');
+}
 
 /** The page under the web's stylesheet in headless Chrome: `test(evaluate, call)` with its `Runtime.evaluate` and its CDP session. */
 async function inChrome(test) {
@@ -133,15 +156,16 @@ check(`the shell carries the resets a careful web app ships`, () => inChrome(asy
   expect(await evaluate(`document.documentElement.setAttribute('data-scrolldocument', ''); ${ends}`)).toBe('["auto","auto"]');
 }), 60000);
 
-check(`the small ones: a control's image is not dragged out, the chevron and the thumb follow the page's direction, a plain dialog has no padding`, () => inChrome(async (evaluate) => {
+check(`the small ones: a control's image is not dragged out, the chevron and the thumb follow the page's direction, a plain dialog has no padding`, () => inChrome(async (evaluate, call) => {
   for (const id of ['symbol', 'in-button', 'in-link', 'in-pressable']) {
     expect([id, await css(evaluate, id, 'webkitUserDrag')]).toEqual([id, 'none']);
-    // Where an engine has no such property, the drag that starts is cancelled.
-    expect(await evaluate(`drag(${JSON.stringify(id)})`)).toEqual([`${id}:true`]);
+    // Where an engine has no such property, the drag that starts is cancelled: Chrome with the property overridden.
+    expect(await mouseDrag(evaluate, call, id)).toEqual([`${id}:true`]);
   }
-  // An image that is content is the browser's, as on any page.
+  // An image that is content is the browser's, as on any page, and a script's `dragstart` is no drag to cancel.
   expect(await css(evaluate, 'content', 'webkitUserDrag')).toBe('auto');
-  expect(await evaluate(`drag('content')`)).toEqual(['content:false']);
+  expect(await mouseDrag(evaluate, call, 'content')).toEqual(['content:false']);
+  expect(await evaluate(`document.getElementById('in-button').dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true }))`)).toBe(true);
 
   // Left to right: room for the select's chevron at the right, where it is drawn; the switch's thumb starts at the left.
   expect([await css(evaluate, 'select', 'paddingLeft'), await css(evaluate, 'select', 'paddingRight')]).toEqual(['12px', '32px']);
@@ -157,4 +181,68 @@ check(`the small ones: a control's image is not dragged out, the chevron and the
   // A plain dialog's box is its author's; an alert keeps the padding the page gives it.
   expect(await css(evaluate, 'dialog', 'padding')).toBe('0px');
   expect(await css(evaluate, 'alert', 'padding')).toBe('24px');
+}), 60000);
+
+check('accent-color:auto resets --exact-accent-said for spinners across static, SSR and dynamic styles', () => inChrome(async (evaluate) => {
+  const result = await evaluate(`(() => {
+    const root = document.getElementById('exact-root');
+    const probe = document.createElement('div');
+    probe.innerHTML = \`
+      <div id="probe-default" data-exact-progress style="display:grid;width:20px;height:20px"></div>
+      <div style="accent-color:#ff0000;--exact-accent:#ff0000;--exact-accent-said:#ff0000">
+        <div id="probe-authored" data-exact-progress style="display:grid;width:20px;height:20px"></div>
+        <div style="accent-color:auto;--exact-accent:AccentColor;--exact-accent-said:var(--exact-accent-design)">
+          <div id="probe-auto-explicit" data-exact-progress style="display:grid;width:20px;height:20px"></div>
+        </div>
+        <div style="accent-color:auto;--exact-accent:AccentColor;">
+          <div id="probe-auto-ssr" data-exact-progress style="display:grid;width:20px;height:20px"></div>
+        </div>
+        <div id="probe-auto-dyn-host">
+          <div id="probe-auto-dyn" data-exact-progress style="display:grid;width:20px;height:20px"></div>
+        </div>
+      </div>
+      <div style="accent-color:auto;--exact-accent:AccentColor;">
+        <div id="probe-ssr-bare" data-exact-progress style="display:grid;width:20px;height:20px"></div>
+      </div>
+    \`;
+    root.append(probe);
+    const dyn = document.getElementById('probe-auto-dyn-host');
+    dyn.style.setProperty('accent-color', 'auto');
+    dyn.style.setProperty('--exact-accent', 'AccentColor');
+    const bg = id => getComputedStyle(document.getElementById(id), '::before').backgroundImage;
+    const withoutDesign = {
+      defaultBg: bg('probe-default'),
+      authored: bg('probe-authored'),
+      autoExplicit: bg('probe-auto-explicit'),
+      autoSsr: bg('probe-auto-ssr'),
+      autoDyn: bg('probe-auto-dyn'),
+      ssrBare: bg('probe-ssr-bare'),
+    };
+    document.documentElement.style.setProperty('--exact-accent-design', 'rgb(0, 128, 0)');
+    document.documentElement.style.setProperty('--exact-accent-said', 'var(--exact-accent-design)');
+    const withDesign = {
+      defaultBg: bg('probe-default'),
+      authored: bg('probe-authored'),
+      autoExplicit: bg('probe-auto-explicit'),
+      autoSsr: bg('probe-auto-ssr'),
+      autoDyn: bg('probe-auto-dyn'),
+      ssrBare: bg('probe-ssr-bare'),
+    };
+    document.documentElement.style.removeProperty('--exact-accent-design');
+    document.documentElement.style.removeProperty('--exact-accent-said');
+    probe.remove();
+    return { withoutDesign, withDesign };
+  })()`);
+  expect(result.withoutDesign.authored).toContain('rgb(255, 0, 0)');
+  expect(result.withoutDesign.authored).not.toBe(result.withoutDesign.defaultBg);
+  expect(result.withoutDesign.autoExplicit).toBe(result.withoutDesign.defaultBg);
+  expect(result.withoutDesign.autoSsr).toBe(result.withoutDesign.defaultBg);
+  expect(result.withoutDesign.autoDyn).toBe(result.withoutDesign.defaultBg);
+  expect(result.withoutDesign.ssrBare).toBe(result.withoutDesign.defaultBg);
+  expect(result.withDesign.defaultBg).toContain('rgb(0, 128, 0)');
+  expect(result.withDesign.authored).toContain('rgb(255, 0, 0)');
+  expect(result.withDesign.autoExplicit).toBe(result.withDesign.defaultBg);
+  expect(result.withDesign.autoSsr).toBe(result.withDesign.defaultBg);
+  expect(result.withDesign.autoDyn).toBe(result.withDesign.defaultBg);
+  expect(result.withDesign.ssrBare).toBe(result.withDesign.defaultBg);
 }), 60000);

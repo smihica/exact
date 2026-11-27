@@ -362,7 +362,7 @@ fn several_completed_frames_can_supply_a_pending_capture() {
     press(&mut p, "capture");
     for time in [16., 32., 48.] {
         p.host.advance(time);
-        p.host.sync_canvases(1., true, &p.assets);
+        p.sync_canvases(true);
     }
     p.sync_surfaces();
     let png = tiny_skia::Pixmap::load_png(p.host.app_roots().unwrap()[2].join("shot.png")).unwrap();
@@ -474,14 +474,24 @@ fn a_static_canvas_keeps_the_direct_panels_ahead_slot() {
     assert!(p.display_presented(&a, 0.).is_none());
     assert!(!p.host.canvas_wants_frame());
     let b = p.panel_frame_ahead(true).unwrap();
-    press(&mut p, "capture");
-    assert_eq!(p.surfaces.captures.len(), 1);
     assert!(p.panel_can_prepare_ahead());
     let c = p.panel_frame_ahead(true).unwrap();
     assert_eq!(p.host.runner().data_ref().2, 0);
-    assert!(p.surfaces.captures.is_empty());
     assert!(p.panel_complete(&b));
+
+    // A queued capture blocks the ahead slot so its outcome is never fulfilled
+    // into a refused ahead picture, then drains on the next single-flight frame.
+    press(&mut p, "capture");
+    assert_eq!(p.surfaces.captures.len(), 1);
+    assert!(!p.panel_can_prepare_ahead());
+    assert!(p.panel_frame_ahead(true).is_none());
+    assert_eq!(p.surfaces.captures.len(), 1);
     assert!(p.panel_complete(&c));
+    assert!(p.panel_can_prepare_ahead());
+    let d = p.panel_frame_ahead(true).unwrap();
+    assert_eq!(p.host.runner().data_ref().2, 0);
+    assert!(p.surfaces.captures.is_empty());
+    assert!(p.panel_complete(&d));
     cleanup(&mut p);
 }
 

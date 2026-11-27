@@ -840,7 +840,7 @@ component SplitDocumentAgent
   view
     main navigationKey=\`\${top(nav).id}\` navigationBack="back" width="100%" height="100%" position="relative" testId="navigation"
       for e in stack(nav) key=e.id
-        column navigationKey=\`\${e.id}\` position="absolute" inset=0 testId=\`route-\${e.name}\`
+        column navigationKey=\`\${e.id}\` navigationSplit="split" position="absolute" inset=0 testId=\`route-\${e.name}\`
           if e.name == "home"
             list
               link href="/a" testId="row-alpha"
@@ -976,6 +976,46 @@ component UnclaimedDocument
     const shown = await browser.carrier.evaluate(`[...document.querySelectorAll('[data-testid="page"] [data-testid]')].map(e => e.dataset.testid + ' ' + e.textContent)`);
     const journal = await browser.carrier.evaluate('exact.journal.filter(l => / document: | adopted the document$/.test(l)).map(l => l.slice(l.indexOf(" ") + 1))');
     expect([shown, journal]).toEqual([['only only'], ['document: rendered at /, not /other; rendering fresh']]);
+  } finally {
+    await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+  }
+}, 30000);
+
+// LLP 1048.000 D6, D11 — one URL per page: a static host that gives a directory's page at `/item/` (it redirects `/item`
+// there) serves the page of `/item`, which the runtime adopts and boots at `/item`, the browser's query and fragment kept.
+test('a page served with a trailing slash is adopted at its own location', async () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/slash-document-agent-test-'));
+  let browser, server;
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Slash Document Agent Test', app: { id: 'test.slash-document', name: 'Slash Document Agent Test' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  home "/" render=build
+    item "/item" render=build
+
+component SlashDocument
+  view
+    main navigationKey=\`\${top(nav).id}\`
+      for e in stack(nav) key=e.id
+        column navigationKey=\`\${e.id}\`
+          text e.name testId=\`name-\${e.name}\`
+`);
+    const dist = resolve(dir, 'dist');
+    const build = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'slash-document-agent-test', '--out', dist, '--render', 'js'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
+    expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+      const path = new URL(req.url).pathname;
+      const file = Bun.file(resolve(dist, path.endsWith('/') ? `.${path}index.html` : path.slice(1)));
+      return await file.exists() ? new Response(file) : new Response('not found', { status: 404 });
+    } });
+    browser = await open({ host: 'web', url: new URL('item/?q=1#part', server.url).href, size: [420, 900] });
+    const journal = await browser.carrier.evaluate('exact.journal.filter(l => / document: | adopted the document$/.test(l)).map(l => l.slice(l.indexOf(" ") + 1))');
+    const here = await browser.carrier.evaluate('location.pathname + location.hash');
+    expect([journal, (await browser.state()).navigation.url, here]).toEqual([['adopted the document'], '/item?q=1#part', '/item#part']);
+    expect(await browser.carrier.evaluate(`document.querySelector('[data-testid="name-item"]')?.textContent`)).toBe('item');
   } finally {
     await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
   }

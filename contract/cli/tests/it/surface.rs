@@ -1,4 +1,5 @@
 use crate::scratch::Scratch;
+use crate::source::boxed;
 use exact_kernel::Kernel;
 use exact_runner::{DataError, DataSource, Runner, Value};
 struct NoData;
@@ -38,10 +39,10 @@ component Readout
         case none
           text "Waiting"
 "#;
-    let plan = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
+    let plan = contract::bake(contract::compile(source).unwrap(), boxed(NoData)).unwrap();
     let mut runner = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -61,14 +62,21 @@ component Readout
 
 #[test]
 fn bake_defaults_are_the_first_frame_and_never_kept_or_typescript() {
-    let p = contract::bake(contract::compile(SOURCE).unwrap(), NoData).unwrap();
+    let p = contract::bake(contract::compile(SOURCE).unwrap(), boxed(NoData)).unwrap();
     assert_eq!(
         Value::from_bytes(p.bytes(p.resources[0].initial)).unwrap(),
         Value::record(vec![Value::Number(0.)])
     );
     assert!(p.resources[0].reader);
     assert!(!contract::typescript(&p).unwrap().contains("exactSurface"));
-    let mut r = Runner::boot(p, NoData, Kernel::with_monospace(), Default::default(), "/").unwrap();
+    let mut r = Runner::boot(
+        p,
+        boxed(NoData),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
     r.set_surface_record("world", Some(r#"{"beacons":1}"#))
         .unwrap();
     assert_eq!(
@@ -114,7 +122,7 @@ fn lint_refuses_arity_nonliteral_nonrecord_and_unknown_surface_by_name() {
     let number = nonrecord.fields[0].ty;
     nonrecord.resources[0].ty = number;
     assert!(matches!(
-        contract::bake(nonrecord, NoData),
+        contract::bake(nonrecord, boxed(NoData)),
         Err(contract::BakeError::Lint {
             id: "bake-surface-record",
             ..
@@ -122,7 +130,7 @@ fn lint_refuses_arity_nonliteral_nonrecord_and_unknown_surface_by_name() {
     ));
     for source in cases {
         let p = contract::compile(&source).unwrap();
-        let error = contract::bake(p, NoData).unwrap_err();
+        let error = contract::bake(p, boxed(NoData)).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -150,7 +158,7 @@ fn viewport_and_delivery_readers_choose_subsets_without_source_unification() {
         let p = contract::compile(&text).unwrap();
         // Named once in the plan's source table (LLP 1030 D7), never unified.
         assert_eq!(p.sources.len(), 1);
-        contract::bake(p, NoData).unwrap();
+        contract::bake(p, boxed(NoData)).unwrap();
     }
 }
 
@@ -160,7 +168,7 @@ fn control_action_is_a_canvas_child_property() {
     let plan = contract::compile(source).unwrap();
     let r = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -198,7 +206,7 @@ fn named_surface_arguments_survive_plan_roundtrip_and_live_updates() {
     assert_eq!(compiled.encode(), plan.encode());
     let mut runner = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -243,7 +251,7 @@ fn named_surface_arguments_survive_plan_roundtrip_and_live_updates() {
     let plan = contract::compile(child).unwrap();
     let mut inlined = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -281,7 +289,7 @@ fn view_binders_preserve_surface_names() {
         }
         let mut r = Runner::boot(
             plan,
-            NoData,
+            boxed(NoData),
             Kernel::with_monospace(),
             Default::default(),
             "/",
@@ -310,7 +318,7 @@ fn d6_empty_v5_surface_call_is_named_and_v4_refuses() {
     let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
     let mut runner = Runner::boot(
         plan.clone(),
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -551,7 +559,7 @@ component App
     canvas surface=world()
       text hud.state
 "#;
-    let plan = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
+    let plan = contract::bake(contract::compile(source).unwrap(), boxed(NoData)).unwrap();
     let default = Value::record(vec![
         Value::str("a|b"),
         Value::record(vec![
@@ -562,7 +570,7 @@ component App
     ]);
     let mut runner = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -655,6 +663,13 @@ fn a_shortcut_on_a_key_the_game_binds_warns() {
     );
     assert_eq!(found[1].related.len(), 1, "the use that passed \"1\"");
     assert_eq!(found[1].related[0].span.line, 4);
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, source.replace("Shift+J", "Mod+Shift+J")).unwrap();
+    let portable = contract::shortcut_findings(&path).unwrap();
+    assert_eq!(portable.len(), found.len());
+    assert!(portable[0]
+        .message
+        .contains("Meta+Shift on Apple platforms or Control+Shift elsewhere"));
     // Rust newer than the keys: they may predate an `Actions` edit.
     std::fs::create_dir_all(dir.join("logic/src")).unwrap();
     std::fs::write(dir.join("logic/src/lib.rs"), "").unwrap();
@@ -748,11 +763,18 @@ component App
       canvas surface=world
       text "Metrics"
 "#;
-    let p = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
+    let p = contract::bake(contract::compile(source).unwrap(), boxed(NoData)).unwrap();
     assert!(!contract::typescript(&p)
         .unwrap()
         .contains("exactCanvasPerformance"));
-    let mut r = Runner::boot(p, NoData, Kernel::with_monospace(), Default::default(), "/").unwrap();
+    let mut r = Runner::boot(
+        p,
+        boxed(NoData),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
     let empty = Value::record(vec![Value::NONE, Value::NONE]);
     assert_eq!(r.resource("metrics"), Some(&empty));
     assert!(r.wants_canvas_performance("world"));
@@ -782,7 +804,7 @@ component App
         source.replace("Performance(\"world\")", "Performance(\"missing\")"),
     ] {
         let p = contract::compile(&bad).unwrap();
-        assert!(contract::bake(p, NoData).is_err());
+        assert!(contract::bake(p, boxed(NoData)).is_err());
     }
 }
 
@@ -802,8 +824,15 @@ component App
   view
     canvas surface=world
 "#;
-    let p = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
-    let mut r = Runner::boot(p, NoData, Kernel::with_monospace(), Default::default(), "/").unwrap();
+    let p = contract::bake(contract::compile(source).unwrap(), boxed(NoData)).unwrap();
+    let mut r = Runner::boot(
+        p,
+        boxed(NoData),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
     assert!(
         !r.wants_canvas_performance("world"),
         "idle readers collect nothing"
@@ -818,4 +847,97 @@ component App
     );
     r.act("second", vec![]).unwrap();
     assert!(!r.wants_canvas_performance("world"));
+}
+
+#[test]
+fn colour_arguments_follow_the_canvas_place() {
+    let dir = Scratch::new(format!("contract-surface-colour-{}", std::process::id()));
+    std::fs::write(dir.join("app.forma"), "forma board\n\naxes\n  ink = plain | bright\n\ntheme\n  surface.board = light-dark(#ececef, #141416)\n    when ink=bright: #00ff00\n  board.dot = color(display-p3 1 0 0 / 50%)\n  gap: length = 4px\n").unwrap();
+    let source = r#"component App
+  state bright = false
+  action change
+    bright = not bright
+  view
+    column
+      column -exact-mode=(bright ? "ink=bright" : "ink=plain")
+        canvas surface=board(color("surface.board"), color("board.dot")) testId="first"
+      column color-scheme="light"
+        canvas surface=board(color("surface.board"), color("board.dot")) testId="second"
+      canvas surface=plain("surface.board")
+"#;
+    let path = dir.join("app.contract");
+    std::fs::write(&path, source).unwrap();
+    let plan = contract::compile_path(&path).unwrap();
+    let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+    let mut r = Runner::boot(
+        plan,
+        boxed(NoData),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let initial = r.take_surface_updates();
+    assert_eq!(initial.len(), 3);
+    let args = |u: &exact_runner::SurfaceUpdate| {
+        serde_json::from_str::<serde_json::Value>(&u.arguments_json()).unwrap()
+    };
+    let light = args(&initial[0]);
+    assert_eq!(light, args(&initial[1]));
+    assert_eq!(args(&initial[2]), serde_json::json!(["surface.board"]));
+    assert!((light[0]["color"][0].as_f64().unwrap() - 0.8388).abs() < 0.001);
+    let p3 = light[1]["color"].as_array().unwrap();
+    assert!(p3[0].as_f64().unwrap() > 1.2 && p3[1].as_f64().unwrap() < 0.);
+    assert_eq!(p3[3], 0.5);
+    let mut prefs = r.viewport().preferences;
+    prefs.dark = true;
+    r.set_preferences(prefs).unwrap();
+    let dark = r.take_surface_updates();
+    assert_eq!(dark.len(), 1);
+    assert_eq!(dark[0].view, initial[0].view);
+    assert!((args(&dark[0])[0]["color"][0].as_f64().unwrap() - 0.007).abs() < 0.0001);
+    assert_eq!(args(&dark[0])[1], light[1]);
+    r.act("change", vec![]).unwrap();
+    let pinned = r.take_surface_updates();
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(
+        args(&pinned[0])[0]["color"],
+        serde_json::json!([0, 1, 0, 1])
+    );
+    r.set_token("board.dot", "#000", &[]).unwrap();
+    let live = r.take_surface_updates();
+    assert_eq!(live.len(), 2);
+    for u in &live {
+        assert_eq!(args(u)[1]["color"], serde_json::json!([0, 0, 0, 1]));
+    }
+    r.set_token("board.dot", "#000000", &[]).unwrap();
+    assert!(r.take_surface_updates().is_empty());
+    for (expr, expected) in [
+        ("color(\"absent\")", "absent"),
+        ("color(\"gap\")", "length"),
+        ("color(bright)", "literal"),
+        ("color(\"#f00\")", "token"),
+    ] {
+        std::fs::write(&path, source.replace("color(\"surface.board\")", expr)).unwrap();
+        let error = contract::compile_path(&path).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    std::fs::write(
+        &path,
+        source.replace(
+            "  action change",
+            "  derive misplaced = color(\"surface.board\")\n  action change",
+        ),
+    )
+    .unwrap();
+    assert!(contract::compile_path(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("surface argument"));
+    let collision = format!("fn color(name: string): string = name\n{source}");
+    std::fs::write(&path, collision).unwrap();
+    assert!(contract::compile_path(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("rename the declared function"));
 }

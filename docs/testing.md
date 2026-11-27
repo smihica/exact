@@ -213,6 +213,13 @@ virtual clock retains its virtual time.
   fixture with the debug `contract` binary the lane's build step has built, run
   directly; not `cargo run --release`, and not a `cargo run` per fixture. The
   compiler's output does not depend on its build profile.
+- **A test binary's runners share one source type.** Rust compiles the
+  whole runner again for each data-source type a binary boots: 1.75 MB of
+  code at `opt-level = 0` and 5 to 8 MB of symbol names, and Xcode 27.2's
+  linker cannot write a symbol string table past 2 GiB. The compiler's
+  integration tests pass `boxed(source)` to `Runner::boot` and
+  `contract::bake` and read it back with `r.source::<T>()`
+  (`contract/cli/tests/it/source.rs`), so their crate instantiates one runner.
 - **An app's Rust tests are its data crate's.** An app's logic and its Rust tests
   live in `apps/<app>/data`; its `web`, `linux`, `apple` and `android` crates are
   host shells, tested mainly by driving the app (conformance, the smokes,
@@ -452,6 +459,20 @@ Measure the gate after an actual one-line edit in a dependency as well as with
 nothing changed. Adding a fast test whose dependencies take a minute to compile
 still breaks the gate's budget.
 
+- **On Apple silicon, report retired instructions per completed app step.**
+  Have the action increment a counter. At interactive QoS, warm the app,
+  read its counter and its process's `proc_pid_rusage` field
+  `ri_instructions`, then repeat both reads after the run. Divide the
+  instruction delta by the counter delta. Record elapsed CPU time and load
+  for interpreting timings. Take call stacks with `sample` in a separate run.
+- Measure a visible window on its display link to capture the work of presenting
+  each frame. Report an agent drive such as `clock +8000 real` (eight seconds)
+  separately. It includes the driver's work inside the app process and can
+  deliver several virtual steps before the window draws. Keep visibility, clock,
+  task and counter text the same within each comparison. To isolate movement,
+  keep the same views mounted at fixed positions in the control, subtract its
+  instructions per step, then divide by the number of moving views. An empty
+  scene as the control includes the cost of having those views mounted.
 - **Measure with interactive QoS.** A process started by a background service
   (an agent's session, a launchd job without `ProcessType Interactive`) can run
   at background QoS, where the kernel coalesces timers: a 10 ms sleep takes

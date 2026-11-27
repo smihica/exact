@@ -6,15 +6,12 @@ use contract::DataSource;
 use std::{env, fs, path::Path, path::PathBuf};
 
 /// What differs between the two generators' host crates.
-pub struct Shape<'a> {
-    /// The directory, relative to the app, whose app.json the bake reads: the app's own (`.`), or the copy a game's
-    /// bake resolves into `.shells/`.
-    pub manifest: &'a str,
+pub struct Shape {
     /// Whether the entry takes the manifest's Rust replacement mode (an app). A game's generated hosts require it off.
     pub replacement: bool,
     /// Whether the desktop hosts compose the app's packages and Rust hatches from `packages.rs` and `hatches.rs`,
-    /// as a TypeScript app's generated crates do (the crate's `main` is its own). Otherwise the entry carries `main`,
-    /// with the packages and no hatches, as a game's does.
+    /// as a TypeScript app's generated crates do (the crate's `main` is its own), and Android's links the update
+    /// store. Otherwise the desktop entry carries `main`, with the packages and no hatches, as a game's does.
     pub composed: bool,
     /// Whether the Apple entry names what it links and takes the update host when the binary has a store, as an
     /// app's does; a game's links every capability into the plain host.
@@ -23,10 +20,9 @@ pub struct Shape<'a> {
     pub shortcuts: bool,
 }
 
-impl Shape<'_> {
+impl Shape {
     /// An app's host crate (LLP 1153.003 D2).
-    pub const APP: Shape<'static> = Shape {
-        manifest: ".",
+    pub const APP: Shape = Shape {
         replacement: true,
         composed: true,
         apple_linked: true,
@@ -101,12 +97,17 @@ pub fn bake<D: DataSource>(
         return;
     }
     let app = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join(app_dir);
-    let manifest_dir = app.join(shape.manifest);
     println!("cargo:rerun-if-env-changed=EXACT_ASSET_ROOTS");
-    for path in ["app.json", "assets", "deck", "gpu/shaders"]
-        .iter()
-        .map(|path| app.join(path))
-        .chain([manifest_dir.join("app.json")])
+    // The manifest is a game's resolved `.shells/app.json` where it has one (`Manifest::read`).
+    for path in [
+        "app.json",
+        ".shells/app.json",
+        "assets",
+        "deck",
+        "gpu/shaders",
+    ]
+    .iter()
+    .map(|path| app.join(path))
     {
         // A nonexistent watch path makes Cargo rebuild every invocation.
         if path.exists() {
@@ -117,21 +118,61 @@ pub fn bake<D: DataSource>(
     // Cargo's build-script fingerprint aligned with the compiler's imports so
     // an edit to a component file reruns this bake.
     contract::rerun_if_changed(&app.join("app.contract"));
-    let manifest =
-        contract::Manifest::read(&manifest_dir).unwrap_or_else(|e| panic!("app.json: {e}"));
-    let mut plan = contract::compile_path(&app.join("app.contract"))
-        .unwrap_or_else(|e| panic!("app.contract: {e}"));
+    let manifest = contract::Manifest::read(&app).unwrap_or_else(|e| panic!("app.json: {e}"));
+    let source = app.join("app.contract");
+    let development = matches!(
+        env::var("EXACT_UPDATE_TRUST").as_deref(),
+        Ok("development") | Err(env::VarError::NotPresent)
+    );
+    // Use the map's canonical filename only if it still names the same entry
+    // in the same app. A symlinked entry can point into another app.
+    let canonical = if development {
+        source.canonicalize().ok().filter(|path| {
+            path.file_name() == source.file_name()
+                && app.canonicalize().ok().as_deref() == path.parent()
+        })
+    } else {
+        None
+    };
+    let path = canonical.as_deref().unwrap_or(&source);
+    let mapped = canonical.is_some();
+    let project_swift = matches!(platform, "ios" | "macos") && {
+        println!("cargo:rerun-if-env-changed=EXACT_FORMA_SWIFT");
+        env::var("EXACT_FORMA_SWIFT").as_deref() == Ok("1")
+    };
+    let (plan, map, swift) = if project_swift {
+        contract::forma_gen::compile_path_swift(path, mapped)
+    } else {
+        contract::compile_path_all(path, mapped).map(|(plan, map)| (plan, map, None))
+    }
+    .unwrap_or_else(|errors| panic!("app.contract: {}", errors[0]));
     if shape.shortcuts {
         for warning in contract::shortcut_findings(&app.join("app.contract")).unwrap_or_default() {
             println!("cargo:warning={}", warning.to_string().replace('\n', " "));
         }
     }
-    if plan.app_id.is_empty() {
-        plan.app_id = manifest.id.clone();
+    // Compatibility reads the source declarations before the bake adds boot answers.
+    let mut boot_plan = plan.clone();
+    if boot_plan.app_id.is_empty() {
+        boot_plan.app_id = manifest.id.clone();
     }
     let grants = data.grants().to_string();
-    let baked = contract::bake(plan, data).unwrap_or_else(|e| panic!("bake: {e}"));
-    fs::write(out.join("app.plan"), baked.encode()).unwrap();
+    let baked = contract::bake(boot_plan, data).unwrap_or_else(|e| panic!("bake: {e}"));
+    let bytes = baked.encode();
+    if let Some(names) = swift {
+        let file = out.join("forma.swift");
+        if fs::read(&file).ok().as_deref() != Some(names.as_bytes()) {
+            fs::write(file, &names).unwrap();
+        }
+        // Cargo preserves stdout for the selected run even when OUT_DIR has
+        // files from earlier runs. Bind the projection to both exact byte sets.
+        println!(
+            "cargo:metadata=exact-forma-swift={}:{}",
+            contract::plan_digest(&bytes),
+            contract::plan_digest(names.as_bytes())
+        );
+    }
+    fs::write(out.join("app.plan"), bytes).unwrap();
     let target = env::var("TARGET").unwrap();
     // Android's Canvas host is the Linux host's presenter under Android's own Canvas, so its
     // cohort is Linux's for this target (as apps/caltrain/android/build.rs computes it).
@@ -140,17 +181,25 @@ pub fn bake<D: DataSource>(
     } else {
         platform
     };
-    let compat =
-        crate::compatibility_id(&app, cohort, &target, &manifest, Some(&grants), host_work)
-            .unwrap_or_else(|e| panic!("compatibility id: {e}"));
+    let compat = crate::compat::compatibility_id_inner(
+        &app,
+        (cohort, &target),
+        &manifest,
+        Some(&grants),
+        None,
+        host_work,
+        crate::compat::Sources::compiled(&plan, map.as_ref()),
+    )
+    .unwrap_or_else(|e| panic!("compatibility id: {e}"));
+    drop((plan, map));
     let mode = compat.inputs["rustMode"].as_str().unwrap_or("off");
     assert!(
         shape.replacement || mode == "off",
         "generated game hosts require app.json rust: false"
     );
     fs::write(out.join("compat.json"), compat.to_json()).unwrap();
-    // What the APK's build reads beside the plan: its capabilities and derived permissions, and for an app the
-    // hatches' install (`hatches.rs`), as a TypeScript app's Android crate writes it.
+    // What the APK's build reads beside the plan: its capabilities and derived permissions, and the hatches' install
+    // (`hatches.rs`), as a TypeScript app's Android crate writes it.
     if platform == "android" {
         contract::native::android_entry(&app, &manifest, &baked, &out)
             .unwrap_or_else(|e| panic!("android: {e}"));
@@ -253,16 +302,13 @@ include!(concat!(env!("OUT_DIR"), "/hatches.rs"));"#
             .unwrap_or_else(|e| panic!("packages: {e}"))
     };
     let main = match platform {
-        "linux" => format!(
-            "fn main() {{ std::process::exit(exact_linux::run_composed::<AppData>(PLAN, COMPAT, {composed})); }}"
-        ),
+        "linux" => compat.linux_main(composed),
         "windows" => format!(
-            "fn main() {{ std::process::exit(exact_windows::run_with_services::<AppData, {}>({:?}, {}, PLAN, COMPAT, {composed}, {}({}))); }}",
-            compat.admits_agent(),
+            "{}fn main() {{ std::process::exit(exact_windows::run_baked::<AppData, ADMIT_AGENT>({:?}, window(), PLAN, COMPAT, {composed}, SERVICES)); }}",
+            compat
+                .windows_shell(baked, manifest)
+                .unwrap_or_else(|e| panic!("app.json: {e}")),
             manifest.name,
-            manifest.windows_window().unwrap_or_else(|e| panic!("app.json: {e}")),
-            compat.windows_image_services(baked),
-            compat.windows_data_executor()
         ),
         "web" => "exact_web::host!(AppData, PLAN, COMPAT, app_data);".into(),
         "macos" | "ios" if shape.apple_linked => {
@@ -278,20 +324,22 @@ include!(concat!(env!("OUT_DIR"), "/hatches.rs"));"#
             )
         }
         "macos" | "ios" => apple_host("PLAN", "COMPAT"),
-        // An app's library with a store takes the update
-        // store's opener, which its crate links at deploy.store.android "A" (LLP 1030.006 D3).
-        "android" if shape.composed => {
-            let updates = if compat.inputs["store"]["L"] == "0" {
-                ""
-            } else {
-                ", updates = exact_painted_update::open"
-            };
-            format!("include!(concat!(env!(\"OUT_DIR\"), \"/hatches.rs\"));\nexact_painted::canvas_jni!(crate::AppData, hatches = crate::exact_hatches(){updates});")
-        }
-        "android" => "exact_painted::canvas_jni!(crate::AppData);".into(),
+        "android" => android_host(shape.composed && compat.inputs["store"]["L"] != "0"),
         _ => panic!("unsupported host platform: {platform}"),
     };
     format!("{packages}\n{main}")
+}
+
+/// The Canvas host's exports over `AppData`, with the hatches `android_entry` wrote, an app's and a game's alike (LLP
+/// 1115.001.000 D4, D5); `updates`, the update store's opener, which an app's crate links at deploy.store.android "A"
+/// (LLP 1030.006 D3).
+fn android_host(updates: bool) -> String {
+    let updates = if updates {
+        ", updates = exact_painted_update::open"
+    } else {
+        ""
+    };
+    format!("include!(concat!(env!(\"OUT_DIR\"), \"/hatches.rs\"));\nexact_painted::canvas_jni!(crate::AppData, hatches = crate::exact_hatches(){updates});")
 }
 
 /// The Apple host's exports over `AppData`, with the plan and compat.json named by the Rust expressions `plan` and
@@ -339,4 +387,25 @@ impl exact_runner::DataSource for ExactEmptyData {{
 }}
 {entry}"#
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// A game's Android entry connects the hatches as an app's does (expo/exact#1468).
+    #[test]
+    fn the_canvas_host_is_handed_the_hatches_with_or_without_an_update_store() {
+        for updates in [false, true] {
+            let entry = super::android_host(updates);
+            assert!(entry.starts_with("include!(concat!(env!(\"OUT_DIR\"), \"/hatches.rs\"));"));
+            assert!(
+                entry.contains("hatches = crate::exact_hatches()"),
+                "{entry}"
+            );
+            assert_eq!(
+                entry.contains("exact_painted_update::open"),
+                updates,
+                "{entry}"
+            );
+        }
+    }
 }

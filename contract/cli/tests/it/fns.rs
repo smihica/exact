@@ -1,18 +1,10 @@
 //! LLP 1017 P5: `fn` in Contract, expanded inline, proven on the runner.
 
+use crate::source::{boxed, NoData, Source};
 use exact_kernel::{Kernel, PropValue};
 use exact_plan::Value;
-use exact_runner::{DataError, DataSource, Runner};
+use exact_runner::Runner;
 use std::path::Path;
-
-#[derive(Default)]
-struct NoData;
-
-impl DataSource for NoData {
-    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
-        Err(DataError::UnknownSource(source.into()))
-    }
-}
 
 fn corpus(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -24,10 +16,10 @@ fn corpus(name: &str) -> String {
 #[test]
 fn a_fn_is_a_pure_expression_over_its_parameters_expanded_where_called() {
     let plan = contract::compile(&corpus("fn.contract")).unwrap();
-    let plan = contract::bake(plan, NoData).unwrap();
+    let plan = contract::bake(plan, boxed(NoData)).unwrap();
     let mut r = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -89,7 +81,7 @@ component Row
     .unwrap();
     let mut r = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -132,13 +124,13 @@ fn a_childs_call_is_never_the_roots_action_of_that_name() {
     let plan = contract::compile(&format!("{root}{child}")).unwrap();
     let mut r = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
     )
     .unwrap();
-    let text = |r: &Runner<NoData>, id: &str| {
+    let text = |r: &Runner<Source>, id: &str| {
         let key = r.kernel().find_by_test_id(id)[0];
         let node = r.kernel().node_by_key(key).unwrap();
         node.props.iter().find_map(|(id, v)| match v {
@@ -222,4 +214,26 @@ fn an_initializer_calls_the_roster_and_fns_not_states_of_that_name() {
     )
     .unwrap_err();
     assert_eq!(e.id, "type-initializer-scope", "{}", e.message);
+}
+
+#[test]
+fn fn_dag_expansion_is_bounded_and_refused_promptly() {
+    let mut distinct = String::from("fn f0(x: number): number = x\n");
+    let mut conditional = String::from("fn f0(x: number): number = x\n");
+    for i in 1..=20 {
+        let p = i - 1;
+        distinct.push_str(&format!(
+            "fn f{i}(x: number): number = f{p}(x) + f{p}(x + 1) + f{p}(x + 2)\n"
+        ));
+        conditional.push_str(&format!(
+            "fn f{i}(x: number): number = (x > 0 ? f{p}(x) : 0) + (x > 0 ? f{p}(x) : 0) + (x > 0 ? f{p}(x) : 0)\n"
+        ));
+    }
+    let tail = "component App\n  view\n    text `${f20(0)}`\n";
+    for src in [format!("{distinct}{tail}"), format!("{conditional}{tail}")] {
+        let started = std::time::Instant::now();
+        let e = contract::compile(&src).unwrap_err();
+        assert_eq!(e.id, "lower-fn-size", "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 }

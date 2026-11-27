@@ -22,7 +22,7 @@ mod android;
 #[cfg(any(target_os = "android", all(test, unix)))]
 mod android_init;
 #[cfg(target_os = "android")]
-pub(crate) use android_init::bind as bind_application;
+pub(crate) use android_init::{attach as attach_application, bind as bind_application};
 #[cfg(any(target_os = "android", test))]
 mod fingers;
 mod performance;
@@ -46,6 +46,7 @@ mod placed;
 mod shaders;
 mod size;
 mod storage;
+mod wake;
 #[cfg(windows)]
 pub(crate) mod window;
 
@@ -56,9 +57,12 @@ type Text = unsafe extern "C" fn(u32, *const u8, usize) -> u32;
 struct Abi {
     // gpu_unload joins workers and drops thread-local state before dlclose; no symbol outlives the library.
     library: Library,
+    #[cfg(target_os = "android")]
+    host_frame: Option<unsafe extern "C" fn(f64, f64, f64, u32)>,
     output_error: std::cell::RefCell<Option<String>>,
     rendered: bool,
     device_loaded: bool,
+    wake_registered: bool,
     reduced_motion: std::cell::Cell<Option<bool>>,
     #[cfg(any(target_os = "android", all(test, unix)))]
     initialized: bool,
@@ -120,12 +124,18 @@ impl Abi {
     ) -> Result<Self, String> {
         verify_module(path, compat, artifact)?;
         // SAFETY: the app's own module, with the ABI checked before any call.
+        let library = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
         let mut abi = Self {
-            library: unsafe { Library::new(path) }.map_err(|e| e.to_string())?,
+            #[cfg(target_os = "android")]
+            host_frame: unsafe { library.get(b"gpu_host_frame") }
+                .ok()
+                .map(|symbol| *symbol),
+            library,
             output_error: Default::default(),
             shaders: Default::default(),
             rendered: std::env::var("EXACT_GPU_RENDER").as_deref() == Ok("1"),
             device_loaded: false,
+            wake_registered: false,
             reduced_motion: std::cell::Cell::new(None),
             #[cfg(any(target_os = "android", all(test, unix)))]
             initialized: false,
@@ -141,11 +151,13 @@ impl Abi {
                 "gpu_children_mode",
                 "gpu_placement",
                 "gpu_unload",
-                "gpu_create_headless",
+                "gpu_create_painted",
                 "gpu_storage",
                 "gpu_bind_at",
                 "gpu_agent",
                 "gpu_input",
+                "gpu_frame_dirty",
+                "gpu_frame_pending",
                 "gpu_wants_input",
                 "gpu_presentation_flags",
                 "gpu_published",
@@ -229,8 +241,15 @@ impl Abi {
         if load {
             android::load(&mut abi)?;
         }
-        #[cfg(not(target_os = "android"))]
-        let _ = load;
+        if load {
+            if let Ok(register) = unsafe {
+                abi.library
+                    .get::<unsafe extern "C" fn(Option<extern "C" fn()>)>(b"gpu_on_wake")
+            } {
+                unsafe { register(Some(wake::surface_woken)) };
+                abi.wake_registered = true;
+            }
+        }
         Ok(abi)
     }
 
@@ -264,9 +283,19 @@ impl Abi {
         // declared signature for it.
         unsafe { std::mem::transmute_copy::<usize, T>(&address) }
     }
+    fn frame_pending(&self, id: u32) -> bool {
+        unsafe { self.symbol::<Read>(b"gpu_frame_pending")(id) != 0 }
+    }
+    fn frame_dirty(&self, id: u32, now: f64) -> bool {
+        unsafe {
+            self.symbol::<unsafe extern "C" fn(u32, f64) -> u32>(b"gpu_frame_dirty")(id, now) != 0
+        }
+    }
     fn lifecycle(&self, id: u32, code: u32) {
-        if self.rendered {
-            // SAFETY: validated rendered-module ABI; id belongs to this module.
+        // Android loads its device in `android::load`, without `rendered`; its
+        // canvases' game audio pauses and resumes on this call.
+        if self.rendered || self.device_loaded {
+            // SAFETY: a device module exports gpu_lifecycle; id belongs to this module.
             unsafe { self.symbol::<unsafe extern "C" fn(u32, u32)>(b"gpu_lifecycle")(id, code) };
         }
     }
@@ -350,6 +379,14 @@ impl Drop for Abi {
         #[cfg(any(target_os = "android", all(test, unix)))]
         if !self.initialized {
             return;
+        }
+        if self.wake_registered {
+            if let Ok(register) = unsafe {
+                self.library
+                    .get::<unsafe extern "C" fn(Option<extern "C" fn()>)>(b"gpu_on_wake")
+            } {
+                unsafe { register(None) };
+            }
         }
         // A missing symbol can occur during validation of an older artifact.
         if let Ok(unload) = unsafe { self.library.get::<unsafe extern "C" fn()>(b"gpu_unload") } {
@@ -513,6 +550,9 @@ pub(crate) struct Surfaces {
     pub(crate) direct_window: Option<window::DirectWindow>,
     #[cfg(windows)]
     pub(crate) startup_device: Option<window::Startup>,
+    /// A hidden window's hardware device, reopened by its next show.
+    #[cfg(windows)]
+    pub(crate) hidden_device: Option<exact_ink::device::d3d11::Hidden>,
     #[cfg(windows)]
     pub(crate) preparing_device: Option<Result<exact_ink::device::d3d11::Startup, String>>,
     /// Each opened artifact by name, "" the primary; each is tried once.
@@ -520,6 +560,8 @@ pub(crate) struct Surfaces {
     attempted: BTreeSet<String>,
     canvases: BTreeMap<u32, Canvas>,
     defer_readback: bool,
+    drawn_sizes: BTreeMap<u32, (f32, f32)>,
+    rested_pixels: BTreeMap<u32, (u32, f32, f32, f32)>,
     performance_due: Option<std::time::Instant>,
     edits_admitted: bool,
     restore: Option<Result<Vec<u8>, String>>,
@@ -546,7 +588,7 @@ pub(crate) struct Surfaces {
     posts: BTreeMap<String, Vec<Value>>,
     // Independent lifecycle causes; also applied before a newly mounted surface
     // can bind or render, including replacement while the window is suspended.
-    hidden: bool,
+    pub(crate) hidden: bool,
     interrupted: bool,
     /// Windows readers gave canvases, by view (Android).
     #[cfg(target_os = "android")]
@@ -616,6 +658,11 @@ impl Surfaces {
 
     pub(crate) fn take_outcomes(&mut self) -> Vec<(u64, Outcome)> {
         std::mem::take(&mut self.outcomes)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_pending_requests(&self) -> bool {
+        !self.captures.is_empty() || !self.work.is_empty() || !self.outcomes.is_empty()
     }
 
     fn sync<D: DataSource>(
@@ -740,7 +787,7 @@ impl Surfaces {
             if !self.canvases.contains_key(&update.view) {
                 let id = unsafe {
                     abi.symbol::<unsafe extern "C" fn(*const u8, usize) -> u32>(
-                        b"gpu_create_headless",
+                        b"gpu_create_painted",
                     )(update.name.as_ptr(), update.name.len())
                 };
                 if id == 0 {

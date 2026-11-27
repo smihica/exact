@@ -181,9 +181,11 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
         dialogs: Default::default(),
         desktop: crate::desktop::Desktop::install("Ink caret regression"),
         closing: false,
+        ended: false,
         keep_running: false,
         hidden: false,
         pending_show: None,
+        reveal_awaited: None,
         instance: None,
         cold_documents: Vec::new(),
         tray: None,
@@ -333,6 +335,8 @@ fn hiding_a_resident_window_releases_its_painter_and_preserves_its_canvas_and_ed
             flags & DWM_CLOAKED_APP != 0
         };
         for cancel_first in [true, false] {
+            let hardware =
+                app.presenter.as_ref().unwrap().painter.api.as_deref() == Some("direct D3D11");
             app.hide_by_app();
             assert_eq!(app.presenter.as_ref().unwrap().painter.name, "cpu");
             app.bring_forward();
@@ -365,11 +369,148 @@ fn hiding_a_resident_window_releases_its_painter_and_preserves_its_canvas_and_ed
             assert_eq!(app.window.as_ref().unwrap().is_visible(), Some(true));
             let p = app.presenter.as_mut().unwrap();
             assert_eq!(p.painter.name, name);
+            if hardware {
+                assert_eq!(p.painter.api.as_deref(), Some("direct D3D11"));
+                assert_eq!(
+                    p.painter.device_ms, 0.,
+                    "the hidden window's device reopened"
+                );
+            }
             verify(p);
         }
     }
 }
 
+#[test]
+#[ignore = "native Windows desktop with DirectComposition"]
+#[allow(deprecated)]
+fn a_shown_window_reveals_the_still_its_canvas_asked_for() {
+    use exact_painted::presenter::PainterChoice;
+    use exact_runner::{exact_canvas, DataError, Value};
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    #[derive(Default)]
+    struct Still;
+    impl DataSource for Still {
+        fn query(&mut self, name: &str, _: &[Value]) -> Result<Value, DataError> {
+            Err(DataError::UnknownSource(name.into()))
+        }
+        fn canvas_surfaces(&self) -> Vec<(String, usize)> {
+            vec![("still".into(), 1)]
+        }
+        fn draw_2d(
+            &mut self,
+            _: &str,
+            args: &[Value],
+            ctx: &exact_canvas::Context2d,
+            frame: &exact_canvas::Frame,
+        ) -> Result<bool, exact_canvas::DrawError> {
+            ctx.clear_rect(0., 0., frame.width as f64, frame.height as f64);
+            if let Some(path) = args.first().and_then(|v| v.as_str()) {
+                if !path.is_empty() {
+                    ctx.draw_image_with_image_handle(path, 0., 0.)?;
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    // A display-sized still written as an ordinary file, so it decodes.
+    let size = [2560u32, 1440u32];
+    let name = format!("reveal-still-{}.png", std::process::id());
+    let disk = exact_painted::picker::roots()[2].join(&name);
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    let mut encoded = Vec::new();
+    let mut encoder = png::Encoder::new(&mut encoded, size[0], size[1]);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_compression(png::Compression::Fast);
+    let rows: Vec<u8> = (0..size[0] * size[1])
+        .flat_map(|i| [(i % 251) as u8, 160, 40, 255])
+        .collect();
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&rows)
+        .unwrap();
+    std::fs::write(&disk, &encoded).unwrap();
+    let path = format!("app:/tmp/{name}");
+
+    let mut events = EventLoop::<crate::accessibility::Event>::with_user_event()
+        .with_any_thread(true)
+        .build()
+        .unwrap();
+    let plan = contract::compile(
+        r#"component App
+  state path = ""
+  action choose(value: string)
+    path = value
+  view
+    main position="absolute" inset=0
+      canvas surface=still(path) position="absolute" inset=0 width="100%" height="100%"
+      input testId="path" value=path input=choose width=120 height=40
+"#,
+    )
+    .unwrap()
+    .encode();
+    let window = Rc::new(
+        events
+            .create_window(
+                Window::default_attributes()
+                    .with_title("Reveal still test")
+                    .with_no_redirection_bitmap(true)
+                    .with_inner_size(winit::dpi::PhysicalSize::new(size[0], size[1])),
+            )
+            .unwrap(),
+    );
+    let owned = exact_ink::device::d3d11::Window::from_owner(window.clone()).unwrap();
+    let (mut p, warning) = Presenter::boot_with(
+        &plan,
+        Still,
+        (size[0] as f32, size[1] as f32),
+        1.,
+        Default::default(),
+        PainterChoice::Ink,
+    )
+    .unwrap();
+    assert!(warning.is_none(), "{warning:?}");
+    p.attach_painter_window(owned.clone(), size).unwrap();
+    let mut app = test_app(events.create_proxy(), &plan, p);
+    app.window = Some(window);
+    app.keep_running = true;
+    app.direct = true;
+    app.painter = PainterBoot::windows::<false>(r#"{"painter":"ink"}"#);
+    present(app.presenter.as_mut().unwrap(), &owned);
+    app.hide_by_app();
+    // Hidden, the app points its canvas at the new still, as a capture's does.
+    let p = app.presenter.as_mut().unwrap();
+    let k = p.host().kernel();
+    let field = k.node_by_key(k.find_by_test_id("path")[0]).unwrap().id;
+    p.type_text(field, &path).unwrap();
+    app.bring_forward();
+    let previous = app.frames;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.frames == previous {
+        events.pump_app_events(Some(Duration::from_millis(1)), &mut app);
+        assert!(
+            !app.failed && Instant::now() < deadline,
+            "first window frame missing"
+        );
+    }
+    assert_eq!(app.window.as_ref().unwrap().is_visible(), Some(true));
+    assert_eq!(
+        app.reveal_awaited,
+        Some(false),
+        "the revealed frame lacks the still its canvas asked for"
+    );
+    let p = app.presenter.as_mut().unwrap();
+    let pixels = p.frame();
+    let _ = std::fs::remove_file(&disk);
+    let at = (size[1] / 2) * size[0] + 300;
+    assert_eq!(
+        &pixels.data()[at as usize * 4..][..4],
+        &[(at % 251) as u8, 160, 40, 255]
+    );
+}
 #[test]
 fn text_without_a_physical_key_reaches_the_editor() {
     use winit::keyboard::{Key, KeyCode, NamedKey, NativeKey, NativeKeyCode, PhysicalKey};
@@ -506,9 +647,11 @@ fn test_app<D: DataSource>(
         dialogs: Default::default(),
         desktop: crate::desktop::Desktop::install("Frame scheduling regression"),
         closing: false,
+        ended: false,
         keep_running: false,
         hidden: false,
         pending_show: None,
+        reveal_awaited: None,
         instance: None,
         cold_documents: Vec::new(),
         tray: None,
@@ -554,10 +697,272 @@ pub(crate) fn run_carrier_tests(events: EventLoop<crate::accessibility::Event>) 
         assert_eq!(events.control_flow(), ControlFlow::WaitUntil(app.started + Duration::from_secs_f64(wake / 1000.)));
         file_drop::tests::shell_selection_over_an_editor(events, app.proxy.clone()).unwrap();
         document_title_reaches_the_window_without_drawing(events, app.proxy.clone());
+        closing_lands_the_storage_an_answer_started(events, app.proxy.clone());
+        an_ended_app_is_served_no_more(events, app.proxy.clone());
+        the_session_end_asks_beforeunload_then_ends_in_order(events, app.proxy.clone());
         checked = true;
         events.exit();
     }).unwrap();
     assert!(checked);
+}
+
+struct Background;
+impl exact_runner::HostWork for Background {}
+
+/// Answers `save()` with 1 and leaves two storage operations to the
+/// background, each 30 ms on the I/O worker.
+#[derive(Default)]
+struct Saving {
+    left: u64,
+    out: bool,
+}
+impl DataSource for Saving {
+    fn query(
+        &mut self,
+        source: &str,
+        _: &[exact_runner::Value],
+    ) -> Result<exact_runner::Value, exact_runner::DataError> {
+        Err(exact_runner::DataError::UnknownSource(source.into()))
+    }
+    fn answer(
+        &mut self,
+        _: &mut exact_runner::Store,
+        _: &str,
+        _: &[exact_runner::Value],
+    ) -> Result<exact_runner::Answer, exact_runner::DataError> {
+        self.left += 2;
+        Ok(exact_runner::Answer::Now(exact_runner::Value::Number(1.0)))
+    }
+    fn dispatch(&mut self, _: u64, _: &exact_runner::Store) -> exact_runner::Dispatch {
+        exact_runner::Dispatch::Run(exact_runner::Work::Now(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(30));
+            exact_runner::Outcome::Storage(Vec::new())
+        })))
+    }
+    fn background(&mut self, _: &exact_runner::Store) -> Option<exact_runner::Request> {
+        if self.out || self.left == 0 {
+            return None;
+        }
+        self.out = true;
+        Some(exact_runner::Request::continuation::<Background>(
+            exact_runner::BACKGROUND,
+        ))
+    }
+    fn background_landed(
+        &mut self,
+        _: &exact_runner::Store,
+        _: exact_runner::Outcome,
+    ) -> Result<Option<exact_runner::Request>, exact_runner::DataError> {
+        self.out = false;
+        self.left -= 1;
+        Ok(None)
+    }
+    fn background_state(&self) -> Option<exact_runner::BackgroundState> {
+        Some(exact_runner::BackgroundState {
+            queued: self.left.saturating_sub(1),
+            in_flight: self.left.min(1),
+            ..Default::default()
+        })
+    }
+}
+
+/// An app whose answer has left storage to the background.
+fn saving_app(proxy: EventLoopProxy<crate::accessibility::Event>) -> App<Saving> {
+    let plan = contract::compile(
+        "component App\n  resource item = save() as shape number else save()\n  view\n    text item.toString() height=20\n",
+    )
+    .unwrap()
+    .encode();
+    let (p, _) = Presenter::boot_with(
+        &plan,
+        Saving::default(),
+        (160., 80.),
+        1.,
+        Default::default(),
+        exact_painted::presenter::PainterChoice::Cpu,
+    )
+    .unwrap();
+    let app = test_app(proxy, &plan, p);
+    assert!(
+        app.presenter
+            .as_ref()
+            .unwrap()
+            .host()
+            .runner()
+            .background_operations()
+            > 0
+    );
+    app
+}
+
+fn landed(app: &App<Saving>) -> bool {
+    let runner = app.presenter.as_ref().unwrap().host().runner();
+    runner.background_operations() == 0 && !runner.must_finish()
+}
+
+/// LLP 1097 D10: the person's close ends the app in order, as the headless
+/// host's exit does: the storage an answer started lands before the loop ends.
+fn closing_lands_the_storage_an_answer_started(
+    events: &ActiveEventLoop,
+    proxy: EventLoopProxy<crate::accessibility::Event>,
+) {
+    let mut app = saving_app(proxy);
+    app.close_requested(events);
+    assert!(landed(&app), "the close dropped it");
+}
+
+/// An app that has started to end is served no more: the loop's turn after
+/// a close or the status menu's Exit, in the same turn, delivers no timer.
+fn an_ended_app_is_served_no_more(
+    events: &ActiveEventLoop,
+    proxy: EventLoopProxy<crate::accessibility::Event>,
+) {
+    let plan = contract::compile(
+        "component App
+  state n = 0
+  action bump
+    n = n + 1
+  task timer mount
+    every(50, bump)
+  view
+    text n.toString() height=20
+",
+    )
+    .unwrap()
+    .encode();
+    let (mut p, _) = Presenter::boot_with(
+        &plan,
+        (),
+        (160., 80.),
+        1.,
+        Default::default(),
+        exact_painted::presenter::PainterChoice::Cpu,
+    )
+    .unwrap();
+    p.frame();
+    let mut app = test_app(proxy, &plan, p);
+    app.end();
+    let due = app
+        .presenter
+        .as_ref()
+        .unwrap()
+        .wake_due_ms()
+        .expect("the timer's wake");
+    let left = due - app.started.elapsed().as_secs_f64() * 1000.;
+    std::thread::sleep(Duration::from_secs_f64(left.max(0.) / 1000.) + Duration::from_millis(20));
+    app.about_to_wait(events);
+    assert_eq!(
+        app.presenter.as_ref().unwrap().wake_due_ms(),
+        Some(due),
+        "the ended app's timer ran"
+    );
+}
+
+/// Windows session end asks `beforeunload` on non-critical `WM_QUERYENDSESSION`,
+/// honours cancelled `WM_ENDSESSION(FALSE)`, and drains background storage on
+/// confirmed `WM_ENDSESSION(TRUE)` without reentrantly borrowing `App` when
+/// hiding the window.
+#[allow(unsafe_code)]
+fn the_session_end_asks_beforeunload_then_ends_in_order(
+    events: &ActiveEventLoop,
+    proxy: EventLoopProxy<crate::accessibility::Event>,
+) {
+    use std::cell::RefCell;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, ENDSESSION_CLOSEAPP, ENDSESSION_CRITICAL, WM_ENDSESSION, WM_QUERYENDSESSION,
+    };
+    let plan = contract::compile(
+        "component App
+  resource item = save() as shape number else save()
+  state asked = false
+  action guard
+    if !asked
+      asked = true
+      preventDefault()
+  view
+    column beforeunload=guard
+      text item.toString() height=20
+",
+    )
+    .unwrap()
+    .encode();
+    let (p, _) = Presenter::boot_with(
+        &plan,
+        Saving::default(),
+        (160., 80.),
+        1.,
+        Default::default(),
+        exact_painted::presenter::PainterChoice::Cpu,
+    )
+    .unwrap();
+    let mut app = test_app(proxy, &plan, p);
+    assert!(
+        app.presenter
+            .as_ref()
+            .unwrap()
+            .host()
+            .runner()
+            .background_operations()
+            > 0
+    );
+    let window = Rc::new(
+        events
+            .create_window(
+                Window::default_attributes()
+                    .with_title("Session end regression")
+                    .with_visible(false)
+                    .with_inner_size(LogicalSize::new(160., 80.)),
+            )
+            .unwrap(),
+    );
+    let RawWindowHandle::Win32(raw) = window.window_handle().unwrap().as_raw() else {
+        panic!("expected a Win32 window handle");
+    };
+    let hwnd = raw.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+    app.window = Some(window);
+    let app = Rc::new(RefCell::new(app));
+    // Re-installing on the same HWND must be a safe no-op.
+    let proxy = app.borrow().proxy.clone();
+    session_end::install(hwnd, Rc::downgrade(&app), proxy.clone());
+    session_end::install(hwnd, Rc::downgrade(&app), proxy);
+    assert_eq!(
+        unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) },
+        0,
+        "beforeunload prevented the first query"
+    );
+    unsafe { SendMessageW(hwnd, WM_ENDSESSION, 0, 0) };
+    assert!(
+        !app.borrow().ended,
+        "cancelled WM_ENDSESSION must not end the app"
+    );
+    assert!(
+        !landed(&app.borrow()),
+        "cancelled WM_ENDSESSION must not tear down storage"
+    );
+    assert_eq!(
+        unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, 0, ENDSESSION_CRITICAL as isize) },
+        1,
+        "ENDSESSION_CRITICAL cannot wait"
+    );
+    assert_eq!(
+        unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) },
+        1,
+        "second query passes once beforeunload stops preventing"
+    );
+    unsafe { SendMessageW(hwnd, WM_ENDSESSION, 1, ENDSESSION_CLOSEAPP as isize) };
+    assert!(
+        app.borrow().ended,
+        "confirmed WM_ENDSESSION marks the app ended"
+    );
+    assert!(
+        landed(&app.borrow()),
+        "confirmed WM_ENDSESSION drains background storage"
+    );
+    assert_eq!(
+        unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) },
+        1,
+        "an ended app never blocks a later query"
+    );
 }
 
 fn document_title_reaches_the_window_without_drawing(

@@ -107,7 +107,7 @@ component Row
   view
     box testId=`row-${n}` timeline-scope="--swipe" width=300 height=56 flex-shrink=0 position="relative" overflow="hidden" box-sizing="border-box" padding=0 border-width=0
       box testId=`label-${n}` position="absolute" left=0 top=0 width=64 height="100%" animation="reveal 1s linear both" animation-timeline="--swipe" animation-range="0px 64px"
-      box testId=`card-${n}` swiperight=keep touch-action="pan-y" width="100%" height="100%" position="relative" box-sizing="border-box" margin=0 padding=0 border-width=0 transition="translate -exact-spring(300, 30, 1)" -exact-drag-timeline="--swipe x"
+      box testId=`card-${n}` swipe=keep swipe-follow="right" touch-action="pan-y" width="100%" height="100%" position="relative" box-sizing="border-box" margin=0 padding=0 border-width=0 transition="translate -exact-spring(300, 30, 1)" -exact-drag-timeline="--swipe x"
         text (kept ? "kept" : "") testId=`kept-${n}`
 "##;
 
@@ -117,7 +117,7 @@ fn rows(p: &Presenter<()>) -> Vec<(f32, f32, f32)> {
         .map(|n| {
             let card = p.host().presented(id(p, &format!("card-{n}")));
             let label = p.host().presented(id(p, &format!("label-{n}")));
-            (card.translate.0, label.opacity, label.scale)
+            (card.translate.0, label.opacity, label.scale.0)
         })
         .collect()
 }
@@ -220,12 +220,12 @@ component App
       box testId="flip" press=flip width=300 height=40 flex-shrink=0
       box testId="m-row" width=300 height=40 position="relative" flex-shrink=0
         box testId="m-label" position="absolute" left=0 top=0 width=64 height=40 opacity=0.55 animation="fade 1s linear both" animation-timeline="--t" animation-range="0px 64px"
-        box testId="m-card" swiperight=noop touch-action="pan-y" width="100%" height="100%" position="relative" transition="translate -exact-spring(300, 30, 1)" -exact-drag-timeline="--t x"
+        box testId="m-card" swipe=noop swipe-follow="right" touch-action="pan-y" width="100%" height="100%" position="relative" transition="translate -exact-spring(300, 30, 1)" -exact-drag-timeline="--t x"
       box testId="z-row" timeline-scope="--t" width=300 height=40 position="relative" flex-shrink=0
         box testId="z-label" position="absolute" left=0 top=0 width=64 height=40 opacity=0.55 animation="fade 1s linear both" animation-timeline="--t" animation-range="0px 64px"
       box testId="t-row" timeline-scope="--t" width=300 height=80 position="relative" flex-shrink=0
         box testId="t-label" position="absolute" left=0 top=0 width=64 height=40 opacity=0.55 animation="fade 1s linear both" animation-timeline="--t" animation-range="0px 64px"
-        box testId="t-card-a" swiperight=noop touch-action="pan-y" width="100%" height=40 position="relative" transition="translate -exact-spring(300, 30, 1)" -exact-drag-timeline="--t x"
+        box testId="t-card-a" swipe=noop swipe-follow="right" touch-action="pan-y" width="100%" height=40 position="relative" transition="translate -exact-spring(300, 30, 1)" -exact-drag-timeline="--t x"
         box testId="t-card-b" width="100%" height=40 position="relative" -exact-drag-timeline=(two ? "--t x" : "none")
 "##;
 
@@ -325,7 +325,7 @@ component App
 fn dealt(p: &Presenter<()>) -> f32 {
     let x = p.host().presented(id(p, "top")).translate.0;
     let tilt = p.host().presented(id(p, "face")).rotate;
-    let rise = p.host().presented(id(p, "next")).scale;
+    let rise = p.host().presented(id(p, "next")).scale.0;
     let (want_tilt, want_rise) = (
         (x / 20.).clamp(-15., 15.),
         1. - 0.05 * (1. - x.abs().min(300.) / 300.),
@@ -378,7 +378,7 @@ fn a_thrown_card_tilts_its_face_and_raises_the_next_in_every_frame() {
     let face = p.host().presented(id(&p, "face"));
     assert_eq!(
         (face.rotate, p.host().presented(id(&p, "next")).scale),
-        (15., 1.)
+        (15., (1., 1.))
     );
 }
 

@@ -18,11 +18,11 @@ use windows_sys::Win32::{
     },
     Foundation::{ERROR_SUCCESS, HWND, LPARAM, POINT, RECT},
     Graphics::Gdi::{
-        ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow,
-        HDC, HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+        EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
+        MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
     },
     UI::{
-        HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
+        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             GetCursorPos, MONITORINFOF_PRIMARY, SPI_SETWORKAREA, WM_DISPLAYCHANGE, WM_DPICHANGED,
@@ -60,14 +60,26 @@ fn tell(watchers: &Watchers) {
 /// thread.
 #[derive(Default)]
 struct Watch {
+    screen_changed: Option<Box<dyn Fn()>>,
     watchers: Watchers,
     /// The monitor the window was on when last compared.
     on: Cell<isize>,
 }
 
+impl Watch {
+    fn display_changed(&self) {
+        tell(&self.watchers);
+        if let Some(changed) = &self.screen_changed {
+            changed();
+        }
+    }
+}
+
 /// The host's display service for the session window `hwnd`.
 struct Displays {
     hwnd: isize,
+    /// The window's least client size in CSS pixels, for where it will show.
+    minimum: (f32, f32),
     watch: Rc<Watch>,
     /// Whether the display changes are heard.
     hears: Cell<bool>,
@@ -77,14 +89,20 @@ struct Displays {
 }
 
 /// Report the displays to every session on this thread, measured against
-/// the session window `hwnd`.
-pub(crate) fn install(hwnd: isize) {
+/// the session window `hwnd`, whose client area is at least `minimum` CSS
+/// pixels.
+pub(crate) fn install(hwnd: isize, minimum: (f32, f32), changed: impl Fn() + 'static) {
     let displays = Rc::new(Displays {
         hwnd,
-        watch: Rc::default(),
+        minimum,
+        watch: Rc::new(Watch {
+            screen_changed: Some(Box::new(changed)),
+            ..Watch::default()
+        }),
         hears: Cell::new(false),
         settings: OnceCell::new(),
     });
+    displays.hear_window();
     CURRENT.with(|current| *current.borrow_mut() = Some(displays.clone()));
     exact_painted::desktop::install_displays(displays);
 }
@@ -93,14 +111,37 @@ thread_local! {
     static CURRENT: RefCell<Option<Rc<Displays>>> = const { RefCell::new(None) };
 }
 
-/// No HWND is needed to enumerate the real desktop. A hidden window keeps
-/// its client geometry; a session without one reports null clientRect.
+pub(crate) fn orientation() -> Option<exact_runner::ScreenOrientation> {
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let on = unsafe { MonitorFromWindow(current.as_ref()?.window(), MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(on, (&mut info as *mut MONITORINFOEXW).cast()) } == 0 {
+            return None;
+        }
+        let rect = info.monitorInfo.rcMonitor;
+        Some(
+            crate::orientation::screen(&info.szDevice).unwrap_or_else(|| {
+                exact_runner::ScreenOrientation::rotated(
+                    rect.bottom - rect.top >= rect.right - rect.left,
+                    0,
+                )
+            }),
+        )
+    })
+}
+
+/// No HWND is needed to enumerate the real desktop. A hidden window's
+/// clientRect is where it will show, at the DPI it will then have
+/// (`crate::placement`); a session without one reports null clientRect.
 pub(crate) fn capture_snapshot() -> Vec<(exact_painted::desktop::Screen, [i32; 4])> {
     let _dpi = crate::screen_capture::os::Dpi::new();
     CURRENT.with(|current| {
         let current = current.borrow();
         let fallback = Displays {
             hwnd: 0,
+            minimum: (0., 0.),
             watch: Rc::default(),
             hears: Cell::new(false),
             settings: OnceCell::new(),
@@ -233,15 +274,8 @@ impl Displays {
     }
 
     fn client(&self) -> Option<Client> {
-        let mut origin = POINT { x: 0, y: 0 };
-        if unsafe { ClientToScreen(self.window(), &mut origin) } == 0 {
-            return None;
-        }
-        let dpi = unsafe { GetDpiForWindow(self.window()) };
-        (dpi != 0).then_some(Client {
-            origin: [origin.x, origin.y],
-            dpi,
-        })
+        let shown = crate::placement::shown_now(self.hwnd, self.minimum)?;
+        (shown.client.dpi != 0).then_some(shown.client)
     }
 
     fn settings(&self) -> Option<&UISettings> {
@@ -268,8 +302,7 @@ impl Displays {
         (read, current)
     }
 
-    /// Hear the window's display changes, and the Text size setting's, from
-    /// the first reader on.
+    /// The first displays resource starts watching the Text size setting.
     fn hear(&self) {
         if self.hears.replace(true) {
             return;
@@ -285,6 +318,9 @@ impl Displays {
                 eprintln!("exact-windows: text-size changes for the displays: {error}");
             }
         }
+    }
+
+    fn hear_window(&self) {
         let on = unsafe { MonitorFromWindow(self.window(), MONITOR_DEFAULTTONEAREST) };
         self.watch.on.set(on as isize);
         let data = Rc::into_raw(self.watch.clone());
@@ -343,12 +379,12 @@ unsafe extern "system" fn heard(
                 RemoveWindowSubclass(window, Some(heard), subclass);
                 drop(Rc::from_raw(watch));
             }
-            WM_DISPLAYCHANGE | WM_DPICHANGED => tell(&(*watch).watchers),
+            WM_DISPLAYCHANGE | WM_DPICHANGED => (*watch).display_changed(),
             WM_SETTINGCHANGE if wparam == SPI_SETWORKAREA as usize => tell(&(*watch).watchers),
             WM_WINDOWPOSCHANGED => {
                 let on = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) as isize;
                 if (*watch).on.replace(on) != on {
-                    tell(&(*watch).watchers);
+                    (*watch).display_changed();
                 }
             }
             _ => {}

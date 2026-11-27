@@ -56,6 +56,38 @@ pub(super) fn transitions(words: &str) -> String {
         .replace("PROPERTIES", &serde_json::to_string(&properties).unwrap())
 }
 
+/// Lower the bound row before CSS rewrites the composed properties and springs.
+pub(super) fn press_timing_map(parser: &str, sampler: &str, written: bool) -> String {
+    let properties: std::collections::BTreeSet<_> = exact_web::css::PRESS_ROWS
+        .into_iter()
+        .map(|(_, p)| p.css_name())
+        .collect();
+    format!(
+        r#"v=>{{
+            const items={{}}, names={};
+            const parsed=({parser})(v,false,(property,duration,delay,curve,spring,easing)=>{{
+                const covered=property==null||property==='all'?names:names.filter(p=>p===property);
+                if(!covered.length)return;
+                let item;
+                if(spring){{
+                    const {{sample,coefficients}}={sampler};
+                    const values=coefficients(spring), timing=values&&sample(values);
+                    if(timing){{
+                        const [seconds,curve]=timing;
+                        item=[seconds*1000,delay*1000,curve];
+                    }}
+                }}else if(duration+delay>0){{
+                    item=[duration*1000,delay*1000,easing(curve,true)];
+                }}
+                for(const name of covered)items[name]=item;
+            }});
+            if(!parsed)return {written}?'{{}}':null;
+            return parsed.held||({written}&&v!=null)?JSON.stringify(items):null;
+        }}"#,
+        serde_json::json!(properties)
+    )
+}
+
 fn animations(plan: &Plan, words: &str) -> String {
     let names: Vec<_> = plan
         .keyframes
@@ -286,7 +318,7 @@ pub fn binding(
             PropId::Disabled if kind == NodeType::Control => flag(DISABLED, "v===true"),
             PropId::ImageSource if kind == NodeType::Image => flag(POLICY, "v!=null&&String(v).startsWith(\"symbol:\")"),
             PropId::BackgroundMaterial => flag(POLICY, "v!=null&&v!==\"none\""),
-            PropId::NavigationPresentation => flag(POLICY, "v===\"modal\""),
+            PropId::NavigationPresentation => flag(POLICY, "v===\"modal\"||v===\"popover\""),
             PropId::SemanticTag => flag(OUTSIDE, "v===\"dialog\""),
             PropId::Popover => flag(OUTSIDE, "v!=null"),
             _ => None,

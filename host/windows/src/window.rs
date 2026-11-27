@@ -30,6 +30,7 @@ mod frames;
 mod lifecycle;
 mod presents;
 mod service;
+mod session_end;
 mod tray;
 use frames::{next_frame_deadline, presentation_resumes, FrameSchedule};
 
@@ -89,12 +90,17 @@ struct App<D: DataSource> {
     desktop: Rc<crate::desktop::Desktop>,
     /// The app called `close()`: the window closes, never hides.
     closing: bool,
+    /// The app has started to end (`App::end`): nothing more is served.
+    ended: bool,
     /// Closing the window hides it (`keepRunning`).
     keep_running: bool,
     /// The window is not shown: hidden by a close, or since a hidden launch.
     hidden: bool,
     /// DWM is composing this window for its first frame after a show request.
     pending_show: Option<lifecycle::PendingShow>,
+    /// Whether a canvas's picture was still loading as the last show was revealed.
+    #[cfg(test)]
+    reveal_awaited: Option<bool>,
     /// The app's one instance, which later launches reach.
     instance: Option<crate::instance::Instance>,
     cold_documents: Vec<String>,
@@ -244,7 +250,7 @@ pub(super) fn run<D: DataSource + Default + 'static, const DEVELOPMENT: bool>(
     {
         std::thread::sleep(Duration::from_millis(200));
     }
-    let mut config = Config::from_bake_with_services::<DEVELOPMENT>(plan, compat, services);
+    let mut config = Config::from_bake::<DEVELOPMENT>(plan, compat, services);
     config.preferences = Some(exact_runner::Preferences {
         screen_reader: if config.agent {
             exact_runner::ScreenReader::Unknown
@@ -373,9 +379,12 @@ pub(super) fn run<D: DataSource + Default + 'static, const DEVELOPMENT: bool>(
         desktop,
         refit_after_scale: false,
         closing: false,
+        ended: false,
         keep_running: opening.keep_running,
         hidden,
         pending_show: None,
+        #[cfg(test)]
+        reveal_awaited: None,
         instance,
         cold_documents,
         tray: None,
@@ -597,6 +606,11 @@ impl<D: DataSource + Default + 'static> App<D> {
         if self.frame_limit.is_some() {
             p.repaint();
         }
+        // A window being shown waits, bounded, for the pictures its draws
+        // asked for, so its first visible frame has them (LLP 1178 D3).
+        if let Some(pending) = &self.pending_show {
+            p.settle_pictures(lifecycle::REVEAL_PICTURES.saturating_sub(pending.began.elapsed()));
+        }
         let painting = p.dirty() || self.frames == 0;
         let paint = Instant::now();
         if let Some(previous) = self.caret.take_previous_frame() {
@@ -680,6 +694,10 @@ impl<D: DataSource + Default + 'static> App<D> {
             return Ok(());
         }
         if let Some(pending) = self.pending_show.take() {
+            #[cfg(test)]
+            {
+                self.reveal_awaited = Some(p.host().runner().canvas_images_pending());
+            }
             pending.reveal()?;
         }
         if painting && handed {
@@ -972,8 +990,19 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
                 self.dialogs
                     .install(handle.hwnd.get(), self.modal.clone(), self.proxy.clone());
                 self.desktop.set_window(handle.hwnd.get());
-                crate::displays::install(handle.hwnd.get());
-                if let Err(error) = self.clicks.install(handle.hwnd.get()) {
+                let proxy = self.proxy.clone();
+                crate::displays::install(handle.hwnd.get(), self.min_size, move || {
+                    let _ = proxy.send_event(crate::accessibility::Event::DisplayChanged);
+                });
+                self.config
+                    .preferences
+                    .get_or_insert_with(Default::default)
+                    .orientation = crate::displays::orientation();
+                if let Err(error) = self
+                    .clicks
+                    .install(handle.hwnd.get())
+                    .and_then(|()| self.touches.observe(handle.hwnd.get()))
+                {
                     self.fail(events, error);
                     return;
                 }
@@ -1065,6 +1094,9 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
     }
     fn user_event(&mut self, events: &ActiveEventLoop, event: crate::accessibility::Event) {
         let _span = crate::probe::Span::new("user event", 0);
+        if self.ended {
+            return;
+        }
         if matches!(event, crate::accessibility::Event::Close) {
             self.closing = true;
             if let Some(window) = &self.window {
@@ -1075,6 +1107,18 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
         match event {
             crate::accessibility::Event::TrayAccess(request) => {
                 return self.tray_access(events, request)
+            }
+            crate::accessibility::Event::DisplayChanged => {
+                if let Some(p) = self.presenter.as_mut() {
+                    let mut prefs = p.host().runner().viewport().preferences;
+                    let orientation = crate::displays::orientation();
+                    if prefs.orientation != orientation {
+                        prefs.orientation = orientation;
+                        if let Some(error) = p.set_preferences(prefs) {
+                            eprintln!("exact-windows: {error}");
+                        }
+                    }
+                }
             }
             crate::accessibility::Event::Focus => self.bring_forward(),
             crate::accessibility::Event::Hide => self.hide_by_app(),
@@ -1132,6 +1176,9 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
     }
     fn window_event(&mut self, events: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let _span = crate::probe::Span::new("window event", 0);
+        if self.ended {
+            return;
+        }
         if counters::enabled() {
             self.service_causes |= match event {
                 WindowEvent::MouseWheel { .. } => counters::WHEEL,
@@ -1411,15 +1458,7 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
         }
     }
     fn about_to_wait(&mut self, events: &ActiveEventLoop) {
-        self.file_dialog_answers();
-        self.handed_launches();
-        self.tray_input(events);
-        self.unshown_first_pixel();
-        self.wait(events, |p| {
-            (p.painter_retry_deadline(), p.painter_present_deadline())
-        });
-        self.queue_file_dialogs();
-        self.tray_sync();
+        self.serve(events);
     }
 }
 

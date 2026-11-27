@@ -71,6 +71,13 @@ package final class FieldSelections {
     unowned let presenter: Presenter
     var onChange: ((UInt32, String, FieldSelection) -> Void)?
     var onBeforeInput: ((UInt32, String, FieldSelection, FieldInput) -> Void)?
+    private(set) var inputSource: UInt32?
+    func input(_ id: UInt32, _ value: String) {
+        let outer = inputSource
+        inputSource = id
+        defer { inputSource = outer }
+        presenter.onInput?(id, value)
+    }
     var inputDetails: [UInt32: FieldInput] = [:]
     var editIntent: [UInt32: String] = [:]
     var composing: Set<UInt32> = []
@@ -259,7 +266,7 @@ package final class FieldSelections {
 
     /// HTML's range replacement, after the command's commit. It is not the
     /// person's edit; the admitted extra input keeps the app's binding
-    /// synchronized (LLP 1069.001, issue #275). It is one undo step, on the
+    /// synchronized (LLP 1069.001). It is one undo step, on the
     /// Markdown editor as a format is (LLP 1045 D1), and on a plain Apple
     /// field with an editor (LLP 1069.001, amended 2026-11-04).
     func setRangeText(_ args: [Any]) {
@@ -339,6 +346,13 @@ package final class FieldSelections {
 
     func invalidateScriptedSelection(_ node: NodeView) {
         scripted[node.id] = nil
+    }
+
+    /// UIKit and AppKit expose ordered ranges. Keep the edit's moving end
+    /// when the accepted value still has a selection.
+    func carried(_ node: NodeView, direction: String?) {
+        guard let direction, direction != "none", let range = node.liveSelection, range.length > 0 else { return }
+        last[node.id] = FieldSelection(start: range.location, end: NSMaxRange(range), direction: direction)
     }
 
     /// An editor replacement keeps the selection's direction and whether
@@ -454,7 +468,7 @@ extension NodeView {
         #endif
     }
 
-    /// `edit` as one undo step of `manager`'s, of its own (issue #792). The
+    /// `edit` as one undo step of `manager`'s, of its own. The
     /// manager groups by event: an edit earlier in this event (the person's
     /// typing, another call) has opened the event's group, which a group
     /// begun now would join. That group is closed, and this step's own is

@@ -15,6 +15,10 @@ import { record } from './pointer.js';
 import { inertAncestor, reportPlace, liveById } from './navigation.js';
 import { appGrantSet, coversPath } from './admission.js';
 import { httpUrlRefusal } from './url.js';
+import { receive, takes } from '../web/drag-in.js';
+import { loadOnce } from '../web/load-once.js';
+
+const loads = {};
 
 const say = line => journal.push(`t=${clock.now} ${line}`);
 const x = () => (globalThis.exact ??= {});
@@ -22,8 +26,8 @@ const x = () => (globalThis.exact ??= {});
 // The web host's glue, as glue.js installs it: `dispatch(view, kind,
 // payload)` in the runner's host event kinds — 26 a file input's picked
 // files, 1 `change` with a string, 27 HTML's `cancel`.
-let Glue = null, picked = 0;
-const glue = () => Glue ??= import(new URL('./picker-glue.js', import.meta.url).href).then(() => x().picker({
+let picked = 0;
+const glue = () => loadOnce(loads, "Glue", () => import(new URL('./picker-glue.js', import.meta.url).href).then(() => x().picker({
   appId: data.appId, log: say,
   pickedPath: async name => `app:/tmp/picked/${reportPlace().split('\0')[2]}-${++picked}.${extension(name)}`,
   dispatch(view, kind, payload) {
@@ -33,7 +37,7 @@ const glue = () => Glue ??= import(new URL('./picker-glue.js', import.meta.url).
     else if (kind === 27) el.dispatchEvent(new Event('cancel'));
     else el.dispatchEvent(new CustomEvent('change', { detail: payload }));
   },
-}));
+})));
 const counted = p => { inflight.n++; return Promise.resolve(p).finally(() => inflight.n--); };
 const extension = name => { const e = /\.([^.]*)$/.exec(name)?.[1]?.toLowerCase() ?? ''; return e && e.length <= 8 && /^[a-z0-9]+$/.test(e) ? e : 'bin'; };
 const byId = id => { const el = liveById(id); return el ? { el, view: viewId(el) } : null; };
@@ -197,7 +201,7 @@ Hosts.share = (title, text, url, files) => {
   const source = globalThis.event?.currentTarget, anchor = source instanceof Element ? viewId(source) : null;
   if (clock.agent) return hold('share', null, { title: title ?? null, text: text ?? null, url: url ?? null, files, anchor }, (_, req) => { say(req.choice === 'shared' ? 'share: shared' : 'share: dismissed'); });
   if (typeof navigator.share !== 'function') return refuse('unavailable');
-  if (files.length) return void counted(glue().then(m => m.share({ title, text, url }, files.map(path => ({ path })))).then(say));
+  if (files.length) return void counted(glue().then(m => m.share({ title, text, url }, files.map(path => ({ path })))).then(say, e => refuse(e?.name ?? e)));
   navigator.share(Object.fromEntries(Object.entries({ title, text, url }).filter(([, v]) => v != null)))
     .then(() => 'share: shared', e => e?.name === 'AbortError' ? 'share: dismissed' : `share: refused: ${e?.name ?? e}`).then(say);
 };
@@ -205,9 +209,9 @@ Hosts.share = (title, text, url, files) => {
 // ---------------------------------------------------------------- the document pickers (file_pickers.rs)
 // What the person chooses becomes a `doc:/<n>/<name>` path the app reaches
 // through `storage.fs` (the glue's handles; storage-request.js routes it).
-let Docs = null;
+
 // An app granted `doc.keep` keeps what the person chooses (LLP 1069.010.000 D3).
-const docs = () => Docs ??= import(new URL('./documents-glue.js', import.meta.url).href).then(() => (x().documents.keeping(data.appId, appGrantSet()), x().documents.install({
+const docs = () => loadOnce(loads, "Docs", () => import(new URL('./documents-glue.js', import.meta.url).href).then(() => (x().documents.keeping(data.appId, appGrantSet()), x().documents.install({
   log: say, openFile: () => false,
   dispatch(view, kind, payload) {
     const el = Views.get(view);
@@ -215,38 +219,33 @@ const docs = () => Docs ??= import(new URL('./documents-glue.js', import.meta.ur
     if (kind === 27) el.dispatchEvent(new Event('cancel'));
     else el.dispatchEvent(new CustomEvent('change', { detail: payload }));
   },
-})));
-// Files and folders dropped from outside (DOM's `drop`, studio diary R19),
-// of any type: Chromium's handles, asked for while the event lasts
-// (`getAsFileSystemHandle`), else a folder's entry or each File read-only,
-// minted as a picker's choice is and heard with the `DragEvent` record. The
-// innermost element with the handler takes them, over a text field too (its
-// own drop is the default this prevents). A `dragover` that carries files
-// is accepted, or the browser would open them itself.
+}))));
+// What a drag drops (DOM's `drop`; LLP 1094.001): files
+// and folders of any type, Chromium's handles asked for while the event
+// lasts (`getAsFileSystemHandle`), else a folder's entry or each File
+// read-only, minted as a picker's choice is; its plain text and its link
+// (drag-in.js), all heard with the `DragEvent` record. The innermost element
+// with the handler takes it, over a text field too when it carries files
+// (the field's own drop is the default this prevents); a field inserts a
+// drag of plain text itself. A `dragover` it takes is accepted, or the
+// browser would open dropped files itself.
 const allowed = e => () => !inertAncestor(e) && !e.matches(':disabled'); // a disabled control, never a box (review b5-b 4)
 // The glue fetched after the first paint, so a drag's enter and a paste find it loaded; the agent waits for it (rt.js `pieces`).
 const warm = (then = () => {}) => { const p = painted().then(docs).then(then); OnHooks.loading = Promise.all([OnHooks.loading, p]); return p; };
 OnHooks.drop = (e, f) => {
   warm();
-  e.addEventListener('dragover', ev => { if (ev.dataTransfer?.types?.includes('Files') && allowed(e)()) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; } });
+  e.addEventListener('dragover', ev => { if (allowed(e)() && takes(e, ev)) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; } });
   e.addEventListener('drop', ev => {
-    const dt = ev.dataTransfer;
-    if (!dt?.types?.includes('Files') || !allowed(e)()) return;
-    ev.preventDefault(); ev.stopPropagation();
+    if (!allowed(e)() || !takes(e, ev)) return;
+    ev.preventDefault(); ev.stopPropagation(); ev.exactTaken = true;
     const [offsetX, offsetY] = record(e, ev), held = [ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey];
-    const items = [...dt.items].filter(i => i.kind === 'file');
-    const handles = items.map(i => i.getAsFileSystemHandle?.().catch(() => null) ?? null), entries = items.map(i => i.webkitGetAsEntry?.() ?? null), files = [...dt.files];
-    counted(docs().then(async m => {
-      const found = await m.dropped(await Promise.all(handles), files, entries);
-      if (!found.length) return say('drop: refused: the browser handed over no file');
-      f([offsetX, offsetY, found, ...held]);
-    }));
+    counted(receive(ev, docs, (found, text, url) => e.isConnected && (f([offsetX, offsetY, found, text, url, ...held]), true), say));
   });
 };
-// `dragenter` and `dragleave` of a file drag (documents-glue.js `hearDrags`):
-// the point, no files (the DOM's are protected until the drop).
+// A drag's `dragenter` and `dragleave` (documents-glue.js `hearDrags`): the
+// point and no data (the DOM keeps a drag's data from a page until the drop).
 OnHooks.drag = (e, kind, f) => {
-  warm(() => x().documents.hearDrags(e, kind, allowed(e), ev => f([...record(e, ev).slice(0, 2), [], ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey])));
+  warm(() => x().documents.hearDrags(e, kind, allowed(e), ev => f([...record(e, ev).slice(0, 2), [], '', '', ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey])));
 };
 // A paste's files (`clipboardData.files`), minted in the paste's own event; none before the glue has loaded.
 OnHooks.pasteWarm = () => warm();
@@ -269,7 +268,9 @@ const PICKERS = { showOpenFilePicker: ['open-file', 'showOpenFilePicker takes (i
 for (const [name, [capability, usage]] of Object.entries(PICKERS)) Hosts[name] = (...args) => {
   const refuse = (why, el) => { say(`${name}: refused: ${why}`); if (el) el.dispatchEvent(new Event('cancel')); };
   // `startIn=` trails the arguments: `(id, multiple, startIn)`, `multiple` none when absent.
-  const named = args.length === (capability === 'open-directory' ? 2 : 3);
+  const withStart = capability === 'open-directory' ? 2 : 3;
+  if (args.length === withStart + 1 && typeof args[withStart] === 'string') args.pop(); // apple.message
+  const named = args.length === withStart;
   let startIn = named ? args.pop() : undefined;
   if (named && capability === 'open-file' && args[1] == null) args.pop();
   const [id, second] = args, rest = args.slice(1);

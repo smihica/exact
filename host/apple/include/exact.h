@@ -32,7 +32,7 @@
 #include <stdint.h>
 
 /* The ABI's version: part of the compatibility id (LLP 1030 D3a). */
-#define EXACT_ABI_VERSION 20
+#define EXACT_ABI_VERSION 21
 
 #ifdef __cplusplus
 extern "C" {
@@ -421,7 +421,8 @@ typedef struct {
     const uint8_t *family; size_t family_len;
     uint16_t family_id; float size; uint16_t weight; uint8_t italic;
 } ExactControlFont;
-/* kind: 0 field/textarea, 1 mini, 2 small, 3 medium/default, 4 large button. */
+/* kind: 0 field/textarea, 1 mini, 2 small, 3 medium/default, 4 large button,
+ * 5 a plain bar item's title (LLP 1141.004 D3; size 0 where the host has none). */
 typedef ExactControlFont (*ExactControlTextFn)(void *ctx, uint8_t kind);
 /* kind: 0 field, 1 secure, 2 search, 3 textarea; plus 4 for a field in a
  * grouped list's row (LLP 1116.005 D2), borderless in its cell on iOS. */
@@ -631,9 +632,10 @@ uint32_t exact_share_land(ExactRuntime rt);
  * 19 = media (UTF-8 event name, newline, payload; numeric times in seconds),
  * 21 = select (formats + newline + mixed 0/1 + newline + unavailable + newline + link);
  * 22 = refresh (the platform's pull-to-refresh control fired; no payload);
+ * 67 = pinch, 68 = pinchrelease (UTF-8 scale,clientX,clientY).
  * 28 = panrelease (UTF-8 vx,vy; px/s, once when a pan that began ends; a
  *      cancelled contact releases at 0,0; LLP 1057 §10.6);
- * 29 = pointerdown, 30 = pointerup, 31 = pointermove (UTF-8
+ * 29 = pointerdown, 30 = pointerup, 31 = pointermove, 65 = pointercancel (UTF-8
  *      offsetX,offsetY,button,buttons,pressure,pointerType,pointerId,clientX,clientY:
  *      content-box CSS px, DOM's button and buttons bits, 0 to 1, mouse|pen|touch, then
  *      the viewport point; LLP 1056 §3 stage 3, LLP 1094 D11);
@@ -646,12 +648,14 @@ uint32_t exact_share_land(ExactRuntime rt);
  * 63 = scrolldragend: UTF-8 velocityX,velocityY[,targetLeft,targetTop]: UIKit's
  *      release velocity in points (CSS px) per millisecond, positive as
  *      scrollLeft/scrollTop grow, and where the momentum will rest, when known.
- * 6 = key (keydown), 43 = keyup and 44 = keycapture (#140): UTF-8 chord (`Shift+Meta+b`),
+ * 6 = key (keydown), 43 = keyup and 44 = keycapture: UTF-8 chord (`Shift+Meta+b`),
  *      optionally newline, KeyboardEvent.code (`KeyB`, "" unknown), newline,
  *      true|false for repeat, and optionally newline, true|false for isComposing;
- * 46 = focusin, 47 = focusout (#283): UTF-8 `<target byte length>:<target id>`
+ * 46 = focusin, 47 = focusout: UTF-8 `<target byte length>:<target id>`
  *      then `0` (no relatedTarget) or `1<related id>`;
  * 64 = host look states (UTF-8 bits: 1 hover, 2 focus-visible); presentation only.
+ * 66 = swipe (no payload; the platform's discrete swipe in the node's
+ *      `swipe-flick` direction, LLP 1057.001 §8).
  * any other kind is refused with an error batch.
  * Format lists are space-separated command tokens. Link keeps the remaining bytes.
  * A change's text, key's name, or guest message is the payload in the input
@@ -715,11 +719,13 @@ void exact_list_covered(ExactRuntime rt, uint32_t view, double start, double end
 /* Property: 0 translate, 1 scale, 2 rotate, 3 opacity. Begin replies with a
  * hold op {token:decimal-string,x,y}. Tokens belong to this runtime incarnation.
  * Check liveness before an authored action; final update, action, then end. */
-/* Authored header binding, generational keys and live Height token. */
+/* Authored header binding, generational keys and live Height token. A sample's
+ * at_ms is the input's own time, carried onto the clock from where the drag
+ * began; the release velocity reads it and now_ms moves the clock. */
 uint32_t exact_height_drag_begin(ExactRuntime rt, uint64_t handle_key, uint64_t target_key, double now_ms);
-uint32_t exact_height_drag_update(ExactRuntime rt, uint64_t token, double height, double now_ms);
+uint32_t exact_height_drag_update(ExactRuntime rt, uint64_t token, double height, double now_ms, double at_ms);
 /* The release velocity is the engine's, over the heights shown (LLP 1057.001 §3). */
-uint32_t exact_height_drag_release(ExactRuntime rt, uint64_t token, double height, double now_ms);
+uint32_t exact_height_drag_release(ExactRuntime rt, uint64_t token, double height, double now_ms, double at_ms);
 uint32_t exact_transform_motion(uint32_t rt, uint32_t len);
 /* Arrange (reorderFor / reorderdrop, LLP 1041 §8.5): the platform recognizes
  * the contact on the handle view. scroll_top is the List's actual offset as
@@ -740,7 +746,9 @@ uint32_t exact_reorder_end(ExactRuntime rt, uint64_t token, uint32_t drop, doubl
  * collection feedback reports it; inside zero (the centre in no grouped
  * port) keeps the certified gap. step: 1 earlier, 2 later, 3 the previous
  * grouped list, 4 the next. group_end drops into the session's target
- * (nonzero) or cancels; a holding drop ignores a cancel. Every reply, and
+ * (1), cancels (0), or accepts the native list's final position (2, one
+ * little-endian u32 successor view in the input buffer, zero at the end).
+ * A holding drop ignores a cancel. Every reply, and
  * every later batch that changes it, carries {"op":"reorder","group":true,
  * "token","list","wrapper","phase":"active"|"holding"|"cancelling"|
  * "settling"|"finished"|"refused","dispatched","ending":null|"landed"|"gone"|
@@ -756,10 +764,11 @@ uint32_t exact_has_hold(ExactRuntime rt, uint64_t token);
 /* A scroller marked `scrollTimeline` (the page, for page 1) now stands at
  * left, top CSS px: the scroll and view timelines it drives, presented. */
 uint32_t exact_timeline_scrolled(ExactRuntime rt, uint32_t page, uint32_t view, double left, double top);
-uint32_t exact_hold_update(ExactRuntime rt, uint64_t token, double x, double y, double now_ms);
+/* at_ms: when the input was sampled, as for a height drag. */
+uint32_t exact_hold_update(ExactRuntime rt, uint64_t token, double x, double y, double now_ms, double at_ms);
 /* cancel: 0 releases at vx, vy; 1 cancels; 2 releases at the velocity the
- * engine measured over the hold's values (LLP 1057.001 §3). */
-uint32_t exact_hold_end(ExactRuntime rt, uint64_t token, uint32_t cancel, double vx, double vy, double now_ms);
+ * engine measured over the hold's values (LLP 1057.001 §3), read at at_ms. */
+uint32_t exact_hold_end(ExactRuntime rt, uint64_t token, uint32_t cancel, double vx, double vy, double now_ms, double at_ms);
 /* A recognition threshold exact2 defines itself: 0 the swipe knee, 1 its
  * resistance, 2 the leading edge a swipe yields, 3 the drag slop (LLP 1057.001 §3). */
 double exact_gesture_constant(uint32_t which);
@@ -890,7 +899,10 @@ uint32_t exact_module_event(ExactRuntime rt, size_t len);
 /* @ref LLP 1133.001 D4: the extensions the app's module composes, one name a
  * line in the input buffer: the runner sends their names to the module. A
  * line `agent <name>` is an implementation bound under the agent, which
- * answers an interface that is its own substitute (LLP 1133.006 D8). */
+ * answers an interface that is its own substitute (LLP 1133.006 D8).
+ * A first line "view-bindings tag.prop ..." subscribes to those committed visible
+ * track bindings. The installed ExactAppCallFn receives each JSON snapshot with
+ * a null slot. Ordinary package calls always have a reply slot. */
 void exact_bind_extensions(ExactRuntime rt, size_t len);
 /* @ref LLP 1133.019 D11 item 1: an `img` source of a package's scheme, in the
  * input buffer, admitted as a read: the output is {"extension","scheme",
@@ -998,7 +1010,9 @@ uint32_t exact_screen(ExactRuntime rt, float width, float height);
  * viewport's width and height, the regions' count (20 or 0) and their insets,
  * then, with 16, the rects' count and each rect's x y w h, on the grid
  * exact_segments set, then, with 32, the software keyboard's overlap with the
- * viewport (exactViewport().keyboardHeight), then, with 64, block,
+ * viewport (exactViewport().keyboardHeight), then, with 128, the window's
+ * aspect-fit guide for the first root (LLP 1123 D16), its x, y, width and
+ * height in the view's points, a zero size clearing it, then, with 64, block,
  * placement and owner update records as exact_host_covers kinds 4, 5, 6,
  * 7, 13 and 21, each update checked and applied as exact_host_covers does.
  * The call is exact_screen, exact_insets, exact_regions, exact_resize and a
@@ -1058,12 +1072,17 @@ uint32_t exact_intrinsics(ExactRuntime rt, size_t len);
  * view's block the kernel refuses is not applied, and one whose view is
  * gone is not applied and is the batch's error. An update for a view with
  * no block holds its keyboard against no bounds, so it occupies nothing.
+ * Kind 29 is the session's update (LLP 1123 D2): the view unused, then as
+ * kind 21 its length and the update as the kernel's `SessionUpdate::encode`
+ * writes it, checked with the call's owner updates; two in one call refuse it.
  * Kind 23 says how a split shows a block's route against its stack's top
  * (LLP 1127 D8): float 1 beside it, live (the split's list column beside
  * its detail), 2 under a pane over it, not live (the detail under the list
  * that overlays it, the columns under a sheet), 0 in its stack; then three
  * unused. Kind 24 gives a column header its track width in the first float.
- * NaN restores automatic sizing. */
+ * NaN restores automatic sizing. Kind 27 says whether a given block is a
+ * navigation bar's item (LLP 1141.004 D3): float 1 for one, 0 for none; then
+ * three unused. */
 uint32_t exact_host_covers(ExactRuntime rt, size_t len);
 /* What a block's root would measure in another block (a popover's
  * position-area option, LLP 1021 D2): each axis a length and a policy as
@@ -1099,17 +1118,24 @@ uint32_t exact_radio_group(ExactRuntime rt, uint32_t view);
  * it; with none, the key is consumed where it is; null for no key or one that is
  * not the group's. */
 uint32_t exact_role_keys(ExactRuntime rt, uint32_t view, uint32_t focused, size_t len);
-/* Whether the stack whose root route is `view` shows that route as a list beside
- * its detail, by the runner's rule (LLP 1115.002 D4), JSON in the output buffer,
- * not a batch: {"list":view|null,"width":number|null,"rows":[[route,row]...],
- * "locations":[[route,url]...],"current":view|null,"pressWrites":bool|null}, the list whose row pushes,
+/* The runner's answer for the stack whose root route is `view` (LLP 1115.002 D4, LLP 1127 D1), JSON in the
+ * output buffer, not a batch: {"asked":bool,"placeholder":view|null,"list":view|null,"width":number|null,
+ * "rows":[[route,row]...],"locations":[[route,url]...],"current":view|null}: whether
+ * the root route asks for the split (LLP 1127 D1), the route's own placeholder box, which the split shows
+ * while nothing is selected, the list whose row pushes,
  * the list column's width where `navigationSplit` names one, each route above the
  * root that is a row's detail with that row, each route above the root with its
- * location, the current row, and whether the press of `pressed` writes the router; null for a stack
- * that pushes. */
-/* `retained` is a previous list to keep while empty and still eligible, or 0;
- * `pressed` is a view being pressed, or 0. */
-uint32_t exact_stack_split(ExactRuntime rt, uint32_t view, uint32_t retained, uint32_t pressed);
+ * location, and the current row. null for a view that is
+ * no route, for a root route presented as a sheet (`modal`, `fullscreen`) or saying "none", and for one
+ * that does not ask and has no list whose rows push, nor an eligible `retained` list. Each host admits a split from the answer by its own
+ * rule (LLP 1127 D22): the Mac where `asked` or where `list` is found. */
+/* `retained` is a previous list to keep while empty and still eligible, or 0. */
+uint32_t exact_stack_split(ExactRuntime rt, uint32_t view, uint32_t retained);
+/* Whether the press of `view` writes the router (LLP 1127 D16), a fact of the plan at the view's site, not a
+ * batch: 1 where it does, 0 where it does not, 2 for a view that hears no press or a runtime that refuses the
+ * call (gone, or busy). Read before the press is dispatched, it answers for a press that then removes or
+ * recycles its view. */
+uint32_t exact_press_writes_router(ExactRuntime rt, uint32_t view);
 /* A button's face, custom or native (LLP 1069.011.000 D1), JSON in the output
  * buffer, not a batch: {"button":bool,"title":string|null,"symbol":apple-name|null,
  * "raster","leading","fits":bool,"label":string|null,"style",...the native style}. */

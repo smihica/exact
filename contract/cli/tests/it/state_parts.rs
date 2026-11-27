@@ -3,24 +3,16 @@
 //! hover and focus targets are literals. List rows admit active parts.
 
 use crate::scratch::Scratch;
+use crate::source::{boxed, NoData, Source};
 use exact_kernel::{Color, ColorValue, Kernel, RowValue, StyleId};
-use exact_plan::Value;
-use exact_runner::{DataError, DataSource, Runner};
+use exact_runner::Runner;
 
-struct NoData;
-
-impl DataSource for NoData {
-    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
-        Err(DataError::UnknownSource(source.into()))
-    }
-}
-
-fn booted(src: &str) -> Runner<NoData> {
+fn booted(src: &str) -> Runner<Source> {
     let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e:?}"));
-    let plan = contract::bake(plan, NoData).unwrap();
+    let plan = contract::bake(plan, boxed(NoData)).unwrap();
     Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -35,7 +27,7 @@ fn refused(src: &str) -> String {
         .unwrap_or_else(|| "compiled".into())
 }
 
-fn colour(r: &Runner<NoData>, id: &str, style: StyleId) -> String {
+fn colour(r: &Runner<Source>, id: &str, style: StyleId) -> String {
     let key = r.kernel().find_by_test_id(id)[0];
     match r.kernel().node_by_key(key).unwrap().computed(style) {
         RowValue::ColorValue(ColorValue::Fixed(c)) => hex(c),
@@ -47,7 +39,7 @@ fn hex(c: Color) -> String {
     format!("#{:06x}", c.0 >> 8)
 }
 
-fn press(r: &mut Runner<NoData>, id: &str) {
+fn press(r: &mut Runner<Source>, id: &str) {
     let view = {
         let k = r.kernel();
         k.node_by_key(k.find_by_test_id(id)[0]).unwrap().id
@@ -595,10 +587,10 @@ fn a_param_read_only_by_a_state_part_is_reached() {
         "the :active row, the press's background"
     );
     // The :disabled row folded over the param: 0.4 once disabled.
-    let plan = contract::bake(plan, NoData).unwrap();
+    let plan = contract::bake(plan, boxed(NoData)).unwrap();
     let mut r = Runner::boot(
         plan,
-        NoData,
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -688,7 +680,7 @@ fn active_targets_follow_regular_commits_and_clear() {
       text "Paint"
 "##,
     );
-    let style = |r: &Runner<NoData>| {
+    let style = |r: &Runner<Source>| {
         let k = r.kernel();
         let s = k.node_by_key(k.find_by_test_id("paint")[0]).unwrap().style;
         (
@@ -764,7 +756,7 @@ fn active_targets_can_belong_to_list_rows() {
           text row
 "##,
     );
-    let fills = |r: &Runner<NoData>| {
+    let fills = |r: &Runner<Source>| {
         let k = r.kernel();
         k.find_by_test_id("paint")
             .into_iter()
@@ -839,4 +831,93 @@ fn active_translate_refuses_a_third_axis() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn state_folds_preserve_per_arm_written_provenance() {
+    use exact_kernel::style::roles::role;
+    use exact_kernel::{Color, ColorValue, StyleMask};
+    let mut r = booted(
+        r##"style Muted
+  color = "#888888"
+style Plain
+  opacity = 0.8
+component App
+  state off = false
+  state muted = false
+  action flip_off
+    off = !off
+  action flip_muted
+    muted = !muted
+  view
+    column
+      list appearance="auto" disabled=off testId="list"
+        :disabled
+          background-color = "#ff0000"
+        section
+          row
+            text "Item"
+      link href="/next" disabled=off testId="link"
+        :disabled
+          color = "#888888"
+        image "symbol:star" testId="sym"
+        text "Next"
+      link href="/next" class=(muted ? Muted : Plain) disabled=off testId="combo"
+        :disabled
+          color = "#000000"
+        text "Combo"
+"##,
+    );
+    let red = ColorValue::Fixed(Color::rgba(255, 0, 0, 255));
+    let link_color = ColorValue::Role(role("LinkText").unwrap());
+    let muted_color = ColorValue::Fixed(Color::rgba(0x88, 0x88, 0x88, 255));
+    let black = ColorValue::Fixed(Color::rgba(0, 0, 0, 255));
+
+    // Grouped list ground (`-exact-grouped-ground`) stays unwritten when
+    // enabled, while `:disabled background-color="#ff0000"` arrives written.
+    // Link `LinkText` stays unwritten when enabled, while `:disabled color`
+    // arrives written and sets `symbol_color_said()`.
+    for off in [false, true, false] {
+        let k = r.kernel();
+        let list = k.node_by_key(k.find_by_test_id("list")[0]).unwrap();
+        assert!(list.style.mask.has(StyleId::BackgroundColor));
+        assert_eq!(list.style.written.has(StyleId::BackgroundColor), off);
+        if off {
+            assert_eq!(list.style.background_color, Some(red));
+        } else {
+            assert_ne!(list.style.background_color, Some(red));
+        }
+        let link = k.node_by_key(k.find_by_test_id("link")[0]).unwrap();
+        let sym = k.node_by_key(k.find_by_test_id("sym")[0]).unwrap();
+        assert_eq!(
+            link.computed_style(StyleMask::of(StyleId::TextColor))
+                .text_color,
+            if off { muted_color } else { link_color }
+        );
+        assert_eq!(link.style.written.has(StyleId::TextColor), off);
+        assert_eq!(sym.symbol_color_said(), off);
+        r.act("flip_off", vec![]).unwrap();
+    }
+    // Restore `off = false` after 3 flips.
+    r.act("flip_off", vec![]).unwrap();
+
+    // Combined `class=(muted ? Muted : Plain)` + `:disabled` over implied `LinkText`.
+    let combo = |r: &Runner<Source>| {
+        let k = r.kernel();
+        let node = k.node_by_key(k.find_by_test_id("combo")[0]).unwrap();
+        (
+            node.computed_style(StyleMask::of(StyleId::TextColor))
+                .text_color,
+            node.style.written.has(StyleId::TextColor),
+        )
+    };
+    assert_eq!(combo(&r), (link_color, false));
+    r.act("flip_muted", vec![]).unwrap();
+    assert_eq!(combo(&r), (muted_color, true));
+    r.act("flip_off", vec![]).unwrap();
+    assert_eq!(combo(&r), (black, true));
+    r.act("flip_muted", vec![]).unwrap();
+    assert_eq!(combo(&r), (black, true));
+    r.act("flip_off", vec![]).unwrap();
+    assert_eq!(combo(&r), (link_color, false));
 }

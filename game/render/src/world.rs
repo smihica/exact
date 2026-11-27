@@ -473,6 +473,96 @@ impl Versions {
     }
 }
 
+/// Renderer inputs for the last complete picture of a resting canvas.
+#[derive(PartialEq)]
+pub(crate) struct IdlePicture {
+    mesh: Option<Versions>,
+    lights: Option<[u64; 7]>,
+    components: [u64; 8],
+    resources: [Option<(u64, u64)>; 5],
+}
+
+impl IdlePicture {
+    pub(crate) fn changed_storages(&self, next: &Self, record: &mut dyn FnMut(&str)) {
+        let mut changed = |name: &str| record(&format!("world:{name}"));
+        match (self.mesh, next.mesh) {
+            (Some(a), Some(b)) => {
+                macro_rules! columns {
+                    ($($field:ident => $name:literal),+) => {
+                        $(if a.$field != b.$field { changed($name); })+
+                    }
+                }
+                columns!(assets => "assets", transform => "Transform", parent => "Parent",
+                    material => "Material", glow => "Glow", mesh => "Mesh", visible => "Visible",
+                    viewmodel => "ViewModel", opacity => "Opacity", node_materials => "NodeMaterials",
+                    material_overrides => "MaterialOverrides", lod => "ModelLod", pose => "Pose",
+                    offset => "Offset", node_offsets => "NodeOffsets", tint => "Tint",
+                    live => "entities", membership => "Transform-membership");
+            }
+            _ if self.mesh != next.mesh => changed("mesh-feed"),
+            _ => {}
+        }
+        if let (Some(a), Some(b)) = (self.lights, next.lights) {
+            columns_changed(
+                a,
+                b,
+                [
+                    "Camera",
+                    "DirectionalLight",
+                    "PointLight",
+                    "Lit",
+                    "SpotLight",
+                    "LightShadows",
+                    "Visible",
+                ],
+                &mut changed,
+            );
+        } else if self.lights != next.lights {
+            changed("light-feed");
+        }
+        columns_changed(
+            self.components,
+            next.components,
+            [
+                "Emitter",
+                "LightShadows",
+                "MouseLook",
+                "ParticleLook",
+                "Placed",
+                "PointerPan",
+                "SocketFollow",
+                "Sprite",
+            ],
+            &mut changed,
+        );
+        columns_changed(
+            self.resources,
+            next.resources,
+            [
+                "AmbientOcclusion",
+                "Environment",
+                "EnvironmentMap",
+                "Shadows",
+                "Water",
+            ],
+            &mut changed,
+        );
+    }
+}
+
+fn columns_changed<T: PartialEq, const N: usize>(
+    a: [T; N],
+    b: [T; N],
+    names: [&str; N],
+    record: &mut dyn FnMut(&str),
+) {
+    for ((a, b), name) in a.into_iter().zip(b).zip(names) {
+        if a != b {
+            record(name);
+        }
+    }
+}
+
 /// Persistent bridge from one world to one renderer. World loads invalidate it
 /// automatically; reset it when replacing a World with an unrelated instance.
 /// Replacement invalidates world-derived records, never renderer asset residency.
@@ -607,6 +697,36 @@ impl Feed {
     ) -> Result<(), RenderError> {
         self.feed_to(world, renderer)
     }
+    /// Inputs to the retained picture. Feed already tracks mesh data and lights.
+    /// Draw-time resources and quads are read separately.
+    pub(crate) fn idle_picture(&self, w: &World) -> IdlePicture {
+        use exact_game::{
+            AmbientOcclusion, Emitter, Environment, EnvironmentMap, LightShadows, MouseLook,
+            ParticleLook, Placed, PointerPan, Shadows, SocketFollow, Sprite, Water,
+        };
+        IdlePicture {
+            mesh: self.versions,
+            lights: self.scene.versions,
+            components: [
+                w.revision::<Emitter>(),
+                w.revision::<LightShadows>(),
+                w.revision::<MouseLook>(),
+                w.revision::<ParticleLook>(),
+                w.revision::<Placed>(),
+                w.revision::<PointerPan>(),
+                w.revision::<SocketFollow>(),
+                w.revision::<Sprite>(),
+            ],
+            resources: [
+                w.resource_revision::<AmbientOcclusion>(),
+                w.resource_revision::<Environment>(),
+                w.resource_revision::<EnvironmentMap>(),
+                w.resource_revision::<Shadows>(),
+                w.resource_revision::<Water>(),
+            ],
+        }
+    }
+
     /// The models this feed last drew, a model kept in place of one in flight
     /// included; the surface passes them to `Sim::hold_assets`.
     pub fn drawn_assets(&self) -> &std::collections::BTreeSet<String> {

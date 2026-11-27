@@ -139,6 +139,8 @@ impl Painter {
             None,
             node,
             self.scrollbars.limits.get(&node.id).copied(),
+            walk.scene.presented,
+            walk.scene.scaled_presented,
         );
         let field = walk.fields.get(&node.id);
         if let Some(field) = field {
@@ -188,7 +190,11 @@ impl Painter {
         let clip = self
             .row_clip(b.clip.map(|c| bbox(to_page, c)))
             .unwrap_or(viewport);
+        // At the CSS offset, which a claimed scroller's content is displaced from (LLP 1123 D14)
         let offset = b.scroll.unwrap_or_default();
+        let offset = (walk.scene.presented)(b.id)
+            .scroll
+            .map_or(offset, |c| c.offset(offset));
         let port = self.split_port(b.id, rect);
         for vertical in [false, true] {
             let i = usize::from(vertical);

@@ -239,7 +239,7 @@ fn a_header_of_buttons_alone_is_a_bar_with_no_title() {
                 HEADER,
                 vec![
                     button(22, BACK),
-                    view(17, vec![]),
+                    view(17, vec![view(19, vec![])]),
                     view(
                         18,
                         vec![button(13, &[]), Node(70, NodeType::Text, STATUS, vec![])],
@@ -450,14 +450,148 @@ fn a_readout_is_an_item_that_is_no_button() {
     );
 }
 
+/// LLP 1141.004 D1: an element the bar has no object for (a row of a
+/// progress and its words, a picture, a second text) is no item. A box
+/// holding a button, pressed or not, is walked for it. A button that presses
+/// nothing is no item, and a box of spacers none. Inside the heading's
+/// wrapper what is not a part is the title's.
+#[test]
+fn an_element_the_bar_has_no_object_for_is_no_item() {
+    const IDLE: Props = &[
+        (PropId::Type, "button"),
+        (PropId::AccessibilityRole, "button"),
+    ];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                view(
+                    60,
+                    vec![Node(61, NodeType::Control, &[], vec![]), text(62, &[])],
+                ),
+                text(12, HEADING),
+                view(
+                    70,
+                    vec![button(13, &[]), Node(71, NodeType::Image, &[], vec![])],
+                ),
+                text(72, &[]),
+                Node(73, NodeType::Control, IDLE, vec![]),
+                view(74, vec![]),
+                // A box around a button that presses nothing is walked: the
+                // button is an item once it presses, or nothing.
+                view(75, vec![Node(76, NodeType::Control, IDLE, vec![])]),
+                // A box of spacers shows nothing.
+                view(77, vec![view(78, vec![])]),
+                // A link with nothing pressing it follows its `href`: an item.
+                Node(
+                    79,
+                    NodeType::Pressable,
+                    &[(PropId::Href, "/history")],
+                    vec![],
+                ),
+                // `role="link"` alone, or an `href` cleared to nothing,
+                // follows nothing: a button that presses nothing.
+                Node(
+                    84,
+                    NodeType::Pressable,
+                    &[(PropId::AccessibilityRole, "link")],
+                    vec![],
+                ),
+                Node(85, NodeType::Pressable, &[(PropId::Href, "")], vec![]),
+            ],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!(shape.leading, Vec::<u32>::new(), "the row is no item");
+    assert_eq!(shape.trailing, vec![13, 79], "the buttons alone");
+    assert_eq!(shape.items, vec![13, 79]);
+    // The heading's wrapper: its picture and its second line are the title's.
+    let wrapped = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![
+                view(
+                    80,
+                    vec![
+                        Node(81, NodeType::Image, &[], vec![]),
+                        text(12, HEADING),
+                        text(82, &[]),
+                    ],
+                ),
+                button(41, &[]),
+            ],
+        )],
+    ));
+    let shape = wrapped.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!((shape.leading, shape.trailing), (vec![], vec![41]));
+    // With no heading, such an element keeps the header in the page.
+    let untitled = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![button(41, &[]), text(83, &[])],
+        )],
+    ));
+    assert_eq!(untitled.header_shape(10, None, true, &pressed), None);
+    // A host's mirror: route > header > [heading, image, idle button].
+    let words = [
+        0,
+        1,
+        fact::HEADER,
+        3,
+        fact::HEADING,
+        0,
+        0,
+        0,
+        fact::BUTTON,
+        0,
+    ];
+    // No item: the image is none, the idle button none.
+    assert_eq!(
+        bars::header_shape_words(&words, 0),
+        Some(vec![1, 3, 2, 0, 0, 0, 0, 0, 0])
+    );
+}
+
 type Props = &'static [(PropId, &'static str)];
+
+/// A heading's level is its own three bits: an `href` on the heading
+/// (`fact::HREF`, above them) leaves a level-1 heading level 1.
+#[test]
+fn a_heading_with_an_href_keeps_its_level() {
+    const LINKED_HEADING: Props = &[
+        (PropId::AccessibilityRole, "heading"),
+        (PropId::AccessibilityHeadingLevel, "1"),
+        (PropId::Href, "/history"),
+    ];
+    let tree = kernel(view(
+        10,
+        vec![Node(
+            11,
+            NodeType::View,
+            HEADER,
+            vec![text(12, LINKED_HEADING)],
+        )],
+    ));
+    let shape = tree.header_shape(10, None, true, &pressed).unwrap();
+    assert_eq!((shape.heading, shape.level), (Some(12), 1));
+}
 
 /// Whether a header button with no `press` is an item is whether what it
 /// invokes, as HTML resolves it (`exact_kernel::Invocation`), opens what it
-/// names: a popover, or a dialog shown modally (#387: an alert's button that
-/// says `commandfor` alone was left out of the iOS bar).
+/// names, a popover or a dialog shown modally, or closes a dialog (#387: an
+/// alert's button that says `commandfor` alone was left out of the iOS bar;
+/// #1316: a dialog's Cancel is `command="close"` alone).
 #[test]
-fn a_header_button_is_an_item_when_its_invocation_opens_what_it_names() {
+fn a_header_button_is_an_item_when_its_invocation_acts_on_what_it_names() {
     let cases: &[(Props, bool, &str)] = &[
         (
             &[
@@ -500,8 +634,8 @@ fn a_header_button_is_an_item_when_its_invocation_opens_what_it_names() {
         ),
         (
             &[(PropId::Commandfor, "clear"), (PropId::Command, "close")],
-            false,
-            "a command that only closes the dialog",
+            true,
+            "a command that closes the dialog: a dialog's Cancel",
         ),
         (
             &[
@@ -1137,4 +1271,216 @@ fn a_linked_panel_inside_the_tablist_belongs_to_the_root() {
     assert_eq!(tabs.tablist, 2);
     assert_eq!(tabs.tabs, [3]);
     assert_eq!(tabs.panels, [4]);
+}
+
+/// #1316's form: a `dialog` whose first child is a `header` of a closing
+/// button, a heading and a pressed button. The rule reads the dialog as it
+/// reads a route: the heading is the title, the Cancel that only closes the
+/// dialog leads, the action trails.
+#[test]
+fn a_dialogs_header_is_read_as_a_routes() {
+    const DIALOG: Props = &[(PropId::Id, "invite"), (PropId::SemanticTag, "dialog")];
+    const CANCEL: Props = &[(PropId::Commandfor, "invite"), (PropId::Command, "close")];
+    let kernel = kernel(view(
+        1,
+        vec![Node(
+            10,
+            NodeType::View,
+            DIALOG,
+            vec![
+                Node(
+                    11,
+                    NodeType::View,
+                    HEADER,
+                    vec![button(20, CANCEL), text(12, HEADING), button(41, &[])],
+                ),
+                view(30, vec![]),
+            ],
+        )],
+    ));
+    let shape = kernel.header_shape(10, None, false, &pressed).unwrap();
+    assert_eq!(shape.heading, Some(12));
+    assert_eq!(shape.level, 2);
+    assert_eq!(shape.leading, vec![20]);
+    assert_eq!(shape.trailing, vec![41]);
+    assert_eq!(shape.items, vec![20, 41]);
+}
+
+#[test]
+fn header_badge_recognizes_single_filled_box_faces_and_rejects_ordinary_buttons() {
+    let mut k = kernel(view(
+        1,
+        vec![
+            // 2: button(initial badge) -> 3: filled box -> 4: text "CC"
+            Node(
+                2,
+                NodeType::Pressable,
+                &[],
+                vec![view(3, vec![text(4, &[(PropId::Text, "CC")])])],
+            ),
+            // 5: button(image + initial fallback) -> [6: filled box -> [7: image, 8: text "AB"], 9: hidden box]
+            Node(
+                5,
+                NodeType::Pressable,
+                &[],
+                vec![
+                    view(
+                        6,
+                        vec![
+                            Node(
+                                7,
+                                NodeType::Image,
+                                &[(PropId::ImageSource, "https://example.test/a.png")],
+                                vec![],
+                            ),
+                            text(8, &[(PropId::Text, "AB")]),
+                        ],
+                    ),
+                    view(9, vec![]),
+                ],
+            ),
+            // 10: button(symbol badge) -> 11: filled box -> 12: symbol image
+            Node(
+                10,
+                NodeType::Pressable,
+                &[],
+                vec![view(
+                    11,
+                    vec![Node(
+                        12,
+                        NodeType::Image,
+                        &[(PropId::ImageSource, "symbol:person")],
+                        vec![],
+                    )],
+                )],
+            ),
+            // 13: ordinary symbol button (no filled box) -> 14: symbol image
+            Node(
+                13,
+                NodeType::Pressable,
+                &[],
+                vec![Node(
+                    14,
+                    NodeType::Image,
+                    &[(PropId::ImageSource, "symbol:more")],
+                    vec![],
+                )],
+            ),
+            // 15: unfilled box button (transparent background) -> 16: box -> 17: text "NO"
+            Node(
+                15,
+                NodeType::Pressable,
+                &[],
+                vec![view(16, vec![text(17, &[(PropId::Text, "NO")])])],
+            ),
+            // 18: two displayed children -> not a constrained badge
+            Node(
+                18,
+                NodeType::Pressable,
+                &[],
+                vec![view(19, vec![]), text(20, &[(PropId::Text, "Extra")])],
+            ),
+            // 21: filled box -> visibility:hidden wrapper -> hidden image + visible text
+            Node(
+                21,
+                NodeType::Pressable,
+                &[],
+                vec![view(
+                    22,
+                    vec![view(
+                        23,
+                        vec![
+                            Node(
+                                24,
+                                NodeType::Image,
+                                &[(PropId::ImageSource, "https://example.test/hidden.png")],
+                                vec![],
+                            ),
+                            text(25, &[(PropId::Text, "OK")]),
+                        ],
+                    )],
+                )],
+            ),
+        ],
+    ));
+    let mut filled = StyleProps::default();
+    filled
+        .set_dynamic(
+            StyleId::BackgroundColor,
+            &StyleValue::Text("#2563eb".into()),
+        )
+        .unwrap();
+    let mut hidden = StyleProps::default();
+    hidden
+        .set_dynamic(StyleId::Display, &StyleValue::Text("none".into()))
+        .unwrap();
+    let mut vis_hidden = StyleProps::default();
+    vis_hidden
+        .set_dynamic(StyleId::Visibility, &StyleValue::Text("hidden".into()))
+        .unwrap();
+    let mut vis_visible = StyleProps::default();
+    vis_visible
+        .set_dynamic(StyleId::Visibility, &StyleValue::Text("visible".into()))
+        .unwrap();
+    let mut styles = Vec::new();
+    for id in [3, 6, 11, 19, 22] {
+        styles.push(Op::SetStyle {
+            id,
+            patch: Box::new(filled.clone()),
+        });
+    }
+    styles.push(Op::SetStyle {
+        id: 9,
+        patch: Box::new(hidden),
+    });
+    styles.push(Op::SetStyle {
+        id: 23,
+        patch: Box::new(vis_hidden),
+    });
+    styles.push(Op::SetStyle {
+        id: 25,
+        patch: Box::new(vis_visible),
+    });
+    k.apply(0, 2, &styles).unwrap();
+
+    let b1 = k.header_badge(2).expect("filled box + initials");
+    assert_eq!(b1.box_node, 3);
+    assert_eq!(b1.picture, None);
+    assert_eq!(b1.symbol, None);
+    assert_eq!(b1.text, "CC");
+    assert_eq!(b1.ink_node, Some(4));
+
+    let b2 = k
+        .header_badge(5)
+        .expect("filled box + image + fallback text + hidden sibling");
+    assert_eq!(b2.box_node, 6);
+    assert_eq!(b2.picture, Some(7));
+    assert_eq!(b2.symbol, None);
+    assert_eq!(b2.text, "AB");
+    assert_eq!(b2.ink_node, Some(8));
+
+    let b3 = k.header_badge(10).expect("filled box + symbol");
+    assert_eq!(b3.box_node, 11);
+    assert_eq!(b3.picture, None);
+    assert_eq!(b3.symbol.as_deref(), Some("person"));
+    assert_eq!(b3.ink_node, Some(12));
+
+    let b4 = k
+        .header_badge(21)
+        .expect("inherited visibility:hidden skips image while keeping visible text");
+    assert_eq!(b4.picture, None);
+    assert_eq!(b4.text, "OK");
+    assert_eq!(b4.ink_node, Some(25));
+
+    assert_eq!(
+        k.header_badge(13),
+        None,
+        "plain symbol button is not a badge"
+    );
+    assert_eq!(k.header_badge(15), None, "unfilled box is not a badge");
+    assert_eq!(
+        k.header_badge(18),
+        None,
+        "button with two visible children is not a badge"
+    );
 }

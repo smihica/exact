@@ -4,19 +4,44 @@
 // permission while `prompt`, so the dialog is the launch's), each photo drawn
 // by its picture and copied when pressed; the last copy can be added back to
 // the library or made the image call's source. Show more reads again with a
-// larger limit; Older reads the next page, after the cursor the last answered.
-use photoLibraryStatus, photoAssets, copyPhotoAsset, addToPhotoLibrary, managePhotoSelection, PhotoLibraryStatus, PhotoAssetList, PhotoCopy, PhotoAdded from "@exact/photos"
+// larger limit; Older reads the next page, after the cursor the last answered;
+// Screenshots reads the screenshots alone (LLP 1133.019.000 D4) from the first
+// page; Changes shows what changed since a token; Import keeps the app's own
+// index of the library in step with it (LLP 1133.019.000 D1, `data/src/index.rs`).
+use photoLibraryStatus, photoAssets, photoChanges, copyPhotoAsset, addToPhotoLibrary, managePhotoSelection, PhotoLibraryStatus, PhotoAssetList, PhotoCopy, PhotoAdded, PhotoChanges from "@exact/photos"
 
 // The image call's record, or its failure, as JSON text.
 shape Edited
   record: string
+
+// The app's index of one view of the library after a sync: how many photos,
+// a digest of their ids, how the sync went (`walked`, `replaced`,
+// `interrupted` or `failed`), the module's pages it read, whether a walk
+// stopped short, the syncs begun since launch, and a failed read's code.
+shape PhotoIndex
+  count: number
+  digest: string
+  how: string
+  pages: number
+  more: bool
+  syncs: number
+  error: string
+
+// The same view listed whole, to compare the index with.
+shape PhotoListing
+  count: number
+  digest: string
+  error: string
 
 component Fixture
   resource status = photoLibraryStatus() as shape PhotoLibraryStatus else empty()
   state limit = 12
   state cursor = ""
   state page = 1
-  resource recent = photoAssets(limit=limit, cursor=cursor) as shape PhotoAssetList else empty()
+  state screenshots = false
+  state watching = false
+  state importing = false
+  resource recent = photoAssets(limit=limit, cursor=cursor, subtypes=(screenshots ? ["screenshot"] : [])) as shape PhotoAssetList else empty()
   mutation copied as shape PhotoCopy
   mutation added as shape PhotoAdded
   mutation managed as shape PhotoLibraryStatus
@@ -28,6 +53,14 @@ component Fixture
   action older(next: string)
     cursor = next
     page = page + 1
+  action watch
+    watching = true
+  action startImport
+    importing = true
+  action toggleScreenshots
+    screenshots = !screenshots
+    cursor = ""
+    page = 1
   action copy(id: string)
     send copied = copyPhotoAsset(asset=id)
   action addBack(path: string)
@@ -45,12 +78,24 @@ component Fixture
   view
     column gap=8 padding=16
       text `${status.state} ${status.access} ${status.addState}` testId="status"
+      text (match failure(recent) { case some(f) => f.code, case none => "" }) testId="recent-error"
       row gap=4 flex-wrap="wrap" testId="grid"
         for a, i in recent.assets key=a.id
           button press=copy(a.id) testId=`photo-${i + 1}` aria-label=`Photo ${i + 1}` padding=0
             image a.picture width=96 height=96 object-fit="cover" alt=`Photo ${i + 1}`
-      button press=more testId="more"
-        text "Show more"
+      row gap=8
+        button press=more testId="more"
+          text "Show more"
+        button press=toggleScreenshots testId="screenshots" aria-pressed=screenshots
+          text "Screenshots"
+        button press=watch testId="watch"
+          text "Changes"
+        button press=startImport testId="import"
+          text "Import"
+      if watching
+        Changes()
+      if importing
+        Importer(access=status.access)
       text `Page ${page}` testId="page"
       match recent.cursor
         case some(next)
@@ -88,3 +133,84 @@ component Fixture
           text e.record testId="edited"
         case none
           text "" testId="edited"
+
+// What changed since a token (LLP 1133.019.000), shown by testId for the
+// drives: the ids of each list, the flags, the error and the token. Advance
+// takes the answer's token; Since takes any text; Screenshots narrows the
+// view, its word given twice, as the module takes it once.
+component Changes
+  state since = ""
+  state limit = 500
+  state shots = false
+  resource changes = photoChanges(since=since, limit=limit, subtypes=(shots ? ["screenshot", "screenshot"] : [])) as shape PhotoChanges else empty()
+  action advance(next: string)
+    since = next
+  action setSince(value)
+    since = value
+  action pageOfOne
+    limit = 1
+  action onlyScreenshots
+    shots = true
+  view
+    column gap=4
+      text `${changes.added.map(a => a.id).join(",")}|${changes.updated.map(a => a.id).join(",")}|${changes.deleted.join(",")}|${changes.more} ${changes.expired}` testId="changes"
+      text (match failure(changes) { case some(f) => f.code, case none => "" }) testId="changes-error"
+      text changes.token testId="token"
+      row gap=8
+        button press=advance(changes.token) testId="advance"
+          text "Advance"
+        button press=pageOfOne testId="page-of-one"
+          text "One a page"
+        button press=onlyScreenshots testId="only-screenshots"
+          text "Screenshots"
+      input value=since input=setSince aria-label="Since" testId="since"
+
+// The app's index of the library: Sync mounts it, synced then and on each
+// announcement of the library's sources, beside a full list of the same view.
+// The options are set before Sync: the screenshots alone, walks of two
+// changes a page, and a budget of two pages, which stops a sync as a
+// relaunch would.
+component Importer
+  props
+    access: string
+  state screenshots = false
+  state limit = 500
+  state budget = 0
+  state syncing = false
+  action onlyScreenshots
+    screenshots = true
+  action pagesOfTwo
+    limit = 2
+  action twoPages
+    budget = 2
+  action sync
+    syncing = true
+  view
+    column gap=4
+      row gap=8 flex-wrap="wrap"
+        button press=onlyScreenshots testId="import-screenshots"
+          text "Screenshots"
+        button press=pagesOfTwo testId="import-pages-of-two"
+          text "Two a page"
+        button press=twoPages testId="import-two-pages"
+          text "Two pages"
+        button press=sync testId="sync"
+          text "Sync"
+      if syncing
+        Index(screenshots=screenshots, limit=limit, budget=budget, access=access)
+
+// The index after its last sync and the view listed whole, shown by testId.
+// A change of access supersedes the sync in flight (LLP 1133.019.000 D1).
+component Index
+  props
+    screenshots: bool
+    limit: number
+    budget: number
+    access: string
+  resource index = photoIndex(screenshots, limit, budget, access) as shape PhotoIndex else empty()
+  resource listing = photoListing(screenshots) as shape PhotoListing else empty()
+  view
+    column gap=4
+      text `${index.count}|${index.digest}|${index.how}|${index.pages}|${index.more}|${index.syncs}|${index.error}` testId="index"
+      text `${listing.count}|${listing.digest}|${listing.error}` testId="listing"
+      text (current(index) && current(listing) && index.error == "" && listing.error == "" && index.digest == listing.digest ? "in step" : "apart") testId="in-step"

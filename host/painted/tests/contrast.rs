@@ -141,6 +141,49 @@ fn contrast_changes_live_and_restores_both_schemes_without_replacing_literal_col
         assert_eq!(role(name, dark), color, "restore {name}, dark={dark}");
     }
     badges_keep_their_labels_in_contrast_themes(palette);
+    selected_field_text_follows_the_highlight_pair(palette);
+    a_pressed_segment_takes_none_of_the_highlight_pair(palette);
+}
+
+/// A segment's chosen member is the selected item, and a press on another
+/// gives it none of the highlight pair, as the web's sheet has it.
+fn a_pressed_segment_takes_none_of_the_highlight_pair(palette: ContrastPalette) {
+    let plan = contract::compile(
+        r##"component App
+  state unit = "km"
+  action pick(u: string)
+    unit = u
+  view
+    column width=300 height=100 padding=20
+      row role="radiogroup" aria-label="Units"
+        for u in ["km", "mi"] key=u
+          button role="radio" aria-checked=(unit == u) press=pick(u) testId=`u-${u}`
+            text u
+"##,
+    )
+    .unwrap();
+    let (mut p, error) = Presenter::boot_with(
+        &plan.encode(),
+        (),
+        (300., 100.),
+        1.,
+        Default::default(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.set_contrast_palette(Some(palette));
+    let unpressed = p.frame().data().to_vec();
+    let key = p.host().kernel().find_by_test_id("u-mi")[0];
+    let mi = p.host().kernel().node_by_key(key).unwrap().id;
+    let r = p.rect_of(mi).unwrap();
+    p.pointer_down(r.0 + 4., r.1 + r.3 / 2., 0.).unwrap();
+    p.clock(500.);
+    assert!(
+        p.frame().data() == unpressed,
+        "a pressed segment keeps its pair"
+    );
+    p.set_contrast_palette(None);
 }
 
 fn badges_keep_their_labels_in_contrast_themes(mut palette: ContrastPalette) {
@@ -226,4 +269,67 @@ component App
     p.set_contrast_palette(None);
     assert!(p.set_preferences(Default::default()).is_none());
     assert_eq!(p.frame().data(), before, "ordinary badges restored");
+}
+
+fn selected_field_text_follows_the_highlight_pair(mut palette: ContrastPalette) {
+    for readonly in [false, true] {
+        let source = format!(
+            r##"decoration red color="#ff0000"
+decoration blue color="#0000ff"
+component Fields
+  action mark
+    focus("editor")
+    setSelectionRange("editor", 0, 7)
+  view
+    column
+      textarea id="editor" testId="editor" value="MMMM\nMMMM" readonly={readonly} appearance="none" width=160 height=72 font-size=24 background-color="Canvas" color="CanvasText"
+        decorations=TextDecorations(value="MMMM\nMMMM",spans=[TextDecorationSpan(name="red",start=0,end=4),TextDecorationSpan(name="blue",start=5,end=9)])
+      button "Mark" testId="mark" press=mark
+"##
+        );
+        let plan = contract::compile(&source).unwrap();
+        let (mut p, error) = Presenter::boot_with(
+            &plan.encode(),
+            (),
+            (200., 120.),
+            1.,
+            Default::default(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let _ = p.frame();
+        let key = p.host().kernel().find_by_test_id("mark")[0];
+        let mark = p.host().kernel().node_by_key(key).unwrap().id;
+        p.tap(mark).unwrap();
+        p.run_commands(<()>::default);
+        let ordinary = p.frame().data().to_vec();
+        for (background, foreground) in [
+            ([255, 255, 0, 255], [0, 0, 0, 255]),
+            ([19, 35, 97, 255], [245, 237, 104, 255]),
+        ] {
+            palette.highlight = background;
+            palette.highlighted_text = foreground;
+            p.set_contrast_palette(Some(palette));
+            let frame = p.frame();
+            let count = |color: [u8; 4]| {
+                frame.data()[..72 * 200 * 4]
+                    .chunks_exact(4)
+                    .filter(|px| *px == color)
+                    .count()
+            };
+            assert!(
+                count(background) > 100,
+                "selection background, readonly={readonly}"
+            );
+            assert!(
+                count(foreground) > 5,
+                "selected glyphs, readonly={readonly}"
+            );
+            assert_eq!(count([255, 0, 0, 255]), 0, "entire red run selected");
+            assert!(count([0, 0, 255, 255]) > 5, "unselected part of blue run");
+        }
+        p.set_contrast_palette(None);
+        assert!(p.frame().data() == ordinary, "ordinary selection restored");
+    }
 }

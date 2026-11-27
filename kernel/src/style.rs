@@ -97,8 +97,7 @@ pub enum Dimension {
     /// Percent of the containing block (0–100) plus points: `calc(50% - 89px)`
     /// is `Calc(50.0, -89.0)`.
     Calc(f32, f32),
-    /// The viewport's safe-area inset at an edge, plus points (zero for a
-    /// bare `env()`).
+    /// The viewport's safe-area inset at an edge, plus points (zero for a bare `env()`).
     Env(Edge, f32),
     /// A layout region's inset at an edge plus points (LLP 1123 D10; [`env`]).
     Region(Region, Edge, f32),
@@ -113,8 +112,7 @@ pub enum Dimension {
     /// handle; resolved as `env()` is, or at layout against its basis when
     /// it holds a percentage ([`calc`]).
     Compare(Comparison),
-    /// A size keyword, on the rows that take it
-    /// (`StyleId::admits_size_keyword`).
+    /// A size keyword, on the rows that take it (`StyleId::admits_size_keyword`).
     Keyword(SizeKeyword),
 }
 
@@ -905,6 +903,8 @@ pub enum RowValue<'a> {
     ShapeOutside(&'a exact_textflow::ShapeOutside),
     /// CSS `aspect-ratio` as authored (LLP 1053 G1).
     AspectRatio(&'a crate::ratio::AspectRatio),
+    /// `-exact-safe-area-aspect-fit` (LLP 1123 D16).
+    AspectFit(&'a crate::ratio::AspectFit),
     /// Ordered invoker-popover flip attempts (LLP 1021 D2).
     PositionTryFallbacks(&'a crate::position_try::PositionTryFallbacks),
     /// `-exact-drag-timeline` (LLP 1057.003).
@@ -1004,18 +1004,18 @@ fn flex_wrap(v: FlexWrap) -> taffy::style::FlexWrap {
     }
 }
 
-// CSS `normal` (the initial value of all four rows below) lowers to `None`,
-// which is Taffy's `normal`: each algorithm resolves it for its display type
-// as CSS Box Alignment §5.1/§6.1 does. Flex: `justify-content` is
-// `flex-start`, `align-content` and `align-items` are `stretch`. Grid: auto
-// tracks stretch into the free space on both axes, and an item stretches
-// unless it has a definite size or an aspect ratio on that axis (then it
-// starts). Block: `align-content` is `start` without establishing an
-// independent formatting context, which every other value does.
+// CSS `normal` (the initial value of all four rows below) lowers to `NORMAL`:
+// each algorithm resolves it for its display type as CSS Box Alignment
+// §5.1/§6.1 does. Flex: `justify-content` is `flex-start`, `align-content`
+// and `align-items` are `stretch`. Grid: auto tracks stretch into the free
+// space on both axes, and an item stretches unless it has a definite size or
+// an aspect ratio on that axis (then it starts). Block: `align-content` is
+// `start` without establishing an independent formatting context, which every
+// other value does.
 
-fn justify_content(v: JustifyContent) -> Option<taffy::style::JustifyContent> {
-    Some(match v {
-        JustifyContent::Normal => return None,
+fn justify_content(v: JustifyContent) -> taffy::style::JustifyContent {
+    match v {
+        JustifyContent::Normal => taffy::style::JustifyContent::NORMAL,
         JustifyContent::Start => taffy::style::JustifyContent::START,
         JustifyContent::End => taffy::style::JustifyContent::END,
         JustifyContent::FlexStart => taffy::style::JustifyContent::FLEX_START,
@@ -1024,12 +1024,12 @@ fn justify_content(v: JustifyContent) -> Option<taffy::style::JustifyContent> {
         JustifyContent::SpaceBetween => taffy::style::JustifyContent::SPACE_BETWEEN,
         JustifyContent::SpaceAround => taffy::style::JustifyContent::SPACE_AROUND,
         JustifyContent::SpaceEvenly => taffy::style::JustifyContent::SPACE_EVENLY,
-    })
+    }
 }
 
-fn align_items(v: AlignItems) -> Option<taffy::style::AlignItems> {
-    Some(match v {
-        AlignItems::Normal => return None,
+fn align_items(v: AlignItems) -> taffy::style::AlignItems {
+    match v {
+        AlignItems::Normal => taffy::style::AlignItems::NORMAL,
         AlignItems::Start => taffy::style::AlignItems::START,
         AlignItems::End => taffy::style::AlignItems::END,
         AlignItems::SelfStart => taffy::style::AlignItems::SELF_START,
@@ -1039,13 +1039,13 @@ fn align_items(v: AlignItems) -> Option<taffy::style::AlignItems> {
         AlignItems::Center => taffy::style::AlignItems::CENTER,
         AlignItems::Baseline => taffy::style::AlignItems::BASELINE,
         AlignItems::Stretch => taffy::style::AlignItems::STRETCH,
-    })
+    }
 }
 
-fn justify_items(v: JustifyItems) -> Option<taffy::style::AlignItems> {
+fn justify_items(v: JustifyItems) -> taffy::style::AlignItems {
     use taffy::style::AlignItems as T;
-    Some(match v {
-        JustifyItems::Normal => return None,
+    match v {
+        JustifyItems::Normal => T::NORMAL,
         JustifyItems::Stretch => T::STRETCH,
         JustifyItems::Baseline => T::BASELINE,
         JustifyItems::Center | JustifyItems::UnsafeCenter => T::CENTER,
@@ -1066,7 +1066,7 @@ fn justify_items(v: JustifyItems) -> Option<taffy::style::AlignItems> {
         JustifyItems::SafeFlexEnd => T::SAFE_FLEX_END,
         JustifyItems::SafeLeft => T::SAFE_LEFT,
         JustifyItems::SafeRight => T::SAFE_RIGHT,
-    })
+    }
 }
 
 fn align_self(v: AlignSelf) -> Option<taffy::style::AlignSelf> {
@@ -1084,9 +1084,9 @@ fn align_self(v: AlignSelf) -> Option<taffy::style::AlignSelf> {
     }
 }
 
-fn align_content(v: AlignContent) -> Option<taffy::style::AlignContent> {
-    Some(match v {
-        AlignContent::Normal => return None,
+fn align_content(v: AlignContent) -> taffy::style::AlignContent {
+    match v {
+        AlignContent::Normal => taffy::style::AlignContent::NORMAL,
         AlignContent::Start => taffy::style::AlignContent::START,
         AlignContent::End => taffy::style::AlignContent::END,
         AlignContent::FlexStart => taffy::style::AlignContent::FLEX_START,
@@ -1096,7 +1096,7 @@ fn align_content(v: AlignContent) -> Option<taffy::style::AlignContent> {
         AlignContent::SpaceBetween => taffy::style::AlignContent::SPACE_BETWEEN,
         AlignContent::SpaceAround => taffy::style::AlignContent::SPACE_AROUND,
         AlignContent::SpaceEvenly => taffy::style::AlignContent::SPACE_EVENLY,
-    })
+    }
 }
 
 impl Overflow {
@@ -1228,21 +1228,21 @@ impl StyleProps {
             Display::None => taffy::style::Display::None,
             Display::Grid => taffy::style::Display::Grid,
         };
-        // Replaced pixels have ink overflow, never scrollable overflow (CSS
-        // Overflow §2.1). This also identifies images for grid intrinsic sizing.
         s.direction = match self.direction {
             Direction::Ltr => taffy::style::Direction::Ltr,
             Direction::Rtl => taffy::style::Direction::Rtl,
         };
+        // Replaced pixels and a form control's natural size are ink overflow, never scrollable
+        // overflow (CSS Overflow §2.1). The first also marks images for grid intrinsic sizing.
         s.item_is_replaced = node_type.is_replaced();
-        // A form control in a block container keeps its preferred width,
-        // where a `<div>` stretches: an `<input>`, `<textarea>` or `<select>`
-        // at `display: block`. Flex columns and grids still stretch it, and
-        // absolute insets still size it, as Chrome does. Taffy's block layout
-        // skips stretch for tables and replaced elements; a replaced element
-        // would also stop the insets, so these measured leaves take the
-        // table's exemption (nothing else follows from that marker).
-        s.item_is_table = matches!(node_type, NodeType::TextInput | NodeType::Control);
+        s.item_is_form_control = matches!(node_type, NodeType::TextInput | NodeType::Control);
+        // A form control in a block container keeps its preferred width, where a `<div>`
+        // stretches: an `<input>`, `<textarea>` or `<select>` at `display: block`. Flex columns
+        // and grids still stretch it, and absolute insets still size it, as Chrome does. Taffy's
+        // block layout skips stretch for tables and replaced elements; a replaced element would
+        // also stop the insets, so these measured leaves take the table's exemption (nothing
+        // else follows from that marker).
+        s.item_is_table = s.item_is_form_control;
         s.box_sizing = match self.box_sizing {
             BoxSizing::ContentBox => taffy::style::BoxSizing::ContentBox,
             BoxSizing::BorderBox => taffy::style::BoxSizing::BorderBox,
@@ -1342,24 +1342,25 @@ impl StyleProps {
     }
 }
 
-/// The engine style for a live slot, its `env()` lengths resolved against
-/// the arena's environment.
-pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
+pub use engine::taffy_style;
+
+pub(crate) fn style_in_block(
+    arena: &NodeArena,
+    slot: u32,
+    block: Option<crate::HostBlock>,
+) -> taffy::style::Style {
     let lowering = handles::Lowering::new();
     let style = arena.effective_style(slot);
     let env = crate::kernel::owner::env_for(arena, slot, &style);
     let mut s = style.to_taffy(arena.node_type(slot), &env);
     arena.alert_layout(slot, &mut s);
     arena.bar_symbol_layout(slot, &mut s);
-    // HTML's button layout, which Exact's reset of a `<button>` keeps: its
-    // automatic inline size is shrink-to-fit, and a block button's content
-    // sits in an anonymous flow-root box centred safely in the block axis,
-    // whatever `align-content` says (Chrome 154; LLP 1001 §1). A flex or
-    // grid button lays out as any flex or grid container.
+    // HTML buttons shrink to fit. A block button safely centres its anonymous
+    // flow-root on the block axis regardless of align-content (LLP 1001 §1).
     if arena.is_button(slot) {
         s.item_is_table = true;
         if s.display == taffy::Display::Block {
-            s.align_content = Some(taffy::style::AlignContent::SAFE_CENTER);
+            s.align_content = taffy::style::AlignContent::SAFE_CENTER;
         }
     }
     if let Some(height) = arena.neutral_tab_min_height(slot) {
@@ -1410,7 +1411,7 @@ pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
         s.rare.multicol = Some(multicol);
         // The flow thread starts at the content top: `align-content` moves
         // the columns, once they are cut (`fragment::cut`).
-        s.align_content = None;
+        s.align_content = taffy::style::AlignContent::NORMAL;
     }
     // A replaced element keeps its natural ratio under `aspect-ratio: auto`
     // (with or without a fallback ratio, or a degenerate one): CSS sizes an
@@ -1454,7 +1455,7 @@ pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
     crate::kernel::bar::lay_out(arena, slot, reserved, &mut s);
     crate::kernel::ignore::lay_out(arena, slot, &mut s);
     // @ref LLP 1115.002 D8.2 — the containing block a host gave the subtree.
-    crate::kernel::apply_block(arena, slot, &mut s);
+    crate::kernel::apply_block(arena, slot, block, &mut s);
     // @ref LLP 1074 T1 — a root is the containing block of every absolutely
     // positioned box no positioned ancestor holds, on every host: a static
     // root is `relative` (its insets apply, as on the web's root element).

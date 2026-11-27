@@ -2,9 +2,9 @@
 //! generated names over the one table, from the design's IR.
 
 use crate::scratch::Scratch;
+use crate::source::{boxed, NoData};
 use exact_kernel::{ColorValue, Kernel};
-use exact_plan::Value;
-use exact_runner::{DataError, DataSource, Place, Runner};
+use exact_runner::{Place, Runner};
 use std::path::Path;
 use std::process::Command;
 
@@ -15,14 +15,6 @@ use std::process::Command;
 mod golden;
 
 const DESIGN: &str = "forma shelf\n\naxes\n  dark-style = black | dim  under scheme=dark\n\ntheme\n  brand = #c8102e\n  surface.card = light-dark(#ffffff, #000000)\n    when dark-style=dim: light-dark(#ffffff, #161e27)\n  CanvasText = #101010\n";
-
-struct NoData;
-
-impl DataSource for NoData {
-    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
-        Err(DataError::UnknownSource(source.into()))
-    }
-}
 
 fn app(name: &str, design: &str, view: &str) -> Scratch {
     let dir = Scratch::new(format!("exact2-gen-{name}-{}", std::process::id()));
@@ -84,8 +76,8 @@ fn the_rust_constants_resolve_through_the_binding_core() {
     let plan = contract::compile_path(&dir.join("app.contract")).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let mut r = Runner::boot(
-        contract::bake(plan, NoData).unwrap(),
-        NoData,
+        contract::bake(plan, boxed(NoData)).unwrap(),
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -131,6 +123,15 @@ fn a_collision_after_mapping_is_refused() {
         !dir.join(".exact/forma/forma.ts").exists(),
         "nothing written"
     );
+    let path = dir.join("app.contract");
+    let (_, _, names) = contract::forma_gen::compile_path_swift(&path, true).unwrap();
+    assert!(
+        names.is_none(),
+        "a collision must fall back to the CLI diagnostic"
+    );
+    let (ok, said) = gen("swift", &dir);
+    assert!(!ok && said.contains("surfaceCard"), "{said}");
+    assert!(!dir.join(".exact/forma/forma.swift").exists());
     let _ = std::fs::remove_dir_all(&dir);
     let dir = app(
         "reserved",
@@ -183,8 +184,8 @@ fn roles_are_generated_as_they_resolve_and_read_outside_exact() {
     assert!(css.contains("--canvasText:#101010ff;"), "{css}");
     let plan = contract::compile_path(&dir.join("app.contract")).unwrap();
     let mut r = Runner::boot(
-        contract::bake(plan, NoData).unwrap(),
-        NoData,
+        contract::bake(plan, boxed(NoData)).unwrap(),
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -226,8 +227,8 @@ fn the_tints_override_resolves_to_the_role() {
     let plan = contract::compile_path(&dir.join("app.contract")).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let mut r = Runner::boot(
-        contract::bake(plan, NoData).unwrap(),
-        NoData,
+        contract::bake(plan, boxed(NoData)).unwrap(),
+        boxed(NoData),
         Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -312,32 +313,51 @@ fn contract_types_follows_exports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `gen swift` writes an `ExactFormaToken` member per colour token, a Swift
-/// keyword backquoted, for a native view's `ExactForma(view).color(_:)`.
 #[test]
 fn swift_names_each_token_as_a_member() {
     let dir = app(
         "swift",
-        "forma t\n\ntheme\n  surface.card = #ffffff\n  default = #000000\n",
+        "forma t\n\ntheme\n  surface.card = #ffffff\n  default = #000000\n  switch = 8px\n  precedencegroup = 4px\n",
         "component App\n  view\n    column\n",
     );
     let (ok, said) = gen("swift", &dir);
     assert!(ok, "{said}");
     let swift = std::fs::read_to_string(dir.join(".exact/forma/forma.swift")).unwrap();
+    let path = dir.join("app.contract");
+    for mapped in [true, false] {
+        let (plan, map, names) = contract::forma_gen::compile_path_swift(&path, mapped).unwrap();
+        let (ordinary, _) = contract::compile_path_all(&path, mapped).unwrap();
+        assert_eq!(ordinary.encode(), plan.encode());
+        assert_eq!(mapped, map.is_some());
+        assert_eq!(Some(swift.as_str()), names.as_deref());
+    }
     assert!(
         swift.contains("public extension ExactFormaToken {"),
         "{swift}"
     );
     assert!(
-        swift.contains(r#"    static let surfaceCard = ExactFormaToken("surface.card")"#),
+        swift.contains(r#"    static let `surfaceCard` = ExactFormaToken("surface.card")"#),
         "{swift}"
     );
-    assert!(
-        swift.contains(r#"    static let `default` = ExactFormaToken("default")"#),
-        "{swift}"
-    );
+    for name in ["default", "switch", "precedencegroup"] {
+        assert!(
+            swift.contains(&format!(
+                r#"    static let `{name}` = ExactFormaToken("{name}")"#
+            )),
+            "{swift}"
+        );
+    }
     let (ok, said) = gen("swift", &dir);
     assert!(ok && said.is_empty(), "unchanged, not written: {said}");
+    let design = dir.join("app.forma");
+    std::fs::write(&design, "forma t\n\ntheme\n  changed = #ffffff\n").unwrap();
+    let (_, _, names) = contract::forma_gen::compile_path_swift(&path, true).unwrap();
+    assert!(names.unwrap().contains("changed"));
+    std::fs::remove_file(&design).unwrap();
+    let (_, _, names) = contract::forma_gen::compile_path_swift(&path, true).unwrap();
+    assert!(names.is_none());
+    std::fs::write(&path, "invalid contract").unwrap();
+    assert!(contract::forma_gen::compile_path_swift(&path, true).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

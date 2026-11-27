@@ -37,6 +37,29 @@ and optionally `EXACT_AGENT_WINDOW_TAP` to a launch button's test ID.
 `EXACT_AGENT_WINDOW_UNPACED=1` removes pacing to measure rendering capacity.
 These switches require a bounded development run and are stripped in production.
 
+## Colour inputs
+
+A Contract surface argument `color("surface.board")` binds straight linear-sRGB
+(D65) RGBA. Read it with `exact_gpu::json::color(&inputs[0], "fill")?`. All four
+components are `f32`. RGB retains out-of-gamut and extended values. Alpha ranges
+from zero to one. Keep the `ColorTarget` passed to `Surface::color_target`.
+Use `target.fragment(rgba)` as a fragment shader's RGBA output with replacement
+blending, or `target.clear(rgba)` as a render pass's clear colour. Both account
+for the attachment's primaries, transfer and alpha mode, including the hardware
+encode on an sRGB view. You can cache either value in `bind`. A changed format,
+colour space or alpha mode delivers the new target and rebinds colour inputs.
+A private straight linear-sRGB working texture takes the original input directly.
+
+Leave `opaque()` false for transparency. If the target offers only opaque
+presentation, the helper writes the straight colour at full alpha. Use a
+transparent canvas over a token-painted view where the compositor supports it.
+
+To run the pixel test, create an app with `bun scripts/exact.mjs new target/board`
+and copy `gpu/tests/board/.` into `target/board/`. Use the
+[GPU module manifest](../docs/recipes/gpu-module.md) with the crate name `board-gpu`. From that app, run
+`bun exact.mjs test macos board.test.contract` or `bun exact.mjs test web board.test.contract`.
+The board also draws a half-alpha Display P3 swatch and a literal clear over white.
+
 ## Android initialization
 
 `dlopen` runs no `JNI_OnLoad`, so a module that calls into Java exports the
@@ -85,6 +108,22 @@ HDR keeps D12b's encoded extended-sRGB output, including values above 1.
 
 `apps/caltrain/gpu` is a complete GPU module; the
 [GPU module recipe](../docs/recipes/gpu-module.md) shows a minimal surface.
+
+## Asynchronous surface wakes
+
+A resting surface whose `render` returned `false` receives no further frames until inputs
+or host state change. To request a redraw from a background thread (or a timer/worker on
+the web), implement `Surface::set_waker(&mut self, waker: SurfaceWaker)` (called once at
+surface creation, before any other callback) and call `waker.wake()` after publishing the
+new state (LLP 1009 D12). Multiple wakes before the next render coalesce into one host
+notification; wakes raised during `render` re-arm the next frame; wakes after surface
+destruction or module unload are silent no-ops. Under a seekable agent clock, wakes stay
+latched and settle deterministically on the next clock advance instead of running wall-clock
+frames.
+
+Native hosts register their coalescing callback through the optional C ABI symbol
+`gpu_on_wake(Option<extern "C" fn()>)`, passing `None` before unload to clear and drain any
+in-flight wake. On the web, `SurfaceWaker::wake` notifies `globalThis.exact.gpu.wake()`.
 
 ## Dynamic buffer offsets
 
@@ -370,21 +409,29 @@ world's ticks. `gpu_max_fps(id)`
 (native) reports the cap, which the Apple host uses to lower its `CADisplayLink`'s
 preferred rate while nothing else on screen asks for more.
 
+A painted host mounts its canvas with `gpu_create_painted`. When the last
+complete picture still fits, `gpu_frame_dirty(id, now_ms)` lets the game tick
+input before drawing. Android uses `gpu_frame_pending(id)` to request a display
+callback while input waits for its fixed simulation tick.
+
 Before each frame `Surface::timing` receives a `FrameTiming`: the interval since
 the canvas's previous drawn frame (0 after a rest), the display period
 (`gpu_period`), the host's callback (`gpu_host_frame(raw_ms, callback_ms,
 fastest_period_ms, thermal)`: its own timestamp and when it began to run, on the
 frame clock, and the display's fastest period) and a `ThermalState` (0 unknown,
-1 nominal, 2 fair, 3 serious, 4 critical). Apple reports `ProcessInfo.thermalState`;
-the web, Android, Linux and Windows report unknown.
+1 nominal, 2 fair, 3 serious, 4 critical). Apple reports `ProcessInfo.thermalState`
+and Android reports `PowerManager`'s thermal status. For canvas performance,
+`NONE` is nominal, `LIGHT` fair, `MODERATE` and `SEVERE` serious, and `CRITICAL`
+through `SHUTDOWN` critical. The device package reports moderate throttling as
+`fair` in `powerState()` (LLP 1133.031 D3). The web, Linux and Windows report unknown.
 
 | host | rests | caps | timing |
 |---|---|---|---|
 | web | yes | `gpu_due` in the `requestAnimationFrame` loop | callback times; thermal unknown |
 | iOS, tvOS, macOS | yes | capped `CADisplayLink` range and `gpu_due` per canvas | callback times, fastest period, thermal state |
-| Android | yes | `gpu_due` per canvas; the cap asked of the platform: `Surface.setFrameRate` with `DEFAULT` compatibility for a canvas with a window of its own (Android 11 and later), `View.setRequestedFrameRate` for one drawn from its buffers in the reader's window (Android 15 and later) | `gpu_period`: Choreographer's vsync spacing (Android 13 and later), else the display's refresh |
-| Linux (display) | no: a rendered canvas repaints every display frame | no | `gpu_period`: the DRM mode's pixel clock over its total pixels |
-| Linux headless, Windows (readback and window frame) | no: a rendered canvas repaints every display frame | no | none |
+| Android | yes | `gpu_due` per canvas; the cap asked of the platform: `Surface.setFrameRate` with `DEFAULT` compatibility for a canvas with a window of its own (Android 11 and later), `View.setRequestedFrameRate` for one drawn from its buffers in the reader's window (Android 15 and later) | `gpu_period`: Choreographer's vsync spacing (Android 13 and later), else the display's refresh; callback times (Choreographer's frame time and when its callback began), the fastest mode's period at the current resolution, thermal state |
+| Linux (display) | the live canvas retains its picture between display frames | no | `gpu_period`: the DRM mode's pixel clock over its total pixels |
+| Linux headless, Windows (readback and window frame) | the live canvas retains its picture between display frames | no | none |
 
 Android canvas caps use an interactive-content vote: AOSP suppresses global touch boost when a
 `DEFAULT` vote is present and still favors refresh rates that are exact multiples of the requested rate.
@@ -433,7 +480,11 @@ a layer the system compositor takes as it is. Otherwise the canvas is composed
 into the window, so each frame it draws makes HWUI's RenderThread redraw the
 window: the reporter's full-window gallery cost 32 % of a CPU core there until
 it declared itself opaque. Return `true` when every pixel the surface writes
-has alpha one.
+has alpha one. A canvas that returns `false` is composed as premultiplied
+colour: the web's canvas as WebGPU's `premultiplied` alpha mode, Apple's
+`CAMetalLayer` non-opaque, Android's in the window, Linux's and Windows'
+readback drawn source-over. The module reads it before each frame's `render`,
+so return `false` from before the first frame that writes alpha below one.
 
 **The pipeline cache.** `exact_gpu::PipelineCache::new(device)` gives a renderer
 the cache Exact installs for its module's device. On Vulkan, pass its `handle` as the

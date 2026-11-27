@@ -14,12 +14,14 @@
 // then is told once it has. rt.js re-exports `ht`: only a plan that marks a
 // node bundles this.
 import { onEnd, journal, clock, viewId, inflight, painted, time, paint, drive } from "./rt.js";
+import { loadOnce } from '../web/load-once.js';
 
-let Page = null;
+const loads = {};
+
 const said = new Set(), warned = new Set();
 const say = line => journal.push(`t=${clock.now} hatch ${line}`);
 // (An app with no page module asks for no module artifact: its table is none, build.mjs `pageModule`.)
-const page = () => Page ??= painted().then(() => globalThis.exact?.pageModule === false ? null : import("./native.js").then(m => m.pageTable()));
+const page = () => loadOnce(loads, "Page", () => painted().then(() => globalThis.exact?.pageModule === false ? null : import("./native.js").then(m => m.pageTable())));
 // `state.hatches` (the agent), as Apple's: per word, its live nodes, and its
 // calls by moment. A row's calls after the first of each moment are counted,
 // not journaled, so a fling does not flood the journal.
@@ -261,7 +263,7 @@ function perfSite(site) {
 // task, so a hatch that keeps asking cannot starve the page. An act is in
 // flight (`clock settle` waits for it) from its asking until it has run.
 const Acts = [], INPUTS = new Set(["text", "search", "url", "tel", "password", "email", "number"]);
-const A = { bytes: 0, refused: 0, drains: 0, scheduled: false, tasks: false, port: null, composing: null };
+const A = { bytes: 0, refused: 0, drains: 0, scheduled: false, tasks: false, port: null, composing: null, watching: false };
 const refuse = (what, why) => { A.refused++; say(`${what}: ${why}`); };
 function ask(h, what, kind, text) {
   if (!h.isLive) return;
@@ -309,10 +311,14 @@ function run({ h, what, kind, text }) {
   e.dispatchEvent(new InputEvent("input", { inputType: "insertReplacementText", bubbles: true }));
   say(`${what}: input (${e.type === "password" ? "protected" : `${[...value].length} chars`}, delivery: hatch)`);
 }
-if (typeof document !== "undefined" && document.addEventListener) {
+// The field composing, which `input` refuses: watched from the entry's start by a page with a page module, the only
+// code a hatch's `input` is given to (build.mjs), so a composition begun before the first render is seen.
+export const watchComposing = () => {
+  if (A.watching || typeof document === "undefined" || !document.addEventListener) return;
+  A.watching = true;
   document.addEventListener("compositionstart", ev => { A.composing = ev.target; }, true);
   document.addEventListener("compositionend", () => { A.composing = null; }, true);
-}
+};
 
 // The frame clock (@ref LLP 1075.003.000.001 §2.4): logical time, for what
 // keeps step with the app. `exact.hatches.frames(frame => …)` is a ticket:

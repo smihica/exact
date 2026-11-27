@@ -61,7 +61,10 @@ use contract_syntax::{BinOp, Component, Expr, File, Span, TemplatePart, TypeExpr
 use exact_plan::Stdlib;
 use frame::Frame;
 use injects::check_injects;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// A closed type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +319,8 @@ pub struct Shapes {
     /// The native modules' sends that answer nothing, by program-unique
     /// name: a statement naming one sends it (LLP 1133.004 D5).
     pub effects: std::collections::BTreeSet<String>,
+    /// A candidate in an expanded component must be judged before substitution.
+    pub(crate) expanded_comparison: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Where `x.length` reads a record's field (`lists::LengthReads`).
     pub(crate) lengths: Arc<std::sync::Mutex<lists::LengthReads>>,
 }
@@ -327,32 +332,6 @@ impl Shapes {
         let ty = self.resolve_unbounded(t)?;
         self.bounded(&ty, t.span())?;
         Ok(ty)
-    }
-
-    fn resolve_unbounded(&self, t: &TypeExpr) -> Result<Ty, TypeError> {
-        Ok(match t {
-            TypeExpr::Enum(values, _) => Ty::Enum(values.clone()),
-            TypeExpr::Named(n, span) => match n.as_str() {
-                "number" => Ty::Number,
-                "string" => Ty::String,
-                "bool" => Ty::Bool,
-                "unit" => Ty::Unit,
-                other => {
-                    if self.map.contains_key(other) {
-                        Ty::Record(other.to_string())
-                    } else if other == "action" {
-                        // Bare `action` is an action prop of inferred arity
-                        // (LLP 1006 §2). Near-prefix names are ordinary
-                        // unknown types, never action typos accepted silently.
-                        Ty::Action(Vec::new())
-                    } else {
-                        return Err(self.unknown_type(other, *span));
-                    }
-                }
-            },
-            TypeExpr::Option(inner, _) => Ty::Option(Box::new(self.resolve_unbounded(inner)?)),
-            TypeExpr::List(inner, _) => Ty::List(Box::new(self.resolve_unbounded(inner)?)),
-        })
     }
 
     /// A field's position and borrowed type in a shape.
@@ -758,27 +737,7 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
         // `[]` is a `list<?>` as `none` is an `option<?>`: the other arm of a
         // `match` or `?:`, a declared `list<T>`, or a write into the state
         // it initializes fills the `?` through `unify`.
-        Expr::List(items, _) => {
-            let mut item = Ty::Unknown;
-            for (i, x) in items.iter().enumerate() {
-                let t = infer(x, scope, shapes)?;
-                held::value(&t, x, "a list")?;
-                item = match item.unify(&t) {
-                    Some(u) => u,
-                    None => {
-                        return err(
-                            "type-list-item",
-                            format!(
-                                "a list's items have one type: item {} is `{t}`, the items before it `{item}`",
-                                i + 1
-                            ),
-                            x.span(),
-                        )
-                    }
-                };
-            }
-            Ty::List(Box::new(item))
-        }
+        Expr::List(items, _) => lists::literal(items, |_, value| infer(value, scope, shapes))?,
         Expr::Some(inner, _) => {
             let t = infer(inner, scope, shapes)?;
             held::value(&t, inner, "`some(…)`")?;
@@ -787,7 +746,7 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
         Expr::NamedArg(_, _, span) => {
             return err(
                 "type-named-argument",
-                "named arguments go to a component use, a shape's call (`Row(title=…)`), `empty(…)`, `t(…)`, a canvas `surface=` binding and `share`, `scrollIntoView`, `saveFile` and the file pickers' `startIn=`; another call's arguments are positional",
+                "named arguments go to a component use, a shape's call (`Row(title=…)`), `empty(…)`, `t(…)`, a canvas `surface=` binding and `share`, `scrollIntoView`, `saveFile` and the file pickers' `startIn=` and `apple.message=`; another call's arguments are positional",
                 *span,
             )
         }
@@ -819,6 +778,9 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
                 other => {
                     // `xs.length`, `xs.map`: the web's properties and methods.
                     let fix = match field.as_str() {
+                        "error" | "data" if matches!(other, Ty::Option(_)) => {
+                            ": an `option` has no `error` or `data` field; for a mutation use `failure(m)` / `failed(m)`, and unwrap an `option` with `match x { case some(v) => ... case none => ... }`".to_owned()
+                        }
                         "length" | "map" | "filter" | "join" | "includes" | "startsWith"
                         | "endsWith" | "concat" | "slice" | "indexOf" | "split" | "count"
                         | "size" => {
@@ -981,8 +943,11 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
             }
         }
         Expr::Binary(op, a, b, span) => {
-            let ta = infer(a, scope, shapes)?;
-            let tb = infer(b, scope, shapes)?;
+            let (ta, tb) = if matches!(op, BinOp::Eq | BinOp::Ne) {
+                (enums::operand(a, b, scope, shapes)?, enums::operand(b, a, scope, shapes)?)
+            } else {
+                (infer(a, scope, shapes)?, infer(b, scope, shapes)?)
+            };
             // An operand still `?` (a derive not yet settled in the fixpoint)
             // defers the whole expression; the fixpoint retries it.
             if ta == Ty::Unknown || tb == Ty::Unknown {
@@ -1357,21 +1322,50 @@ fn check_with_sites(
         });
     }
     check_children(&called, &mut types, &mut sink);
+    let mut child_uses = Sink::default();
+    let mut refused_bindings = uses::check_child_uses(file, &types, &mut child_uses);
     // The root is checked against its inlined view, so a handler's real call
     // site (behind a child's prop) types the action's parameters.
     // The expanded root (LLP 1017 P4c): the inlined view plus every stateful
     // child's own declarations, lifted in — what lowering will lower.
     // A use that cannot be expanded is refused and left out; the rest of the
     // root is still checked, what it lacked reading as `?`.
-    let (mut expanded, refused) = contract_syntax::expand_checked(&called, capture_sites);
-    for e in refused {
-        sink.push(TypeError {
-            id: e.id,
-            message: e.message,
-            span: e.span,
-        });
+    if called.components.len() > 1 {
+        types.shapes.expanded_comparison = Some(Arc::default());
     }
-    let independent = check_root(file, &mut types, &expanded, &mut sink);
+    let mut before_expansion = sink.errors.len();
+    let (mut expanded, independent) = loop {
+        let (expanded, refused) =
+            contract_syntax::expand_checked(&called, capture_sites, &refused_bindings);
+        for e in refused {
+            sink.push(TypeError {
+                id: e.id,
+                message: e.message,
+                span: e.span,
+            });
+        }
+        for error in &child_uses.errors {
+            sink.push(error.clone());
+        }
+        let (independent, provider_errors) = check_root(
+            file,
+            &mut types,
+            &expanded,
+            &mut sink,
+            &mut refused_bindings,
+        );
+        if provider_errors.is_empty() {
+            break (expanded, independent);
+        }
+        // Provider types depend on expanded handlers. Once their scopes are
+        // known, replace a refused value only where a data inject reads it.
+        sink.errors.truncate(before_expansion);
+        for error in provider_errors {
+            sink.push(error);
+        }
+        before_expansion = sink.errors.len();
+    };
+    enums::check_authored_root(&called, &expanded, &mut types, &mut sink);
     persist::check(file, &types, &expanded, &mut sink);
     // What lowering lowers: each caller's names renamed apart from what its
     // callees read, after the checks spoke in the author's (LLP 1089 D7).
@@ -1416,27 +1410,26 @@ fn check_children(file: &File, types: &mut Types, sink: &mut Sink) {
         }
     }
     for c in file.components.iter().skip(1) {
-        let ct = component::check_component(c, types, None, &[], &[], sink);
+        let ct = component::check_component(c, types, None, &[], &[], &[], sink);
         types.components.push(ct);
     }
 }
 
-/// Check child uses before the expanded root; return the boundary between
-/// independent errors and errors substitution may have caused.
+/// Check the expanded root and return the boundary between independent
+/// errors and errors substitution may have caused, plus newly refused providers.
 fn check_root(
     file: &File,
     types: &mut Types,
     expanded: &contract_syntax::Expanded,
     sink: &mut Sink,
-) -> usize {
-    for (c, ct) in file.components.iter().zip(&types.components).skip(1) {
-        uses::check_uses(&c.view, &types.component_scope(c, ct), types, file, sink);
-    }
+    refused_bindings: &mut BTreeSet<Span>,
+) -> (usize, Vec<TypeError>) {
     for u in &expanded.owned_uses {
         if let Some(repeat) = u.repeat {
             sink.push(tasks::repeated_owner(file, u, repeat));
         }
     }
+    (tasks::starts_from_request(expanded).into_iter()).for_each(|e| sink.push(e));
     let independent = sink.errors.len();
     types.components[0] = component::check_component(
         &expanded.root,
@@ -1444,6 +1437,7 @@ fn check_root(
         Some(&expanded.owners),
         &expanded.resource_owners,
         &expanded.task_owners,
+        &[],
         sink,
     );
     // @ref LLP 1048.000 D2 — each route's `pages=` source, in the root's seam.
@@ -1455,17 +1449,29 @@ fn check_root(
     let scope = types.component_scope(&expanded.root, &types.components[0]);
     let root = &file.components[0];
     uses::check_uses(&root.view, &scope, types, file, sink);
-    for b in &root.provides {
-        sink.keep(infer(&b.expr, &scope, &types.shapes));
+    let invalid = check_injects(root, &scope, types, file, sink, refused_bindings);
+    (independent, invalid)
+}
+
+#[cfg(test)]
+mod d11_diagnostic_tests {
+    #[test]
+    fn option_error_and_data_fields_name_failure_and_match() {
+        for field in ["error", "data"] {
+            let src = format!(
+                "component App\n  state m: option<string> = none\n  view\n    text m.{field}\n"
+            );
+            let file = contract_syntax::parse(&src).unwrap();
+            let err = crate::check(&file, |_| false)
+                .err()
+                .expect("expected type error");
+            assert_eq!(err.id, "type-not-a-record", "{err:?}");
+            assert!(
+                err.message.contains("failure(m)") && err.message.contains("case some(v)"),
+                "{err:?}"
+            );
+        }
     }
-    sink.keep_unit(check_injects(
-        &root.view,
-        &root.provides,
-        &scope,
-        types,
-        file,
-    ));
-    independent
 }
 
 #[cfg(test)]

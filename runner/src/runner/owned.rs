@@ -30,7 +30,8 @@ use std::rc::{Rc, Weak};
 pub(super) struct OwnedRow {
     /// The plan's resource.
     pub(super) site: usize,
-    /// The instance's path, for the agent's `state` and the journal.
+    /// The instance's path, which finds its page's answer (`PageAnswers`)
+    /// and names it in the agent's `state` and the journal.
     pub(super) path: String,
     /// The instance's storage: gone once the render destroys the instance.
     storage: Weak<RefCell<vm::Owned>>,
@@ -49,7 +50,7 @@ pub(super) struct OwnedRow {
 pub(super) struct Want {
     /// Its `when` holds (true when it has none).
     pub(super) open: bool,
-    /// Its arguments.
+    /// Its arguments, read while open or to match a launch checkpoint.
     pub(super) args: Vec<Value>,
 }
 
@@ -105,7 +106,8 @@ impl<D: DataSource> Runner<D> {
     /// its instances' requests need.
     pub(super) fn boot_owned(&mut self, receipt: &mut CommitReceipt) -> Result<(), RunnerError> {
         self.owned_launch = true;
-        let asked = self.reconcile_owned();
+        let owners = self.tree.as_ref().expect("booted").owners();
+        let asked = self.reconcile_owned(&owners);
         self.owned_launch = false;
         // The first frame's launch asks are made: their marks go, as the
         // boot's own do (`boot_inner`), so a later forced ask is a refresh.
@@ -118,9 +120,10 @@ impl<D: DataSource> Runner<D> {
             }
         }
         if !asked? {
-            self.reconcile_tasks(&self.tree.as_ref().expect("booted").owners())?;
+            self.reconcile_tasks(&owners)?;
             return Ok(());
         }
+        drop(owners);
         let next = self.render_owned(true, |tree, u| tree.update(u))?;
         *receipt = merged(std::mem::take(receipt), next);
         Ok(())
@@ -131,13 +134,11 @@ impl<D: DataSource> Runner<D> {
     /// destroyed instances let go. When anything changed, settle it, and say
     /// so: the caller renders again. (A `refresh` is the commit's own
     /// settlement's, which settles every row.)
-    pub(super) fn reconcile_owned(&mut self) -> Result<bool, RunnerError> {
+    pub(super) fn reconcile_owned(
+        &mut self,
+        owners: &[crate::instance::OwnerInst],
+    ) -> Result<bool, RunnerError> {
         let requests = self.plan.resources.iter().any(|r| r.owner.is_some());
-        let tasks = self.plan.timers.iter().any(|t| t.owner.is_some());
-        if !requests && !tasks && !self.sends_live() {
-            return Ok(false);
-        }
-        let owners = self.tree.as_ref().map(Tree::owners).unwrap_or_default();
         // A destroyed instance's sends go with it (D6); nothing a live
         // instance shows reads them.
         if self.sends_live() {
@@ -149,18 +150,19 @@ impl<D: DataSource> Runner<D> {
         }
         let mut changed = false;
         let mut live = Vec::new();
-        for owner in &owners {
+        for owner in owners {
             let requests: Vec<(usize, Option<usize>)> = (owner.storage.borrow().requests)
                 .iter()
                 .map(|q| (q.resource as usize, q.row))
                 .collect();
             for (k, (site, row)) in requests.into_iter().enumerate() {
-                let want = self.owned_want(site, &owner.frames)?;
                 let mine = row.filter(|&r| {
                     self.owned_row(r).is_some_and(|o| {
                         !o.gone && std::ptr::eq(o.storage.as_ptr(), Rc::as_ptr(&owner.storage))
                     })
                 });
+                let page_path = mine.is_none().then_some(owner.path.as_str());
+                let want = self.owned_want(site, &owner.frames, page_path)?;
                 let r = match mine {
                     Some(r) => {
                         let o = self.resources[r].owned.as_mut().expect("owned");
@@ -171,8 +173,9 @@ impl<D: DataSource> Runner<D> {
                         let same = o.want.open == want.open
                             && crate::compare::unchanged_arguments(&o.want.args, &want.args);
                         if !same {
+                            // Dropping the launch arguments needs no settlement.
+                            changed |= o.want.open || want.open;
                             o.want = want;
-                            changed = true;
                         }
                         r
                     }
@@ -205,7 +208,12 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Resource `site`'s gate and arguments in an instance's `frames`.
-    fn owned_want(&self, site: usize, frames: &[Frame]) -> Result<Want, RunnerError> {
+    fn owned_want(
+        &self,
+        site: usize,
+        frames: &[Frame],
+        page_path: Option<&str>,
+    ) -> Result<Want, RunnerError> {
         let row = &self.plan.resources[site];
         let name = || self.plan.str(row.name).to_string();
         let open = match row.gate.iter().next() {
@@ -218,12 +226,34 @@ impl<D: DataSource> Runner<D> {
                 value == Value::Bool(true)
             }
         };
+        let page = self.resources[site].page_answers.as_deref();
+        if !open
+            && !page_path
+                .zip(page)
+                .is_some_and(|(path, page)| page.has_path(path))
+        {
+            return Ok(Want {
+                open,
+                args: Vec::new(),
+            });
+        }
         let mut args = Vec::with_capacity(row.args.len as usize);
         for (k, a) in row.args.iter().enumerate() {
             let code = self.plan.arg(a).expr;
-            let value = self
-                .eval(code, &[], frames)
-                .map_err(|e| e.evaluated(|| format!("resource {:?} argument {}", name(), k + 1)))?;
+            let value = match self.eval(code, &[], frames) {
+                Ok(value) => value,
+                // The checkpoint admits answers only at this row's arity.
+                // A trapping argument leaves it with no matching answer.
+                Err(_) if !open => {
+                    return Ok(Want {
+                        open,
+                        args: Vec::new(),
+                    });
+                }
+                Err(e) => {
+                    return Err(e.evaluated(|| format!("resource {:?} argument {}", name(), k + 1)));
+                }
+            };
             args.push(value);
         }
         Ok(Want { open, args })
@@ -350,7 +380,8 @@ impl<D: DataSource> Runner<D> {
             let Some(state) = row.state.as_ref().filter(|s| !s.placeholder) else {
                 continue;
             };
-            let skip = row.pending || row.entropy_reader || row.store_reader;
+            let (clock, entropy) = self.resource_ambient_taint(r);
+            let skip = row.pending || entropy || clock || row.store_reader;
             let id = exact_plan::ResourcesId(o.site as u32);
             if skip
                 || dated.get(o.site) == Some(&true)
@@ -378,7 +409,7 @@ impl<D: DataSource> Runner<D> {
 /// One commit's receipt for two renders, `a` then `b`: what a host reads
 /// of the commit as if it had been one batch. A node made by `a` and
 /// destroyed by `b` is in neither list.
-fn merged(mut a: CommitReceipt, b: CommitReceipt) -> CommitReceipt {
+pub(super) fn merged(mut a: CommitReceipt, b: CommitReceipt) -> CommitReceipt {
     use std::collections::BTreeSet;
     let gone: BTreeSet<_> = b.destroyed.iter().copied().collect();
     let made: BTreeSet<_> = a.created.iter().copied().collect();
@@ -394,6 +425,7 @@ fn merged(mut a: CommitReceipt, b: CommitReceipt) -> CommitReceipt {
     for (into, from) in [
         (&mut a.touched, b.touched),
         (&mut a.display_changed, b.display_changed),
+        (&mut a.reparented, b.reparented),
         (&mut a.timelines, b.timelines),
         (&mut a.renewed, b.renewed),
         (&mut a.revealed, b.revealed),
@@ -404,6 +436,7 @@ fn merged(mut a: CommitReceipt, b: CommitReceipt) -> CommitReceipt {
     }
     a.touched.retain(live);
     a.display_changed.retain(|k| !gone.contains(k));
+    a.reparented.retain(|k| !gone.contains(k));
     a.timelines.retain(|k| !gone.contains(k));
     a.renewed.retain(|k| !gone.contains(k));
     a.revealed.retain(|k| !gone.contains(k));

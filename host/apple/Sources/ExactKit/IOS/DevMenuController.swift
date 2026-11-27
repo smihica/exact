@@ -11,8 +11,11 @@ final class DevMenuController: UITableViewController {
         var unavailable: (title: String, message: String)? = nil
         /// Whether what the command shows is on screen: the row has a checkmark, and a tap hides it
         var checked = false
+        /// Whether the command runs as the row is tapped, not once the menu has gone: a revocation takes effect at once
+        var immediate = false
     }
     private(set) var groups: [[Command]] = []
+    private var titles: [String] = []
     /// The card above the menu can close itself, which unchecks its row
     private var cardObserver: NSObjectProtocol?
 
@@ -49,17 +52,15 @@ final class DevMenuController: UITableViewController {
         if WidgetGallery.available { project.append(Command(title: "Widgets…", symbol: "square.grid.2x2", action: WidgetGallery.show)) }
         #endif
         var diagnostics = [Self.frameHealth(DevMenu.session?.frameHealth, container: DevMenu.frameHealthContainer != nil)]
-        if TextDiagnostics.shared.recording {
-            diagnostics[0].unavailable = ("Text Recording Is Active", "Share or stop the text recording before showing Frame Health. The recording keeps the card hidden to avoid its drawing cost.")
-            diagnostics.append(Command(title: "Stop Text Diagnostics", symbol: "stop.circle", action: { TextDiagnostics.shared.finish() }))
-        } else {
-            diagnostics.append(Command(title: "Record Text Diagnostics (30 seconds)", symbol: "record.circle", action: { TextDiagnostics.shared.start() }))
-        }
-        if TextDiagnostics.shared.recording || TextDiagnostics.shared.saved != nil {
-            diagnostics.append(Command(title: "Share Text Diagnostics", symbol: "square.and.arrow.up.on.square", action: { TextDiagnostics.shared.share() }))
-        }
         if FrameSampler.measured { diagnostics.append(Command(title: "Save Trace", symbol: "square.and.arrow.up", action: DevMenu.saveTrace)) }
-        groups = [project, diagnostics, [Command(title: "Build Information", symbol: "info.circle", action: {})]]
+        groups = [project, diagnostics]
+        titles = ["Project", "Diagnostics"]
+        #if EXACT_ATTACH && os(iOS) && targetEnvironment(simulator)
+        let agent = AgentAttach.menuCommands() // LLP 1012.000 D1
+        if !agent.isEmpty { groups.append(agent); titles.append("Agent") }
+        #endif
+        groups.append([Command(title: "Build Information", symbol: "info.circle", action: {})])
+        titles.append("About")
         tableView.reloadData()
     }
 
@@ -76,7 +77,7 @@ final class DevMenuController: UITableViewController {
     override func numberOfSections(in tableView: UITableView) -> Int { groups.count }
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { groups[section].count }
     override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
-        ["Project", "Diagnostics", "About"][section]
+        titles[section]
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -92,24 +93,27 @@ final class DevMenuController: UITableViewController {
         cell.isUserInteractionEnabled = command.action != nil
         cell.accessibilityTraits = enabled ? (command.checked ? [.button, .selected] : [.button]) : [.button, .notEnabled]
         cell.accessibilityHint = command.unavailable == nil ? nil : "Explains why it is unavailable."
-        cell.accessoryType = indexPath.section == 2 ? .disclosureIndicator : command.checked ? .checkmark : .none
+        cell.accessoryType = isAbout(indexPath) ? .disclosureIndicator : command.checked ? .checkmark : .none
         cell.accessibilityIdentifier = "exact.host.dev-menu.\(command.symbol)"
         return cell
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        if indexPath.section == 2 {
+        if isAbout(indexPath) {
             navigationController?.pushViewController(BuildInformationController(), animated: true)
         } else if let unavailable = groups[indexPath.section][indexPath.row].unavailable {
             let alert = UIAlertController(title: unavailable.title, message: unavailable.message, preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             present(alert, animated: true)
         } else {
-            guard let action = groups[indexPath.section][indexPath.row].action else { return }
-            dismiss(animated: true, completion: action)
+            let command = groups[indexPath.section][indexPath.row]
+            guard let action = command.action else { return }
+            if command.immediate { action(); dismiss(animated: true) } else { dismiss(animated: true, completion: action) }
         }
     }
+
+    private func isAbout(_ indexPath: IndexPath) -> Bool { indexPath.section == groups.count - 1 }
 
     static func navigation() -> UINavigationController {
         let navigation = UINavigationController(rootViewController: DevMenuController())

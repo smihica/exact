@@ -72,6 +72,8 @@ mod timers;
 mod trapped;
 #[path = "type_descriptors.rs"]
 mod type_descriptors;
+#[path = "viewport.rs"]
+mod viewport;
 use regions::root_slot;
 pub use sites::{Site, Sites};
 use type_descriptors::type_code;
@@ -169,6 +171,8 @@ struct Em<'a> {
     zoom: bool,
     /// Whether a `video` or `audio` is in the plan (`media.js` is installed).
     media: bool,
+    /// Whether the plan says `portal`: its boxes carry `data-exact-view` for portal.js's D3 checks.
+    portals: bool,
     /// Whether a route declares its own entrance or exit (shared.js plays it).
     route_parts: bool,
     /// Whether an image draws a symbol (`symbols.js`), and whether a
@@ -217,6 +221,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     // Emitting parses the plan's CSS, and a plan decoded from a file has
     // not passed the compiler, which links every grammar.
     exact_kernel::style::link_all();
+    // @ref LLP 1013.002 §8 — placement comes to the JS target as its own piece.
     // A development build makes every token a property (LLP 1121 stage 4).
     let _every = crate::modes::every_for(plan, dev_reload);
     // And every overridden role its sheet's property (stage 5).
@@ -286,6 +291,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         follow: false,
         zoom: false,
         media: false,
+        portals: exact_runner::uses::portals(plan),
         route_parts: false,
         symbols: (false, false),
         heights: Default::default(),
@@ -465,7 +471,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     }
     em.out.clear();
     em.template_scope(true, |em| em.mount_node(sites.root, "$R", &top))?;
-    let view = std::mem::take(&mut em.out);
+    let view = crate::hoist::lift(&std::mem::take(&mut em.out), crate::hoist::MIN)?;
     if let Some(m) = &modes {
         body.push_str(&m.js(plan, &em.classes));
     }
@@ -502,6 +508,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         let owned = em.uses.rt("ownedTasks");
         let _ = write!(body, "{owned}();");
     }
+    viewport::fit(&mut em, sites.root as usize, &mut body);
     let mount = em.uses.rt("mount");
     let _ = write!(body, "{mount}($R=>{{{view}}});");
     // A plan whose actions read geometry fetches the page's reader after
@@ -581,20 +588,8 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
     }
     timers::timers(&mut em, &mut body)?;
     timers::sequences(&mut em, &mut body)?;
-    let viewport = em.parts[sites.root as usize].as_ref().and_then(|p| {
-        let fit = p.props.get("viewportFit");
-        let widget = p.props.get("interactiveWidget");
-        (fit.is_some() || widget.is_some()).then(|| {
-            let mut m = String::from("width=device-width, initial-scale=1");
-            if let Some(f) = fit {
-                let _ = write!(m, ", viewport-fit={f}");
-            }
-            if let Some(w) = widget {
-                let _ = write!(m, ", interactive-widget={w}");
-            }
-            m
-        })
-    });
+    let root = em.parts[sites.root as usize].as_ref();
+    let viewport = root.and_then(viewport::meta);
     // The sources' parameter types, then `|` and the answer's type, for a
     // data module that needs values encoded by type (records and lists are
     // both arrays here).
@@ -737,11 +732,12 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         [
             (!commands.is_empty(), commands_import.as_str()),
             (paint, "import{paintUse as $paint}from\"./paint.js\";"),
-            (em.list, "import{vl as $vl}from\"./list.js\";"),
+            (em.list, "import{vl as $vl,load as $loadLists}from\"./list.js\";"),
             (each::readers(plan), "import{reader as $reader}from\"./store-reader.js\";"),
             (em.follow, "import\"./follow.js\";"),
             (em.zoom, "import{zoom as $zoom}from\"./zoom.js\";"),
             (em.media, "import{mediaUse as $media}from\"./media.js\";"),
+            (em.portals, "import{portal as $portal}from\"./portal.js\";"),
             (links, "import{linkUse as $links}from\"./links.js\";"),
             (iframes, "import\"./iframes.js\";"),
             (lists, "import\"./list-items.js\";"),
@@ -773,6 +769,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         js
     };
     let mut css = fonts.css.clone();
+    surfaces::color_observer_css(&mut css, plan);
     // @ref LLP 1095 D4 — the theme's reach into the host's own sheet.
     css.push_str(&(exact_kernel::style::roles::theme_css() + &crate::base_scale::css(plan)));
     css.push_str("#exact-root#exact-root{");
@@ -889,19 +886,8 @@ impl Em<'_> {
             return Ok(None);
         }
         let parts = self.parts[i as usize].clone().ok_or("no parts")?;
-        let mut virtualized = false;
-        for b in row.bindings.iter().map(|b| plan.binding(b)) {
-            if b.kind == BindingKind::Prop && b.id == PropId::Virtualized as u16 {
-                match style::literal(plan, plan.code(b.expr)) {
-                    Some(Value::Bool(v)) => virtualized = v,
-                    _ => {
-                        return Err(format!(
-                            "node {i}: a dynamic `virtualized` is not in the JS target"
-                        ))
-                    }
-                }
-            }
-        }
+        let mut filter_input = false;
+        let virtualized = self.virtualized(i)?;
         let element = if parts.tag == "canvas" {
             "div"
         } else {
@@ -915,6 +901,10 @@ impl Em<'_> {
             self.symbols.1 |= bound;
         }
         let (mut attrs, content, extra) = rows::attributes(element, &parts.props);
+        attrs.retain(|(k, _)| k != "data-portal");
+        if self.portals && matches!(node_type, NodeType::View | NodeType::SvgForeignObject) {
+            attrs.push(("data-exact-view".into(), String::new()));
+        }
         crate::symbols::path_in_source(&mut attrs);
         if element == "img" && exact_runner::rows::repeated(plan, exact_plan::NodesId(i)) {
             attrs.push(("loading".into(), "lazy".into()));
@@ -959,11 +949,7 @@ impl Em<'_> {
             let _ = write!(self.out, "{press}();");
         }
         self.clocks_in(&presence);
-        // A fitted text (LLP 1116.001 D1.4): the runtime scales it after each tree update.
-        if presence.contains("--exact-fit:") {
-            let fit = self.uses.rt("fitTexts");
-            let _ = write!(self.out, "{fit}();");
-        }
+        self.after_updates_in(&presence);
         if element == "a" {
             attrs.push(("data-view".into(), String::new()));
         }
@@ -1011,9 +997,8 @@ impl Em<'_> {
         {
             attrs.push(("tabindex".into(), "0".into()));
         }
-        // A `symbol`'s content is drawn as `use`'s clones, which Chrome
-        // styles from their own attributes, not the page's class rules: its
-        // static rows go inline too (the live host writes every row inline).
+        // A `symbol`'s content is drawn as `use`'s clones, which Chrome styles from their own attributes, not the page's
+        // class rules: its static rows go inline too (the live host writes every row inline).
         if !css.is_empty() && self.in_symbol(i) {
             attrs.push(("style".into(), format!("{css}{presence}")));
         } else if !presence.is_empty() {
@@ -1022,6 +1007,7 @@ impl Em<'_> {
         if parts.tag == "canvas" {
             attrs.extend(style::canvas_bitmap(plan, row)?);
         }
+        attrs.extend(crate::safe_area::attribute(&parts.css)); // LLP 1123 D17
         let class = if css.is_empty() {
             "0".to_string()
         } else {
@@ -1162,12 +1148,17 @@ impl Em<'_> {
             if self.named_record(i, &b, &e, scope)? {
                 continue;
             }
+            // @ref LLP 1013.002 D6 — placement is portal.js's, after each flush.
+            if b.kind == BindingKind::Prop && b.id == PropId::Portal as u16 {
+                let f = self.bound(i, &e, &b, scope)?;
+                let _ = write!(self.out, "$portal({e},{f});");
+                continue;
+            }
             // tvOS's focus guide has no DOM property, whether literal or bound.
             if b.kind == BindingKind::Prop && b.id == PropId::FocusGuide as u16 {
                 continue;
             }
-            // Nor have the system bars (LLP 1105 D7), interactive glass,
-            // a menu's order or a tip (LLP 1035.006.000 D4).
+            // Nor have the system bars (LLP 1105 D7), UIKit's glass and menu props or a tip (LLP 1035.006.000 D4).
             // A zoomable scroller's zoom is zoom.js's; no other scroller has one.
             if b.kind == BindingKind::Prop && b.id == PropId::ScrollZoom as u16 {
                 if zoomable {
@@ -1180,11 +1171,17 @@ impl Em<'_> {
                 continue;
             }
             if b.kind == BindingKind::Prop
-                && (b.id == PropId::StatusBarStyle as u16
+                && (b.id == PropId::AppleMagnification as u16
+                    || b.id == PropId::AppleAllowsMagnification as u16
+                    || b.id == PropId::AppleAllowsBackForwardNavigationGestures as u16
+                    || b.id == PropId::AppleInactiveSchedulingPolicy as u16
+                    || b.id == PropId::StatusBarStyle as u16
                     || b.id == PropId::StatusBarAnimation as u16
                     || b.id == PropId::SystemBarsHidden as u16
                     || b.id == PropId::GlassInteractive as u16
                     || b.id == PropId::MenuOrder as u16
+                    || b.id == PropId::KeepsMenuPresented as u16
+                    || b.id == PropId::Arrangement as u16
                     || b.id == PropId::Tip as u16
                     || b.id == PropId::TipMessage as u16
                     || b.id == PropId::TipImage as u16
@@ -1199,15 +1196,11 @@ impl Em<'_> {
                     self.markdown(i, &e, &format!("()=>{source}"), plan.code(b.expr));
                 }
                 // Refused SVG literals still run their binding to journal the refusal.
-                let svg_animation = node_type.is_svg_element()
-                    && b.kind == BindingKind::Style
-                    && matches!(
-                        exact_kernel::StyleId::from_bit(b.id as u32),
-                        Some(
-                            exact_kernel::StyleId::Animation | exact_kernel::StyleId::ExitAnimation
-                        )
-                    );
+                let svg_animation = self.needs_svg_animation_guard(node_type, b.kind, b.id);
                 if !svg_animation
+                    && !(b.kind == BindingKind::Prop
+                        && b.id == PropId::AccessibilityKeyShortcuts as u16
+                        && v.as_str().is_some_and(exact_plan::shortcut::portable))
                     && (b.kind != BindingKind::Prop
                         || !exact_runner::bridge::prop_value(b.id, &v)
                             .is_err_and(|e| crate::svg_lengths::refused(&e)))
@@ -1218,7 +1211,7 @@ impl Em<'_> {
             let at = self.out.len();
             let f = if let Some((_, read)) = heading.iter().flatten().find(|(index, _)| *index == k)
             {
-                self.status_read(i, &e, &b, read.clone())
+                self.status_read(i, &e, &b, scope, read.clone())
             } else {
                 let f = self
                     .bound(i, &e, &b, scope)
@@ -1230,13 +1223,19 @@ impl Em<'_> {
                 BindingKind::Prop if markdown && b.id == PropId::Text as u16 => {
                     self.markdown(i, &e, &f, plan.code(b.expr))
                 }
+                BindingKind::Prop if b.id == PropId::Value as u16 && input::text_field(&parts) => {
+                    filter_input = self.field_value(i, b.expr, &e, &f);
+                }
                 BindingKind::Prop if b.id == PropId::Dataset as u16 => self.dataset(&e, &f),
+                BindingKind::Prop if self.canvas_setting(&b, &e, &f) => {}
                 BindingKind::Prop => {
                     let prop = PropId::from_wire(b.id).ok_or("unknown prop")?;
                     let name = style::prop_name(node_type, prop)?;
                     // The plan stores editable; HTML exposes the inverse, readonly.
                     // `glassGroup`'s reserved `-1` is `auto` (LLP 1053.000.000.000 D3).
-                    let f = if prop == PropId::Editable {
+                    let f = if prop == PropId::AccessibilityKeyShortcuts {
+                        format!("()=>{}(({f})())", self.uses.rt("resolveShortcuts"))
+                    } else if prop == PropId::Editable {
                         format!("()=>{{const v=({f})();return v==null?v:!v}}")
                     } else if prop == PropId::GlassGroup {
                         format!("()=>{{const v=({f})();return v===-1?\"auto\":v}}")
@@ -1277,7 +1276,6 @@ impl Em<'_> {
             self.lower(&e, &class, &parts, scope, seen)?;
         }
         self.motion_node(i, &e, scope)?;
-        self.height_owner(i, &e, scope)?;
         if self.reorder_handle(i) {
             self.motion = true;
             let on = self.uses.rt("onReorder");
@@ -1297,6 +1295,9 @@ impl Em<'_> {
                     self.out,
                     "{on}({e},\"message\",{ve}({name},[{types}],a_{a}),{message});"
                 );
+                continue;
+            }
+            if matches!(h.event, EventKind::Pinch | EventKind::Pinchrelease) {
                 continue;
             }
             let mut args = Vec::new();
@@ -1333,7 +1334,7 @@ impl Em<'_> {
                 | EventKind::Contextmenu
                 | EventKind::Dblclick
                 | EventKind::Pointerdown
-                | EventKind::Pointerup
+                | EventKind::Pointercancel | EventKind::Pointerup
                 | EventKind::Pointermove
                 | EventKind::Copy
                 | EventKind::Cut
@@ -1393,7 +1394,7 @@ impl Em<'_> {
                 | EventKind::Capture // and the runtime refusing a capture (`onFrameCapture`)
                 | EventKind::Userpromptopened // @ref LLP 1020.002 D9: the browser's own dialogs
                 | EventKind::Historyswipe // @ref LLP 1115.000 D5.5: the browser shows its own arrow
-                | EventKind::Select => {}
+                | EventKind::Swipe | EventKind::Select => {} // @ref LLP 1057.001 §8.1 (swipe)
                 // The motion piece's: the swipe's holds, a pan's velocity.
                 EventKind::Swiperight
                 | EventKind::Swipeleft
@@ -1404,6 +1405,11 @@ impl Em<'_> {
                 EventKind::Reachstart | EventKind::Reachend if virtualized => {}
                 EventKind::Reachstart | EventKind::Reachend => {
                     return Err(contract::collection_edge_refusal(h.event.name()))
+                }
+                EventKind::Reorderdrop if !virtualized => {
+                    self.list = true;
+                    self.motion = true;
+                    self.out.push_str("$loadLists();");
                 }
                 EventKind::Reorderdrop | EventKind::Reordertargetchange if virtualized => {
                     self.motion = true
@@ -1419,9 +1425,7 @@ impl Em<'_> {
             if self.row_actions.contains(&(h.action.0 as usize)) {
                 args.insert(0, scope.rows.clone().unwrap_or_else(|| "{}".into()));
             }
-            // Its arguments are evaluated in the action's commit (`.t`): one
-            // that traps refuses it, as the runner's handler evaluation does
-            // (LLP 1090 D1).
+            // Evaluated in the action's commit (`.t`) so a trap refuses it (LLP 1090 D1).
             let action = scope.operand(format!("a_{}", h.action.0));
             let handler = if args.is_empty() {
                 action
@@ -1447,6 +1451,11 @@ impl Em<'_> {
             }
             // The event family's binder (rt.js), imported only where a plan binds it.
             let bind = crate::events::binder(h.event).map(|b| format!(",{}", self.uses.rt(b)));
+            let handler = if filter_input && h.event == EventKind::Input {
+                format!("{}({e},{handler})", self.uses.rt("filterInput"))
+            } else {
+                handler
+            };
             let (bind, name) = (bind.unwrap_or_default(), h.event.name());
             let _ = write!(self.out, "{on}({e},\"{name}\",{handler}{bind});");
         }
@@ -1458,14 +1467,21 @@ impl Em<'_> {
             let _ = write!(self.out, "{tp}({e},{e}=>{{");
         }
         let mut slot = None;
-        self.template_scope(status_owner || (panel && self.dev_reload), |em| {
-            if virtualized {
-                em.collection_children(i, &e, scope, &edges)
-            } else {
-                slot = em.mount_children(i, &parent_of_children, scope, !status_owner)?;
-                Ok(())
-            }
-        })?;
+        self.status_scope(
+            i,
+            &e,
+            status_owner,
+            panel && self.dev_reload,
+            scope,
+            |em, sc| {
+                if virtualized {
+                    em.collection_children(i, &e, sc, &edges)
+                } else {
+                    slot = em.mount_children(i, &parent_of_children, sc, !status_owner)?;
+                    Ok(())
+                }
+            },
+        )?;
         self.live_time(i, element, &e, scope)?;
         if panel {
             self.out.push_str("});");
@@ -1474,8 +1490,11 @@ impl Em<'_> {
     }
 }
 
-/// A drag's `url` or `files`: bound even when constant, for `drag.js`'s hooks
-/// to admit as the runner does on other hosts (LLP 1094.000 D1, D2).
+/// A drag's `url`, `files` or files and names: bound even when constant, for
+/// `drag.js`'s hooks to admit as the runner does on other hosts (LLP 1094.000
+/// D1, D2, D14).
 pub fn admitted_on_the_page(id: u16) -> bool {
-    id == PropId::DataTransferUrl as u16 || id == PropId::DataTransferFiles as u16
+    id == PropId::DataTransferUrl as u16
+        || id == PropId::DataTransferFiles as u16
+        || id == PropId::DataTransferEntries as u16
 }

@@ -79,13 +79,24 @@ impl<D: DataSource> Presenter<D> {
         #[cfg(windows)]
         let preserves_picture = preserves_picture
             || (self.surfaces.direct_window.is_some() && target != FrameTarget::Window);
+        if self.carries_press(target) {
+            self.host.release_quick_presses();
+        }
         // Its session's roles, whatever else lives on the thread (LLP 1121 stage 5).
         let _roles = self.host.runner().bind_roles();
         let frame = crate::text::cache::deferring_eviction(|| {
             // The probe draws nothing, so the canvases' tick stays with the frame's own paint.
-            if self.focus_reveal.is_some() || !self.host.flights.reveal.is_empty() {
+            let resnap = self.snap_probe_needed();
+            if resnap || self.focus_reveal.is_some() || !self.host.flights.reveal.is_empty() {
                 self.paint_frame(FrameTarget::Geometry, false, true);
                 if self.last_frame_succeeded {
+                    if resnap {
+                        #[cfg(test)]
+                        {
+                            self.snap_layout.probe_paints += 1;
+                        }
+                        self.resnap_before_paint();
+                    }
                     self.reveal_before_paint();
                 }
             }
@@ -93,6 +104,7 @@ impl<D: DataSource> Presenter<D> {
             if !self.last_frame_succeeded {
                 return frame;
             }
+            self.remember_snap_layout();
             let immediate = !self.display.submitting();
             let scrollbar_hover = immediate && self.scrollbars_shown();
             // Layout can move a caret, a fragment target (LLP 1153 D5),
@@ -125,6 +137,11 @@ impl<D: DataSource> Presenter<D> {
             self.picture_dirty |= had_damage;
         } else if self.last_frame_succeeded {
             self.picture_dirty = false;
+            // A picture no display reports is shown when painted.
+            if !self.presents {
+                let painted = self.host.painted_press_generation();
+                self.dirty |= self.host.presses_presented(painted);
+            }
         }
         frame
     }
@@ -132,6 +149,15 @@ impl<D: DataSource> Presenter<D> {
     pub fn last_frame_succeeded(&self) -> bool {
         self.last_frame_succeeded
     }
+    /// Whether a frame painted for `target` is a picture a person sees, so
+    /// that it shows a press (LLP 1061 D7 "Timing" item 3): a display's
+    /// submission or a window's frame, or any frame where no display reports
+    /// its presents. A capture or a geometry query is not one.
+    fn carries_press(&self, target: FrameTarget) -> bool {
+        target != FrameTarget::Geometry
+            && (!self.presents || self.display.submitting() || target == FrameTarget::Window)
+    }
+
     fn paint_frame(
         &mut self,
         target: FrameTarget,
@@ -156,6 +182,9 @@ impl<D: DataSource> Presenter<D> {
                 previous,
                 self.brush.window_canvas,
             );
+            if self.surfaces.has_rendered_canvas() {
+                self.brush.placements = self.surfaces.placements(&self.host, false);
+            }
         }
         // The hatches' overlays as published (LLP 1075.003.000.001 §2.2.1):
         // read here, at the start of the paint; the walk calls no hatch.
@@ -196,16 +225,17 @@ impl<D: DataSource> Presenter<D> {
             BTreeMap::new()
         };
         let model_scroll = deferred.then(|| self.collection_paint_scroll()).flatten();
-        // Keep logical scroll offsets clamped; rubber-banding only moves the painted content.
-        let visual_scroll = self.kiosk_overscroll.map(|(id, dy)| {
-            let mut offsets = model_scroll.as_ref().unwrap_or(&self.scroll).clone();
-            offsets.entry(id).or_default().1 += dy;
-            offsets
-        });
-        let painted_scroll = visual_scroll
+        let displaced = self.displaced_scroll(model_scroll.as_ref().unwrap_or(&self.scroll));
+        let painted_scroll = displaced
             .as_ref()
             .or(model_scroll.as_ref())
             .unwrap_or(&self.scroll);
+        // Keep logical scroll offsets clamped; rubber-banding only moves the painted content.
+        let visual_scroll = self.kiosk_overscroll.map(|(id, dy)| {
+            let mut offsets = painted_scroll.clone();
+            offsets.entry(id).or_default().1 += dy;
+            offsets
+        });
         self.brush.flow_damage(
             &self.host,
             &self.boxes,
@@ -218,6 +248,9 @@ impl<D: DataSource> Presenter<D> {
         // Display submission temporarily takes the boxes that place the menu.
         let menu = self.menu_paint().or_else(|| self.display.menu.clone());
         let selection = self.focus.map(|id| self.field_selection(id));
+        let press_generation = self
+            .carries_press(target)
+            .then(|| self.host.press_generation());
         let host = &self.host;
         let presented = |id: ViewId| host.presented(id);
         let page = if deferred {
@@ -233,9 +266,11 @@ impl<D: DataSource> Presenter<D> {
             },
             roots: &roots,
             presented: &presented,
+            scaled_presented: host.scaled_presented(),
             paths: &|id| host.presented_path(id),
             filters: &|id| host.presented_filter(id),
-            scroll: painted_scroll,
+            clips: &|id| host.presented_clip(id),
+            scroll: visual_scroll.as_ref().unwrap_or(painted_scroll),
             page,
             images: &self.images.bitmaps,
             focus: self.focus,
@@ -389,6 +424,9 @@ impl<D: DataSource> Presenter<D> {
                 .is_some_and(|r| r.publication_painted())
         {
             self.queue_collections();
+        }
+        if let Some(generation) = press_generation.filter(|_| self.last_frame_succeeded) {
+            self.host.press_painted(generation);
         }
         self.dirty = self.collection.pending();
         if self.last_frame_succeeded {

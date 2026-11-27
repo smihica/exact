@@ -1,7 +1,7 @@
 //! Whole-set grant admission, sharing ibex2's pure grammar.
 //! @ref LLP 1016 D6 / LLP 1018 D3. Presenter and device grants remain
 //! with their owning executors, exactly as `io_grants` treats them.
-pub use exact_grants::{is_service_type, DEVELOPMENT, LOCAL_NETWORK};
+pub use exact_grants::{is_loopback, is_service_type, DEVELOPMENT, LOCAL_NETWORK, LOOPBACK};
 
 /// A grant spec that parsed: its lines, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,9 +84,10 @@ pub struct GrantLinks {
     /// Whether an `fs.read` or `fs.write` line admits a path:
     /// [`crate::save_file::covered`].
     pub covers: fn(&str, &str, &str) -> bool,
-    /// Why data code may not call a child process's operation from an
-    /// origin (LLP 1133.007 D13); `process.spawn` lines link I/O.
-    pub process: fn(&str, crate::CallOrigin) -> Result<(), String>,
+    /// Whether a child process's operation is held to the app's origin
+    /// (LLP 1133.007 D13), or why data code may not call it from any;
+    /// `process.spawn` lines link I/O.
+    pub process: fn(&str) -> Result<bool, String>,
 }
 
 /// The I/O grant grammar.
@@ -95,7 +96,7 @@ pub const LINKED: GrantLinks = GrantLinks {
     admitting,
     session_admits,
     covers: crate::save_file::covered,
-    process: crate::runner::process_refusal,
+    process: crate::runner::process_held,
 };
 
 /// Read one I/O grant line.
@@ -104,13 +105,29 @@ pub fn validate(line: &str) -> Result<(), String> {
 }
 
 /// Whether `grant`, the origin an `auth.session` line names, admits a
-/// sign-in page at `origin`, as a `net.fetch` line of it would admit a fetch.
+/// sign-in page at `origin`, as an exact-origin or subdomain `net.fetch` line
+/// would admit a fetch. Non-origin targets (`self`, `loopback`, `local-network`,
+/// scheme-wide) are refused (LLP 1016 D6).
 pub fn session_admits(grant: &str, origin: &str) -> bool {
+    use exact_grants::{Grant, GrantSet, Operation};
+    if !crate::auth::is_session_grant_origin(grant) {
+        return false;
+    }
     let Ok(origin) = exact_grants::origin_of(origin) else {
         return false;
     };
-    exact_grants::GrantSet::parse(&format!("net.fetch {grant}"))
-        .is_ok_and(|set| set.permits(&exact_grants::Operation::Fetch { origin }))
+    let Ok(set) = GrantSet::parse(&format!("net.fetch {grant}")) else {
+        return false;
+    };
+    !set.is_empty()
+        && set.iter().all(|g| {
+            matches!(
+                g,
+                Grant::Fetch(o) | Grant::FetchSubdomains(o)
+                    if matches!(o.scheme.as_str(), "http" | "https")
+            )
+        })
+        && set.permits(&Operation::Fetch { origin })
 }
 
 /// Parse `spec` whole: its grants, or every line that is not one, each as
@@ -266,6 +283,7 @@ pub(crate) fn own(line: &str) -> bool {
         || exact_grants::process::is_process_line(line)
         || line.starts_with("net.dns-sd ")
         || line.split_whitespace().next() == Some("net.listen")
+        || line == "clipboard.read"
         || line == "browser.automation"
         || line == "payment.google-pay"
         || line.starts_with("payment.apple-pay ")
@@ -398,6 +416,7 @@ fn quote(text: &str, out: &mut String) {
 fn grant_json(grant: &exact_grants::Grant, out: &mut String) {
     use exact_grants::Grant;
     match grant {
+        Grant::FetchSelf => out.push_str(r#"["fetch-self"]"#),
         Grant::Fetch(origin)
         | Grant::FetchSubdomains(origin)
         | Grant::WebSocket(origin)
@@ -431,6 +450,8 @@ fn grant_json(grant: &exact_grants::Grant, out: &mut String) {
             }
             out.push(']');
         }
+        Grant::FetchLoopback => out.push_str(r#"["fetch-loopback"]"#),
+        Grant::WebSocketLoopback => out.push_str(r#"["websocket-loopback"]"#),
         Grant::FetchScheme(scheme) | Grant::WebSocketScheme(scheme) => {
             let kind = match grant {
                 Grant::FetchScheme(_) => "fetch-scheme",
@@ -737,6 +758,63 @@ fs.read doc:/";
                 let expected = probe[1].as_bool().unwrap().then_some(spec);
                 assert_eq!(super::admitting(spec, None, url), expected, "{spec}: {url}");
             }
+        }
+    }
+
+    #[test]
+    fn loopback_lines_normalize_admit_and_are_refused_by_session_admits() {
+        let spec = "net.fetch loopback\nnet.websocket loopback";
+        let json = normalized_json(spec);
+        assert!(json.contains(r#"["fetch-loopback"]"#), "{json}");
+        assert!(json.contains(r#"["websocket-loopback"]"#), "{json}");
+        assert_eq!(
+            super::admitting(spec, None, "http://127.0.0.1:49152/health"),
+            Some("net.fetch loopback")
+        );
+        assert_eq!(
+            super::admitting(spec, None, "wss://[::1]:8443/rpc"),
+            Some("net.websocket loopback")
+        );
+        assert_eq!(super::admitting(spec, None, "http://192.168.1.40/"), None);
+        assert_eq!(super::admitting(spec, None, "http://example.com/"), None);
+        assert!(super::session_admits(
+            "http://127.0.0.1:4400",
+            "http://127.0.0.1:4400/cb"
+        ));
+        assert!(super::session_admits(
+            "https://login.example/",
+            "https://login.example/authorize"
+        ));
+        assert!(super::session_admits(
+            "https://*.example.com",
+            "https://auth.example.com/login"
+        ));
+        for target in [
+            "self",
+            "loopback",
+            "local-network",
+            "local-network development",
+            "http:",
+            "https:",
+            "https://login.example\u{0000}",
+            "https://login.example/path",
+            "https://login.example\\path",
+            "https://login.example?a=1",
+            "https://login.example#frag",
+            "https://user@login.example",
+        ] {
+            assert!(
+                !super::session_admits(target, "http://127.0.0.1:4400/cb"),
+                "session_admits must refuse `{target}`"
+            );
+            assert!(
+                !super::session_admits(target, "https://auth.example.com/login"),
+                "session_admits must refuse `{target}`"
+            );
+            assert!(
+                !super::session_admits(target, "https://login.example/authorize"),
+                "session_admits must refuse `{target}`"
+            );
         }
     }
 
