@@ -463,7 +463,12 @@ fn agrees_with_the_shader_arithmetic(d: &mut impl Device) {
 #[test]
 fn wgpu_coverage_and_shadows_agree_with_the_shader_arithmetic() {
     match super::wgpu::Wgpu::new() {
-        Ok(mut d) => agrees_with_the_shader_arithmetic(&mut d),
+        Ok(mut d) => {
+            // This suite mirrors fs_main's 8-tap shadow arithmetic; fs_fast_shadow
+            // is tested against a high-precision 2D Gaussian oracle in shadow_tests.
+            d.fast_shadow = false;
+            agrees_with_the_shader_arithmetic(&mut d);
+        }
         Err(Error::NoAdapter(e)) => eprintln!("no GPU here ({e}); ink's pixels are not checked"),
         Err(e) => panic!("ink device: {e}"),
     }
@@ -484,6 +489,8 @@ fn d3d11_coverage_and_shadows_agree_with_the_shader_arithmetic() {
 #[test]
 fn fixed_programs_match_general_coverage_scenes_pixel_for_pixel() {
     let mut d = wgpu::Wgpu::new().expect("wgpu device for program parity");
+    // Verify byte-exact parity of fs_main's fixed program specializations (CLASSES).
+    d.fast_shadow = false;
     for scene in scenes() {
         d.general_only = true;
         let general = render(&mut d, &scene);

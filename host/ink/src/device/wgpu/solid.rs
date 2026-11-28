@@ -56,9 +56,9 @@ fn shadow_interior(i: &Instance, scissor: Scissor) -> Option<(Scissor, Scissor)>
         return None;
     }
     let radius = programs::clip1_radii(i).into_iter().fold(0f32, f32::max);
-    // clip1 is in device pixels. This far inside it, clip1 coverage is
-    // identically 1, so the outer shadow contributes zero under source-over.
-    // raster_rect also rejects skewed or out-of-range transforms.
+    // clip1 is in device pixels. This far inside it, both shape_coverage and
+    // rounded_box_coverage return identically 1, so the outer shadow contributes
+    // zero under source-over. raster_rect also rejects skewed or out-of-range transforms.
     let margin = (radius + 1.).max(5.);
     let bounds = scissor.intersect(Scissor::from_rect(raster_rect(i)?));
     let inner = sizeable_interior(
