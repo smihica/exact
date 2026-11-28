@@ -3,6 +3,7 @@ use super::*;
 fn quad() -> Instance {
     Instance::rounded([0., 0., 10., 10.], [2.; 4], [1.; 4])
 }
+
 fn clip(x: f32) -> RoundedClip {
     RoundedClip {
         rect: [x, x, 20., 20.],
@@ -267,4 +268,103 @@ fn draw_bounds_unite_clipped_draws_and_stop_at_the_limit() {
     };
     assert_eq!(empty.union(clipped), clipped);
     assert_eq!(clipped.union(empty), clipped);
+}
+
+fn outer_shadow() -> Instance {
+    let mut i = Instance::new(Kind::Shadow, Brush::Solid, [0., 0., 200., 100.]);
+    i.uv = [20., 20., 160., 60.];
+    i.radii = [8.; 4];
+    i.param[0] = 6.;
+    i.set_clip(
+        1,
+        RoundedClip {
+            rect: i.uv,
+            radii: i.radii,
+        },
+    )
+    .unwrap();
+    i
+}
+
+#[test]
+fn shadow_quads_keep_order_clips_and_shape_in_one_batch() {
+    let mut e = Encoder::new(300, 200);
+    let mut shadow = outer_shadow().translated([11.25, 7.5]);
+    let parent = RoundedClip {
+        rect: [0., 0., 250., 150.],
+        radii: [4.; 4],
+    };
+    let mask = CoverageClip {
+        texture: TextureId(7),
+        rect: parent.rect,
+        uv: [0., 0., 1., 1.],
+    };
+    e.push_clip(Clip::Rounded(parent)).unwrap();
+    e.push_clip(Clip::Coverage(mask)).unwrap();
+    e.push(quad(), Bindings::default()).unwrap();
+    e.push(shadow, Bindings::default()).unwrap();
+    e.push(quad(), Bindings::default()).unwrap();
+    let frame = e.finish();
+    assert_eq!(frame.batches.len(), 1);
+    assert_eq!(frame.batches[0].instances, 0..6);
+    shadow.set_clip(0, parent).unwrap();
+    shadow.set_mask(mask);
+    let mut area = 0.;
+    for piece in &frame.instances[1..5] {
+        assert_eq!(
+            *piece,
+            Instance {
+                rect: piece.rect,
+                ..shadow
+            }
+        );
+        assert_eq!(frame.batches[0].bindings.mask, mask.texture);
+        area += piece.rect[2] * piece.rect[3];
+    }
+    assert!(area < shadow.rect[2] * shadow.rect[3] * 0.75);
+    assert_eq!(frame.instances[0].rect, quad().rect);
+    assert_eq!(frame.instances[5].rect, quad().rect);
+}
+
+#[test]
+fn shadow_quads_leave_small_transformed_and_unsafe_inputs_whole() {
+    let shadow = outer_shadow();
+    assert!(shadow_quads(&shadow).is_some());
+    let mut cases = [shadow; 7];
+    cases[0].clip1[2] = 10.;
+    cases[1].xform[1] = 0.2;
+    cases[2].xform[0] = -1.;
+    cases[3].clip1[0] = 32768.;
+    cases[4].param[0] = 1e-35;
+    cases[5].rect[0] = f32::NAN;
+    cases[6].flags |= flags::REPLACE;
+    for i in cases {
+        assert!(shadow_quads(&i).is_none(), "{i:?}");
+    }
+}
+
+#[test]
+fn shadow_quads_keep_the_original_under_large_affine_cancellation() {
+    for (rect, scale) in [
+        ([-3_333_336_576., -3_333_336_576., 9984., 9984.], 0.3),
+        ([-2., -2., 4., 4.], 1e9),
+    ] {
+        let mut i = Instance::new(Kind::Shadow, Brush::Solid, rect);
+        i.xform = [scale, 0., 0., scale, 1e9, 1e9];
+        i.uv = rect;
+        i.radii = [16.; 4];
+        i.param[0] = 4.;
+        i.color = [0.2, 0.1, 0.05, 0.5];
+        i.set_clip(
+            1,
+            RoundedClip {
+                rect: [100., 100., 800., 150.],
+                radii: [16.; 4],
+            },
+        )
+        .unwrap();
+        let mut e = Encoder::new(1000, 500);
+        e.push(i, Bindings::default()).unwrap();
+        assert_eq!(e.finish().instances, [i]);
+    }
 }

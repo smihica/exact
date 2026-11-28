@@ -169,6 +169,66 @@ fn pack_radii(radii: [f32; 4]) -> Result<[u32; 2], NeedsLayer> {
     Ok([r[0] | (r[1] << 16), r[2] | (r[3] << 16)])
 }
 
+fn shadow_quads(i: &Instance) -> Option<[[f32; 4]; 4]> {
+    if i.kind_brush != Kind::Shadow as u32 | ((Brush::Solid as u32) << 16)
+        || i.flags & flags::CLIP1 == 0
+        || i.flags & (flags::REPLACE | flags::BLEND_MASK) != 0
+    {
+        return None;
+    }
+    let [scale, b, c, sy, tx, ty] = i.xform;
+    if b != 0.
+        || c != 0.
+        || scale <= 0.
+        || scale != sy
+        || !i.xform.into_iter().all(f32::is_finite)
+        || !i
+            .rect
+            .into_iter()
+            .chain(i.uv)
+            .chain(i.radii)
+            .chain(i.color)
+            .all(f32::is_finite)
+        || !i.param[0].is_finite()
+        || (i.param[0] > 0. && i.param[0] < 1e-30)
+    {
+        return None;
+    }
+    // Large cancelling transforms can project the split edges outside the hole.
+    raster_rect(i)?;
+    let [x, y, w, h] = i.clip1;
+    let bounds = [x, y, x + w, y + h];
+    if w <= 0. || h <= 0. || !bounds.into_iter().all(|v| v.abs() < 32768.) {
+        return None;
+    }
+    let radius = i.clip_radii[2..]
+        .iter()
+        .flat_map(|r| [r & 65535, r >> 16])
+        .max()
+        .unwrap() as f32
+        / 16.;
+    // shape_coverage is exactly one here, clear of both its edge samples and
+    // corner branches. Integer device edges put the quad seams between pixels.
+    let inset = (radius + 1.).max(5.);
+    let left = (x + inset).ceil();
+    let top = (y + inset).ceil();
+    let right = (x + w - inset).floor();
+    let bottom = (y + h - inset).floor();
+    let [x0, y0, width, height] = i.rect;
+    let (x3, y3) = (x0 + width, y0 + height);
+    let (x1, y1) = ((left - tx) / scale, (top - ty) / scale);
+    let (x2, y2) = ((right - tx) / scale, (bottom - ty) / scale);
+    if !(x0 < x1 && x1 < x2 && x2 < x3 && y0 < y1 && y1 < y2 && y2 < y3) {
+        return None;
+    }
+    Some([
+        [x0, y0, width, y1 - y0],
+        [x0, y2, width, y3 - y2],
+        [x0, y1, x1 - x0, y2 - y1],
+        [x2, y1, x3 - x2, y2 - y1],
+    ])
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextureId(pub u64);
 
@@ -568,21 +628,29 @@ impl Encoder {
         }
         let replace = instance.flags & (flags::REPLACE | flags::BLEND_MASK) != 0;
         let index = u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
+        let quads = shadow_quads(&instance);
+        let end = index + if quads.is_some() { 4 } else { 1 };
         if let Some(batch) =
             self.frame.batches.last_mut().filter(|b| {
                 !replace && !b.replace && b.scissor == scissor && b.bindings == bindings
             })
         {
-            batch.instances.end = index + 1;
+            batch.instances.end = end;
         } else {
             self.frame.batches.push(Batch {
                 replace,
-                instances: index..index + 1,
+                instances: index..end,
                 scissor,
                 bindings,
             });
         }
-        self.frame.instances.push(instance);
+        if let Some(quads) = quads {
+            self.frame
+                .instances
+                .extend(quads.map(|rect| Instance { rect, ..instance }));
+        } else {
+            self.frame.instances.push(instance);
+        }
         Ok(())
     }
 

@@ -492,3 +492,93 @@ fn fixed_programs_match_general_coverage_scenes_pixel_for_pixel() {
         assert_eq!(general, specialized, "{}", scene.name);
     }
 }
+
+#[test]
+fn shadow_quads_preserve_the_rim_with_bounded_interpolation_error() {
+    use crate::instance::{Batch, Frame, Scissor};
+    let mut d = wgpu::Wgpu::new().expect("wgpu device for shadow quad parity");
+    eprintln!("shadow quad parity on {:?}", d.info());
+    let target = d.create_target(800, 320).unwrap();
+    let mut differences = Vec::new();
+    for (scale, counts) in [
+        (1., [4, 4, 4]),
+        (1.25, [4, 4, 1]),
+        (1.5, [4, 4, 1]),
+        (2., [4, 4, 1]),
+    ] {
+        // A different triangulation changes interpolation rounding. These
+        // non-binary phases differ from the full quad by at most one UNORM step.
+        for (phase, tolerance) in [
+            (0., 0),
+            (0.3125, 0),
+            (0.5, 0),
+            (0.8125, 0),
+            (0.1, 1),
+            (1. / 3., 1),
+        ] {
+            for (radius, count) in [0., 16., 64.].into_iter().zip(counts) {
+                let mut i = shadow(
+                    [32., 50., 736. / scale, 160. / scale],
+                    radius,
+                    [0., 4.],
+                    0.,
+                    9.,
+                    scale,
+                    [phase, phase],
+                );
+                i.color = [34. / 255. * 0.2, 34. / 255. * 0.2, 34. / 255. * 0.2, 0.2];
+                i.set_clip(
+                    0,
+                    RoundedClip {
+                        rect: [8., 8., 784., 300.],
+                        radii: [13.; 4],
+                    },
+                )
+                .unwrap();
+                let mut encoder = Encoder::new(800, 320);
+                encoder.push(i, Bindings::default()).unwrap();
+                let split = encoder.finish();
+                assert_eq!(
+                    split.instances.len(),
+                    count,
+                    "scale={scale}, radius={radius}, phase={phase}"
+                );
+                assert_eq!(split.batches.len(), 1);
+                let full = Frame {
+                    instances: vec![i],
+                    batches: vec![Batch {
+                        replace: false,
+                        instances: 0..1,
+                        scissor: Scissor::full([800, 320]),
+                        bindings: Bindings::default(),
+                    }],
+                };
+                for general in [false, true] {
+                    d.general_only = general;
+                    d.render(&full, target, Some([0.8, 0.7, 0.6, 1.])).unwrap();
+                    let a = d.readback(target).unwrap();
+                    d.render(&split, target, Some([0.8, 0.7, 0.6, 1.])).unwrap();
+                    let c = d.readback(target).unwrap();
+                    let count = a.iter().zip(&c).filter(|(a, c)| a != c).count();
+                    let max = a.iter().zip(&c).map(|(a, c)| a.abs_diff(*c)).max().unwrap();
+                    if max > tolerance {
+                        differences.push((
+                            scale,
+                            phase,
+                            radius,
+                            general,
+                            split.instances.len(),
+                            count,
+                            max,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    d.retire_texture(target).unwrap();
+    assert!(
+        differences.is_empty(),
+        "scale/phase/radius/general/quads/count/max: {differences:?}"
+    );
+}
