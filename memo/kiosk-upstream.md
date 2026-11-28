@@ -11,6 +11,41 @@ Read [KIOSK.md](../KIOSK.md) for runtime switches, prototype limits and checks.
 This memo maps the changes to their code and assesses what is worth sharing
 upstream. The assessments are the fork's, not acceptance decisions by Exact's maintainers.
 
+## Zero-cache analytic outer shadows on upstream main (2026-11-28)
+
+The fork merged [`c9c306905`](https://github.com/expo/exact/tree/c9c306905)
+(including Linux pure-Rust JPEG/WebP/GIF decoders and desktop overlay support),
+retired the opt-in `RASTERED_SHADOW` / `KIOSK_SHADOW_CACHE` / `KIOSK_SHADOW_BANDS`
+raster cache (`host/painted/src/ink/shadows*`, returning `host/painted/src/ink*`
+to upstream parity), and replaced it with three zero-cache `host/ink` commits
+shared on [Issue #145](https://github.com/expo/exact/issues/145#issuecomment-7237157030):
+
+1. Specialize `Kind::Shadow / Brush::Solid / flags::CLIP1` as a 13th fixed
+   `fs_main` class (0-diff; V3D shader drops `1700 → 1166 inst`).
+2. Skip the excluded interior of large analytic outer shadows in `solid::draw`
+   using 4 scissor strips bounded by `raster_rect` (0-diff, zero WGSL edits).
+3. Add a dedicated `@fragment fn fs_fast_shadow` pipeline (alongside
+   `fs_flat_fill`, leaving `fs_main` at 6011 instructions and public `flags`
+   unchanged) using a separable closed-form Gaussian CDF with 4-point corner
+   arc quadrature (`347 inst, 4 threads, 0 loops, 0 spills, 2 sfu-stalls`;
+   `<= 0.61/255` against an exact 2D Gaussian reference; zero extra shadow VRAM).
+
+On the Pi 4 (800 × 1280 portrait, 60 Hz panel, Ink/Vulkan, `EXACT_PAINTER=ink`,
+`WGPU_BACKEND=vulkan`, `EXACT_ROTATE=90`, `KIOSK_TOUCH_SCROLL=1`,
+`KIOSK_CAMERA=1`, `KIOSK_DIALOG_FADE=1`, no shadow cache flags), the integrated
+interactive Payspot build booted in 653.0 ms and measured on the warmed photo
+transaction history list (`31.6°C`, `throttled=0x0`, 2 s post-test idle CPU
+0.0 ms / GPU 0.0 ms, physical USB touch `1a86:e2e3` open):
+
+| Payspot photo-list test (zero shadow cache) | Completed flips / fps | GPU ms/flip | Intervals ≤ 20 ms | Flip interval median / p95 / p99 / max |
+| --- | ---: | ---: | ---: | --- |
+| 16 s matched wheel wave (`panel-interactive` wave, 3680 px warm-up) | 957 / 59.81 fps | 13.14 ms | 955 / 956 | 16.67 / 16.67 / 16.67 / 33.32 ms |
+| 10 s real touch drag (`KIOSK_TOUCH_SCROLL=1`, 120 Hz finger wave) | 598 / 59.80 fps | 13.13 ms | 597 / 597 | 16.67 / 16.67 / 16.67 / 16.68 ms |
+
+At the stationary top of the history list (800 × 1280), the zero-cache render
+differed from the prior cached interactive build by at most `2/255` (`mean
+0.0015/255`, `1,456 / 1,024,000` pixels).
+
 ## Blurred shadows on upstream main (2026-11-27)
 
 The fork merged [`8dd84a33b`](https://github.com/expo/exact/tree/8dd84a33b). It now uses
@@ -206,9 +241,10 @@ used a different app scene and additional renderer changes.
 
 ## Fork implementations and earlier assessments
 
-This table describes the fork before the November 27 integration. The
-[November 27 results](#blurred-shadows-on-upstream-main-2026-11-27) identify the
-implementations the fork now takes from upstream.
+This table describes the fork before the November 27–28 integrations. The
+[November 28 zero-cache results](#zero-cache-analytic-outer-shadows-on-upstream-main-2026-11-28)
+and [November 27 results](#blurred-shadows-on-upstream-main-2026-11-27) identify
+the implementations the fork now takes from upstream or has since retired.
 
 | Change | Implementation at the time | Value to upstream | Work before general adoption |
 | --- | --- | --- | --- |
@@ -218,8 +254,8 @@ implementations the fork now takes from upstream.
 | [GPU rotation](../host/linux/src/rotation.rs) | The integrated build uses upstream's GPU rotation and absolute input mapping. The earlier fork fused rotation into its final presentation copy. | GPU rotation landed in `b2a7e278c` and works with upstream direct presentation. | Measure any future fused-copy candidate against the upstream host on the same workload. |
 | [GPU limits](../host/ink/src/device/wgpu.rs) | Use upstream `requested_limits` in Ink and [Vello](../host/painted/src/gpu.rs); clamp defaults to adapter capacities and validate renderer requirements. | Already incorporated upstream in `44395c82`. | Confirmed on Pi 4 with Ink/Vulkan, Ink/GLES and Vello/Vulkan; the fork uses the upstream implementation. |
 | [Split render/display devices](../vendor/wgpu-hal/src/vulkan/drm.rs) | Match the Pi's display connector to a different rendering device. | Integrated in Exact’s vendored wgpu in `c75288253`; also relevant to gfx-rs/wgpu. | The integrated fork uses the upstream [vendor changes 18 and 19](../vendor/wgpu-hal/EXACT-PATCHES.md). |
-| [Shadow cache](../host/painted/src/ink/shadows.rs) | Raster eligible fixed geometry once, then reuse alpha with live position, color and opacity. | High: useful for repeated cards and moving dialogs. | Evaluate cache lifetime, changing geometry, allocation failure and first-use work. The current cache has a 16 MiB non-evicting budget and falls back to analytic drawing for uncached geometry after the budget is exhausted. |
-| [Outer shadow bands](../host/painted/src/ink/shadows.rs) | Draw the visible bands around the excluded border box. | Useful: reduces the area drawn for outer shadows. | Fix the extra combined-mask work with nested rounded clips or fractional rectangular clips, then measure broader scenes. |
+| [Shadow cache (retired 2026-11-28)](https://github.com/smihica/exact/blob/6dbd46170/host/painted/src/ink/shadows.rs) | Raster eligible fixed geometry once, then reuse alpha with live position, color and opacity. | Superseded by zero-cache analytic outer shadows (`fs_fast_shadow`). | Retired from the fork on 2026-11-28; analytic shadows now reach 60 fps with zero cache VRAM. |
+| [Outer shadow bands (retired 2026-11-28)](https://github.com/smihica/exact/blob/6dbd46170/host/painted/src/ink/shadows.rs) | Draw the visible bands around the excluded border box. | Superseded by `solid::draw` scissor interior skip on analytic shadows. | Retired from the fork on 2026-11-28 alongside the shadow cache. |
 | [Display hatch activation](../host/painted/src/presenter/display_frame.rs) | Connect hatches when a successful display receipt activates the session, including when newer input is dirty. | Correctness fix: real display sessions can otherwise omit hatches that work under the headless agent. | Regression tests cover first display, one-time connection and a stale receipt after reload; the Pi direct-display QR fixture also reaches its next screen. |
 | [Camera preview](../host/painted/src/image/kiosk_camera.rs) | Read and convert each fixed-size frame from `rpicam-vid`; publish only the latest through the Linux image path. Bounded luminance subscribers let apps analyze that same capture. | Useful as a working Pi reference and evidence for Linux camera support. | Fit the capture/preview lifecycle into `@exact/media-capture` and `@exact/camera`, including grants and agent substitutes. Linux camera support remains deferred in the [pinned upstream rules](../rules/DEFERRED.md); widening that scope needs a maintainer decision. |
 | [Touch drag and inertia](../host/linux/src/display/kiosk_scroll.rs) | Single-finger vertical drag, fling, cancellation of a pending tap and catching an active fling. | High for a usable Linux touchscreen host. | Connect to the existing reader drag lifecycle and completion/events; define nested-scroller behavior and device classification. |

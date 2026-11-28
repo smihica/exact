@@ -442,8 +442,7 @@ export const classifications = [
     ["painted:host/painted/src/presenter.rs",
       "Presenter::boxes Presenter::compat Presenter::damage_rects Presenter::dirty Presenter::executor_fd Presenter::focus Presenter::hit Presenter::host " +
       "Presenter::hosts Presenter::image_fd Presenter::images Presenter::node_count Presenter::page Presenter::paragraph Presenter::pending Presenter::rect_of " +
-      "Presenter::repaint Presenter::text Presenter::viewport Presenter::wants_display_frames Presenter::wheel"],
-    ["painted:host/painted/src/presenter/scrollers.rs", "Presenter::scroll_of"],
+      "Presenter::repaint Presenter::scroll_of Presenter::text Presenter::viewport Presenter::wants_display_frames Presenter::wheel"],
     ["painted:host/painted/src/presenter/access.rs", "Presenter::access_reset Presenter::access_told Presenter::access_tree Presenter::reader_access"],
     ["painted:host/painted/src/presenter/access/surface.rs", "PopupAccess::nodes Presenter::popup_access"],
     ["painted:host/painted/src/presenter/ahead.rs", "Presenter::foresee_press Presenter::foreseen_at Presenter::forget_press Presenter::scratch"],

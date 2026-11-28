@@ -1450,6 +1450,10 @@ impl<D: DataSource> Presenter<D> {
     pub fn rect_of(&mut self, id: ViewId) -> Option<Rect4> {
         self.box_of(id).map(|b| b.rect)
     }
+    /// A scroll container's offset.
+    pub fn scroll_of(&self, id: ViewId) -> (f32, f32) {
+        self.scroll.get(&id).copied().unwrap_or((0.0, 0.0))
+    }
     /// How many nodes are live.
     pub fn node_count(&self) -> usize {
         self.host.kernel().live_count()

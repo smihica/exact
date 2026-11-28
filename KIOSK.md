@@ -34,22 +34,30 @@ Existing app manifests can keep their `scanout` feature.
 Use `EXACT_ROTATE=0|90|180|270` to orient the picture and absolute input.
 Older launchers can still select 90 degrees with `KIOSK_PORTRAIT=1`. GLES comparisons use `WGPU_BACKEND=gl` in a build
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
-Ink compiles the twelve upstream material programs plus one for cached outer
-shadows at device creation.
-Large unclipped solid fills use a flat-color pipeline for their interior.
+Ink compiles thirteen `fs_main` material programs (the twelve upstream classes
+plus a `CLIP1`-only outer-shadow class) alongside the dedicated `fs_flat_fill`
+and `fs_fast_shadow` pipelines at device creation.
+Large unclipped solid fills use `fs_flat_fill` for their interior, and large
+analytic outer shadows skip their excluded `CLIP1` interior via scissor strips
+without allocating any shadow cache texture. Eligible uniform-scale, non-skewed
+`CLIP1`-only outer shadows automatically use `fs_fast_shadow`; all other shadows
+use the standard 8-tap `fs_main` shader.
 The direct Vulkan host rotates on the GPU. With three swapchain images it can
 submit one frame while the previous frame awaits presentation. Hit testing
 and animation starts follow the completed presentation. On a Pi 4 with a
 60 Hz portrait panel, a 16-second photo-list drag measured 30.0 fps with a
-single pending frame and 60.0 fps with one frame ahead. Earlier integration
-measurements are recorded in the [kiosk memo](memo/kiosk-upstream.md#rich-list-and-dialog-after-merging-upstream).
+single pending frame and 59.8 fps with one frame ahead and zero-cache analytic
+outer shadows. Measurements are recorded in the
+[kiosk memo](memo/kiosk-upstream.md#zero-cache-analytic-outer-shadows-on-upstream-main-2026-11-28).
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
-`KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
-`KIOSK_SHADOW_BANDS=1`. `KIOSK_FPS=1` adds an on-screen counter;
-`KIOSK_TIMING=1` logs frame submission timings.
-The [Pi 4 shadow comparison](memo/kiosk-upstream.md#blurred-shadows-on-upstream-main-2026-11-27)
-measures the cache and exterior bands with the general and fixed shadow programs.
+`KIOSK_DIALOG_FADE=1` and `KIOSK_CAMERA=1`. `KIOSK_FPS=1` adds an on-screen
+counter; `KIOSK_TIMING=1` logs frame submission timings. The retired
+`KIOSK_SHADOW_CACHE` and `KIOSK_SHADOW_BANDS` switches are no longer needed and
+have been removed; see the
+[zero-cache Pi 4 measurements](memo/kiosk-upstream.md#zero-cache-analytic-outer-shadows-on-upstream-main-2026-11-28)
+and the historical
+[cached shadow comparison](memo/kiosk-upstream.md#blurred-shadows-on-upstream-main-2026-11-27).
 
 Ink reuses full-size photo textures by default. Each painter keeps up to 64
 idle textures within an 8 MiB budget including mip levels. Memory trimming
@@ -81,18 +89,18 @@ Subscriptions do not start capture or change preview ownership.
 - The Linux DRM host does not signal memory pressure, window hiding or focus
   loss. Idle textures stay within the budget. The next frame retires entries
   whose decoded picture has been released.
-- Shadow textures share a 16 MiB LRU budget, including pending retirement.
-  A frame keeps its references across intermediate flushes. Only completed,
-  unused textures can be evicted; without space, new shapes draw analytically.
-  Kept rows record shadow geometry and resolve the raster when replayed, so
-  trimming can release the cache. Device failures use the renderer's existing
-  recovery, including device loss reported during cleanup.
-- Outer bands resolve the effective parent clip once before splitting the
-  shadow, including retained-row replay. The cache keeps its geometry-only
-  key and RGBA8 bilinear sampling. Quantization and fractional-pixel filtering
-  can still differ from analytic drawing; both shadow switches remain opt-in.
-- New shadow geometries incur first-use work. Warm-frame
-  throughput does not measure that cost or long-running stability.
+- `fs_fast_shadow` is restricted to uniform-scale (`0 < sx <= 64`, `sigma * sx >= 1`),
+  non-skewed, `CLIP1`-only outer shadows with `0.5 <= sigma < 32768`,
+  `r_max <= 2.0 * sigma`, `min(w, h) >= 2 * r_max + 7.5 * sigma`, and a device-space
+  `clip1` box with `w, h >= 4` and all corner radii in `[1.5, min(w, h) / 2]`.
+  Within this domain its alpha stays within `0.61/255` of an exact 2D Gaussian;
+  shadows outside it automatically fall back to the stock 8-tap `fs_main` path
+  with no extra VRAM allocation.
+- Because upstream `e2524d34d` enables desktop overlay surfaces on Linux
+  (`serve_overlays()`), `KIOSK_DIALOG_FADE=1` applies to plain `<dialog>`
+  elements (`paint_alert`), not desktop confirmation overlays
+  (`role="alertdialog"`), whose scrollable bodies rely on wheel input rather
+  than `KIOSK_TOUCH_SCROLL=1`.
 
 ## Focused checks
 
