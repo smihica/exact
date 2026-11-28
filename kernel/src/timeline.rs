@@ -12,11 +12,12 @@
 //! - `view-timeline-name`, `-axis` and `-inset` on any node: a view progress
 //!   timeline, the node's border box crossing the scrollport of its nearest
 //!   ancestor scroll container.
-//! - `animation-timeline: auto | <dashed-ident> | scroll() | view()` on a
-//!   consumer: a named timeline, or an anonymous one the consumer's own
-//!   place gives ([`Anonymous`]). Its fifth value, `-exact-clock(<ident>)`,
-//!   keeps the animations on the clock and only syncs their starts (LLP
-//!   1055.002); the lookup never sees it.
+//! - `animation-timeline: auto | none | <dashed-ident> | scroll() | view()` on a
+//!   consumer: a named timeline, an anonymous one the consumer's own place
+//!   gives ([`Anonymous`]), or `none` (no timeline: the animation does not
+//!   progress). Its sixth value, `-exact-clock(<ident>)`, keeps the animations
+//!   on the clock and only syncs their starts (LLP 1055.002); the lookup never
+//!   sees it.
 //! - `animation-range` on the consumer: where on the timeline its
 //!   animations are at 0% and 100% ([`AnimationRange`]).
 //! - `timeline-scope: none | all | <dashed-ident>#`: names declared below a
@@ -167,15 +168,16 @@ impl DragTimeline {
     }
 }
 
-/// `animation-timeline`: `auto` (the clock), a named timeline, or a clock
-/// timeline, `-exact-clock(<ident>)`: the clock, from a start every animation on
-/// the same one shares (LLP 1055.002 D2, a deviation LLP 1001 declares).
+/// `animation-timeline`: `auto` (the clock), `none` (no timeline), a named or
+/// anonymous timeline, or a clock timeline, `-exact-clock(<ident>)`: the clock,
+/// from a start every animation on the same one shares (LLP 1055.002 D2, a
+/// deviation LLP 1001 declares).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnimationTimeline(pub Option<String>);
 
 impl AnimationTimeline {
-    /// `auto`, a `<dashed-ident>` or `-exact-clock(<ident>)`; `None` also while
-    /// unlinked.
+    /// `auto`, `none`, a `<dashed-ident>`, `scroll()`, `view()`, or
+    /// `-exact-clock(<ident>)`; `None` also while unlinked.
     pub fn parse(css: &str) -> Option<Self> {
         (LINKED.get()?.timeline)(css)
     }
@@ -185,6 +187,9 @@ impl AnimationTimeline {
         if t.eq_ignore_ascii_case("auto") {
             return Some(Self(None));
         }
+        if t.eq_ignore_ascii_case("none") {
+            return Some(Self(Some("none".into())));
+        }
         if let Some(name) = clock_name(t) {
             return Some(Self(Some(format!("-exact-clock({name})"))));
         }
@@ -192,6 +197,11 @@ impl AnimationTimeline {
             return Some(Self(Some(anonymous.css())));
         }
         dashed(t).map(|n| Self(Some(n)))
+    }
+
+    /// Whether this is `none` (no timeline: CSS Animations 2).
+    pub fn is_none(&self) -> bool {
+        self.0.as_deref() == Some("none")
     }
 
     /// The named timeline's `<dashed-ident>`, which the lookup resolves.
@@ -297,6 +307,18 @@ mod tests {
             AnimationTimeline::parse("auto"),
             Some(AnimationTimeline(None))
         );
+        let none = AnimationTimeline::parse(" NONE ").unwrap();
+        assert!(none.is_none());
+        assert_eq!(
+            (
+                none.css().as_str(),
+                none.name(),
+                none.anonymous(),
+                none.clock()
+            ),
+            ("none", None, None, None)
+        );
+        assert!(!AnimationTimeline::parse("auto").unwrap().is_none());
         let c = AnimationTimeline::parse(" -exact-clock( Pending ) ").unwrap();
         assert_eq!(
             (c.css().as_str(), c.clock(), c.name()),

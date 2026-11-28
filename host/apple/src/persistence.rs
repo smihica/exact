@@ -101,4 +101,30 @@ impl<D: DataSource> Host<D> {
     fn store_failure(&mut self, line: String) {
         self.runner.log(line);
     }
+
+    /// Carries owed store writes across a state-preserving reload so failed
+    /// disk writes remain pending and are retried instead of silently forgotten.
+    pub(crate) fn carry_pending_store_writes(&mut self, from: &mut Self) {
+        if from.pending_store_writes.is_empty() {
+            return;
+        }
+        for write in std::mem::take(&mut from.pending_store_writes) {
+            if !self
+                .pending_store_writes
+                .iter()
+                .any(|w| w.name == write.name)
+            {
+                if let Some(stamp) = from.pending_store_stamps.remove(&write.name) {
+                    self.pending_store_stamps.insert(write.name.clone(), stamp);
+                }
+                if let Some(base) = from.pending_store_bases.remove(&write.name) {
+                    self.pending_store_bases.insert(write.name.clone(), base);
+                }
+                if from.reported_store_failures.remove(&write.name) {
+                    self.reported_store_failures.insert(write.name.clone());
+                }
+                self.pending_store_writes.push(write);
+            }
+        }
+    }
 }

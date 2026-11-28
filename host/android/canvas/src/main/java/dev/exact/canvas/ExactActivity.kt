@@ -719,30 +719,16 @@ open class ExactActivity : Activity() {
             }
         }
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(c[4]))
-        val bars = barAppearance(c[5])
-        val hide = bars.hidden.takeIf { it != barsHidden }
-        barsHidden = bars.hidden
-        if (Build.VERSION.SDK_INT < 30) {
-            Legacy.lightBars(window, bars.statusLight, bars.navigationLight)
-            hide?.let { Legacy.hideBars(window, it) }
-            return
-        }
-        val controller = window.insetsController ?: return
-        val status = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
-        val navigation = android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-        controller.setSystemBarsAppearance(
-            (if (bars.statusLight) status else 0) or (if (bars.navigationLight) navigation else 0), status or navigation)
-        // Immersive mode as a hand-built app asks for it: both bars go, and a swipe from an edge shows them over the
-        // page for a moment. Only a change is applied, so a chrome that moves the page does not hide bars the person
-        // has just swiped in.
-        if (hide == true) {
-            controller.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            controller.hide(android.view.WindowInsets.Type.systemBars())
-        } else if (hide == false) controller.show(android.view.WindowInsets.Type.systemBars())
+        val next = barAppearance(c[5])
+        val hide = next.hidden.takeIf { it != bars?.hidden }
+        bars = next
+        applyBarAppearance(window, next, hide)
+        requests.surfaces?.barAppearance(next)
     }
 
-    /** Whether [chrome] last hid the system bars; null before the first. */
-    private var barsHidden: Boolean? = null
+    /** The page's last resolved bar appearance from [chrome]; null before the first chrome update. */
+    internal var bars: BarAppearance? = null
+        private set
 
     /** The device's settings as the host was last told them. */
     private var told: Device? = null
@@ -1048,7 +1034,7 @@ open class ExactActivity : Activity() {
             "x_agent_substitutes", "x_agent_fail_fetch", "x_agent_process", "x_agent_home", "x_agent_login_env",
             "x_agent_share", "x_agent_bind", "x_agent_pads", "x_agent_timing", "x_agent_presentation", "x_agent_chrome",
             "x_rows", "x_moves", "x_idle_frames", "x_slots", "x_lower", "x_row_reuse",
-            "x_image_viewports", "x_defer_collections", "x_log_journal",
+            "x_image_viewports", "x_defer_collections", "x_log_journal", "x_log_access", "x_log_fields",
             // The update store's origin and directory (LLP 1030.006 D7); a production bake ignores both.
             "x_update_origin", "x_update_dir").forEach { k ->
             intent.getStringExtra(k)?.let { android.system.Os.setenv("EXACT_" + k.removePrefix("x_").uppercase(), it, true) }

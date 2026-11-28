@@ -63,7 +63,7 @@ enum ResetGate {
 
     /// Held calls dropped, by `Runtime` method, and why; any other held call is dropped too (as about the old tree).
     static let dropped: [String: String] = [
-        "ownerReports(updates:registrations:)": "the old tree's owner updates are moot, and the new tree's owners report their own; a registration is the session's, and the new kernel is told every live one when the new tree is in (`treeIsIn`)",
+        "ownerReports(updates:registrations:session:)": "the old tree's owner and session updates are moot, and the new tree's owners and session report their own; a registration is the session's, and the new kernel is told every live one when the new tree is in (`treeIsIn`)",
         "holdBegin(_:property:now:)": "a gesture beginning on the old tree",
         "hostRoot(_:now:)": "a link in another window retargeting this rooted one over the teardown (LLP 1030.004 D2): it keeps its screen, as a press on the old tree would",
         "heightDragBegin(_:targetKey:now:)": "a height drag beginning on the old tree",
@@ -188,7 +188,7 @@ enum ResetGate {
         "setModes(_:check:)": "mode pins: not applied",
         "navigate(_:_:now:)": "a URL opened from outside (`openIncoming`), or a navigation from the old tree: the URL is not followed",
         "hostGo(_:now:)": "a URL followed without a navigate handler: not taken",
-        "share(_:now:)": "an incoming share: its inbox is deleted after delivery (`ShareReceive.claimInbox`), so it is gone",
+        "share(_:now:)": "an incoming share: held shares stay in the inbox and are retried after the reset (`ShareReceive.claimDeferredInbox`)",
         "picked(_:_:now:)": "a picker's chosen files, copied before the pick is told: told once, not again",
         "change(_:_:selection:now:)": "an edit the teardown ends (the Mac commits it as its field goes) is the old field's, moot; but a document's delivered file paths ride it too (`ExactDocuments.deliver`), and are lost",
         "deliverySync()": "the delivery facts after an app-level event: `applyTogether` asks again after its resets, but a dev-menu fresh boot or a single session's `apply` does not",
@@ -228,7 +228,10 @@ extension ExactSession {
     /// After the committed batch: the held calls ResetGate replays, each once, in order; the rest dropped.
     @discardableResult func replayHeld() -> [ResetGate.Replay] {
         let replays = ResetGate.replays(runtime.takeHeldCalls()), entered = runtime.entered
-        defer { if !replays.isEmpty { ResetGate.spy?(.replayed(replays, entered: runtime.entered - entered)) } }
+        defer {
+            if !replays.isEmpty { ResetGate.spy?(.replayed(replays, entered: runtime.entered - entered)) }
+            shareHost.claimPending(self)
+        }
         for replay in replays {
             switch replay {
             case .advance: advanceIfDue()

@@ -16,7 +16,7 @@
 // title it is the selected route's header's heading, else the app's name
 // (navigation.js `pageTitle`, both web targets': LLP 1115.000 D4.1).
 import { unselected, unselectedForHead, pageTitle, panelsOf, viewChildren, overPage, fitVisualViewport, onVisualViewport } from "./navigation.js";
-import { scope, owner, onEnd, adopting, end, stood, PrepareTasks } from "./rt.js";
+import { scope, mounted, owner, onEnd, adopting, end, stood, PrepareTasks } from "./rt.js";
 
 /** The active head's fields by prop name (`headTitle` …): what a renderer
  * reads (render.mjs), and the agent's `state.head`. */
@@ -217,20 +217,32 @@ export function tp(e, build) {
 }
 /** Whether `e` is a panel whose tab has never been selected: the agent's `unopened`. */
 export const unopened = e => Waiting.has(e);
+const dead = s => { for (; s; s = s.up) if (s.gone) return true; return false; };
 /** Build each waiting panel its root now selects, and any no root's tablist names. */
 function openTabs() {
-  for (let open = toOpen(); open.length; open = toOpen()) for (const e of open) {
-    const waiting = Waiting.get(e); Waiting.delete(e);
-    if (waiting.prepared) e.append(...waiting.prepared.shell.childNodes);
+  // Re-evaluate `toOpen()` after each panel opens so a reentrant tab switch
+  // inside mount/build hooks does not open a superseded selection from a stale batch.
+  for (let open = toOpen(); open.length; open = toOpen()) {
+    const e = open[0], waiting = Waiting.get(e);
+    if (!waiting) continue;
+    Waiting.delete(e);
+    if (dead(waiting.up)) continue;
+    if (waiting.prepared && !dead(waiting.prepared.s)) {
+      e.append(...waiting.prepared.shell.childNodes);
+      mounted(waiting.prepared.s);
+    }
     else scope(() => waiting.build(e), waiting.up);
   }
 }
 /** Validate a newly selected panel's tasks before publishing the selection. */
 function prepareTabs() {
   if (!PrepareTasks) return;
-  for (let open = toOpen(true); open.length; open = toOpen(true)) for (const e of open) {
-    const waiting = Waiting.get(e), shell = e.cloneNode(false);
-    const s = scope(() => waiting.build(shell), waiting.up);
+  for (let open = toOpen(true); open.length; open = toOpen(true)) {
+    const e = open[0], waiting = Waiting.get(e);
+    if (!waiting) continue;
+    if (dead(waiting.up)) { Waiting.delete(e); continue; }
+    const shell = e.cloneNode(false);
+    const s = scope(() => waiting.build(shell), waiting.up, true);
     waiting.prepared = { shell, s };
     const keep = () => {};
     keep.refused = () => {

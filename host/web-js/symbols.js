@@ -1,4 +1,4 @@
-import { symbolBox, symbolSize, symbolPlaceholder, syncSymbolPlaceholder, symbolFit, tintFit } from "../web/symbol-geometry.js";
+import { symbolSize, symbolPlaceholder, symbolMask, syncSymbolPlaceholder, symbolFit, tintFit } from "../web/symbol-geometry.js";
 // Symbol images on the JS target (`image "symbol:<role>"`, LLP 1011): the
 // web host's rendering (`glue.js` `refreshSymbols`) — the role's path as a
 // mask in the node's `color` (LLP 1081 stage 2, as the Apple hosts draw a
@@ -9,14 +9,23 @@ import { symbolBox, symbolSize, symbolPlaceholder, syncSymbolPlaceholder, symbol
 // loaded once (`symbol-roles.js`, the build's). Imported by an app's module
 // only when its plan draws a symbol or a tinted raster, binds an image's
 // source, or names an `app:/` file (below).
-import { After, PropHooks, Hooks, inflight, journal, clock, data, onEnd } from "./rt.js";
+import { After, PropHooks, Hooks, inflight, journal, clock, data, onEnd, onMount } from "./rt.js";
 import { loadOnce } from '../web/load-once.js';
 
 const loads = {};
 // The commit pass visits symbols, app:/ images and tinted rasters until their
 // scope ends, in place of document-wide queries (LLP 1071.001 A7).
 const Images = new Set();
-const image = e => { if (!Images.has(e)) { Images.add(e); onEnd(() => Images.delete(e)); } };
+const image = e => {
+  if (!Images.has(e)) {
+    Images.add(e);
+    onEnd(() => {
+      Images.delete(e);
+      e.$app = null;
+      e.$appSeq = (e.$appSeq ?? 0) + 1;
+    });
+  }
+};
 Hooks.image = e => {
   const s = e.getAttribute("data-symbol-source");
   if (s?.startsWith("symbol:icon|")) draw(e, s.slice(7));
@@ -62,15 +71,15 @@ const draw = (e, name) => {
   image(e);
   // A form that is no icon draws nothing: no path, viewBox or rule.
   const form = name.startsWith("icon|") ? iconForm(name) : undefined;
-  const [path, filled, box, file, evenOdd] = form === undefined ? (Object.hasOwn(Table, name) ? Table[name] : [""]) : form ?? ["", 0, "", "", 0];
+  const [path, flags = 0, box, file, evenOdd] = form === undefined ? (Object.hasOwn(Table, name) ? Table[name] : [""]) : form ?? ["", 0, "", "", 0];
   e.toggleAttribute("data-symbol-file", !!file);
   // A file shown as written: no path, viewBox, rule or mask of a path drawn before.
   if (file) {
-    for (const a of ["data-symbol-path", "data-symbol-viewbox", "data-symbol-nonzero", "data-symbol-evenodd"]) e.removeAttribute(a);
+    for (const a of ["data-symbol-path", "data-symbol-fill", "data-symbol-mirror", "data-symbol-viewbox", "data-symbol-nonzero", "data-symbol-evenodd"]) e.removeAttribute(a);
     e.style.removeProperty("--exact-symbol-mask"); e.symbolKey = e.symbolMask = null;
     e.src = `assets/${file}`; return;
   }
-  e.setAttribute("data-symbol-path", path); e.toggleAttribute("data-symbol-fill", !!filled);
+  e.setAttribute("data-symbol-path", path); e.toggleAttribute("data-symbol-fill", !!(flags & 1)); e.toggleAttribute("data-symbol-mirror", !!(flags & 2));
   // An icon's paths are each filled nonzero under its own viewBox (`d`s joined by `;`), or
   // even-odd where its SVG says so (the mask's `fill-rule`, `refresh`).
   e.toggleAttribute("data-symbol-nonzero", (!!form || !!box) && !evenOdd);
@@ -81,7 +90,7 @@ function everyRole() {
   inflight.n++;
   loadOnce(loads, "All", () => import("./symbol-roles.js").then(m => {
     Table = { ...m.default, ...Table };
-    for (const e of document.querySelectorAll("#exact-root img[data-symbol-source]")) draw(e, e.getAttribute("data-symbol-source").slice(7));
+    for (const e of Images) if (e.hasAttribute("data-symbol-source")) draw(e, e.getAttribute("data-symbol-source").slice(7));
     rolesReady = true;
     refresh();
   }), error => journal.push(`t=${clock.now} symbol roles: unavailable: ${error.message}`)).finally(() => inflight.n--);
@@ -99,18 +108,18 @@ export function symbols(table) {
   // A hook before this one (pictures.js: a package's scheme) takes its sources first.
   const prior = PropHooks.src;
   PropHooks.src = (e, v) => {
-    if (prior?.(e, v)) return true;
-    // A source that is no longer a symbol drops the symbol's rendering first,
-    // so neither `refresh` nor the role table's late load paints it back over
-    // what the new source shows (an `app:/` file lands asynchronously).
+    // Drop any previous symbol or app:/ rendering before delegating (including to
+    // pictures.js) so a late app-file reply or old symbol mask cannot paint over it.
     if (!v?.startsWith("symbol:")) unsymbol(e);
+    if (e.localName === "img" && e.$app && !v?.startsWith("app:/")) { e.$app = null; e.$appSeq = (e.$appSeq ?? 0) + 1; e.removeAttribute("data-app-src"); }
+    if (prior?.(e, v)) { template(e, null); return true; }
     if (e.localName === "img" && v?.startsWith("app:/")) { appSource(e, v); return true; }
-    if (e.localName === "img" && e.$app) { e.$app = null; e.removeAttribute("data-app-src"); }
     // A `data:` source past its bound shows nothing, as on every host (LLP 1011 §2; exact_raster::MAX_DATA_URL_BYTES).
     if (e.localName === "img" && v?.startsWith("data:") && v.length > DATA_LIMIT) { journal.push(`t=${clock.now} image refused: a data: source is over ${DATA_LIMIT} bytes`); e.removeAttribute("src"); return true; }
     if (e.localName !== "img" || !v?.startsWith("symbol:")) { template(e, v); return false; }
     template(e, null);
     if (!Object.hasOwn(Table, v.slice(7)) && !loads.All && !v.startsWith("symbol:icon|")) everyRole();
+    e.$unsymbol = () => unsymbol(e);
     e.setAttribute("data-symbol-source", v); draw(e, v.slice(7));
     // Decorative unless its author named it (`alt`, `aria-label`), as the template writes it.
     if (!e.getAttribute("alt")) e.alt = "";
@@ -125,14 +134,18 @@ export function symbols(table) {
     addEventListener("resize", schedule);
     for (const query of ["(prefers-color-scheme: dark)", "(prefers-contrast: more)"]) matchMedia(query).addEventListener("change", schedule);
     matchMedia("(forced-colors: active)").addEventListener("change", event => { if (!event.matches) schedule(); });
-    new MutationObserver(schedule).observe(document.getElementById("exact-root"), {
+    const observer = new MutationObserver(schedule);
+    observer.observe(document.getElementById("exact-root"), {
       attributes: true, subtree: true, attributeFilter: ["data-exact-sidebar"],
+    });
+    observer.observe(document.documentElement, {
+      attributes: true, attributeFilter: ["dir"],
     });
   }
 }
 function unsymbol(e) {
   if (!e.hasAttribute?.("data-symbol-source") && !e.hasAttribute?.("data-symbol-path")) return;
-  for (const a of ["data-symbol-path", "data-symbol-fill", "data-symbol-source", "data-symbol-viewbox", "data-symbol-nonzero", "data-symbol-evenodd", "data-symbol-file"]) e.removeAttribute(a);
+  for (const a of ["data-symbol-path", "data-symbol-fill", "data-symbol-mirror", "data-symbol-source", "data-symbol-viewbox", "data-symbol-nonzero", "data-symbol-evenodd", "data-symbol-file"]) e.removeAttribute(a);
   e.style.removeProperty("--exact-symbol-mask"); e.style.removeProperty("--exact-symbol-fit"); e.style.removeProperty("--exact-symbol-position");
   if (e.getAttribute("src") === e.symbolPlaceholder) e.removeAttribute("src");
   e.symbolKey = e.symbolMask = e.symbolPlaceholder = e.symbolRefusal = null;
@@ -144,13 +157,25 @@ function unsymbol(e) {
 
 const DATA_LIMIT = 1024 * 1024;
 function appSource(e, v) {
-  image(e); e.$app = v;
+  image(e);
+  const changed = e.$app !== v;
+  e.$app = v;
+  const seq = (e.$appSeq = (e.$appSeq ?? 0) + 1);
   if (e.getAttribute("data-app-src") !== v) e.setAttribute("data-app-src", v);
-  inflight.n++;
-  (loadOnce(loads, "Files", () => import(new URL("./picker-glue.js", import.meta.url).href).then(() => globalThis.exact.appURL)))
-    .then(appURL => appURL(v, data.appId))
-    .then(url => { if (e.$app === v && e.getAttribute("src") !== url) { if (url) e.setAttribute("src", url); else e.removeAttribute("src"); template(e, url || null); } })
-    .catch(() => {}).finally(() => inflight.n--);
+  if (changed) {
+    e.removeAttribute("src");
+    template(e, null);
+    e.$settled = null;
+    e.$why = null;
+  }
+  onMount(() => {
+    if (e.$appSeq !== seq || e.$app !== v) return;
+    inflight.n++;
+    (loadOnce(loads, "Files", () => import(new URL("./picker-glue.js", import.meta.url).href).then(() => globalThis.exact.appURL)))
+      .then(appURL => appURL(v, data.appId))
+      .then(url => { if (e.$appSeq === seq && e.$app === v && e.getAttribute("src") !== url) { if (url) e.setAttribute("src", url); else e.removeAttribute("src"); template(e, url || null); } })
+      .catch(() => {}).finally(() => inflight.n--);
+  }, (e.$appMountKey ??= {}));
 }
 // A raster with a `-exact-tint-color` is a template (element.rs `host_css`, LLP
 // 1011 §3): its alpha masks the tint. A source that becomes a raster takes
@@ -184,6 +209,7 @@ function template(e, v) {
   e.style.setProperty("--exact-tint-offset", "-100000px 0");
   e.style.setProperty("object-position", "var(--exact-tint-offset,var(--exact-object-position,50% 50%))");
   e.$template = true;
+  e.$untemplate = () => template(e, null);
   if (!globalThis.__exactRender) tintFit(e);
 }
 function refresh() {
@@ -192,6 +218,10 @@ function refresh() {
   for (const el of Images) {
     if (!el.isConnected) continue;
     if (el.$app === undefined && el.hasAttribute("data-app-src")) appSource(el, el.getAttribute("data-app-src"));
+    if (el.hasAttribute("data-symbol-source") && !el.getAttribute("data-symbol-path") && !el.hasAttribute("data-symbol-file")) {
+      const role = el.getAttribute("data-symbol-source").slice(7);
+      if (Object.hasOwn(Table, role)) draw(el, role);
+    }
     if (el.hasAttribute("data-symbol-path")) symbols.push(el);
     else if (el.$template) rasters.push(el);
   }
@@ -203,18 +233,17 @@ function refresh() {
     return [[el, style]]; });
   for (const [el, style] of titles) Object.assign(el.style, style);
   const configs = symbols.map(el => { const cs = getComputedStyle(el);
-    return { el, point: parseFloat(cs.fontSize) * (parseFloat(cs.getPropertyValue("--exact-symbol-scale")) || 1), weight: Number(cs.fontWeight), objectFit: cs.objectFit }; });
-  for (const { el, point, weight } of configs) {
-    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", source = el.getAttribute("data-symbol-source"), key = `${path}:${filled}:${point}:${weight}:${box}:${el.hasAttribute("data-symbol-nonzero")}:${source}`;
+    return { el, point: parseFloat(cs.fontSize) * (parseFloat(cs.getPropertyValue("--exact-symbol-scale")) || 1), weight: Number(cs.fontWeight), objectFit: cs.objectFit, rtl: cs.direction === "rtl" }; });
+  for (const { el, point, weight, rtl } of configs) {
+    const path = el.getAttribute("data-symbol-path"), filled = el.hasAttribute("data-symbol-fill"), nonzero = el.hasAttribute("data-symbol-nonzero"), mirror = rtl && el.hasAttribute("data-symbol-mirror"), box = el.getAttribute("data-symbol-viewbox") || "0 0 24 24", source = el.getAttribute("data-symbol-source"), key = `${path}:${filled}:${point}:${weight}:${box}:${nonzero}:${mirror}:${source}`;
     // As the web host says it (glue.js `refreshSymbols`), once every role is here.
     if (!path && rolesReady && !source?.startsWith("symbol:sf/") && source !== "symbol:" && el.symbolRefusal !== source) {
       journal.push(`t=${clock.now} image ${source} refused: unknown symbol role`); el.symbolRefusal = source;
     }
     if (el.symbolKey !== key) {
-      el.symbolKey = key; const stroke = 1.1 + (Math.max(100, Math.min(900, weight)) - 100) / 400;
-      const paint = filled ? `fill="black" fill-rule="${el.hasAttribute("data-symbol-nonzero") ? "nonzero" : "evenodd"}"` : `fill="none" stroke="black" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"`;
+      el.symbolKey = key;
       const [width, height] = symbolSize(box, point, source);
-      el.symbolMask = `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" ${width === height ? `width="${width}" height="${height}" ` : ""}viewBox="${symbolBox(box).join(" ")}">${path.split(";").map(d => `<path d="${d}" ${paint}/>`).join("")}</svg>`)}")`;
+      el.symbolMask = symbolMask(path, filled, nonzero, box, width, height, weight, mirror);
       el.symbolPlaceholder = symbolPlaceholder(width, height);
     }
     syncSymbolPlaceholder(el, refresh);

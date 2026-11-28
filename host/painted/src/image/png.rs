@@ -7,6 +7,19 @@ use exact_raster::{
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use tiny_skia::{IntSize, Pixmap};
 
+/// Container format for `PLATFORM` images so pure-Rust targets can choose
+/// the matching decoder and charge an honest scratch budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlatformFormat {
+    None,
+    Jpeg,
+    JpegProgressive,
+    Webp,
+    WebpAlpha,
+    WebpAnimated,
+    Gif,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Header {
     pub metadata: Metadata,
@@ -14,8 +27,12 @@ pub(super) struct Header {
     channels: u8,
     color: u8,
     interlaced: bool,
-    #[cfg(windows)]
     pub(super) orientation: u8,
+    #[cfg(any(
+        not(any(target_os = "android", windows, target_os = "macos")),
+        all(target_os = "macos", test)
+    ))]
+    format: PlatformFormat,
     #[cfg(windows)]
     pub(super) icon: Option<super::windows_bitmap::IconEntry>,
 }
@@ -43,17 +60,33 @@ impl Header {
 
     /// The platform decodes this source to 8-bit RGBA.
     pub(super) fn platform(metadata: Metadata) -> Header {
+        Self::platform_format(metadata, PlatformFormat::None)
+    }
+
+    pub(super) fn platform_format(metadata: Metadata, _format: PlatformFormat) -> Header {
         Header {
             metadata,
             depth: 8,
             channels: 4,
             color: PLATFORM,
             interlaced: false,
-            #[cfg(windows)]
             orientation: 1,
+            #[cfg(any(
+                not(any(target_os = "android", windows, target_os = "macos")),
+                all(target_os = "macos", test)
+            ))]
+            format: _format,
             #[cfg(windows)]
             icon: None,
         }
+    }
+
+    #[cfg(any(
+        not(any(target_os = "android", windows, target_os = "macos")),
+        all(target_os = "macos", test)
+    ))]
+    pub(super) fn format(&self) -> PlatformFormat {
+        self.format
     }
 
     /// An SVG's header: its natural size the document's (LLP 1011.001 D1),
@@ -70,13 +103,8 @@ impl Header {
         self.color == SVG
     }
 
-    #[cfg(any(windows, target_os = "android", target_os = "macos"))]
     pub(super) fn oriented(mut self, orientation: u8) -> Self {
-        // WIC turns the decode by it; Android's decoders turn it themselves.
-        #[cfg(windows)]
-        {
-            self.orientation = orientation;
-        }
+        self.orientation = orientation;
         if orientation >= 5 {
             std::mem::swap(
                 &mut self.metadata.natural.width,
@@ -117,7 +145,7 @@ pub(super) fn inspect(
     if super::jpeg_decode::is_jpeg(head) {
         return super::jpeg_decode::inspect(input, encoded_bytes);
     }
-    if let Some(header) = super::jpeg_decode::inspect_animated(head, encoded_bytes)? {
+    if let Some(header) = super::jpeg_decode::inspect_animated(head, input, encoded_bytes)? {
         return Ok(header);
     }
     if super::svg_picture::could_be(head) {
@@ -195,8 +223,12 @@ pub(super) fn inspect_png(
                 channels,
                 color: head[25],
                 interlaced: head[28] == 1,
-                #[cfg(windows)]
                 orientation: 1,
+                #[cfg(any(
+                    not(any(target_os = "android", windows, target_os = "macos")),
+                    all(target_os = "macos", test)
+                ))]
+                format: PlatformFormat::None,
                 #[cfg(windows)]
                 icon: None,
             });
@@ -307,6 +339,14 @@ impl DecodePlan {
                 .and_then(|n| n.checked_add(u64::from(pixels.0) * u64::from(pixels.1) * 4))
                 .and_then(|n| n.checked_add(header.metadata.encoded_bytes))
                 .ok_or(Refusal::Overflow)?
+        } else {
+            scratch
+        };
+        // Pure-Rust decoders (Linux) hold the encoded bytes plus full-frame decode
+        // workspace (and `AreaRows` resampling rows) before dropping scratch.
+        #[cfg(not(any(target_os = "android", windows, target_os = "macos")))]
+        let scratch = if header.color == PLATFORM {
+            pure_platform_scratch(header, pixels)?
         } else {
             scratch
         };
@@ -449,6 +489,89 @@ impl DecodePlan {
     pub fn peak_bytes(self) -> u64 {
         self.cost.peak().expect("checked plan")
     }
+}
+
+/// Worst-case scratch reservation for pure-Rust JPEG, WebP, and GIF decoding.
+/// Audited against `zune-jpeg =0.5.15`, `image-webp =0.2.4`, and `gif =0.14.2`
+/// in `allocation_tests.rs`.
+#[cfg(any(
+    not(any(target_os = "android", windows, target_os = "macos")),
+    all(target_os = "macos", test)
+))]
+pub(super) fn pure_platform_scratch(header: Header, pixels: (u32, u32)) -> Result<u64, Refusal> {
+    let natural = header.metadata.natural;
+    let (stored_w, stored_h) = if header.orientation >= 5 {
+        (natural.height, natural.width)
+    } else {
+        (natural.width, natural.height)
+    };
+    let stored_pixels = u64::from(stored_w)
+        .checked_mul(u64::from(stored_h))
+        .ok_or(Refusal::Overflow)?;
+    let padded_w = u64::from(stored_w).next_multiple_of(16);
+    let padded_h = u64::from(stored_h).next_multiple_of(16);
+    let padded_pixels = padded_w.checked_mul(padded_h).ok_or(Refusal::Overflow)?;
+    // JPEG components can have sampling factors 1..=4 (MCU up to 32x32).
+    let jpeg_padded_w = u64::from(stored_w).next_multiple_of(32);
+    let jpeg_padded_h = u64::from(stored_h).next_multiple_of(32);
+    let jpeg_padded_pixels = jpeg_padded_w
+        .checked_mul(jpeg_padded_h)
+        .ok_or(Refusal::Overflow)?;
+    let codec = match header.format {
+        // Single-scan baseline RGB (3 B/px) + MCU row/upsampler workspace (<= 1024 B/padded col for v_max<=4).
+        PlatformFormat::Jpeg => stored_pixels
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(jpeg_padded_w.checked_mul(1024)?))
+            .ok_or(Refusal::Overflow)?,
+        // Progressive or multi-scan baseline: RGB (3 B/px) + full 32px-aligned i16 planes (<= 4 comps * 2 B) + MCU rows.
+        PlatformFormat::JpegProgressive => stored_pixels
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(jpeg_padded_pixels.checked_mul(8)?))
+            .and_then(|n| n.checked_add(jpeg_padded_w.checked_mul(1024)?))
+            .ok_or(Refusal::Overflow)?,
+        // Still WebP without VP8X alpha: output (<= 4 B/px) + padded internal VP8/VP8L plane (<= 4 B/px)
+        // + 3x encoded_bytes for VP8 final-partition `read_to_end` doubling + `chunks` copy.
+        PlatformFormat::Webp => stored_pixels
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(padded_pixels.checked_mul(4)?))
+            .and_then(|n| n.checked_add(header.metadata.encoded_bytes.checked_mul(3)?))
+            .ok_or(Refusal::Overflow)?,
+        // Still VP8X with alpha: output (4 B/px) + VP8 YUV frame (1.5 B/px) + compressed ALPH
+        // lossless decode buffer (4 B/px) + AlphaChunk (1 B/px) + 3x encoded_bytes for VP8 partitions.
+        PlatformFormat::WebpAlpha => stored_pixels
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(padded_pixels.checked_mul(7)?))
+            .and_then(|n| n.checked_add(header.metadata.encoded_bytes.checked_mul(3)?))
+            .ok_or(Refusal::Overflow)?,
+        // Animated WebP: output (4 B/px) + compositing canvas (4 B/px) + first frame / ALPH decode
+        // workspace (up to 7 B/px padded) + 3x encoded_bytes for VP8 partitions.
+        PlatformFormat::WebpAnimated => stored_pixels
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(padded_pixels.checked_mul(11)?))
+            .and_then(|n| n.checked_add(header.metadata.encoded_bytes.checked_mul(3)?))
+            .ok_or(Refusal::Overflow)?,
+        // GIF frame 0: decoded RGBA frame (4 B/px) + sub-rect composite canvas (4 B/px)
+        // + 2x encoded_bytes for `gif` 0.14.2 XMP/ICC metadata Vec growth.
+        PlatformFormat::Gif => stored_pixels
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(header.metadata.encoded_bytes.checked_mul(2)?))
+            .ok_or(Refusal::Overflow)?,
+        PlatformFormat::None => stored_pixels.checked_mul(4).ok_or(Refusal::Overflow)?,
+    };
+    let row_buf = u64::from(natural.width) * 4;
+    let area = if pixels != (natural.width, natural.height) {
+        u64::from(pixels.0) * 2 * std::mem::size_of::<[u64; 4]>() as u64
+    } else {
+        0
+    };
+    header
+        .metadata
+        .encoded_bytes
+        .checked_add(codec)
+        .and_then(|n| n.checked_add(u64::from(natural.width) * 8 + 1024 * 1024))
+        .and_then(|n| n.checked_add(row_buf))
+        .and_then(|n| n.checked_add(area))
+        .ok_or(Refusal::Overflow)
 }
 
 fn area_scratch(header: Header, pixels: (u32, u32)) -> u64 {
@@ -621,7 +744,7 @@ fn sample(at: u32, output: u32, natural: u32) -> u32 {
     (((2 * u64::from(at) + 1) * u64::from(natural)) / (2 * u64::from(output))) as u32
 }
 
-fn premultiplied(px: &[u8]) -> [u8; 4] {
+pub(super) fn premultiplied(px: &[u8]) -> [u8; 4] {
     let (r, g, b, a) = match px.len() {
         4 => (px[0], px[1], px[2], px[3]),
         3 => (px[0], px[1], px[2], 255),
@@ -632,14 +755,14 @@ fn premultiplied(px: &[u8]) -> [u8; 4] {
     [premul(r), premul(g), premul(b), a]
 }
 
-struct AreaRows {
+pub(super) struct AreaRows {
     horizontal: Vec<[u64; 4]>,
     accumulated: Vec<[u64; 4]>,
     next_y: u32,
 }
 
 impl AreaRows {
-    fn new(plan: &DecodePlan) -> Self {
+    pub(super) fn new(plan: &DecodePlan) -> Self {
         Self {
             horizontal: vec![[0; 4]; plan.pixels.width as usize],
             accumulated: vec![[0; 4]; plan.pixels.width as usize],
@@ -647,7 +770,14 @@ impl AreaRows {
         }
     }
 
-    fn push(&mut self, row: &[u8], channels: usize, y: u32, plan: &DecodePlan, out: &mut Pixmap) {
+    pub(super) fn push(
+        &mut self,
+        row: &[u8],
+        channels: usize,
+        y: u32,
+        plan: &DecodePlan,
+        out: &mut Pixmap,
+    ) {
         let (w, h) = plan.natural();
         let full = plan.full();
         let top = u64::from(y) * u64::from(full.height);

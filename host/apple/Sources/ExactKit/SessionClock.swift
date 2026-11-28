@@ -62,15 +62,18 @@ extension ExactSession {
     /// due; what is due after it is posted.
     func advanceIfDue() {
         guard !advancingDue, !applying, !landing, !waits(.advance), !holdingReports, state != .destroyed, clock == nil, !ExactEnv.agentFreezes,
-              !frames.tasks, !ownerInFlight, let due = timerDue, due <= now() else { return }
-        advancingDue = true
-        defer { advancingDue = false }
-        followOffset()
-        guard postsTimerAdvances else { applyUnlessEmpty(runtime.advance(now: now())); return }
-        let then = runtime.landThenFirst()
-        guard !then.held else { return } // (over a reset: ResetGate replays it)
-        applyUnlessEmpty(then)
-        if state != .destroyed, !ownerInFlight, let due = timerDue, due <= now() { sendAdvance(now: now()) }
+              !frames.tasks, !ownerInFlight else { return }
+        if let due = timerDue, due <= now() {
+            advancingDue = true
+            defer { advancingDue = false }
+            followOffset()
+            guard postsTimerAdvances else { applyUnlessEmpty(runtime.advance(now: now())); return }
+            let then = runtime.landThenFirst()
+            guard !then.held else { return } // (over a reset: ResetGate replays it)
+            applyUnlessEmpty(then)
+            if state != .destroyed, !ownerInFlight, let due = timerDue, due <= now() { sendAdvance(now: now()); return }
+        }
+        if state != .destroyed, !ownerInFlight { shareHost.claimPending(self) }
     }
 
     /// A timer advance on the owner, not waited for (LLP 1072.000 §4 B):

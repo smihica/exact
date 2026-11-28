@@ -4,7 +4,7 @@
 // the app makes (`scrollIntoView`, a `scrollTop` write) owns the scrollers it moves until it settles (LLP 1070.000
 // §15): the follow moves nothing meanwhile, `scrollFollowEnd` turning true in the same commit included, and where
 // the scroll rests decides whether the end is followed. A commit's follow settles once its commands have run.
-import { After, Before, Hosts, PropHooks, clock } from "./rt.js";
+import { After, Before, Hosts, PropHooks, clock, onEnd, onMount } from "./rt.js";
 import { liveById, scrollFollowers } from "./navigation.js";
 
 /** Installs the follow over the runtime's hooks; returns the follower table and the commit's settle, for tests. */
@@ -26,8 +26,8 @@ export function endFollow(rt, nav, styleOf = (e) => getComputedStyle(e), timers 
       }
     }
     for (const s of [...F.followedScrolls.values()]) {
-      // A scroller the commit removed (its branch, its route) is let go, with what it holds.
-      if (s.el.$list || !s.el.isConnected) F.followScroll(s.el, false);
+      // A scroller the commit removed or started exiting is let go, with what it holds.
+      if (s.el.$list || !s.el.isConnected || s.el.closest?.("[data-exiting]")) F.followScroll(s.el, false);
       else F.settleFollow(s);
     }
   };
@@ -36,14 +36,27 @@ export function endFollow(rt, nav, styleOf = (e) => getComputedStyle(e), timers 
   rt.After.push(queue);
   rt.PropHooks.scrollFollowEnd = (e, v) => {
     if (e.$list) return false;
-    F.followScroll(e, v === "true");
+    const on = v === "true";
+    e.$followEnd = on;
+    if (!e.$followEndEnd && rt.onEnd) {
+      e.$followEndEnd = true;
+      rt.onEnd(() => F.followScroll(e, false));
+    }
+    (rt.onMount ?? (f => f()))(() => {
+      if (!e.$list && e.$followEnd === on && (!on || !e.closest?.("[data-exiting]"))) F.followScroll(e, on);
+    }, (e.$followEndKey ??= {}));
     return true;
   };
   for (const name of ["scrollTop", "scrollLeft"]) {
     const prior = rt.PropHooks[name];
     rt.PropHooks[name] = (e, v) => {
       // rt.js `drain` animates it under `scroll-behavior: smooth`, except on the agent's clock.
-      if (v != null) authored.push([e, !rt.clock.agent && e.style?.scrollBehavior === "smooth" ? "smooth" : "instant"]);
+      const seq = (e['$scrollSeq' + name] = (e['$scrollSeq' + name] ?? 0) + 1);
+      if (v != null)
+        (rt.onMount ?? (f => f()))(() => {
+          if (e['$scrollSeq' + name] === seq)
+            authored.push([e, !rt.clock.agent && e.style?.scrollBehavior === "smooth" ? "smooth" : "instant"]);
+        }, (e['$followScrollKey' + name] ??= {}));
       return prior?.(e, v) ?? false;
     };
   }
@@ -56,4 +69,4 @@ export function endFollow(rt, nav, styleOf = (e) => getComputedStyle(e), timers 
   return { F, settle };
 }
 
-endFollow({ After, Before, Hosts, PropHooks, clock }, { liveById, scrollFollowers });
+endFollow({ After, Before, Hosts, PropHooks, clock, onEnd, onMount }, { liveById, scrollFollowers });

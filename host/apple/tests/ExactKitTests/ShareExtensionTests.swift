@@ -76,6 +76,159 @@ final class ShareExtensionTests: XCTestCase {
         XCTAssertEqual(record["dropped"] as? [String: Int], ["files": 1])
         XCTAssertEqual(try String(contentsOf: dir.appendingPathComponent("1.txt"), encoding: .utf8), "water, map")
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("share.json.partial").path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("staging").path), [])
+        XCTAssertNoThrow(try ShareInboxWriter.syncPath(dir.appendingPathComponent("share.json")))
+        XCTAssertNoThrow(try ShareInboxWriter.syncPath(dir))
+        XCTAssertThrowsError(try ShareInboxWriter.syncPath(dir.appendingPathComponent("missing")))
+    }
+
+    func testWriterSyncsStagedFilesAndDirectoriesBeforePublishingAndNotifying() throws {
+        let writer = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        var events: [String] = []
+        writer.sync = { url in
+            events.append("sync:\(url.lastPathComponent)")
+            try ShareInboxWriter.syncPath(url)
+        }
+        writer.notify = { name in events.append("notify:\(name)") }
+        let done = expectation(description: "taken")
+        writer.take(try items()) { done.fulfill() }
+        wait(for: [done], timeout: 10)
+        // Before finish, nothing is visible in `shares/`.
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("shares").path), [])
+        try writer.finish(title: "Trip", text: "Bring water")
+        let id = writer.directory.lastPathComponent
+        let containerName = scratch.lastPathComponent
+        XCTAssertEqual(events, [
+            "sync:1.txt",
+            "sync:share.json.tmp",
+            "sync:share-\(id)",
+            "sync:\(containerName)",
+            "sync:shares",
+            "sync:staging",
+            "sync:\(id)",
+            "notify:com.exact.test.shares",
+        ])
+    }
+
+    func testWriterRejectsOversizedShareRecord() throws {
+        let writer = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        var notified = false
+        writer.notify = { _ in notified = true }
+        let huge = String(repeating: "a", count: ShareInboxWriter.recordCap + 1024)
+        XCTAssertThrowsError(try writer.finish(title: "Big", text: huge))
+        XCTAssertFalse(notified)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("shares").path), [])
+        writer.discard()
+    }
+
+    func testSyncFailureAbortsBeforePublishingOrNotifying() throws {
+        // Failure while syncing an accepted attachment aborts Post even if text is present.
+        let attWriter = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        var attNotified = false
+        attWriter.sync = { url in
+            if url.lastPathComponent == "1.txt" { throw POSIXError(.EIO) }
+            try ShareInboxWriter.syncPath(url)
+        }
+        attWriter.notify = { _ in attNotified = true }
+        let attDone = expectation(description: "att-taken")
+        attWriter.take(try items()) { attDone.fulfill() }
+        wait(for: [attDone], timeout: 10)
+        XCTAssertThrowsError(try attWriter.finish(title: "Trip", text: "Bring water"))
+        XCTAssertFalse(attNotified)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("shares").path), [])
+        attWriter.discard()
+
+        // Failure before rename leaves `shares/` untouched and never notifies.
+        let writer = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        var notified = false
+        writer.sync = { url in
+            if url.lastPathComponent == "share.json.tmp" { throw POSIXError(.EIO) }
+            try ShareInboxWriter.syncPath(url)
+        }
+        writer.notify = { _ in notified = true }
+        let done = expectation(description: "taken")
+        writer.take(try items()) { done.fulfill() }
+        wait(for: [done], timeout: 10)
+        XCTAssertThrowsError(try writer.finish(title: "Trip", text: "Bring water"))
+        XCTAssertFalse(notified)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("shares").path), [])
+        writer.discard()
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("staging").path), [])
+
+        // Failure on parent `shares/` sync (simulating writer death right after rename
+        // WITHOUT discard): only `share.json.tmp` exists in `shares/<uuid>/`, never
+        // `share.json`, so even after lock release a receiver never sees a failed publication.
+        var writer2: ShareInboxWriter? = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        var notified2 = false
+        var lockHeldDuringParentSync = false
+        let failedDir = writer2!.directory
+        writer2!.sync = { url in
+            if url.lastPathComponent == "shares" {
+                let fd = failedDir.withUnsafeFileSystemRepresentation { open($0!, O_RDONLY) }
+                if fd >= 0 {
+                    lockHeldDuringParentSync = (flock(fd, LOCK_EX | LOCK_NB) != 0)
+                    close(fd)
+                }
+                throw POSIXError(.EIO)
+            }
+            try ShareInboxWriter.syncPath(url)
+        }
+        writer2!.notify = { _ in notified2 = true }
+        let done2 = expectation(description: "taken2")
+        writer2!.take(try items()) { done2.fulfill() }
+        wait(for: [done2], timeout: 10)
+        XCTAssertThrowsError(try writer2!.finish(title: "Trip", text: "Bring water"))
+        XCTAssertTrue(lockHeldDuringParentSync)
+        XCTAssertFalse(notified2)
+        // Drop writer without calling discard() (releases flock, simulating process death).
+        writer2 = nil
+        XCTAssertFalse(FileManager.default.fileExists(atPath: failedDir.appendingPathComponent("share.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: failedDir.appendingPathComponent("share.json.tmp").path))
+        try? FileManager.default.removeItem(at: failedDir)
+
+        // Failure on final `sync(directory)` AFTER `share.json.tmp` -> `share.json`
+        // rename: finish() unlinks `share.json` while still holding the flock so even
+        // if the writer dies before discard(), no receiver can accept the failed record.
+        var writerFinal: ShareInboxWriter? = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        var notifiedFinal = false
+        let finalDir = writerFinal!.directory
+        writerFinal!.sync = { url in
+            if url.lastPathComponent == finalDir.lastPathComponent {
+                throw POSIXError(.EIO)
+            }
+            try ShareInboxWriter.syncPath(url)
+        }
+        writerFinal!.notify = { _ in notifiedFinal = true }
+        let doneFinal = expectation(description: "taken-final")
+        writerFinal!.take(try items()) { doneFinal.fulfill() }
+        wait(for: [doneFinal], timeout: 10)
+        XCTAssertThrowsError(try writerFinal!.finish(title: "Trip", text: "Bring water"))
+        XCTAssertFalse(notifiedFinal)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: finalDir.appendingPathComponent("share.json").path))
+        // Drop without discard() (releases flock, simulating process death).
+        writerFinal = nil
+        XCTAssertFalse(FileManager.default.fileExists(atPath: finalDir.appendingPathComponent("share.json").path))
+        try? FileManager.default.removeItem(at: finalDir)
+
+        // Calling discard() after a successful finish() must be a no-op and leave
+        // the published share and its attachments intact.
+        let publishedWriter = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        let donePub = expectation(description: "taken-pub")
+        publishedWriter.take(try items()) { donePub.fulfill() }
+        wait(for: [donePub], timeout: 10)
+        try publishedWriter.finish(title: "Trip", text: "Bring water")
+        publishedWriter.discard()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedWriter.directory.appendingPathComponent("share.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: publishedWriter.directory.appendingPathComponent("1.txt").path))
+        try? FileManager.default.removeItem(at: publishedWriter.directory)
+
+        // Calling discard() puts the writer into a terminal cancelled state so a late finish() fails.
+        let cancelledWriter = try XCTUnwrap(ShareInboxWriter(info: info, container: scratch))
+        let done3 = expectation(description: "taken3")
+        cancelledWriter.take(try items()) { done3.fulfill() }
+        wait(for: [done3], timeout: 10)
+        cancelledWriter.discard()
+        XCTAssertThrowsError(try cancelledWriter.finish(title: "Trip", text: "Bring water"))
     }
 
     /// A file over the cap is counted against the member that accepts it and not stored, and a link that is no web

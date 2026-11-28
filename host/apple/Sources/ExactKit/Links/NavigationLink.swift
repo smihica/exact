@@ -107,11 +107,16 @@ package enum RouteGeometry {
     /// confirmations, written between its header and its scroller or after
     /// the scroller, leave the scroller its route's top and bottom edges. A
     /// dialog given back to layout to show in Exact's views counts as laid out.
+    /// Whether a computed CSS `position` participates in normal flow.
+    package static func isInFlowPosition(_ position: String) -> Bool {
+        position != "absolute" && position != "fixed"
+    }
+
     package static func inFlow(_ v: NodeView) -> Bool {
         // A popover lays out absolute (`layoutPosition`), unless sticky; a
         // sticky one is in flow while laid out, as a dialog is (`MenuHost.layOut`).
         let dialog = v.props["semanticTag"] == "dialog" || v.props["popover"] != nil
-        return v.style["display"]?.string != "none" && !["absolute", "fixed"].contains(v.layoutPosition)
+        return v.style["display"]?.string != "none" && isInFlowPosition(v.layoutPosition)
             && (!dialog || v.presenter?.menus.isLaidOut(v) == true)
     }
 
@@ -398,6 +403,9 @@ package protocol NavigationHosting: AnyObject {
     var barItemBlocks: [UInt32: HostBlock] { get }
     /// Whether a grouped list shows as UIKit's sidebar: in a split's list column while the split is expanded (LLP 1127 D7).
     func showsAsSidebar(_ list: UIView) -> Bool
+    /// Whether UIKit's sidebar material is `view`'s ground: it shows as the sidebar and the split's style is
+    /// `.sidebar`, which an embedder may set otherwise (LLP 1127 D3).
+    func sidebarMaterial(_ view: UIView) -> Bool
     /// The row of a sidebar list whose detail shows, which stays selected;
     /// `.some(nil)` for none, and nil while the runner cannot say.
     func sidebarSelection(_ list: UIView) -> UInt32??
@@ -711,6 +719,7 @@ package final class NoNavigation: NavigationHosting {
     #endif
     package var barItemBlocks: [UInt32: HostBlock] { [:] }
     package func showsAsSidebar(_ list: UIView) -> Bool { false }
+    package func sidebarMaterial(_ view: UIView) -> Bool { false }
     package func sidebarSelection(_ list: UIView) -> UInt32?? { .some(nil) }
     package func listPress(_ row: UInt32, in list: UIView, _ press: () -> Void) { press() }
 

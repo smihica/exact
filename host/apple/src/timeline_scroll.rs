@@ -24,43 +24,45 @@ impl<D: DataSource> Host<D> {
     /// the scrollers they read, and hold each consumer at its scroller's
     /// offset.
     pub(super) fn place_timelines(&mut self, batch: &mut Batch) {
-        for (node, binding) in self.runner.kernel_mut().place_timelines() {
-            self.engine.set_animation_timeline(node, binding);
-        }
+        let placed = self.runner.kernel_mut().place_timelines();
         let kernel = self.runner.kernel();
         let now = kernel.timeline_scrollers();
         let was = &self.timeline_scrolls.scrollers;
-        if now.is_empty() && was.is_empty() {
-            return;
-        }
-        let mut scrollers = Vec::with_capacity(now.len());
-        for s in now {
-            // A view this batch creates is a new scroller, at its start.
-            let kept = (!batch.creates(s.view))
-                .then(|| was.iter().find(|(w, _)| w == s))
-                .flatten();
-            if kept.is_none() {
-                let mark = if s.page { "page" } else { "1" };
-                batch.props(s.view, &[("scrollTimeline", mark.into())], &[]);
+        if !now.is_empty() || !was.is_empty() {
+            let mut scrollers = Vec::with_capacity(now.len());
+            for s in now {
+                // A view this batch creates is a new scroller, at its start.
+                let kept = (!batch.creates(s.view))
+                    .then(|| was.iter().find(|(w, _)| w == s))
+                    .flatten();
+                if kept.is_none() {
+                    let mark = if s.page { "page" } else { "1" };
+                    batch.props(s.view, &[("scrollTimeline", mark.into())], &[]);
+                }
+                // A scroller marked anew is where the presenter last showed it,
+                // which the runner notes for every scroll, marked or not; a
+                // node created since has none noted, and is at its start.
+                let offset = kept.map(|k| k.1).unwrap_or_else(|| {
+                    let (x, y) = self.runner.scroll_offset((!s.page).then_some(s.view));
+                    [x, y]
+                });
+                scrollers.push((*s, offset));
             }
-            // A scroller marked anew is where the presenter last showed it,
-            // which the runner notes for every scroll, marked or not; a
-            // node created since has none noted, and is at its start.
-            let offset = kept.map(|k| k.1).unwrap_or_else(|| {
-                let (x, y) = self.runner.scroll_offset((!s.page).then_some(s.view));
-                [x, y]
-            });
-            scrollers.push((*s, offset));
-        }
-        for (s, _) in was {
-            if !now.iter().any(|n| n.view == s.view) && kernel.node(s.view).is_some() {
-                batch.props(s.view, &[], &["scrollTimeline"]);
+            for (s, _) in was {
+                if !now.iter().any(|n| n.view == s.view) && kernel.node(s.view).is_some() {
+                    batch.props(s.view, &[], &["scrollTimeline"]);
+                }
             }
+            // Supply each scroller's saved offset before installing bindings so
+            // a freshly paused animation locks at that offset rather than 0.
+            for (s, [x, y]) in &scrollers {
+                self.engine.set_scroll_offset(s.node, *x, *y);
+            }
+            self.timeline_scrolls.scrollers = scrollers;
         }
-        for (s, [x, y]) in &scrollers {
-            self.engine.set_scroll_offset(s.node, *x, *y);
+        for (node, binding) in placed {
+            self.engine.set_animation_timeline(node, binding);
         }
-        self.timeline_scrolls.scrollers = scrollers;
     }
 
     /// The presenter's scroller `view` (the page for `None`) now stands at

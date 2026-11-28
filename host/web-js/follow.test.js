@@ -3,7 +3,7 @@
 // follow settling once they have run. Stand-in elements and ResizeObserver; the follower is the web host's own.
 import { test, expect, mock } from "bun:test";
 
-mock.module("./rt.js", () => ({ After: [], Before: [], Hosts: {}, PropHooks: {}, clock: { agent: false } }));
+mock.module("./rt.js", () => ({ After: [], Before: [], Hosts: {}, PropHooks: {}, clock: { agent: false }, onEnd: () => {}, onMount: f => f() }));
 mock.module("./navigation.js", () => import("../web/navigation.js"));
 globalThis.ResizeObserver = class { constructor(fn) { this.fn = fn; } observe() {} disconnect() {} };
 const { endFollow } = await import("./follow.js");

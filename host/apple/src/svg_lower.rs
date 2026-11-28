@@ -298,6 +298,11 @@ pub(crate) fn specs_in(
             // The engine samples every animation on this node.
             break;
         }
+        // A play held at an unresolved time (inactive or detached timeline) has
+        // no effect and must never serialize non-finite JSON.
+        if play.hold.is_some_and(|h| !h.is_finite()) || !play.start.is_finite() {
+            continue;
+        }
         for p in play.animation.keyframes.properties() {
             if !props.contains(&p) {
                 continue;
@@ -1322,5 +1327,139 @@ mod stepped_cost_tests {
         assert_eq!(track.times.len(), 131071);
         assert_eq!(track.values.last(), Some(&Value::scalar(1.0)));
         assert!(track.times.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn detached_paused_play_reattached_to_auto_never_serializes_nan() {
+        exact_motion::link_animations();
+        let mut engine = Engine::new();
+        let kf = exact_motion::Keyframes::parse("from{opacity:0}to{opacity:1}").unwrap();
+        let row = |text: &str| {
+            let mut a = exact_motion::Animations::parse(text).unwrap();
+            a.resolve(|_| Some(&kf));
+            a
+        };
+        engine
+            .set_animations(1, &row("fade 1s linear both"))
+            .unwrap();
+        engine.frame();
+        engine.advance(0.4).unwrap();
+        engine.set_animation_timeline(
+            1,
+            Some((exact_motion::NamedTimeline::Missing, [0.0, 100.0])),
+        );
+        engine
+            .set_animations(1, &row("fade 1s linear both paused"))
+            .unwrap();
+        engine.set_animation_timeline(1, None);
+        let json = specs(&engine, 1, &[Property::Opacity], &|_| {
+            (Value::scalar(1.0), 1.0)
+        });
+        assert!(!json.contains("NaN"), "invalid JSON: {json}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["h"].as_f64(), Some(0.0));
+
+        // An inactive timeline paused and reattached still holds NaN and must
+        // skip emitting a spec rather than serializing `"h":NaN`.
+        let mut inactive = Engine::new();
+        inactive
+            .set_animations(1, &row("fade 1s linear both"))
+            .unwrap();
+        inactive.set_animation_timeline(
+            1,
+            Some((exact_motion::NamedTimeline::Inactive, [0.0, 100.0])),
+        );
+        inactive
+            .set_animations(1, &row("fade 1s linear both paused"))
+            .unwrap();
+        inactive.set_animation_timeline(1, None);
+        let inactive_json = specs(&inactive, 1, &[Property::Opacity], &|_| {
+            (Value::scalar(1.0), 1.0)
+        });
+        assert!(
+            !inactive_json.contains("NaN"),
+            "invalid JSON: {inactive_json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&inactive_json).unwrap(),
+            serde_json::json!([])
+        );
+
+        // End-to-end Apple host handoff: `animation-timeline: none` stays sampled
+        // via `eligibility` (no Core Animation spec while bound), then hands off to
+        // Core Animation with a finite hold when paused and reattached to `auto`.
+        let app = r#"keyframes fade
+  from opacity=0
+  to opacity=1
+component App
+  state mode = 0
+  action step
+    mode = mode + 1
+  view
+    column
+      button "Step" press=step testId="step"
+      box testId="box" width=40 height=40 opacity=0.9 animation=(mode >= 2 ? "fade 1s linear both paused" : "fade 1s linear both") animation-timeline=(mode == 1 || mode == 2 ? "none" : "auto")
+"#;
+        struct NoData;
+        impl exact_runner::DataSource for NoData {
+            fn query(
+                &mut self,
+                source: &str,
+                _: &[exact_plan::Value],
+            ) -> Result<exact_plan::Value, exact_runner::DataError> {
+                Err(exact_runner::DataError::UnknownSource(source.into()))
+            }
+        }
+        let plan = contract::compile(app).unwrap().encode();
+        let (mut host, _) = crate::Host::boot(
+            &plan,
+            NoData,
+            Box::new(exact_kernel::MonospaceMeasurer::default()),
+            390.0,
+            844.0,
+        )
+        .unwrap();
+        let step = (1..=host.runner.kernel().live_count() as u32)
+            .find(|&id| {
+                host.runner
+                    .kernel()
+                    .node(id)
+                    .and_then(|n| n.props.str(exact_kernel::PropId::TestId))
+                    == Some("step")
+            })
+            .unwrap();
+        let view = (1..=host.runner.kernel().live_count() as u32)
+            .find(|&id| {
+                host.runner
+                    .kernel()
+                    .node(id)
+                    .and_then(|n| n.props.str(exact_kernel::PropId::TestId))
+                    == Some("box")
+            })
+            .unwrap();
+        let node = exact_kernel::motion::motion_node(host.runner.kernel().node(view).unwrap().key);
+        // Mode 0 (`auto`, running): lowered to Core Animation (not sampled).
+        assert!(!host.engine.timeline_bound(node));
+        assert!(!host.engine.node_sampled(node));
+        // Mode 1 (`none`, detached from clock): bound & sampled by Rust engine.
+        host.dispatch_at(step, exact_runner::Event::Press, 400.0);
+        assert!(host.engine.timeline_bound(node));
+        assert!(host.engine.node_sampled(node));
+        // Mode 2 (`none`, paused): hold resolves to 0.0, still sampled.
+        host.dispatch_at(step, exact_runner::Event::Press, 500.0);
+        assert!(host.engine.timeline_bound(node));
+        assert!(host.engine.node_sampled(node));
+        // Mode 3 (`auto`, paused): unbound & handed back to Core Animation with finite hold 0.0.
+        host.dispatch_at(step, exact_runner::Event::Press, 600.0);
+        assert!(!host.engine.timeline_bound(node));
+        assert!(!host.engine.node_sampled(node));
+        let handoff = specs(&host.engine, node, &[Property::Opacity], &|_| {
+            (Value::scalar(0.9), 1.0)
+        });
+        assert!(!handoff.contains("NaN"), "invalid JSON: {handoff}");
+        let handoff_parsed: serde_json::Value = serde_json::from_str(&handoff).unwrap();
+        assert_eq!(handoff_parsed.as_array().unwrap().len(), 1);
+        assert_eq!(handoff_parsed[0]["h"].as_f64(), Some(0.0));
     }
 }

@@ -103,6 +103,14 @@ mimalloc = { version = "0.1", default-features = false, features = ["local_dynam
 [target.'cfg(not(any(windows, target_os = "android")))'.dependencies]
 jpeg-encoder = "0.7"
 
+# Pure-Rust JPEG, WebP and GIF (frame 0) decoders on targets without a platform
+# decoder (Linux). Pinned because `DecodePlan::new` audits their scratch bounds.
+[target.'cfg(not(any(target_os = "android", windows, target_os = "macos")))'.dependencies]
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+zune-core = { version = "=0.5.3", default-features = false, features = ["std"] }
+image-webp = "=0.2.4"
+gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # The font directories and generic families fontconfig's own files name,
 # read as files (no fontconfig library is linked).
@@ -139,3 +147,10 @@ contract = { path = "../../contract/cli" }
 url = "2.5"
 # A stand-in Java VM's function tables (src/surfaces/android_init_tests.rs).
 jni-sys = "0.3"
+
+# Exercise the Linux pure-Rust decoders and allocation bounds on macOS tests.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+zune-core = { version = "=0.5.3", default-features = false, features = ["std"] }
+image-webp = "=0.2.4"
+gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }

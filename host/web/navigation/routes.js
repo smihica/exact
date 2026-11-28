@@ -66,19 +66,16 @@ export const liveById = (id, root = document) => {
 const shownRoutes = new WeakMap();
 // @ref LLP 1013.001 D2, D6 — while a route transition plays (shared.js), the route beneath a pushed route stays shown
 // and the pushed route inert; the projection keeps both so until the transition ends.
-const heldRoutes = new Set(), arrivingRoutes = new Set();
+const heldRoutes = new Map(), arrivingRoutes = new Map();
+const bump = (m, k, d) => { const n = (m.get(k) ?? 0) + d; n > 0 ? m.set(k, n) : m.delete(k); };
 /** Each navigation root under `root` with the routes it last showed in its selected stack, bottom first. */
 export const shownStacks = (root) => new Map([...root.querySelectorAll("[navigationBack]")].map((nav) => [nav, shownRoutes.get(nav) ?? []]));
 /** Hold `beneath` shown and `arriving` inert, projected now; what it returns lets them go and projects again. */
 export function holdRoutes(beneath, arriving) {
-  heldRoutes.add(beneath);
-  arrivingRoutes.add(arriving);
-  navigation.project(root, log);
-  return () => {
-    heldRoutes.delete(beneath);
-    arrivingRoutes.delete(arriving);
-    navigation.project(root, log);
-  };
+  bump(heldRoutes, beneath, 1); bump(arrivingRoutes, arriving, 1);
+  try { navigation.project(root, log); } catch (e) { bump(heldRoutes, beneath, -1); bump(arrivingRoutes, arriving, -1); throw e; }
+  let done = false;
+  return () => { if (done) return; done = true; bump(heldRoutes, beneath, -1); bump(arrivingRoutes, arriving, -1); navigation.project(root, log); };
 }
 export const sheetLeaves = (el) => SHEETS && slideAway(el);
 // @ref LLP 1115.000 D4.8 — a sheet the look draws (fixed to the window) slides back down as it closes, as it slid up (neutral.css), unless the person asks for less motion. A runtime asks this before it removes a modal route (glue.js's `destroy`; rt.js's `clear`, `each` and presence's `Leave`); a sheet that leaves stays whole until it is off the window, from where it stands, out of input, accessibility and the routes as presence-glue.js's leaving views are (LLP 1063), the focus leaving it as a removed one's would (input-glue.js's `arrive` takes one a blur does not reach). One holding media or a field whose decorations the browser paints closes at once, as its runtime empties those with the commit, and so does one holding an open dialog or popover, which the top layer would leave frozen on the window; a native view slides, showing what its module left in it. It keeps its ids for what it draws, though a command by id passes over it (`liveById`), and its stack's projection ends it on showing a sheet that was not beneath it, which may share them (compared as elements: a replace keeps its key).
@@ -493,7 +490,7 @@ const stamp = (index, op) => ({ exact: index, id: op.top, url: op.url, ...placeO
 /** A route's Back control, the selected route's unless named (1035.001 D1: the `id` the root's `navigationBack` names), pressable or not: the route's own, else one in no route at all (a header the routes share), as iOS resolves it (NavigationBack.control); another route's is that route's. */
 const backControl = (nav, route = selectedRoute(nav), name = nav.getAttribute("navigationBack")) => route && name !== null ? route.querySelector(`[id="${CSS.escape(name)}"]`) ?? [...nav.ownerDocument.querySelectorAll(`[id="${CSS.escape(name)}"]`)].find((control) => [null, nav].includes(control.closest("[navigationKey]"))) ?? null : undefined;
 // LLP 1116.000 D4: Back belongs to the header shadow root; bar items proxy the authored controls.
-const BACK = `<style>button{all:unset;display:inline-flex;align-items:center;gap:6px;flex:none;vertical-align:middle;margin-inline:-6px 6px;padding:4px 8px 4px 4px;border-radius:8px;cursor:pointer;white-space:nowrap;-webkit-user-select:none;user-select:none}button[hidden],span[hidden]{display:none}button:focus-visible{outline:2px solid var(--exact-accent,AccentColor);outline-offset:1px}button:active>*{opacity:var(--exact-back-press,.5)}svg{width:1em;height:1em;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}button:dir(rtl) svg{scale:-1 1}</style><button part="back" type="button"><svg viewBox="4 4 16 16" aria-hidden="true"><path d="M19 12H5m6-6-6 6 6 6"/></svg><span></span></button><slot></slot>`;
+const BACK = `<style>button{all:unset;display:inline-flex;align-items:center;gap:6px;flex:none;vertical-align:middle;margin-inline:-6px 6px;padding:4px 8px 4px 4px;border-radius:8px;cursor:pointer;white-space:nowrap;-webkit-user-select:none;user-select:none}button[hidden],span[hidden]{display:none}button:focus-visible{outline:2px solid var(--exact-accent,AccentColor);outline-offset:1px}button:active>*{opacity:var(--exact-back-press,.5)}svg{width:1em;height:1em;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}button[data-rtl] svg{scale:-1 1}</style><button part="back" type="button"><svg viewBox="4 4 16 16" aria-hidden="true"><path d="M19 12H5m6-6-6 6 6 6"/></svg><span></span></button><slot></slot>`;
 const headerOf = (route) => liveChildren(route).find((child) => child.localName === "header");
 const authored = "[data-exact-said~=\"appearance\"]";
 // a header or a node in one whose author wrote `appearance: none` (element.rs)
@@ -779,8 +776,8 @@ function readProjections(root, log) {
         live,
         over: routes.map(overPage),
         headers: BARS ? routes.map((route) => {
-          const header = headerOf(route);
-          return !!header && getComputedStyle(header).display !== "none";
+          const header = headerOf(route), style = header && getComputedStyle(header);
+          return style && style.display !== "none" ? { rtl: style.direction === "rtl" } : null;
         }) : []
       };
     });
@@ -792,9 +789,9 @@ function readProjections(root, log) {
   }
   return projections;
 }
-function appBarBack(nav, routes, index, shown, headerShown, bar) {
+function appBarBack(nav, routes, index, shown, headerFact, bar) {
   if (!bar) return;
-  const route = routes[index], { header, pushed, control, inShownHeader } = bar;
+  const headerShown = !!headerFact, route = routes[index], { header, pushed, control, inShownHeader } = bar;
   // A header iOS makes no bar of draws Back where its Back control does not show, as the settled marks leave it (iOS draws it either way)
   const items = bar.items !== undefined ? bar.items : headerShown && shown ? barItems(route, header) : null;
   const drawn = pushed && !(inShownHeader && header.contains(control.closest(authored))) && (!inShownHeader || !!items || !control.checkVisibility({ visibilityProperty: true }));
@@ -821,6 +818,7 @@ function appBarBack(nav, routes, index, shown, headerShown, bar) {
   if (!button || button.hidden) {
     return;
   }
+  button.toggleAttribute("data-rtl", headerFact ? headerFact.rtl : getComputedStyle(header).direction === "rtl");
   const words = control ? control.textContent.trim() : titleOf(routes[index - 1]), english = /^en\b/i.test(document.documentElement.lang || "en");
   const label = control ? words.length <= 14 ? words : english ? "Back" : "" : english ? "Back" : "", name = control ? control.getAttribute("aria-label") || words || "Back" : !english ? words || "Back" : words ? `Back to ${words}` : "Back";
   button.lastChild.hidden = !label;
@@ -1292,7 +1290,7 @@ export const navigation = {
         const { found, headers } = facts[stack];
         detailRows(routes, found);
         for (const index of BARS ? routes.keys() : []) {
-          bars.set(routes[index], settleBar(nav, routes, index, found.width > 0, headers[index]));
+          bars.set(routes[index], settleBar(nav, routes, index, found.width > 0, !!headers[index]));
         }
       }
     }

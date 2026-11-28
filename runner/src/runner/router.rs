@@ -110,11 +110,18 @@ pub trait Routing {
     /// Whether the table declares one location: a single route besides
     /// `notfound`, which is then the root `/` (`Table::check`).
     fn one_location(&self) -> bool;
-    /// Set what `sharedFiles` answers for a share's token (LLP 1133.024 D3);
-    /// false when it already answers that.
-    fn share(&self, token: &str, files: Value) -> bool;
+    /// Set or clear `sharedFiles` for `token` (LLP 1133.024 D3); `Some(prev)` if changed.
+    fn share(&self, token: &str, files: Option<Value>) -> Option<Option<Value>>;
     /// This launch's claims (D3), drawn from `seed` the first time.
     fn claims(&self, seed: f64) -> std::cell::RefMut<'_, crate::share_in::Claims>;
+    /// Snapshot share tokens and claim counters across a carried reload.
+    fn share_state(&self) -> (Vec<(String, Value)>, Option<crate::share_in::Claims>);
+    /// Restore share tokens and claim counters from a carried reload.
+    fn restore_share_state(
+        &self,
+        shared: Vec<(String, Value)>,
+        claims: Option<crate::share_in::Claims>,
+    );
     /// Whether a committed change asked for a scroll to its top's fragment
     /// that no host has been told to make yet (LLP 1153 D5).
     fn fragment_due(&self) -> bool;
@@ -635,18 +642,12 @@ fn element(plan: &Plan, ty: TypesId) -> Result<TypesId, RunnerError> {
         .ok_or_else(|| invalid("list needs an element type"))
 }
 fn record(v: &Value) -> Option<&[Value]> {
-    if let Value::Record(v) = v {
-        Some(v)
-    } else {
-        None
-    }
+    let Value::Record(v) = v else { return None };
+    Some(v)
 }
 fn list(v: &Value) -> Option<&[Value]> {
-    if let Value::List(v) = v {
-        Some(v)
-    } else {
-        None
-    }
+    let Value::List(v) = v else { return None };
+    Some(v)
 }
 fn integer(v: &Value) -> Option<u64> {
     let n = v.as_number()?;
@@ -658,14 +659,46 @@ impl Routing for RouterContext {
         self.slot
     }
 
-    fn share(&self, token: &str, files: Value) -> bool {
-        self.shared.borrow_mut().insert(token.into(), files.clone()) != Some(files)
+    fn share(&self, token: &str, files: Option<Value>) -> Option<Option<Value>> {
+        let mut s = self.shared.borrow_mut();
+        if s.get(token) == files.as_ref() {
+            return None;
+        }
+        Some(match files {
+            Some(v) => s.insert(token.into(), v),
+            None => s.remove(token),
+        })
     }
 
     fn claims(&self, seed: f64) -> std::cell::RefMut<'_, crate::share_in::Claims> {
         std::cell::RefMut::map(self.claims.borrow_mut(), |c| {
             c.get_or_insert_with(|| crate::share_in::Claims::new(seed))
         })
+    }
+
+    fn share_state(&self) -> (Vec<(String, Value)>, Option<crate::share_in::Claims>) {
+        (
+            self.shared
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            self.claims.borrow().clone(),
+        )
+    }
+
+    fn restore_share_state(
+        &self,
+        shared: Vec<(String, Value)>,
+        claims: Option<crate::share_in::Claims>,
+    ) {
+        let mut s = self.shared.borrow_mut();
+        for (k, v) in shared {
+            s.insert(k, v);
+        }
+        if let Some(c) = claims {
+            *self.claims.borrow_mut() = Some(c);
+        }
     }
 
     fn call(&self, plan: &Plan, f: Stdlib, args: &[Value]) -> Option<Value> {
@@ -1428,72 +1461,5 @@ impl<D: DataSource> Runner<D> {
 mod test_fixture;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::Cell;
-
-    thread_local! {
-        pub(super) static DECODES: Cell<usize> = const { Cell::new(0) };
-    }
-
-    #[test]
-    fn unrelated_commits_do_not_decode_the_router_at_any_stack_depth() {
-        let table = Table {
-            routes: [
-                ("home", "/", None, true),
-                ("thread", "/t/:thread", Some(0), false),
-            ]
-            .into_iter()
-            .map(|(name, pattern, parent, tab)| exact_route::Route {
-                name: name.into(),
-                pattern: pattern.into(),
-                parent,
-                tab,
-                notfound: false,
-            })
-            .collect(),
-        };
-        let mut decodes = Vec::new();
-        for depth in [1, 4, 16] {
-            let mut runner = Runner::boot(
-                test_fixture::plan(&table),
-                (),
-                exact_kernel::Kernel::with_monospace(),
-                Default::default(),
-                "/",
-            )
-            .unwrap();
-            for visit in 1..=depth {
-                runner
-                    .act("push", vec![Value::str(&format!("/t/{visit}"))])
-                    .unwrap();
-            }
-            runner.take_router_change();
-            runner.act("back", vec![]).unwrap();
-            let value = runner.slot("nav").unwrap().clone();
-            assert_eq!(runner.derive("depth"), Some(&Value::Number(depth as f64)));
-            let before = DECODES.get();
-            for edit in 0..100 {
-                runner
-                    .act("encode", vec![Value::str(&format!("edit {edit}"))])
-                    .unwrap();
-            }
-            decodes.push(DECODES.get() - before);
-            assert_eq!(runner.slot("encoded"), Some(&Value::str("edit%2099")));
-            assert!(crate::compare::same(runner.slot("nav").unwrap(), &value));
-            assert_eq!(runner.location_ahead(), Some(format!("/t/{depth}")));
-            let pending = runner.take_router_change().unwrap();
-            assert_eq!(pending.visits.len(), depth);
-            assert_eq!(pending.removed.len(), 1);
-            runner
-                .act("encode", vec![Value::str("after drain")])
-                .unwrap();
-            assert!(runner.take_router_change().is_none());
-        }
-        assert_eq!(
-            decodes,
-            [0, 0, 0],
-            "100 unrelated commits at depths 1, 4 and 16"
-        );
-    }
-}
+#[path = "router_tests.rs"]
+mod tests;

@@ -64,7 +64,21 @@ impl<D: DataSource> Host<D> {
         self.runner.collection_reply_key()
     }
 
-    pub(super) fn finish(&mut self, mut batch: Batch, error: Option<String>) -> String {
+    pub(super) fn finish(&mut self, batch: Batch, error: Option<String>) -> String {
+        self.finish_checked(batch, error, None, false).0
+    }
+
+    /// Runs final presentation, resize settlement, and batch encoding, returning
+    /// `(batch_json, ok)` where `ok` reflects the exact final error (including any
+    /// late resize-round error or, when `require_persisted`, failed store write)
+    /// encoded into the batch.
+    pub(super) fn finish_checked(
+        &mut self,
+        mut batch: Batch,
+        error: Option<String>,
+        error_prefix: Option<&str>,
+        require_persisted: bool,
+    ) -> (String, bool) {
         #[cfg(test)]
         {
             self.finish_passes += 1;
@@ -84,6 +98,15 @@ impl<D: DataSource> Host<D> {
             documents(self);
         }
         let (mut batch, error) = self.resize_rounds(batch, error);
+        let error = error.or_else(|| {
+            (require_persisted && !self.pending_store_writes.is_empty())
+                .then(|| "store persistence failed; retry required".to_string())
+        });
+        let error = error.map(|e| match error_prefix {
+            Some(prefix) if !e.starts_with(prefix) => format!("{prefix}{e}"),
+            _ => e,
+        });
+        let ok = error.is_none();
         self.emit_prose_markers(&mut batch);
         self.route_overflow.settled =
             error.is_none() && !batch.layout_provisional && !self.layout_owed;
@@ -91,7 +114,7 @@ impl<D: DataSource> Host<D> {
             (canvas.captures)(self, &mut batch);
         }
         self.state_onto(&mut batch);
-        self.write_batch(batch, error.as_deref(), true)
+        (self.write_batch(batch, error.as_deref(), true), ok)
     }
 
     /// Observe the viewport at the host's time, laying out due timer commits

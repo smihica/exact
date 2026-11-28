@@ -1191,7 +1191,7 @@ impl<D: DataSource> Host<D> {
         token: &str,
         files: exact_runner::share_in::SharedFiles,
     ) -> Option<String> {
-        let answer = self.runner.set_shared(token, files);
+        let answer = self.runner.set_shared([(token, files)]);
         self.told(answer, "share")
     }
 

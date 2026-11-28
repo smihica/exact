@@ -153,8 +153,14 @@ impl<D: DataSource> Host<D> {
         self.scroll_anchors
             .laid_out(self.runner.kernel(), &self.runner.roots());
         // @ref LLP 1057.003 D5 — scroll and view timelines, placed from
-        // the layout; the presenter gives their scrollers' offsets.
-        for (node, binding) in self.runner.kernel_mut().place_timelines() {
+        // the layout; feed any known presenter scroll offset before installing
+        // bindings so a freshly paused consumer locks at that offset, not 0.
+        let placed = self.runner.kernel_mut().place_timelines();
+        for s in self.runner.kernel().timeline_scrollers() {
+            let (x, y) = self.runner.scroll_offset((!s.page).then_some(s.view));
+            self.engine.set_scroll_offset(s.node, x, y);
+        }
+        for (node, binding) in placed {
             self.engine.set_animation_timeline(node, binding);
         }
         Ok(changed)

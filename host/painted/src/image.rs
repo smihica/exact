@@ -1418,6 +1418,14 @@ fn plan(
         (u64::from(natural.width) * u64::from(bucket)).div_ceil(u64::from(longest)) as u32,
         (u64::from(natural.height) * u64::from(bucket)).div_ceil(u64::from(longest)) as u32,
     );
+    // If even the smallest decode (1x1) exceeds `available`, halving `pixels`
+    // can never make it fit; return the requested size so a larger session
+    // budget accepts real resolution and a smaller one refuses cleanly as
+    // `TooLarge` instead of crushing a photo to 1x1. When scratch shrinks with
+    // `pixels` (e.g. macOS thumbnails), keep halving to find a size that fits.
+    if png_decode::DecodePlan::new(header, (1, 1)).is_ok_and(|min| min.peak_bytes() > available) {
+        return png_decode::DecodePlan::new(header, pixels);
+    }
     loop {
         let candidate = png_decode::DecodePlan::new(header, pixels);
         if candidate

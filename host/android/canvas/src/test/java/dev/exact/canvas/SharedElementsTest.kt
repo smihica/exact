@@ -22,9 +22,9 @@ class SharedElementsTest {
     private fun key(k: Long) = intArrayOf(k.toInt(), (k ushr 32).toInt())
     private fun rect(r: RectF) = intArrayOf(f(r.left), f(r.top), f(r.width()), f(r.height()))
     private fun state(alive: List<Long>, pairs: List<Triple<Long, Long, Float>> = emptyList(), reduced: Boolean = false,
-        ancestorOpacity: Float = 1f): IntBuffer {
+        ancestorOpacity: Float = 1f, dissolve: Boolean = false, unpose: FloatArray = floatArrayOf(1f, 1f, 0f, 0f)): IntBuffer {
         val body = arrayListOf(if (reduced) 1 else 0, pairs.size)
-        for ((a, b, p) in pairs) body.addAll((key(a) + key(b) + f(p) + f(ancestorOpacity)).toList())
+        for ((a, b, p) in pairs) body.addAll((key(a) + key(b) + f(p) + f(ancestorOpacity) + unpose.map(::f) + (if (dissolve) 1 else 0)).toList())
         body.add(alive.size)
         for (k in alive) body.addAll(key(k).toList())
         return IntBuffer.wrap(intArrayOf(50, body.size) + body.toIntArray())
@@ -98,6 +98,14 @@ class SharedElementsTest {
         assertRect(mid, t.shared.shown(3)!!.box)
         t.shared.begin(state(listOf(3))); t.shared.finish()
         assertFalse(t.shared.isFlying(3)); assertEquals(1f, t.shared.node(3).alpha, 0f)
+    }
+
+    @Test fun aFlightAimsAtItsDestinationUnposedOnEachAxis() {
+        val t = Fixture()
+        t.shared.begin(state(listOf(1))); t.define(definition(1, RectF(0f, 0f, 10f, 10f))); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 1f)), unpose = floatArrayOf(2f, 4f, -10f, 5f)))
+        t.define(definition(2, RectF(20f, 10f, 70f, 30f))); t.shared.finish(); t.draw()
+        assertRect(RectF(30f, 45f, 130f, 125f), t.shared.shown(2)!!.box)
     }
 
     @Test fun pendingRasterKeepsPhotoAndCropMorphsInPoints() {
@@ -388,6 +396,137 @@ class SharedElementsTest {
         val b = SharedElements.rasterRect(loaded)
         assertEquals(a.left, b.left + 0.25f * b.width(), 0.01f)
         assertEquals(a.right, b.left + 0.75f * b.width(), 0.01f)
+    }
+
+    @Test fun aRouteFlightDissolvesAndScalesALabelByItsLinesWidth() {
+        // A label's box spans its row at both ends; its lines take 60 of 80 at the source and 40 of 100
+        // at the destination, where a 20 point glyph 40 high stands at their left.
+        val from = RectF(0f, 0f, 80f, 20f)
+        val to = RectF(0f, 40f, 100f, 80f)
+        val clear = intArrayOf(2, Color.TRANSPARENT) + rect(from) + IntArray(8)
+        val glyph = intArrayOf(1, f(1f), 0, 0, f(1f), f(to.left), f(to.top), 2, Color.RED) + rect(RectF(0f, 0f, 20f, 40f)) + IntArray(8)
+        val t = Fixture()
+        t.shared.begin(state(listOf(1)))
+        t.define(definition(1, from, fit = 6, content = clear, contentBox = RectF(0f, 0f, 60f, 20f))); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 0.5f)), dissolve = true))
+        t.define(definition(2, to, fit = 6, content = glyph, contentBox = RectF(0f, 40f, 40f, 80f))); t.shared.finish()
+        val pixels = t.pixels()
+        // Halfway its lines are 50 wide: the glyph is 25 wide, not 15 as the box's height would make it,
+        // and at full strength, as the source is at its own.
+        assertEquals(Color.RED, pixels.getPixel(22, 30))
+        assertEquals(Color.WHITE, pixels.getPixel(28, 30))
+        pixels.recycle()
+    }
+
+    @Test fun aDissolvesSourceDrawingIsDiscardedWhenItsFlightLeaves() {
+        val t = Fixture()
+        t.shared.begin(state(listOf(1))); t.define(definition(1, RectF(0f, 0f, 80f, 20f))); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 0.5f)), dissolve = true))
+        t.define(definition(2, RectF(0f, 40f, 100f, 80f))); t.shared.finish()
+        val flights = SharedElements::class.java.getDeclaredField("flights").apply { isAccessible = true }
+        val flight = (flights.get(t.shared) as Map<*, *>).values.single()!!
+        val content = flight.javaClass.getDeclaredField("content").apply { isAccessible = true }.get(flight) as RenderNode
+        assertTrue(content.hasDisplayList())
+        t.shared.begin(state(listOf(2))); t.shared.finish()
+        assertFalse(content.hasDisplayList())
+    }
+
+    @Test fun aSourceStillMountedIsItselfAgainWhenItsFlightLeaves() {
+        val t = Fixture()
+        t.shared.begin(state(listOf(1))); t.define(definition(1, RectF(0f, 0f, 80f, 20f))); t.shared.finish()
+        t.shared.begin(state(listOf(1, 2), listOf(Triple(1, 2, 0.5f)), dissolve = true))
+        t.define(definition(2, RectF(0f, 40f, 100f, 80f))); t.shared.finish()
+        t.draw()
+        val flights = SharedElements::class.java.getDeclaredField("flights").apply { isAccessible = true }
+        val flight = (flights.get(t.shared) as Map<*, *>).values.single()!!
+        val source = flight.javaClass.getDeclaredField("content").apply { isAccessible = true }.get(flight) as RenderNode
+        assertTrue(source.useCompositingLayer)
+        t.shared.begin(state(listOf(1, 2))); t.shared.finish()
+        assertFalse(source.useCompositingLayer)
+    }
+
+    @Test fun aScrollersRowsInANamedBoxAreShiftedOnce() {
+        // A box from 20 points down, its scroller's rows filling the page from 24 to 44.
+        val t = Fixture()
+        t.player.group = { RenderNode("rows") }; t.player.width = 100; t.player.height = 100
+        val rows = intArrayOf(20, 1, 1, f(1f), 0, 0, f(1f), 0, 0, 2, Color.RED) + rect(RectF(0f, 24f, 100f, 44f)) + IntArray(8) + 21
+        t.shared.begin(state(listOf(1)))
+        t.define(definition(1, RectF(0f, 20f, 100f, 100f), content = rows)); t.shared.finish()
+        val canvas = t.page.beginRecording()
+        canvas.drawColor(Color.WHITE); canvas.drawRenderNode(t.shared.node(1))
+        t.page.endRecording()
+        val pixels = HardwareRenderer::class.java.getDeclaredMethod("createHardwareBitmap",
+            RenderNode::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            .invoke(null, t.page, 100, 100) as Bitmap
+        assertEquals(Color.RED, pixels.getPixel(50, 30))
+        assertEquals(Color.WHITE, pixels.getPixel(50, 10))
+        pixels.recycle()
+    }
+
+    @Test fun aRouteFlightsFadeLeadsItsBoxAsComposesSprings() {
+        assertEquals(0.849f, SharedElements.fade(0.5f), 0.005f)
+        assertEquals(0f, SharedElements.fade(0f), 0.001f)
+    }
+
+    @Test fun aFlightClipsAScrollersRowsToItsBox() {
+        // The source's rows fill it to 90; it flies into a box 30 high, a tenth of the way.
+        val t = Fixture()
+        t.player.group = { RenderNode("rows") }; t.player.width = 100; t.player.height = 100
+        val rows = intArrayOf(20, 1, 1, f(1f), 0, 0, f(1f), 0, 0, 2, Color.RED) + rect(RectF(0f, 0f, 100f, 90f)) + IntArray(8) + 21
+        t.shared.begin(state(listOf(1))); t.define(definition(1, RectF(0f, 0f, 100f, 90f), content = rows)); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 0.1f)), dissolve = true))
+        t.define(definition(2, RectF(0f, 0f, 100f, 30f))); t.shared.finish()
+        val pixels = t.pixels()
+        assertEquals(Color.WHITE, pixels.getPixel(50, 80))
+        pixels.recycle()
+    }
+
+    @Test fun aDissolvesBoxEndsWhereItsContentsDo() {
+        val t = Fixture()
+        t.shared.begin(state(listOf(1))); t.define(definition(1, RectF(0f, 0f, 100f, 96f))); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 0.5f)), dissolve = true))
+        t.define(definition(2, RectF(0f, 0f, 100f, 24f))); t.shared.finish()
+        val pixels = t.pixels()
+        // Halfway the box is 60 high; past half dissolved, its contents end at the destination's 24.
+        assertNotEquals(Color.WHITE, pixels.getPixel(50, 20))
+        assertEquals(Color.WHITE, pixels.getPixel(50, 30))
+        pixels.recycle()
+    }
+
+    @Test fun aRouteFlightScalesABoxByWidthAndAChildInsideItsFlyingParent() {
+        // Halfway from 80 by 20 to 100 by 40 the box is 90 by 30 at 0, 20; by height its fill would end at 75.
+        val t = Fixture()
+        t.shared.begin(state(listOf(1))); t.define(definition(1, RectF(0f, 0f, 80f, 20f))); t.shared.finish()
+        t.shared.begin(state(listOf(2), listOf(Triple(1, 2, 0.5f)), dissolve = true))
+        t.define(definition(2, RectF(0f, 40f, 100f, 80f))); t.shared.finish()
+        var pixels = t.pixels()
+        assertEquals(Color.RED, pixels.getPixel(85, 35))
+        pixels.recycle()
+        // A child 100 square flies inside its parent, 50 square.
+        val c = Fixture()
+        val parent = RectF(0f, 0f, 50f, 50f); val child = RectF(0f, 0f, 100f, 100f)
+        c.shared.begin(state(listOf(1, 3)))
+        c.define(definition(1, parent)); c.define(definition(3, child, parents = listOf(1))); c.shared.finish()
+        c.shared.begin(state(listOf(2, 4), listOf(Triple(1, 2, 0.5f), Triple(3, 4, 0.5f))))
+        c.define(definition(2, parent)); c.define(definition(4, child, parents = listOf(2))); c.shared.finish()
+        pixels = c.pixels()
+        assertEquals(Color.RED, pixels.getPixel(25, 25))
+        assertEquals(Color.WHITE, pixels.getPixel(75, 75))
+        pixels.recycle()
+    }
+
+    @Test fun aChildOfAParentSprungPastNothingIsNotDrawn() {
+        // An underdamped spring from 300 to 10 overshoots: at 1.15 the parent is 33.5 points less than nothing.
+        val t = Fixture()
+        t.shared.begin(state(listOf(1, 3)))
+        t.define(definition(1, RectF(0f, 0f, 300f, 300f))); t.define(definition(3, RectF(0f, 0f, 20f, 20f), parents = listOf(1)))
+        t.shared.finish()
+        t.shared.begin(state(listOf(2, 4), listOf(Triple(1, 2, 1.15f), Triple(3, 4, 0.5f))))
+        t.define(definition(2, RectF(0f, 0f, 10f, 10f))); t.define(definition(4, RectF(0f, 0f, 5f, 5f), parents = listOf(2)))
+        t.shared.finish()
+        val pixels = t.pixels()
+        assertEquals(Color.WHITE, pixels.getPixel(2, 2))
+        pixels.recycle()
     }
 
     @Test fun aLiveSubtreeKeepsItsRotationInFlight() {

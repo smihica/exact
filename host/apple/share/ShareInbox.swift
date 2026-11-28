@@ -11,6 +11,7 @@
 // ignores it. What is decoded is read from a file up to a cap (`head`): a
 // property list small enough to be Safari's page details (`readPage`), and
 // the confirmation's text (ShareConfirmation.swift).
+import Darwin
 import Foundation
 import UniformTypeIdentifiers
 
@@ -60,12 +61,33 @@ public final class ShareInboxWriter {
     /// The 64 MB an outgoing share also refuses (LLP 1125 D12).
     public static let cap: Int64 = 64 << 20
     public let info: ShareTargetInfo
+    /// Final published path under `<container>/shares/<uuid>/`.
     public let directory: URL
+    /// App Group container root (`<container>/`), synced when publishing so
+    /// newly created `shares/` and `staging/` entries are durable.
+    let container: URL
+    /// Private staging directory `<container>/staging/<uuid>/`, moved into `directory`
+    /// only after attachments, `share.json.tmp`, and the staging directory itself are synced.
+    let staging: URL
+    /// Exclusive advisory lock held on `staging` (and after rename, `directory`) until
+    /// publication or discard so the receiver's incomplete-directory sweep never races a live writer.
+    private var lockFd: Int32 = -1
+    /// Injectable in tests to observe sync ordering and simulate sync failures.
+    var sync: (URL) throws -> Void = ShareInboxWriter.syncPath
+    /// Injectable in tests to assert that notification never fires before sync succeeds.
+    var notify: (String) -> Void = { name in
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFNotificationName(name as CFString), nil, nil, true)
+    }
     /// The longest title taken from Safari's answer, in UTF-16 units: the page script's bound (SharePage.js), held
     /// here too because a page writes its own answer.
     static let titleCap = 4096
     private var files: [[String: String]] = []
     private var dropped: [String: Int] = [:]
+    /// First fatal I/O or sync failure while persisting an accepted attachment.
+    private var writeError: Error?
+    /// Terminal lifecycle flags guarded by `lock` so cancellation prevents late publication.
+    private var cancelled = false
+    private var published = false
     /// Each link attached, in the order attached, as it loaded: nil for one that did not.
     private var links: [URL?] = []
     #if EXACT_SHARE_PAGE
@@ -83,11 +105,60 @@ public final class ShareInboxWriter {
     #endif
     private let lock = NSLock()
 
-    /// A writer into `container/shares/<uuid>/`; nil when the container cannot be made.
+    /// Upper bound on serialized `share.json` size; matches `ShareInbox.recordCap` (4 MiB)
+    /// so the extension never reports success for a record the receiver would reject.
+    public static let recordCap = 4 << 20
+
+    /// A writer staged in `container/staging/share-<uuid>/` and published into `container/shares/<uuid>/`;
+    /// nil when the container cannot be made or locked.
     public init?(info: ShareTargetInfo, container: URL) {
         self.info = info
-        directory = container.appendingPathComponent("shares", isDirectory: true).appendingPathComponent(UUID().uuidString, isDirectory: true)
-        do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) } catch { return nil }
+        self.container = container
+        let id = UUID().uuidString
+        let sharesDir = container.appendingPathComponent("shares", isDirectory: true)
+        directory = sharesDir.appendingPathComponent(id, isDirectory: true)
+        staging = container.appendingPathComponent("staging", isDirectory: true).appendingPathComponent("share-\(id)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: sharesDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        let fd = staging.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Self.openRetryingEINTR(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        }
+        guard fd >= 0 else { return nil }
+        if Self.flockRetryingEINTR(fd, LOCK_EX | LOCK_NB) != 0 {
+            // Do not unlink `staging` on lock contention: a sweeper may hold it.
+            close(fd)
+            return nil
+        }
+        // Verify the locked descriptor still matches the path on disk (guards against
+        // a sweeper unlinking the directory between createDirectory and flock).
+        var fdStat = stat()
+        var pathStat = stat()
+        let sameInode = fstat(fd, &fdStat) == 0
+            && staging.withUnsafeFileSystemRepresentation { path in
+                guard let path else { return false }
+                return lstat(path, &pathStat) == 0
+            }
+            && fdStat.st_dev == pathStat.st_dev
+            && fdStat.st_ino == pathStat.st_ino
+        guard sameInode else {
+            close(fd)
+            return nil
+        }
+        lockFd = fd
+    }
+
+    deinit { releaseLock() }
+
+    private func releaseLock() {
+        if lockFd >= 0 {
+            close(lockFd)
+            lockFd = -1
+        }
     }
 
     /// The App Group's container, or nil when the extension is not entitled to it.
@@ -256,32 +327,144 @@ public final class ShareInboxWriter {
     }
 
     /// Copies `file` (the provider's temporary copy, gone after the callback) into the share under a stored name.
+    /// Validates that the source is a regular file and enforces `Self.cap` while streaming;
+    /// destination write or sync errors fail publication rather than silently dropping accepted bytes.
     private func store(_ file: URL, index: Int, type: UTType, member: String, suggested: String?) {
-        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-        guard size <= Self.cap else { return count(dropped: member) }
-        let ext = type.preferredFilenameExtension ?? file.pathExtension
-        let stored = ext.isEmpty ? "\(index)" : "\(index).\(ext)"
-        do {
-            try FileManager.default.copyItem(at: file, to: directory.appendingPathComponent(stored))
-        } catch {
+        var isCancelled = false
+        locked { isCancelled = cancelled }
+        if isCancelled { return }
+        let srcFd = file.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Self.openRetryingEINTR(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        }
+        guard srcFd >= 0 else { return count(dropped: member) }
+        defer { close(srcFd) }
+        var st = stat()
+        guard fstat(srcFd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else {
             return count(dropped: member)
         }
+        guard st.st_size <= Self.cap else { return count(dropped: member) }
+        let ext = type.preferredFilenameExtension ?? file.pathExtension
+        let stored = ext.isEmpty ? "\(index)" : "\(index).\(ext)"
+        let destination = staging.appendingPathComponent(stored)
+        let dstFd = destination.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Self.openRetryingEINTR(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode: 0o600)
+        }
+        guard dstFd >= 0 else {
+            let err = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            locked { if writeError == nil { writeError = err } }
+            return
+        }
+        var total: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        var readFailed = false
+        var overCap = false
+        var dstFailure: Error?
+        while true {
+            let n = buffer.withUnsafeMutableBytes { buf -> ssize_t in
+                while true {
+                    let r = read(srcFd, buf.baseAddress, buf.count)
+                    if r < 0 && errno == EINTR { continue }
+                    return r
+                }
+            }
+            if n == 0 { break }
+            if n < 0 { readFailed = true; break }
+            total += Int64(n)
+            if total > Self.cap { overCap = true; break }
+            var offset = 0
+            while offset < n {
+                let wrote = buffer.withUnsafeBytes { buf -> ssize_t in
+                    while true {
+                        let w = write(dstFd, buf.baseAddress!.advanced(by: offset), n - offset)
+                        if w < 0 && errno == EINTR { continue }
+                        return w
+                    }
+                }
+                if wrote <= 0 {
+                    dstFailure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    break
+                }
+                offset += wrote
+            }
+            if dstFailure != nil { break }
+        }
+        let closeResult = close(dstFd)
+        if dstFailure == nil && closeResult != 0 && errno != EINTR {
+            dstFailure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        if overCap || readFailed {
+            try? FileManager.default.removeItem(at: destination)
+            return count(dropped: member)
+        }
+        if let dstFailure {
+            try? FileManager.default.removeItem(at: destination)
+            locked { if writeError == nil { writeError = dstFailure } }
+            return
+        }
+        do {
+            try sync(destination)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            locked { if writeError == nil { writeError = error } }
+            return
+        }
         let name = suggested.map { s in s.contains(".") || ext.isEmpty ? s : "\(s).\(ext)" } ?? file.lastPathComponent
-        locked { files.append(["file": stored, "name": name, "type": type.preferredMIMEType ?? "application/octet-stream", "member": member]) }
+        var droppedAfterCancel = false
+        locked {
+            if cancelled {
+                droppedAfterCancel = true
+            } else {
+                files.append(["file": stored, "name": name, "type": type.preferredMIMEType ?? "application/octet-stream", "member": member])
+            }
+        }
+        if droppedAfterCancel { try? FileManager.default.removeItem(at: destination) }
     }
 
     private func count(dropped member: String) { locked { dropped[member, default: 0] += 1 } }
     private func locked(_ body: () -> Void) { lock.lock(); body(); lock.unlock() }
 
-    /// Writes `share.json` last, by write-and-rename, then pings the app. A share with nothing for the app to keep
-    /// is not written: it throws.
+    /// Publishes the share atomically and durably, then pings the app.
+    /// Any attachment write/sync error or cancellation aborts publication.
     public func finish(title: String?, text: String?) throws {
-        let ordered = files.sorted { Int($0["file"]!.split(separator: ".")[0]) ?? 0 < Int($1["file"]!.split(separator: ".")[0]) ?? 0 }
-        var record: [String: Any] = ["v": 1, "files": ordered, "dropped": dropped]
+        var snapshotFiles: [[String: String]] = []
+        var snapshotDropped: [String: Int] = [:]
+        var snapshotLinks: [URL?] = []
+        var pendingWriteError: Error?
+        var alreadyEnded = false
         #if EXACT_SHARE_PAGE
-        let merged = Self.merge(links: links, answer: answer, title: title, mapped: info.mapped)
+        var snapshotAnswer: [String: Any]?
+        var snapshotUnread = false
+        #endif
+        locked {
+            alreadyEnded = cancelled || published
+            pendingWriteError = writeError
+            snapshotFiles = files
+            snapshotDropped = dropped
+            snapshotLinks = links
+            #if EXACT_SHARE_PAGE
+            snapshotAnswer = answer
+            snapshotUnread = unread
+            #endif
+        }
+        if alreadyEnded { throw Self.failure(7, "The share was cancelled.") }
+        if let pendingWriteError { throw pendingWriteError }
+        let ordered = snapshotFiles.sorted { Int($0["file"]!.split(separator: ".")[0]) ?? 0 < Int($1["file"]!.split(separator: ".")[0]) ?? 0 }
+        var memberTotals = snapshotDropped
+        for entry in ordered {
+            if let member = entry["member"] {
+                memberTotals[member, default: 0] += 1
+            }
+        }
+        guard !memberTotals.values.contains(where: { $0 > 10_000 }) else {
+            throw Self.failure(9, "The share contains more files than can be saved.")
+        }
+        var record: [String: Any] = ["v": 1, "files": ordered, "dropped": snapshotDropped]
+        #if EXACT_SHARE_PAGE
+        let merged = Self.merge(links: snapshotLinks, answer: snapshotAnswer, title: title, mapped: info.mapped)
         #else
-        let merged = Self.merge(links: links, answer: nil, title: title, mapped: info.mapped)
+        let merged = Self.merge(links: snapshotLinks, answer: nil, title: title, mapped: info.mapped)
         #endif
         if let title = merged.title { record["title"] = title }
         if info.mapped.contains("text"), let text, !text.isEmpty { record["text"] = text }
@@ -292,24 +475,113 @@ public final class ShareInboxWriter {
         // title alone is no share, and the claim gives a link to `url`, or to `text` when only that is mapped.
         let linked = !info.mapped.isDisjoint(with: ["url", "text"])
         if !linked || merged.url == nil, record["text"] == nil, ordered.isEmpty {
-            if linked, links.contains(where: { $0 == nil }) { throw Self.failure(3, "The shared link could not be read.") }
+            if linked, snapshotLinks.contains(where: { $0 == nil }) { throw Self.failure(3, "The shared link could not be read.") }
             #if EXACT_SHARE_PAGE
             // Safari shares a page as its answer alone.
-            if unread { throw Self.failure(4, "The shared page could not be read.") }
+            if snapshotUnread { throw Self.failure(4, "The shared page could not be read.") }
             #endif
             throw Self.failure(6, "Nothing in the share could be saved.")
         }
         let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
-        let partial = directory.appendingPathComponent("share.json.partial")
-        try data.write(to: partial)
-        try FileManager.default.moveItem(at: partial, to: directory.appendingPathComponent("share.json"))
-        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFNotificationName("\(info.appId).shares" as CFString), nil, nil, true)
+        guard data.count <= Self.recordCap else {
+            throw Self.failure(8, "The share metadata is too large to save.")
+        }
+        // Two-phase publication, serialized with `discard()` under `self.lock`:
+        // 1. Write and sync `share.json.tmp` and the staging directory while invisible to `shares/`.
+        // 2. Move `staging/share-<uuid>` -> `shares/<uuid>` and sync container, `shares/`, and `staging/`.
+        //    At this point every attachment and parent directory entry is durable on disk, and only
+        //    `share.json.tmp` (never `share.json`) exists, so failure or death leaves nothing visible.
+        // 3. Atomically rename `share.json.tmp` -> `share.json` inside `shares/<uuid>/` and sync
+        //    `shares/<uuid>/`. If this final sync throws, unlink `share.json` and flush the rollback
+        //    while still holding both `self.lock` and the directory `flock`.
+        let stagedTemp = staging.appendingPathComponent("share.json.tmp")
+        let movedTemp = directory.appendingPathComponent("share.json.tmp")
+        let finalRecord = directory.appendingPathComponent("share.json")
+        try {
+            lock.lock()
+            defer { lock.unlock() }
+            if cancelled || published {
+                throw Self.failure(7, "The share was cancelled.")
+            }
+            try data.write(to: stagedTemp)
+            try sync(stagedTemp)
+            try sync(staging)
+            try FileManager.default.moveItem(at: staging, to: directory)
+            try sync(container)
+            try sync(directory.deletingLastPathComponent())
+            try sync(staging.deletingLastPathComponent())
+            try FileManager.default.moveItem(at: movedTemp, to: finalRecord)
+            do {
+                try sync(directory)
+            } catch {
+                if (try? FileManager.default.removeItem(at: finalRecord)) != nil {
+                    try? sync(directory)
+                }
+                throw error
+            }
+            published = true
+            releaseLock()
+        }()
+        notify("\(info.appId).shares")
+    }
+
+    private static func openRetryingEINTR(_ path: UnsafePointer<CChar>, _ flags: Int32, mode: mode_t = 0) -> Int32 {
+        while true {
+            let fd = (flags & O_CREAT) != 0 ? open(path, flags, mode) : open(path, flags)
+            if fd < 0 && errno == EINTR { continue }
+            return fd
+        }
+    }
+
+    private static func flockRetryingEINTR(_ fd: Int32, _ operation: Int32) -> Int32 {
+        while true {
+            let rc = flock(fd, operation)
+            if rc != 0 && errno == EINTR { continue }
+            return rc
+        }
+    }
+
+    /// Requests a durable flush of `url` (a file or directory) via `F_FULLFSYNC`
+    /// (best-effort barrier on Apple platforms; Darwin `fcntl(2)`), falling back
+    /// to `fsync(2)` where a filesystem returns `ENOTSUP` or `EINVAL`. Retries `EINTR`.
+    static func syncPath(_ url: URL) throws {
+        let fd = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return openRetryingEINTR(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        }
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { close(fd) }
+        while true {
+            if fcntl(fd, F_FULLFSYNC) == 0 { return }
+            if errno == EINTR { continue }
+            if errno == ENOTSUP || errno == EINVAL {
+                while true {
+                    if fsync(fd) == 0 { return }
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     private static func failure(_ code: Int, _ reason: String) -> NSError {
         NSError(domain: "exact.share", code: code, userInfo: [NSLocalizedDescriptionKey: reason])
     }
 
-    /// Removes what was written (the person cancelled, or the write failed).
-    public func discard() { try? FileManager.default.removeItem(at: directory) }
+    /// Removes what was written (the person cancelled, or the write failed) while
+    /// still holding `self.lock` and the directory `flock`. A no-op once published
+    /// so a late cancel can never delete a live share owned by the app.
+    public func discard() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !published, !cancelled else { return }
+        cancelled = true
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("share.json"))
+        try? FileManager.default.removeItem(at: staging)
+        try? FileManager.default.removeItem(at: directory)
+        releaseLock()
+    }
 }

@@ -29,6 +29,17 @@ use exact_motion::NamedTimeline;
 pub type TimelineBinding = (NamedTimeline, [f64; 2]);
 pub(crate) type Binding = TimelineBinding;
 
+/// The style and topology inputs a placed binding depends on; if any change in
+/// a commit, the cached placement is dropped before `motion_sync` so a newly
+/// paused animation waits for layout placement rather than latching stale range.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlacementKey {
+    scroller: Option<(u64, bool)>,
+    anonymous: Option<Anonymous>,
+    source_inset: Option<ViewTimelineInset>,
+    range: AnimationRange,
+}
+
 /// The linked placement's signature: [`place`].
 pub(super) type Place = fn(&mut NodeArena) -> Vec<(u64, Option<Binding>)>;
 
@@ -65,7 +76,7 @@ impl crate::kernel::Kernel {
 pub(super) fn place(arena: &mut NodeArena) -> Vec<(u64, Option<Binding>)> {
     let at = &*arena;
     let mut scrollers: Vec<TimelineScroller> = Vec::new();
-    let mut placed: Vec<(NodeKey, Binding)> = Vec::new();
+    let mut placed: Vec<(NodeKey, Binding, PlacementKey)> = Vec::new();
     for &(consumer, found) in &at.timelines.resolved {
         let Some(slot) = at.resolve(consumer) else {
             continue;
@@ -113,16 +124,77 @@ pub(super) fn place(arena: &mut NodeArena) -> Vec<(u64, Option<Binding>)> {
                 (NamedTimeline::Scroll { scroller: node, x }, range)
             })
             .unwrap_or((NamedTimeline::Inactive, [0.0, 1.0]));
-        placed.push((consumer, binding));
+        let pkey = placement_key(at, consumer, found, binding.0).unwrap_or(PlacementKey {
+            scroller: None,
+            anonymous: style.rare.animation_timeline.anonymous(),
+            source_inset: None,
+            range: style.animation_range.clone(),
+        });
+        placed.push((consumer, binding, pkey));
     }
     let changed = placed
         .iter()
-        .filter(|(key, binding)| at.timelines.placed(*key) != Some(*binding))
-        .map(|(key, binding)| (motion_node(*key), Some(*binding)))
+        .filter(|(key, binding, _)| at.timelines.placed(*key) != Some(*binding))
+        .map(|(key, binding, _)| (motion_node(*key), Some(*binding)))
         .collect();
     arena.timelines.scrollers = scrollers;
     arena.timelines.placed = placed;
     changed
+}
+
+/// Computes the current placement key for `key` if `binding` still matches its
+/// scroller and axis; `None` invalidates the cached placement.
+pub(super) fn placement_key(
+    arena: &NodeArena,
+    key: NodeKey,
+    found: Found,
+    binding: NamedTimeline,
+) -> Option<PlacementKey> {
+    let slot = arena.resolve(key)?;
+    let style = arena.style(slot);
+    let anonymous = style.rare.animation_timeline.anonymous();
+    let (expected_scroller, axis, source_inset) = match found {
+        Found::Scroll(src) => {
+            let s = arena.resolve(src)?;
+            (s, arena.style(s).rare.scroll_timeline_axis, None)
+        }
+        Found::View(src) => {
+            let s = arena.resolve(src)?;
+            let rare = &arena.style(s).rare;
+            (
+                nearest_scroller(arena, s),
+                rare.view_timeline_axis,
+                Some(rare.view_timeline_inset),
+            )
+        }
+        Found::Anonymous => match anonymous? {
+            Anonymous::Scroll {
+                scroller: which,
+                axis,
+            } => {
+                let s = match which {
+                    Scroller::Nearest => nearest_scroller(arena, slot),
+                    Scroller::Root => root_of(arena, slot),
+                    Scroller::Itself => slot,
+                };
+                (s, axis, None)
+            }
+            Anonymous::View { axis, inset } => (nearest_scroller(arena, slot), axis, Some(inset)),
+        },
+        Found::Drag(_) | Found::Inactive | Found::Missing => return None,
+    };
+    let target = (motion_node(arena.key(expected_scroller)), reads_x(axis));
+    if let NamedTimeline::Scroll { scroller, x } = binding {
+        if (scroller, x) != target {
+            return None;
+        }
+    }
+    Some(PlacementKey {
+        scroller: Some(target),
+        anonymous,
+        source_inset,
+        range: style.animation_range.clone(),
+    })
 }
 
 /// A scroll or view timeline, before layout places it.

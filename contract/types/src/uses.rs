@@ -58,6 +58,9 @@ fn provisional_scope(c: &Component, types: &Types, routes: bool) -> Scope {
         t.and_then(|t| shapes.resolve(t).ok())
             .unwrap_or(Ty::Unknown)
     };
+    let resolve_value = |t: &contract_syntax::TypeExpr, what: &str| {
+        shapes.resolve_value(t, what).unwrap_or(Ty::Unknown)
+    };
     let mut ct = ComponentTypes {
         name: c.name.clone(),
         props: c
@@ -71,31 +74,83 @@ fn provisional_scope(c: &Component, types: &Types, routes: bool) -> Scope {
         resources: c
             .resources
             .iter()
-            .map(|r| resolve(Some(&r.shape)))
+            .map(|r| {
+                let t = resolve_value(&r.shape, &format!("resource `{}`", r.name));
+                if r.each.is_some() && t != Ty::Unknown {
+                    Ty::List(Box::new(t))
+                } else {
+                    t
+                }
+            })
             .collect(),
         mutations: c
             .mutations
             .iter()
-            .map(|m| resolve(Some(&m.shape)))
+            .map(|m| resolve_value(&m.shape, &format!("mutation `{}`", m.name)))
             .collect(),
         actions: c
             .actions
             .iter()
-            .map(|a| a.params.iter().map(|p| resolve(p.ty.as_ref())).collect())
+            .map(|a| {
+                a.params
+                    .iter()
+                    .map(|p| {
+                        p.ty.as_ref()
+                            .map(|t| {
+                                resolve_value(
+                                    t,
+                                    &format!("parameter `{}` of action `{}`", p.name, a.name),
+                                )
+                            })
+                            .unwrap_or(Ty::Unknown)
+                    })
+                    .collect()
+            })
             .collect(),
         sources: Default::default(),
     };
     // One scope, each name retyped as it is learned: building it again for
     // each state is quadratic in a large expanded root, and only a refused
-    // build gets here.
+    // build gets here. State initializers see only props, injects and earlier
+    // states, matching `check_component`, so an out-of-scope initializer stays
+    // `?` instead of inventing a downstream `type-prop`.
+    let mut init_scope = Scope::default();
+    let mut init_names: Vec<(String, crate::Ref, Ty)> = c
+        .props
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                p.name.clone(),
+                crate::Ref::Prop(i as u32),
+                ct.props[i].clone(),
+            )
+        })
+        .collect();
+    for (j, p) in c.injects.iter().enumerate() {
+        let i = c.props.len() + j;
+        init_names.push((
+            p.name.clone(),
+            crate::Ref::Prop(i as u32),
+            ct.props[i].clone(),
+        ));
+    }
+    init_scope.push(init_names);
     let mut scope = types.component_scope(c, &ct);
     let first = c.props.len() + c.injects.len();
     for i in 0..c.states.len() {
         ct.slots[i] = if i == 0 && routes {
             Ty::Record("Router".into())
+        } else if crate::component::initializer_scope(c, i, &init_scope, shapes).is_some() {
+            Ty::Unknown
         } else {
-            infer(&c.states[i].expr, &scope, shapes).unwrap_or(Ty::Unknown)
+            crate::component::state_type(&c.states[i], &init_scope, shapes).unwrap_or(Ty::Unknown)
         };
+        init_scope.push_name((
+            c.states[i].name.clone(),
+            crate::Ref::Slot(i as u32),
+            ct.slots[i].clone(),
+        ));
         scope.retype(first + i, ct.slots[i].clone());
     }
     let first = first + c.states.len();

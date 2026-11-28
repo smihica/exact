@@ -16,7 +16,7 @@
 //! A name that finds a scroll or view timeline is bound once layout has
 //! placed it (`place.rs`); until then its consumer keeps the last placement.
 
-use super::place::{Binding, TimelineScroller};
+use super::place::{Binding, PlacementKey, TimelineScroller};
 use super::{Axis, TimelineScope, LINKED};
 use crate::arena::NodeArena;
 use crate::generated::StyleProps;
@@ -39,7 +39,7 @@ pub enum Found {
     Anonymous,
     /// An inactive timeline: a scope with no declaration below it, or several.
     Inactive,
-    /// No timeline of that name in scope.
+    /// No timeline: `none`, or no timeline of that name in scope.
     Missing,
 }
 
@@ -55,23 +55,25 @@ pub(super) type Resolve = fn(&mut NodeArena, &CommitReceipt) -> Vec<NodeKey>;
 pub(crate) struct Registry {
     slots: SlotSet,
     pub(super) resolved: Vec<(NodeKey, Found)>,
-    pub(super) placed: Vec<(NodeKey, Binding)>,
+    pub(super) placed: Vec<(NodeKey, Binding, PlacementKey)>,
     pub(super) scrollers: Vec<TimelineScroller>,
 }
 
 impl Registry {
     fn resolved(&self, consumer: NodeKey) -> Option<Found> {
-        self.resolved
-            .iter()
-            .find(|(k, _)| *k == consumer)
-            .map(|(_, t)| *t)
+        let i = self
+            .resolved
+            .binary_search_by_key(&consumer.index, |(k, _)| k.index)
+            .ok()?;
+        (self.resolved[i].0 == consumer).then_some(self.resolved[i].1)
     }
 
     pub(super) fn placed(&self, consumer: NodeKey) -> Option<Binding> {
-        self.placed
-            .iter()
-            .find(|(k, _)| *k == consumer)
-            .map(|(_, b)| *b)
+        let i = self
+            .placed
+            .binary_search_by_key(&consumer.index, |(k, _, _)| k.index)
+            .ok()?;
+        (self.placed[i].0 == consumer).then_some(self.placed[i].1)
     }
 }
 
@@ -80,6 +82,12 @@ impl crate::kernel::Kernel {
     /// commit (LLP 1057.003 D4); `None` for a node that follows no
     /// timeline, or while the lookup is unlinked.
     pub fn timeline_found(&self, consumer: NodeKey) -> Option<Found> {
+        if self
+            .node_by_key(consumer)
+            .is_some_and(|n| n.style.rare.animation_timeline.is_none())
+        {
+            return Some(Found::Missing);
+        }
         self.arena().timelines.resolved(consumer)
     }
 
@@ -89,7 +97,7 @@ impl crate::kernel::Kernel {
     /// missing one; `None` as for [`Self::timeline_found`].
     pub fn timeline_of(&self, consumer: NodeKey) -> Option<NamedTimeline> {
         let timelines = &self.arena().timelines;
-        Some(match timelines.resolved(consumer)? {
+        Some(match self.timeline_found(consumer)? {
             Found::Drag(n) => NamedTimeline::Source(n),
             Found::Inactive => NamedTimeline::Inactive,
             Found::Missing => NamedTimeline::Missing,
@@ -100,8 +108,9 @@ impl crate::kernel::Kernel {
     }
 
     /// Whether any node bears a timeline row: a source, a scope or a
-    /// consumer. A host whose page seeks consumers itself (the web's glue)
-    /// follows every commit while one does.
+    /// consumer (excluding explicit `none`, which needs no resolution or
+    /// web glue pass). A host whose page seeks consumers itself (the web's
+    /// glue) follows every commit while one does.
     pub fn has_timelines(&self) -> bool {
         !self.arena().timelines.slots.is_empty()
     }
@@ -118,16 +127,20 @@ pub(crate) fn refresh(arena: &mut NodeArena, receipt: &CommitReceipt) -> Vec<Nod
 }
 
 fn bears(s: &StyleProps) -> bool {
+    let t = &s.rare.animation_timeline;
     s.rare.drag_timeline.name.is_some()
         || s.rare.scroll_timeline_name.0.is_some()
         || s.rare.view_timeline_name.0.is_some()
-        || follows(s)
+        || t.name().is_some()
+        || t.anonymous().is_some()
         || s.rare.timeline_scope != TimelineScope::None
 }
 
-/// Whether `s`'s animations follow a named or an anonymous timeline.
+/// Whether `s`'s animations are bound off the clock (`none`, a named timeline,
+/// or an anonymous `scroll()`/`view()` timeline).
 fn follows(s: &StyleProps) -> bool {
-    s.rare.animation_timeline.name().is_some() || s.rare.animation_timeline.anonymous().is_some()
+    let t = &s.rare.animation_timeline;
+    t.name().is_some() || t.anonymous().is_some() || t.is_none()
 }
 
 /// [`refresh`], linked: keep the registry, then re-resolve every consumer.
@@ -159,12 +172,12 @@ pub(super) fn resolve(arena: &mut NodeArena, receipt: &CommitReceipt) -> Vec<Nod
         .iter()
         .filter_map(|slot| {
             let timeline = &at.style(slot).rare.animation_timeline;
-            let found = match timeline.name() {
-                Some(name) => lookup(at, slot, name),
-                None => {
-                    timeline.anonymous()?;
-                    Found::Anonymous
-                }
+            let found = if let Some(name) = timeline.name() {
+                lookup(at, slot, name)
+            } else if timeline.anonymous().is_some() {
+                Found::Anonymous
+            } else {
+                return None;
             };
             Some((at.key(slot), found))
         })
@@ -178,12 +191,33 @@ pub(super) fn resolve(arena: &mut NodeArena, receipt: &CommitReceipt) -> Vec<Nod
         })
         .map(|(key, _)| *key)
         .collect();
-    arena.timelines.resolved = resolved;
-    let live = &arena.timelines.resolved;
+    let previous = std::mem::replace(&mut arena.timelines.resolved, resolved);
     let placed = std::mem::take(&mut arena.timelines.placed);
-    arena.timelines.placed = (placed.into_iter())
-        .filter(|(key, _)| live.iter().any(|(k, _)| k == key))
-        .collect();
+    let kept: Vec<_> = {
+        let at = &*arena;
+        let live = &at.timelines.resolved;
+        placed
+            .into_iter()
+            .filter(|(key, (binding_tl, _), pkey)| {
+                let Ok(i) = live.binary_search_by_key(&key.index, |(k, _)| k.index) else {
+                    return false;
+                };
+                if live[i].0 != *key {
+                    return false;
+                }
+                // Drop stale placements when the consumer's resolved timeline,
+                // scroller, axis, anonymous kind, view inset, or `animation-range`
+                // changed so a freshly paused animation waits for fresh layout placement.
+                let same_found = previous
+                    .binary_search_by_key(&key.index, |(k, _)| k.index)
+                    .is_ok_and(|j| previous[j].0 == *key && previous[j].1 == live[i].1);
+                same_found
+                    && super::place::placement_key(at, *key, live[i].1, *binding_tl)
+                        .is_some_and(|cur| cur == *pkey)
+            })
+            .collect()
+    };
+    arena.timelines.placed = kept;
     changed
 }
 
@@ -268,18 +302,24 @@ pub(crate) fn rows(arena: &NodeArena, slot: u32) -> TimelineRows {
         .map(|_| style.rare.drag_timeline.axis == Axis::X);
     let lengths = || style.animation_range.lengths().map(|r| r.map(f64::from));
     let whole = [0.0, 1.0];
-    let binding = match arena.timelines.resolved(key) {
-        _ if !follows(style) => None,
-        // `normal`, a percentage or a name: no length range to map a drag onto.
-        Some(Found::Drag(source)) => lengths().map(|r| (NamedTimeline::Source(source), r)),
-        Some(Found::Inactive) => Some((NamedTimeline::Inactive, lengths().unwrap_or(whole))),
-        Some(Found::Missing) | None => Some((NamedTimeline::Missing, lengths().unwrap_or(whole))),
-        Some(Found::Scroll(_) | Found::View(_) | Found::Anonymous) => Some(
-            arena
-                .timelines
-                .placed(key)
-                .unwrap_or((NamedTimeline::Inactive, whole)),
-        ),
+    let binding = if style.rare.animation_timeline.is_none() {
+        Some((NamedTimeline::Missing, lengths().unwrap_or(whole)))
+    } else {
+        match arena.timelines.resolved(key) {
+            _ if !follows(style) => None,
+            // `normal`, a percentage or a name: no length range to map a drag onto.
+            Some(Found::Drag(source)) => lengths().map(|r| (NamedTimeline::Source(source), r)),
+            Some(Found::Inactive) => Some((NamedTimeline::Inactive, lengths().unwrap_or(whole))),
+            Some(Found::Missing) | None => {
+                Some((NamedTimeline::Missing, lengths().unwrap_or(whole)))
+            }
+            Some(Found::Scroll(_) | Found::View(_) | Found::Anonymous) => Some(
+                arena
+                    .timelines
+                    .placed(key)
+                    .unwrap_or((NamedTimeline::Inactive, whole)),
+            ),
+        }
     };
     (motion_node(key), source, binding)
 }

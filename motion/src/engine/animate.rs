@@ -38,6 +38,16 @@ pub struct AnimationPlay {
     /// frame too: then the frame gives it the origin's phase (LLP 1003.001
     /// D8), not a start of its own.
     pub(crate) clock_wait: bool,
+    /// Whether this play has already run on the clock (document timeline):
+    /// switching it to `none` or a missing timeline then makes its time
+    /// unresolved while keeping `start` (Web Animations 2 §4.4.4).
+    pub(crate) clocked: bool,
+    /// Whether `hold = Some(NaN)` came from detaching a running clock play
+    /// onto no timeline (`Missing`): returning to `auto` keeps `start`.
+    pub(crate) detached_clock: bool,
+    /// Whether this play is an `-exact-exit-animation`, which always runs on
+    /// the clock regardless of the node's `animation-timeline`.
+    pub(crate) exit: bool,
 }
 
 impl AnimationPlay {
@@ -96,9 +106,13 @@ impl Engine {
             .map_err(|_| EngineError::InvalidAnimation)?;
         let now = self.sample_time();
         let pend = self.holds().then_some(now);
-        // A timeline-bound play keeps its held time: the timeline, not the
-        // row's play state, holds it (LLP 1057.003 D2).
-        let bound = self.timeline_bound(node);
+        // A timeline-bound play holds its time in `play.hold`: running plays
+        // are sought to the timeline's progress, while paused plays keep their
+        // fixed hold time across seeks (Web Animations 2 / LLP 1057.003 D2).
+        let timeline = self.timeline_kind(node);
+        let bound = timeline.is_some();
+        let is_missing = matches!(timeline, Some(super::NamedTimeline::Missing));
+        let progress_bound = bound && !is_missing;
         let old = self.animations.remove(&node).unwrap_or_default();
         if old.is_empty() && animations.0.is_empty() {
             return Ok(());
@@ -126,14 +140,51 @@ impl Engine {
                     // A pending play keeps waiting; a pause takes the
                     // local time it waits at; a resume waits at its held one
                     // (LLP 1003.001 D3). A clock's join decides for its own.
-                    let (start, hold, pending) = match (prior.hold, a.paused) {
-                        (hold, _) if bound => (prior.start, hold, None),
-                        (None, true) => (prior.start, Some(prior.local(now)), None),
+                    let (start, hold, pending, detached_clock) = match (prior.hold, a.paused) {
+                        // Web Animations 2 §4.4.6: pausing a running unresolved
+                        // play on no timeline (`none`/missing) resolves its hold
+                        // to 0; an already-paused unresolved play stays pending
+                        // (`NaN`) so unrelated restyles do not resolve it.
+                        (Some(h), true) if is_missing && h.is_nan() && !prior.animation.paused => {
+                            (prior.start, Some(0.0), None, false)
+                        }
+                        // Web Animations 2 normalized timing: retiming a paused
+                        // progress-timeline play keeps its normalized progress.
+                        (Some(h), true) if progress_bound && !h.is_nan() => {
+                            let old_end = prior.animation.end_time();
+                            let new_end = a.end_time();
+                            let hold = if old_end != new_end && old_end.is_finite() && old_end > 0.0
+                            {
+                                if new_end.is_finite() {
+                                    (h / old_end) * new_end
+                                } else {
+                                    a.delay.max(0.0)
+                                }
+                            } else {
+                                h
+                            };
+                            (prior.start, Some(hold), None, false)
+                        }
+                        (hold, _) if bound => (prior.start, hold, None, prior.detached_clock),
+                        (None, true) => (prior.start, Some(prior.local(now)), None, false),
                         // A play on a clock timeline rejoins its phase
                         // (LLP 1055.002 D6); any other continues.
-                        (Some(_), false) if on_clock => (now, None, None),
-                        (Some(held), false) => (now - held, None, pend),
-                        (hold, _) => (prior.start, hold, prior.pending),
+                        (Some(_), false) if on_clock => (now, None, None, false),
+                        (Some(_), false) if prior.detached_clock => {
+                            (prior.start, None, None, false)
+                        }
+                        (Some(held), false) => (
+                            now - if held.is_nan() { 0.0 } else { held },
+                            None,
+                            pend,
+                            false,
+                        ),
+                        (hold, _) => (
+                            prior.start,
+                            hold,
+                            prior.pending,
+                            prior.detached_clock && hold.is_some(),
+                        ),
                     };
                     let resumed = on_clock && !bound && prior.hold.is_some() && !a.paused;
                     joins.push(resumed.then_some(Join::Resumed));
@@ -144,6 +195,9 @@ impl Engine {
                         dark: prior.dark,
                         clock_wait: prior.clock_wait && pending.is_some(),
                         pending,
+                        clocked: prior.clocked && !bound && hold.is_none(),
+                        detached_clock,
+                        exit: false,
                     }
                 }
                 None => {
@@ -151,10 +205,13 @@ impl Engine {
                     AnimationPlay {
                         animation: a.clone(),
                         start: now,
-                        hold: a.paused.then_some(0.0),
+                        hold: (a.paused && !bound).then_some(0.0),
                         dark: self.dark_of(node),
                         pending: pend.filter(|_| !a.paused && !bound && !on_clock),
                         clock_wait: false,
+                        clocked: false,
+                        detached_clock: false,
+                        exit: false,
                     }
                 }
             };
@@ -190,7 +247,14 @@ impl Engine {
         if plays.is_empty() {
             self.animating.remove(&node);
         } else {
+            let needs_clock_mark = !bound
+                && plays
+                    .iter()
+                    .any(|p| !p.exit && p.hold.is_none() && p.pending.is_none() && !p.clocked);
             self.animations.insert(node, plays);
+            if needs_clock_mark {
+                self.newly_clocked.push(node);
+            }
             self.schedule_animations(node);
             self.seek_bound(node);
             let of = |join| {
@@ -348,6 +412,9 @@ impl Engine {
             dark,
             pending,
             clock_wait: false,
+            clocked: false,
+            detached_clock: false,
+            exit: true,
         }));
         self.animating.insert(node);
         Ok(now + exit.end_time())

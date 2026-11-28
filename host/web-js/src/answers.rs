@@ -100,6 +100,19 @@ impl<'a> Answers<'a> {
         (self.status.heads[region as usize] || !owners.is_empty()).then_some(owners)
     }
 
+    /// The plan's CSS custom-property token map (`modes::properties`), cached once per emission.
+    pub fn properties(&mut self) -> &[(String, String)] {
+        let plan = self.plan;
+        let (props, _) = self.tokens.get_or_insert_with(|| {
+            let every = crate::modes::every_token();
+            (
+                crate::modes::properties(plan),
+                crate::measures::type_properties(plan, every),
+            )
+        });
+        props
+    }
+
     /// Row `id`'s bound map ([`crate::measures::map`]).
     pub fn map(&mut self, id: StyleId, attribute: bool, container: bool) -> Option<&str> {
         let (plan, tokens) = (self.plan, &mut self.tokens);

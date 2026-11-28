@@ -703,15 +703,14 @@ fn an_unbound_consumer_is_sampled_on_the_clock_again() {
             let mut e = Engine::new();
             e.set_start_on_frame(first_frame, 0.0).unwrap();
             observe(&mut e, Property::Opacity, 1.0);
-            let text = if paused {
-                "fade 1s linear both paused"
-            } else {
-                "fade 1s linear both"
-            };
-            e.set_animations(NODE, &row(text)).unwrap();
+            e.set_animations(NODE, &row("fade 1s linear both")).unwrap();
             e.set_animation_timeline(NODE, Some((scroll, [0.0, 100.0])));
             e.set_scroll_offset(SCROLLER, 25.0, 0.0);
             assert_eq!(opacity(&mut e), Some(0.25));
+            if paused {
+                e.set_animations(NODE, &row("fade 1s linear both paused"))
+                    .unwrap();
+            }
             e.set_animation_timeline(NODE, None);
             let case = format!("first frame {first_frame}, paused {paused}");
             if paused {
@@ -728,4 +727,268 @@ fn an_unbound_consumer_is_sampled_on_the_clock_again() {
             }
         }
     }
+}
+
+// Web Animations 2 §4.4.4 (Chrome & WebKit parity, #2106):
+// - fresh `none`/`Missing` holds time 0 (`from` applies) without progressing;
+// - detaching a running clock animation (`auto -> none`) makes its current time
+//   unresolved (underlying value shows) while preserving its original `start`,
+//   so returning `none -> auto` continues from `now - start` instead of 0;
+// - detaching a paused clock animation preserves its held time;
+// - detaching a scroll/drag timeline preserves its resolved progress.
+#[test]
+fn detaching_to_missing_timeline_matches_web_animations_2() {
+    let range = [0.0, 100.0];
+    // Running `auto` -> `Missing` -> `auto` preserves original `start`.
+    let mut e = Engine::new();
+    observe(&mut e, Property::Opacity, 0.9);
+    e.set_animations(NODE, &row("fade 1s linear both")).unwrap();
+    assert_eq!(opacity(&mut e), Some(0.0));
+    e.advance(0.4).unwrap();
+    assert!((opacity(&mut e).unwrap() - 0.4).abs() < 1e-9);
+    e.set_animation_timeline(NODE, Some((NamedTimeline::Missing, range)));
+    assert!((opacity(&mut e).unwrap() - 0.9).abs() < 1e-9);
+    assert!(e.quiescent());
+    e.advance(0.6).unwrap();
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.9).abs() < 1e-9);
+    e.set_animation_timeline(NODE, None);
+    assert!((opacity(&mut e).unwrap() - 0.6).abs() < 1e-9);
+    e.advance(0.8).unwrap();
+    assert!((opacity(&mut e).unwrap() - 0.8).abs() < 1e-9);
+
+    // Pausing while detached resolves the hold time to 0 (Web Animations 2
+    // pause algorithm), so returning to `auto` while paused keeps the first
+    // keyframe and resuming advances from 0 without `NaN`.
+    let mut repaused = Engine::new();
+    observe(&mut repaused, Property::Opacity, 0.9);
+    repaused
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    assert_eq!(opacity(&mut repaused), Some(0.0));
+    repaused.advance(0.4).unwrap();
+    assert!((opacity(&mut repaused).unwrap() - 0.4).abs() < 1e-9);
+    repaused.set_animation_timeline(NODE, Some((NamedTimeline::Missing, range)));
+    assert!((opacity(&mut repaused).unwrap() - 0.9).abs() < 1e-9);
+    repaused
+        .set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    assert_eq!(opacity(&mut repaused), Some(0.0));
+    repaused.set_animation_timeline(NODE, None);
+    repaused.frame();
+    assert_eq!(
+        repaused.sampled_value(NODE, Property::Opacity).unwrap().x,
+        0.0
+    );
+    repaused.advance(0.6).unwrap();
+    repaused
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    repaused.frame();
+    assert_eq!(
+        repaused.sampled_value(NODE, Property::Opacity).unwrap().x,
+        0.0
+    );
+    repaused.advance(0.85).unwrap();
+    assert!((opacity(&mut repaused).unwrap() - 0.25).abs() < 1e-9);
+
+    // First-frame pending play switched to `none` before its first frame holds
+    // time 0 instead of turning unresolved.
+    let mut pending = Engine::new();
+    pending.set_start_on_frame(true, 0.0).unwrap();
+    observe(&mut pending, Property::Opacity, 0.9);
+    pending
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    pending.advance(0.4).unwrap();
+    pending.frame();
+    pending.set_animation_timeline(NODE, Some((NamedTimeline::Missing, range)));
+    pending.frame();
+    assert_eq!(
+        pending.sampled_value(NODE, Property::Opacity).unwrap().x,
+        0.0
+    );
+
+    // Paused `auto` -> `Missing` keeps its held time (0.0 -> fade start).
+    let mut paused = Engine::new();
+    observe(&mut paused, Property::Opacity, 0.9);
+    paused
+        .set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    assert_eq!(opacity(&mut paused), Some(0.0));
+    paused.advance(0.5).unwrap();
+    paused.set_animation_timeline(NODE, Some((NamedTimeline::Missing, range)));
+    paused.frame();
+    assert_eq!(
+        paused.sampled_value(NODE, Property::Opacity).unwrap().x,
+        0.0
+    );
+    assert!(paused.quiescent());
+
+    // First-frame pending resume switched to `Missing` before presentation
+    // preserves the resumed local time (0.4) instead of snapping back to 0.0.
+    let mut pending_resume = Engine::new();
+    pending_resume.set_start_on_frame(true, 0.0).unwrap();
+    observe(&mut pending_resume, Property::Opacity, 0.9);
+    pending_resume
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    pending_resume.present_frame(0.0, 0.0).unwrap();
+    pending_resume.advance(0.4).unwrap();
+    assert!((opacity(&mut pending_resume).unwrap() - 0.4).abs() < 1e-9);
+    pending_resume
+        .set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    pending_resume.advance(0.6).unwrap();
+    pending_resume
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    // Still pending (no present_frame after resume); detach to `Missing`.
+    pending_resume.set_animation_timeline(NODE, Some((NamedTimeline::Missing, range)));
+    pending_resume.frame();
+    assert!(
+        (pending_resume
+            .sampled_value(NODE, Property::Opacity)
+            .unwrap()
+            .x
+            - 0.4)
+            .abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn exit_animation_runs_on_clock_when_node_timeline_is_missing() {
+    let mut exiting = Engine::new();
+    observe(&mut exiting, Property::Opacity, 1.0);
+    exiting
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    exiting.set_animation_timeline(NODE, Some((NamedTimeline::Missing, [0.0, 100.0])));
+    assert_eq!(opacity(&mut exiting), Some(0.0));
+    let mut leave = Animations::parse("leave 1s linear both").unwrap();
+    let leave_kf = Keyframes::parse("from{opacity:1}to{opacity:0}").unwrap();
+    leave.resolve(|_| Some(&leave_kf));
+    exiting.play_exit(NODE, &leave).unwrap();
+    // Re-seeking the node's own timeline after `play_exit` must leave the exit on the clock.
+    exiting.set_animation_timeline(NODE, Some((NamedTimeline::Missing, [0.0, 100.0])));
+    exiting.advance(0.5).unwrap();
+    assert!(!exiting.quiescent());
+    assert!((opacity(&mut exiting).unwrap() - 0.5).abs() < 1e-9);
+    exiting.advance(1.0).unwrap();
+    assert!((opacity(&mut exiting).unwrap() - 0.0).abs() < 1e-9);
+    exiting.advance(1.01).unwrap();
+    exiting.frame();
+    assert!(exiting.quiescent());
+
+    // Moving a scroll timeline after `play_exit` must not overwrite the exit play's hold.
+    const SCROLLER: u64 = 12;
+    let mut scroll_exit = Engine::new();
+    observe(&mut scroll_exit, Property::Opacity, 1.0);
+    scroll_exit.set_animation_timeline(
+        NODE,
+        Some((
+            NamedTimeline::Scroll {
+                scroller: SCROLLER,
+                x: false,
+            },
+            [0.0, 100.0],
+        )),
+    );
+    scroll_exit
+        .set_animations(NODE, &row("fade 1s linear both"))
+        .unwrap();
+    scroll_exit.set_scroll_offset(SCROLLER, 0.0, 20.0);
+    scroll_exit.frame();
+    scroll_exit.play_exit(NODE, &leave).unwrap();
+    scroll_exit.set_scroll_offset(SCROLLER, 0.0, 80.0);
+    scroll_exit.advance(0.25).unwrap();
+    assert!((opacity(&mut scroll_exit).unwrap() - 0.75).abs() < 1e-9);
+}
+
+#[test]
+fn paused_animation_holds_time_across_missing_and_scroll_timelines() {
+    const SCROLLER: u64 = 9;
+    let scroll = NamedTimeline::Scroll {
+        scroller: SCROLLER,
+        x: false,
+    };
+    let mut e = Engine::new();
+    observe(&mut e, Property::Opacity, 0.9);
+    e.set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    e.set_animation_timeline(NODE, Some((NamedTimeline::Missing, [0.0, 100.0])));
+    assert_eq!(opacity(&mut e), Some(0.0));
+    // Switching `none -> scroll()` while paused holds time 0 as the scroller moves.
+    e.set_scroll_offset(SCROLLER, 0.0, 50.0);
+    e.set_animation_timeline(NODE, Some((scroll, [0.0, 100.0])));
+    e.set_scroll_offset(SCROLLER, 0.0, 75.0);
+    e.frame();
+    assert_eq!(e.sampled_value(NODE, Property::Opacity).unwrap().x, 0.0);
+    // Unpausing seeks immediately to the scroller's current progress.
+    e.set_animations(NODE, &row("fade 1s linear both")).unwrap();
+    assert!((opacity(&mut e).unwrap() - 0.75).abs() < 1e-9);
+    // Re-pausing freezes at 0.75 even as the scroller moves or becomes inactive.
+    e.set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    e.set_scroll_offset(SCROLLER, 0.0, 20.0);
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.75).abs() < 1e-9);
+    // Retiming duration on a paused progress animation keeps normalized progress (75%).
+    e.set_animations(NODE, &row("fade 2s linear both paused"))
+        .unwrap();
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.75).abs() < 1e-9);
+    e.set_animation_timeline(NODE, Some((NamedTimeline::Inactive, [0.0, 100.0])));
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.75).abs() < 1e-9);
+    // Returning to `none` while paused still holds 0.75.
+    e.set_animation_timeline(NODE, Some((NamedTimeline::Missing, [0.0, 100.0])));
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.75).abs() < 1e-9);
+}
+
+#[test]
+fn paused_animation_on_inactive_scroller_samples_once_scroller_becomes_active() {
+    const SCROLLER: u64 = 15;
+    let scroll = NamedTimeline::Scroll {
+        scroller: SCROLLER,
+        x: false,
+    };
+    let mut e = Engine::new();
+    observe(&mut e, Property::Opacity, 0.9);
+    // Bind inactive (zero-length range) before installing paused animation.
+    e.set_animation_timeline(NODE, Some((scroll, [0.0, 0.0])));
+    e.set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.9).abs() < 1e-9);
+    // Once the scroller gains a range at offset 40, the pending pause locks at 0.4.
+    e.set_scroll_offset(SCROLLER, 0.0, 40.0);
+    e.set_animation_timeline(NODE, Some((scroll, [0.0, 100.0])));
+    assert!((opacity(&mut e).unwrap() - 0.4).abs() < 1e-9);
+    // Subsequent scroll movement stays frozen at 0.4.
+    e.set_scroll_offset(SCROLLER, 0.0, 85.0);
+    e.frame();
+    assert!((e.sampled_value(NODE, Property::Opacity).unwrap().x - 0.4).abs() < 1e-9);
+
+    // A paused animation that starts on an inactive timeline and moves to
+    // `Missing` stays unresolved even when an unrelated restyle restates the
+    // same paused animation row.
+    let mut inactive = Engine::new();
+    observe(&mut inactive, Property::Opacity, 0.9);
+    inactive.set_animation_timeline(NODE, Some((NamedTimeline::Inactive, [0.0, 100.0])));
+    inactive
+        .set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    inactive.frame();
+    assert!((inactive.sampled_value(NODE, Property::Opacity).unwrap().x - 0.9).abs() < 1e-9);
+    inactive.set_animation_timeline(NODE, Some((NamedTimeline::Missing, [0.0, 100.0])));
+    inactive.frame();
+    assert!((inactive.sampled_value(NODE, Property::Opacity).unwrap().x - 0.9).abs() < 1e-9);
+    inactive
+        .set_animations(NODE, &row("fade 1s linear both paused"))
+        .unwrap();
+    inactive.frame();
+    assert!((inactive.sampled_value(NODE, Property::Opacity).unwrap().x - 0.9).abs() < 1e-9);
 }

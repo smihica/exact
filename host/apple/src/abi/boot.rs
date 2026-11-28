@@ -46,6 +46,33 @@ impl<D: DataSource> Bridge<D> {
         batch
     }
 
+    pub(super) fn commit_candidate_boot(&mut self, candidate: &mut PreparedHost<D>) {
+        if let Some(old) = self.host.as_mut() {
+            if candidate
+                .carried_from
+                .as_ref()
+                .is_some_and(|c| !c.fresh_state)
+            {
+                candidate.host.carry_pending_store_writes(old);
+            }
+        }
+        candidate.host.commit_boot();
+    }
+
+    pub(super) fn replace_host_plan(
+        &mut self,
+        host: crate::host::Host<D>,
+        batch: String,
+        carried_from: Option<&exact_runner::Carried>,
+    ) -> String {
+        if self.host.is_some() && carried_from.is_none_or(|c| c.fresh_state) {
+            self.cold_share = None;
+            self.launch_facts.shared.clear();
+            self.launch_facts.claims = None;
+        }
+        self.replace_host(host, batch)
+    }
+
     /// Prepare with candidate delivery facts, without publishing them globally.
     pub fn prepare_plan_with_delivery(
         &mut self,
@@ -200,7 +227,13 @@ impl<D: DataSource> Bridge<D> {
         let native_timers = self.native_timers;
         let wall = self.live_clock;
         let ctx = hooks.ctx;
-        let launch = self.launch();
+        let mut launch = self.launch();
+        if self.host.is_some() {
+            // A fresh reboot of an already-booted host starts without any prior
+            // launch's unlanded cold share tokens or claims.
+            launch.shared.clear();
+            launch.claims = None;
+        }
         let sequence = self
             .host
             .as_ref()
@@ -264,6 +297,11 @@ impl<D: DataSource> Bridge<D> {
                 self.wake = hooks.wake.map(|w| (w, hooks.wake_ctx));
                 self.executor = executor;
                 self.restore_window.clear();
+                if self.host.is_some() {
+                    self.cold_share = None;
+                    self.launch_facts.shared.clear();
+                    self.launch_facts.claims = None;
+                }
                 let batch = self.replace_host(host, batch);
                 self.launch_layout.insets = None;
                 self.parked.clear();

@@ -335,6 +335,9 @@ pub struct Springs {
     /// Springs the browser presented, at their ready time: the started op's
     /// `at`, so the page's pin writes the start the browser chose.
     presented: BTreeMap<(u64, Property), f64>,
+    /// Whether the last committed tree bore any non-`none` timeline row, so a
+    /// commit that drops the last one still runs one final DOM timeline pass.
+    timelines_active: bool,
 }
 
 impl Springs {
@@ -658,6 +661,7 @@ impl Motion for Springs {
         }
         let applied = sync.apply(&mut self.engine);
         debug_assert!(applied.is_ok(), "kernel rows are always valid engine input");
+        self.timelines_active = kernel.has_timelines();
         let _ = self.engine.frame();
     }
 
@@ -675,9 +679,11 @@ impl Motion for Springs {
         // @ref LLP 1057.003 D4 — the browser gives a consumer a fresh CSS
         // animation for changes the kernel records on other nodes (an
         // ancestor's `display`, a move) as well as for its own rows and its
-        // name's resolution, so while any node bears a timeline every commit
-        // is followed; pages without one never are.
-        let mut timelines = !receipts.is_empty() && kernel.has_timelines();
+        // name's resolution, so while any node bears a non-`none` timeline
+        // every commit is followed; pages with none (or only `none`) never are.
+        let has_timelines = kernel.has_timelines();
+        let mut timelines = !receipts.is_empty() && (has_timelines || self.timelines_active);
+        self.timelines_active = has_timelines;
         let mut out = Vec::new();
         let mut touched = BTreeSet::new();
         for receipt in receipts {
@@ -707,9 +713,13 @@ impl Motion for Springs {
                     self.presented.remove(&(*node, property));
                 }
             }
-            // Before it applies: the last consumer, unbound here, was bound.
-            timelines |= sync.timelines.iter().any(|(node, source, binding)| {
-                source.is_some() || binding.is_some() || self.engine.timeline_bound(*node)
+            // Catch a transient timeline introduced and removed within a multi-receipt batch.
+            timelines |= sync.timelines.iter().any(|(_, source, binding)| {
+                source.is_some()
+                    || matches!(
+                        binding,
+                        Some((t, _)) if !matches!(t, exact_motion::NamedTimeline::Missing)
+                    )
             });
             let applied = sync.apply(&mut self.engine);
             debug_assert!(applied.is_ok(), "kernel rows are always valid engine input");

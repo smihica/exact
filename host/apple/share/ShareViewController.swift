@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 @objc(ExactShareViewController)
 public final class ExactShareViewController: SLComposeServiceViewController {
     private var writer: ShareInboxWriter?
+    private var cancelled = false
     /// The inbox's target and its container (the App Group's when nil), and the extension's context; a test sets
     /// all three.
     public var info: ShareTargetInfo? = ShareTargetInfo(bundle: .main)
@@ -45,19 +46,25 @@ public final class ExactShareViewController: SLComposeServiceViewController {
             return
         }
         self.writer = writer
+        cancelled = false
         writer.take(items) { [weak self] in
+            guard let self, !self.cancelled, self.writer === writer else { return }
             do {
                 try writer.finish(title: title, text: text)
-                self?.context?.completeRequest(returningItems: [], completionHandler: nil)
+                self.writer = nil
+                self.context?.completeRequest(returningItems: [], completionHandler: nil)
             } catch {
                 writer.discard()
-                self?.context?.cancelRequest(withError: error)
+                self.writer = nil
+                self.context?.cancelRequest(withError: error)
             }
         }
     }
 
     public override func didSelectCancel() {
+        cancelled = true
         writer?.discard()
+        writer = nil
         super.didSelectCancel()
     }
 }
@@ -70,6 +77,7 @@ public final class ExactShareViewController: NSViewController {
     private let textView = NSTextView()
     private let thumbnail = NSImageView()
     private var writer: ShareInboxWriter?
+    private var cancelled = false
     /// The inbox's target and its container (the App Group's when nil), and the extension's context; a test sets
     /// all three.
     public var info: ShareTargetInfo? = ShareTargetInfo(bundle: .main)
@@ -132,19 +140,25 @@ public final class ExactShareViewController: NSViewController {
             return
         }
         self.writer = writer
+        cancelled = false
         writer.take(items) { [weak self] in
+            guard let self, !self.cancelled, self.writer === writer else { return }
             do {
                 try writer.finish(title: title, text: text)
-                self?.context?.completeRequest(returningItems: [], completionHandler: nil)
+                self.writer = nil
+                self.context?.completeRequest(returningItems: [], completionHandler: nil)
             } catch {
                 writer.discard()
-                self?.context?.cancelRequest(withError: error)
+                self.writer = nil
+                self.context?.cancelRequest(withError: error)
             }
         }
     }
 
     @objc public func cancel(_ sender: Any?) {
+        cancelled = true
         writer?.discard()
+        writer = nil
         context?.cancelRequest(withError: NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError))
     }
 }

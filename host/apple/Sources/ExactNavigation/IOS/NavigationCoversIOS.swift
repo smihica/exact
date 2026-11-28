@@ -242,6 +242,43 @@ extension NavigationHost {
         return false
     }
 
+    /// Whether `c` is the outgoing route of its stack's active transition.
+    private func isDeparting(_ c: RouteController) -> Bool {
+        stackTransition(for: c)?.viewController(forKey: .from).map { owns(c, in: $0) } == true
+    }
+
+    /// Whether `c` sits inside a modal presentation currently being dismissed or retired.
+    private func isDismissingModal(_ c: RouteController) -> Bool {
+        sequence(first: c as UIViewController, next: \.parent).contains {
+            $0.isBeingDismissed || presenter.modalHost.retires($0)
+        }
+    }
+
+    /// Bar visibility and settlement state shared between cover reporting and mid-transition
+    /// scroll-edge refreshes so both agree on when a route's bar state is settled.
+    private func barSettlement(for c: RouteController, in nav: UINavigationController?, departing: Bool) -> (search: Bool, barAbove: Bool, settled: Bool) {
+        let search = searching(c)
+        let barAbove = nav.map { c.parent is PlainTab ? !$0.isNavigationBarHidden : routeShowsBar(c, in: $0) } ?? false
+        // Nested in a split's list column, the detail's routes are under that column's bar (LLP 1127 §1, item 2)
+        let barNav = split.flatMap { $0.nested && nav === $0.detail ? $0.list : nil } ?? nav
+        // A departing route holds its settled cover through the stack transition: sliding it
+        // away clears its side safe area (e.g. an open iPhone Duo's vertical bar) mid-swipe (#1942).
+        let settled = c.surface.window != nil && !departing && (search || (barNav?.isNavigationBarHidden ?? true) != barAbove)
+        return (search, barAbove, settled)
+    }
+
+    /// Re-select top and bottom scroll edges for settled non-departing routes whose content changed
+    /// while a stack or modal transition holds full projection (expo/exact#2055). Preserves native
+    /// `setContentScrollView` holds (`scrollEdgesOwed`) and modal presentation setup (`safeAreaOwed`).
+    func refreshScrollEdgesInTransition(in routes: [RouteController]? = nil) {
+        for c in routes ?? Array(controllers.values) where presenter.views[c.node.id] === c.node {
+            guard c.inStack, !c.scrollEdgesOwed, !c.safeAreaOwed, !isDismissingModal(c) else { continue }
+            let departing = isDeparting(c)
+            guard barSettlement(for: c, in: c.navigationController, departing: departing).settled else { continue }
+            selectScrollEdges(of: c)
+        }
+    }
+
     /// What Exact's containers cover of each route — its controller's safe
     /// area past the insets the kernel already has as `env()`: a shown bar's
     /// top, and every edge while the containers take the whole view for a
@@ -269,11 +306,15 @@ extension NavigationHost {
             // A lifted header takes no room, on a stack yet or not (`coverLifted`).
             for node in c.coveredBarNodes { wanted[node.id] = NavigationHost.cover(of: node, in: c) }
             // Include the departing route until UIKit finishes its transition
-            let transition = stackTransition(for: c)
-            let departing = transition?.viewController(forKey: .from).map { owns(c, in: $0) } == true
+            let departing = isDeparting(c)
             let nav = c.navigationController ?? (departing ? c.lastStack : nil)
             let stacked = c.stack?.stackRoutes.contains(c) == true || departing
-            guard stacked else { continue }
+            // A cancelled swipe's source leaves the stack for a moment before UIKit puts it back: while it shows,
+            // its last covers stand (dropped, its content jumped under the bar).
+            guard stacked else {
+                if c.surface.window != nil { for id in [c.node, c.collapseScroll, c.edgeScroll].compactMap({ $0?.id }) { wanted[id] = covers[id] } }
+                continue
+            }
             // A presented route's controller takes its sheet's whole view, and
             // the document's insets (`env()`) are not the sheet's: its route is
             // covered for its own safe area whatever the document's fit (LLP
@@ -293,13 +334,7 @@ extension NavigationHost {
             // UIKit's own does, but a title's insets are not sampled.
             // A plain tab's route has no bar of its own: More's shows above it
             // under More, and none on the tab bar.
-            let search = searching(c)
-            let barAbove = nav.map { c.parent is PlainTab ? !$0.isNavigationBarHidden : routeShowsBar(c, in: $0) } ?? false
-            // Nested in a split's list column, the detail's routes are under that column's bar (LLP 1127 §1, item 2)
-            let barNav = split.flatMap { $0.nested && nav === $0.detail ? $0.list : nil } ?? nav
-            // A departing route holds its settled cover through the stack transition: sliding it
-            // away clears its side safe area (e.g. an open iPhone Duo's vertical bar) mid-swipe (#1942).
-            let settled = c.surface.window != nil && !departing && (search || (barNav?.isNavigationBarHidden ?? true) != barAbove)
+            let (search, barAbove, settled) = barSettlement(for: c, in: nav, departing: departing)
             // A route showing no bar has no title: its inset is the status bar's, none in landscape (LLP 1130 D3).
             let barless = !barAbove
             let topPeers = arrangementScrollers(in: c, top: true), bottomPeers = arrangementScrollers(in: c, top: false)
@@ -326,7 +361,16 @@ extension NavigationHost {
                 }
             }
             if settled {
-                let safe = Self.routeSafe(c.surface.safeAreaInsets, box: c.node.convert(c.node.bounds, to: c.surface), in: c.surface.bounds)
+                var surfaceSafe = c.surface.safeAreaInsets
+                if c.inPresentation, stackTransition(for: c) == nil, let landing = Self.landingSafeArea(c) {
+                    surfaceSafe = UIEdgeInsets(
+                        top: max(surfaceSafe.top, landing.top),
+                        left: landing.left,
+                        bottom: max(surfaceSafe.bottom, landing.bottom),
+                        right: landing.right
+                    )
+                }
+                let safe = Self.routeSafe(surfaceSafe, box: c.node.convert(c.node.bounds, to: c.surface), in: c.surface.bounds)
                 // The route's end with its page unscrolled: scrolling moves the route, not the bars.
                 // A route the keyboard shortens can end above the bars, with no bottom cover.
                 let end = c.node.convert(c.node.bounds, to: c.contentMount).maxY + (c.contentViewport?.frame.minY ?? 0)
@@ -389,13 +433,15 @@ extension NavigationHost {
                     // A band's part of the safe area is a UI inset over control bars, not layout (LLP 1131 D2).
                     let title = ownsTop ? node.scrollOrigin : 0
                     let stretched = title > 0 && node.scrollView.map { Self.stretched($0, origin: title) } == true
-                    let noTop = node === c.collapseScroll && RouteGeometry.insetsNoTop(c.node)
+                    // A route's top opt-out holds for its bottom-only scroller as for its title's
+                    let noTop = (node === c.collapseScroll || node === c.edgeScroll) && RouteGeometry.insetsNoTop(c.node)
                     let top = noTop ? 0 : max(0, max(stretched ? min(safe.top, title) : safe.top, title) - node.pageBand.top)
                     // Only the scroller whose clearance takes back UIKit's inset loses it in layout.
                     let back = min(0, node.scrollView.flatMap { extras[ObjectIdentifier($0)]?.bottom } ?? 0)
                     let bottomOff = RouteGeometry.clearanceOff(c.node) & 4 != 0
-                    // When a tab bar goes away on a cover page, the route takes its padding back.
-                    // The title scroller's old safe area disappears after that layout.
+                    // A cover page's route that keeps its bottom clearance (its title scroller does not hold the
+                    // bottom edge) pads it, and the scroller takes none: its safe area can still hold a tab bar
+                    // that went away until UIKit lays it out again.
                     let keepsBottom = covered && !presented && c.tabBarController != nil && !bottomOff && node !== c.edgeScroll && !peerBottom
                     let bottom = keepsBottom || (noTop && node !== c.edgeScroll) ? 0 : max(0, max(safe.bottom, bottomOff ? 0 : reach) + back - node.pageBand.bottom)
                     if top > 0 || bottom > 0 { wanted[node.id] = .inset(top: top, bottom: bottom) }
@@ -576,18 +622,50 @@ extension NavigationHost {
         session.whenIdle(bound: true, write, cancelled: answered)
     }
 
-    /// The side insets of a route in a sheet still being presented, as they are where the sheet lands
-    /// (`UIPresentationController.frameOfPresentedViewInContainerView`). The sheet's own safe area during the
-    /// transition is not that: on the iPhone Duo the side by the button strip read 8 points wider.
-    static func landingSides(_ c: RouteController) -> (left: CGFloat, right: CGFloat)? {
+    /// The safe area `c.surface` will have where a presentation still running lands
+    /// (`UIPresentationController.frameOfPresentedViewInContainerView`). During presentation
+    /// UIKit reports transitional values: a full-screen route sliding up from off-screen reads 0
+    /// at the top until it moves into place, a full-screen route with a navigation bar can report
+    /// the bar alone before the status bar propagates, and a sheet on the iPhone Duo reads 8 points
+    /// wider on the button-strip side. Preserves `additionalSafeAreaInsets` owned by controllers in
+    /// the presented hierarchy.
+    static func landingSafeArea(_ c: RouteController) -> UIEdgeInsets? {
+        // UIKit floors each child controller at its inherited safe area, so a negative
+        // `additionalSafeAreaInsets` on `c` can offset its own navigation bar height
+        // down to the inherited floor, while never subtracting an ancestor's inset
+        // (LLP 1123, "Floored bar"). Ancestor additions project into `c.surface`
+        // (for `navigationExtendedLayout="none"`, `c.surface` starts below the bar).
         var top: UIViewController = c
-        while let parent = top.parent { top = parent }
+        var ancestor = UIEdgeInsets.zero
+        while let parent = top.parent {
+            top = parent
+            ancestor.top += max(0, top.additionalSafeAreaInsets.top)
+            ancestor.left += max(0, top.additionalSafeAreaInsets.left)
+            ancestor.bottom += max(0, top.additionalSafeAreaInsets.bottom)
+            ancestor.right += max(0, top.additionalSafeAreaInsets.right)
+        }
         guard top.isBeingPresented, let sheet = top.presentationController, let container = sheet.containerView else { return nil }
         let landed = sheet.frameOfPresentedViewInContainerView
-        let box = c.node.convert(c.node.bounds, to: top.view)
+        guard !landed.isEmpty else { return nil }
+        let bounds = top.view.bounds
+        let surface = c.surface.bounds.isEmpty ? bounds : c.surface.convert(c.surface.bounds, to: top.view)
         let safe = container.safeAreaInsets
-        let minX = landed.minX + max(0, box.minX), maxX = landed.maxX - max(0, top.view.bounds.maxX - box.maxX)
-        return (max(0, safe.left - minX), max(0, safe.right - (container.bounds.maxX - maxX)))
+        var barTop: CGFloat = 0
+        if let nav = c.navigationController, !nav.isNavigationBarHidden, !nav.navigationBar.isHidden,
+           c.edgesForExtendedLayout.contains(.top) {
+            barTop = max(0, nav.navigationBar.bounds.height)
+        }
+        let inheritedTop = max(0, max(0, safe.top - landed.minY) + ancestor.top - max(0, surface.minY))
+        let withBarTop = max(0, max(0, safe.top - landed.minY) + ancestor.top + barTop - max(0, surface.minY))
+        let leftFromContainer = max(0, safe.left - landed.minX) + ancestor.left
+        let bottomFromContainer = max(0, safe.bottom - (container.bounds.maxY - landed.maxY)) + ancestor.bottom
+        let rightFromContainer = max(0, safe.right - (container.bounds.maxX - landed.maxX)) + ancestor.right
+        return UIEdgeInsets(
+            top: max(inheritedTop, withBarTop + c.additionalSafeAreaInsets.top),
+            left: max(0, leftFromContainer - max(0, surface.minX)) + max(0, c.additionalSafeAreaInsets.left),
+            bottom: max(0, bottomFromContainer - max(0, bounds.maxY - surface.maxY)) + max(0, c.additionalSafeAreaInsets.bottom),
+            right: max(0, rightFromContainer - max(0, bounds.maxX - surface.maxX)) + max(0, c.additionalSafeAreaInsets.right)
+        )
     }
 
     /// @ref LLP 1123 D9 — each route's own safe area, which its content reads as
@@ -595,30 +673,40 @@ extension NavigationHost {
     /// status bar and the home indicator in it, on the sides only as far as the
     /// route's box reaches them, as its covers are. A route out of a window keeps
     /// the last it had, UIKit's zero there being no measurement, and so does one
-    /// while its stack's transition runs, as its cover does, but for its sides
-    /// while it appears (`RouteController.appearing`), since UIKit can give a route
-    /// coming back in a pop its new sides during the transition, after
-    /// `viewIsAppearing`. One that has none yet takes what it has, and an appearing
-    /// one its sides, from where a sheet being presented lands (`landingSides`).
-    /// And the session root's while the containers take the whole view, where
-    /// `env()` is 0 but the screen's insets are not. Whether any changed.
+    /// while its stack's transition or modal dismissal runs, as its cover does,
+    /// except for sides while a route returns in a pop (`RouteController.appearing`),
+    /// and a route whose modal presentation is running (`RouteController.inPresentation`),
+    /// which reads its landed safe area (`landingSafeArea`) from frame 0 and adopts
+    /// bar insets as UIKit lays them out. And the session root's while the containers
+    /// take the whole view, where `env()` is 0 but the screen's insets are not.
+    /// Whether any changed.
     func reportLocalInsets() -> Bool {
         var wanted: [UInt32?: [CGFloat]] = [:]
         for c in controllers.values where presenter.views[c.node.id] === c.node {
             let last = localInsets.wanted[c.node.id]
-            let moving = stackTransition(for: c) != nil || c.navigationController?.transitionCoordinator != nil
+            let stack = stackTransition(for: c)
+            let moving = stack != nil || c.navigationController?.transitionCoordinator != nil
+            let presenting = c.inPresentation && stack == nil
             let view = c.surface
-            guard view.window != nil, c.node.window != nil, last == nil || !moving || c.appearing else {
+            guard view.window != nil, c.node.window != nil, last == nil || !moving || c.appearing || presenting else {
                 wanted[c.node.id] = last
                 continue
             }
             let box = c.node.convert(c.node.bounds, to: view)
-            let safe = view.safeAreaInsets
-            var sides = (left: max(0, safe.left - max(0, box.minX)), right: max(0, safe.right - max(0, view.bounds.maxX - box.maxX)))
-            if last == nil || c.appearing, let landing = Self.landingSides(c) { sides = landing }
-            // An appearing route takes its sides afresh while the transition runs and keeps its top and bottom, which the
-            // bars' own transition moves, until it ends
-            if let last, moving { wanted[c.node.id] = [last[0], sides.right, last[2], sides.left] }
+            var safe = view.safeAreaInsets
+            if (last == nil || c.appearing || presenting), let landing = Self.landingSafeArea(c) {
+                safe = UIEdgeInsets(
+                    top: max(safe.top, landing.top),
+                    left: landing.left,
+                    bottom: max(safe.bottom, landing.bottom),
+                    right: landing.right
+                )
+            }
+            let sides = (left: max(0, safe.left - max(0, box.minX)), right: max(0, safe.right - max(0, view.bounds.maxX - box.maxX)))
+            // An appearing pop destination takes its sides afresh while the transition runs and keeps its top and
+            // bottom, which the bars' own transition moves, until it ends. A presenting modal takes its landed insets
+            // from frame 0 and tracks any bar height UIKit adds during presentation setup.
+            if let last, moving, !presenting { wanted[c.node.id] = [last[0], sides.right, last[2], sides.left] }
             else { wanted[c.node.id] = [safe.top, sides.right, safe.bottom, sides.left] }
         }
         if wantsWholeView, let view = presenter.session?.view, view.window != nil {

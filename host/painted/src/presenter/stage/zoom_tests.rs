@@ -96,9 +96,10 @@ fn a_source_route_grows_from_the_first_card_and_returns_from_its_kept_drawing() 
             leaving.scale > start.scale && leaving.scale < 1.0,
             "{leaving:?}"
         );
-        assert!(leaving.opacity > 0.99);
+        // Past 0.6 of its eased progress the source fades in over the route.
+        assert!(leaving.opacity < 0.5, "{leaving:?}");
         after(&mut p, 130.0);
-        assert!(poses(&p).0.opacity < 0.5);
+        assert_eq!(poses(&p).0.opacity, 0.0);
         after(&mut p, 45.0);
         assert!(!p.stage_moving());
         assert!(!p.brush.kept(detail));
@@ -177,6 +178,11 @@ fn a_zoom_pop_starts_at_the_predictive_back_pose() {
         assert!(p.back_progress(1, 0.6, 0, now));
         after(&mut p, 0.0);
         let preview = poses(&p).0;
+        // The preview runs the container's return, as Compose seeks it.
+        assert!(
+            preview.scale < 0.5 && preview.height.is_some(),
+            "{preview:?}"
+        );
         back(&mut p);
         after(&mut p, 0.0);
         let leaving = poses(&p).0;
@@ -609,5 +615,81 @@ fn a_computed_zoom_wins_over_the_routes_authored_parts_both_ways() {
     assert!(
         leaving.scale < 1.0,
         "the pop returns into the card: {leaving:?}"
+    );
+}
+
+#[test]
+fn a_container_draws_its_source_under_it_in_and_over_it_back_masked_to_its_height() {
+    let mut p = phone_source(ZOOM);
+    let card = rect(&mut p, "card");
+    let key = p.host.kernel().node(id(&p, "card")).unwrap().key;
+    let lift = |p: &mut Presenter<()>| p.stage_paint().crossing.iter().find_map(|c| c.lift);
+    tap(&mut p, "card");
+    after(&mut p, 0.0);
+    assert_eq!(lift(&mut p), Some((key, 412. / card.2, false)));
+    after(&mut p, 400.0);
+    back(&mut p);
+    after(&mut p, 0.0);
+    assert_eq!(lift(&mut p), Some((key, 412. / card.2, true)));
+    let shift = p.stage.shift.as_ref().unwrap().progress;
+    let mut now = shift.start;
+    while shift.at(now) < 0.9 {
+        now += 1.0;
+    }
+    // By 0.9 the route, fitted to the container's width, is masked to the
+    // card's proportions.
+    let leaving = p.shift_poses(now, None).0;
+    assert!(
+        near(leaving.height.unwrap(), card.3 * 412. / card.2),
+        "{leaving:?}"
+    );
+    assert!(leaving.scale > card.2 / 412. + 0.01);
+}
+
+#[test]
+fn a_cancelled_zoom_preview_plays_its_entrance_back_from_where_it_was() {
+    let mut p = phone_source(ZOOM);
+    tap(&mut p, "card");
+    after(&mut p, 400.0);
+    let now = p.host().now();
+    assert!(p.back_progress(0, 0.0, 0, now));
+    assert!(p.back_progress(1, 0.6, 0, now));
+    after(&mut p, 0.0);
+    let held = poses(&p).0.scale;
+    assert!(p.back_progress(2, 0.0, 0, p.host().now()));
+    after(&mut p, 16.0);
+    // The first frame moves it a little, not most of the way back.
+    let first = poses(&p).0.scale;
+    assert!(first > held && first - held < 0.05, "{held} {first}");
+    after(&mut p, 400.0);
+    assert!(p.stage.preview.is_none());
+}
+
+#[test]
+fn a_container_whose_route_paints_no_background_shows_the_ground_not_the_route_beneath() {
+    let source = ZOOM
+        .replace("inset=0 background-color=\"#225599\"", "inset=0")
+        .replace(
+            "background-color=\"#ffffff\"",
+            "background-color=\"#00ff00\"",
+        );
+    let mut p = phone_source(&source);
+    tap(&mut p, "card");
+    after(&mut p, 250.0);
+    let pose = poses(&p).1;
+    let middle = (
+        pose.dx + 206. * pose.scale,
+        pose.dy + pose.height.unwrap() * pose.scale / 2.,
+    );
+    let c = p
+        .frame()
+        .pixel(middle.0 as u32, middle.1 as u32)
+        .unwrap()
+        .demultiply();
+    let ground = crate::paint::look::role("Canvas", false);
+    assert_eq!(
+        [c.red(), c.green(), c.blue()],
+        [ground[0], ground[1], ground[2]],
+        "{pose:?}"
     );
 }

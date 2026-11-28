@@ -113,11 +113,11 @@ export const classifications = [
     ["apple:host/apple/src/abi/exports.rs", "exact_dispatch"],
     ["painted:host/painted/src/canvas/access.rs", "CanvasHost::access CanvasHost::access_act CanvasHost::access_custom_action CanvasHost::access_off"],
     ["painted:host/painted/src/canvas/field.rs", "CanvasHost::field_action CanvasHost::field_composing CanvasHost::field_edited CanvasHost::field_focused CanvasHost::field_input CanvasHost::field_scrolled CanvasHost::field_selected"],
-    ["painted:host/painted/src/canvas/drop.rs", "CanvasHost::drag_dropped CanvasHost::drag_left CanvasHost::drag_over CanvasHost::drop_landed CanvasHost::drop_released CanvasHost::field_drop"],
+    ["painted:host/painted/src/canvas/drop.rs", "CanvasHost::drag_dropped CanvasHost::drag_left CanvasHost::drag_over CanvasHost::drop_landed CanvasHost::drop_released CanvasHost::field_drop CanvasHost::lift_began CanvasHost::lift_ended"],
     ["painted:host/painted/src/canvas/input.rs", "CanvasHost::finger CanvasHost::reader_selection CanvasHost::scroll CanvasHost::touch CanvasHost::touching"],
     ["painted:host/painted/src/canvas/jni_drop.rs",
       "Java_dev_exact_canvas_Native_dragDropped Java_dev_exact_canvas_Native_dragLeft Java_dev_exact_canvas_Native_dragOver " +
-      "Java_dev_exact_canvas_Native_dropLanded Java_dev_exact_canvas_Native_dropReleased Java_dev_exact_canvas_Native_fieldDrop"],
+      "Java_dev_exact_canvas_Native_dropLanded Java_dev_exact_canvas_Native_dropReleased Java_dev_exact_canvas_Native_fieldDrop Java_dev_exact_canvas_Native_liftBegan Java_dev_exact_canvas_Native_liftEnded"],
     ["painted:host/painted/src/canvas/jni.rs",
       "Java_dev_exact_canvas_Native_readerSelection " +
       "Java_dev_exact_canvas_Native_accessAct Java_dev_exact_canvas_Native_fieldAction Java_dev_exact_canvas_Native_fieldComposing " +
@@ -177,9 +177,10 @@ export const classifications = [
     ["painted:host/painted/src/presenter/picker.rs", "Presenter::open_document"],
     ["painted:host/painted/src/presenter/pan_release.rs", "Presenter::release_pan"],
     ["painted:host/painted/src/presenter/file_drop.rs",
-      "Presenter::deliver_drop Presenter::drag_chain Presenter::drag_dropped Presenter::drag_event Presenter::drag_flush " +
-      "Presenter::drag_left Presenter::drag_over Presenter::drag_renewed Presenter::drop_landed Presenter::drop_landed_checked Presenter::drop_owner " +
-      "Presenter::drop_released Presenter::drop_released_behind Presenter::dropped Presenter::field_drop Presenter::landed"],
+      "Presenter::deliver_drop Presenter::drag_chain Presenter::drag_dropped Presenter::drag_event Presenter::drag_flush Presenter::drags_gone " +
+      "Presenter::drag_committed Presenter::drag_edge_at Presenter::drag_left Presenter::drag_over Presenter::drag_renewed Presenter::drag_scrolls Presenter::drop_landed Presenter::drop_landed_checked Presenter::drop_owner " +
+      "Presenter::drop_released Presenter::drop_released_behind Presenter::drop_released_lift Presenter::dropped Presenter::field_drop Presenter::landed"],
+    ["painted:host/painted/src/presenter/drag_source.rs", "Presenter::lift_asked Presenter::lift_began Presenter::lift_ended Presenter::source_event"],
     ["painted:host/painted/src/presenter/pointer.rs", "Presenter::pointer_dispatch"],
     ["painted:host/painted/src/presenter/radio.rs", "Presenter::activate_radio"],
     ["painted:host/painted/src/presenter/replacement.rs", "Presenter::buttons_released Presenter::pointer_released Presenter::reader_touch Presenter::set_touching"],
@@ -297,9 +298,10 @@ export const classifications = [
     ["runner:runner/src/instance/collection/mod.rs", "Collection::feedback#scroll_sequence:1 Collection::update_data#data_generation:1 Collection::update_data#scroll_sequence:1"],
     ["runner:runner/src/instance/collection/traversal.rs", "Tree::collection_travel#scroll_sequence:1 Tree::update_collection#scroll_sequence:1"],
     ["runner:runner/src/instance/collection/nest.rs", "PinEpoch::bump#PIN_EPOCH.fetch_add:1"],
+    ["runner:runner/src/instance/collection/traversal.rs", "Tree::collection_live"],
     ["runner:runner/src/runner/list_seam.rs",
       "Runner::collection_travel Runner::collection Runner::collection_data Runner::collection_feedback Runner::collection_feedback_bytes Runner::collection_feedback_filled " +
-      "Runner::collection_mounted Runner::collection_shown Runner::collections Runner::collections_bounded Runner::collections_json Runner::collections_shallow " +
+      "Runner::collection_live Runner::collection_mounted Runner::collection_shown Runner::collections Runner::collections_bounded Runner::collections_json Runner::collections_shallow " +
       "Runner::kept_positions_json Runner::list_sections"],
     ["runner:runner/src/runner/gates.rs", "Runner::collection_reply_key"],
     ["runner:runner/src/runner/foresee.rs", "Runner::foresee"],
@@ -491,7 +493,7 @@ export const classifications = [
     ["painted:host/painted/src/transform_binding.rs", "Host::discover_transform_handles Host::transform_bindings Host::transform_path_ready"],
     ["painted:host/painted/src/window_title.rs", "WindowTitle::caption WindowTitle::update"],
     ["runner:runner/src/head.rs", "Runner::head Runner::inactive"],
-    ["runner:runner/src/runner.rs", "Runner::data_ref Runner::derive Runner::failed_resources Runner::grants Runner::handlers Runner::handlers_of Runner::is_poisoned Runner::kernel Runner::last_instance_work Runner::log Runner::now_ms Runner::resource Runner::roots Runner::site_of Runner::slot"],
+    ["runner:runner/src/runner.rs", "Runner::data_ref Runner::derive Runner::failed_resources Runner::grants Runner::handlers Runner::handlers_of Runner::hears_any Runner::is_poisoned Runner::kernel Runner::last_instance_work Runner::log Runner::now_ms Runner::resource Runner::roots Runner::site_of Runner::slot"],
     ["runner:runner/src/runner/apply.rs", "Runner::declared_parent Runner::declared_parents Runner::hidden_movers"],
     ["runner:runner/src/runner/resources.rs", "Runner::resource_draws_entropy Runner::resource_reads_clock"],
     ["runner:runner/src/runner/checkpoint.rs", "Runner::document_checkpoint"],
@@ -776,7 +778,7 @@ export const classifications = [
   group("shared tokens", ["one-shot"], "share token in the live router; copying may outlive the initiating view", "UI-owned",
     "runner/src/runner/picker/shared.rs:596-630 updates only a token accepted by router.share. Copied files can survive, but this completion targets the current router token.", [
     ["painted:host/painted/src/host.rs", "Host::set_shared"],
-    ["runner:runner/src/runner/picker/shared.rs", "Runner::claim_share Runner::set_shared"],
+    ["runner:runner/src/runner/picker/shared.rs", "Claimed::has_files Runner::claim_share Runner::claim_share_checked Runner::clear_shared Runner::set_shared"],
   ]),
   group("sockets and listens", ["subscription"], "source stream/watch and pending subscription in a session", "UI-owned",
     "runner/src/runner/sockets.rs and listen.rs associate reader facts with source requests; retirement of the source removes the UI observer.", [
@@ -810,7 +812,7 @@ export const classifications = [
     ["painted:host/painted/src/holds.rs", "Host::advance_retained_input"],
     ["painted:host/painted/src/host.rs", "Host::advance Host::advance_effects Host::advance_until_request Host::commit_effects Host::frame Host::land_then Host::tick Host::timer_due_by Host::timer_due_ms"],
     ["painted:host/painted/src/presence.rs", "Host::advance_in_layout_steps"],
-    ["painted:host/painted/src/presenter.rs", "Presenter::tick"],
+    ["painted:host/painted/src/presenter/clock.rs", "Presenter::tick"],
     ["painted:host/painted/src/presenter/clock.rs",
       "Presenter::admit_idle_timer Presenter::admit_timer_waits Presenter::advance Presenter::animation_frame Presenter::clock Presenter::clock_until_request " +
       "Presenter::fire_native_timer Presenter::land_then Presenter::native_timer_generation Presenter::set_live_clock Presenter::timer_observation " +
@@ -1130,7 +1132,7 @@ export const classifications = [
     ["runner:runner/src/runner/apply.rs", "Runner::apply#batch:1 Runner::apply#batch:2"],
     ["runner:runner/src/runner/background.rs", "Runner::background_landed#rounds:1"],
     ["runner:runner/src/runner/canvas2d.rs", "Canvases::reply#draws:1"],
-    ["runner:runner/src/runner/faults.rs", "Faults::take_method#hits:1 Faults::take_method#failure_hits:1 Runner::fault_dispatch#hits:1 Runner::fault_dispatch#failure_hits:1"],
+    ["runner:runner/src/runner/faults.rs", "Faults::take_method#hits:1 Faults::take_method#failure_hits:1 Faults::count_stream_hit#hits:1 Faults::count_stream_hit#failure_hits:1 Faults::count_stream_failure#failure_hits:1 Runner::fault_dispatch#hits:1 Runner::fault_dispatch#failure_hits:1"],
     ["runner:runner/src/runner/into_view.rs",
       "Runner::update_into_views_inner#batch:1 Runner::update_into_views_inner#bindings_evaluated:1 Runner::update_into_views_inner#derives_evaluated:1 " +
       "Runner::update_into_views_inner#nodes_visited:1 Runner::update_into_views_inner#regions_skipped:1 Runner::update_into_views_inner#rows_keyed:1 " +
@@ -1145,7 +1147,7 @@ export const classifications = [
       "Runner::count_dispatch#committed:1 Runner::count_dispatch#dispatched:1 Runner::count_failure#count:1 Runner::measure#before:1 Runner::measure#created:1 " +
       "Runner::moved#moved:1 Runner::tally#authored:1 Runner::tally#inherited:1"],
     ["runner:runner/src/runner/persist.rs", "Reader::eat#at:1 Reader::number#at:1 Reader::space#at:1 Reader::string#at:1"],
-    ["runner:runner/src/runner/picker/shared.rs", "Claimed::copy_with#dropped:1 Claims::claim#2:1 Claims::claim#2:2"],
+    ["runner:runner/src/runner/picker/shared.rs", "Claimed::copy_checked#dropped:1 Claimed::copy_with#dropped:1 Claims::claim_inner#2:1 Claims::claim_inner#2:2"],
     ["runner:runner/src/runner/processes.rs", "Runner::note_child_outcome#bytes_out:1 Runner::note_child_sent#bytes_in:1"],
     ["runner:runner/src/runner/query.rs", "Runner::count_churn#2:1"],
     ["runner:runner/src/runner/queue.rs", "Runner::ask_send#mutation_requests:1"],
@@ -1185,7 +1187,7 @@ export const classifications = [
   ]),
   group("shared tokens", ["one-shot"], "share token in the current router and launch-seeded copied-file path", "UI-owned",
     "runner/src/runner/picker/shared.rs Claims::claim advances files for copied paths and tokens for incoming router shares. set_shared admits only the live router token.", [
-    ["runner:runner/src/runner/picker/shared.rs", "Claims::claim#files:1 Claims::claim#tokens:1"],
+    ["runner:runner/src/runner/picker/shared.rs", "Claims::claim_inner#files:1 Claims::claim_inner#tokens:1"],
   ]),
   group("wakes", ["durable operation"], "app wake reference and retry/backoff state", "durable",
     "runner/src/runner/modules/declared/wake_list.rs wake_entry_ended increments the wake reference retry count and uses it to schedule backoff, independently of a mounted UI.", [
@@ -1335,8 +1337,8 @@ export const classifications = [
     "The named painted adapter reads or updates the current Presenter through the runner or its Host forwarding API. runner/src/runner/router.rs validates visits against the live router; replacement/retirement changes that owner.", [
     ["painted:host/painted/src/presenter/history.rs", "Presenter::history_action"],
     ["painted:host/painted/src/presenter/stage.rs",
-      "Presenter::back_sheets Presenter::desktop_stage Presenter::place_sheets Presenter::stage_page_route Presenter::stage_paint Presenter::stage_sheets Presenter::stage_shows " +
-      "Presenter::sync_stage Presenter::top_sheet"],
+      "Presenter::back_sheets Presenter::desktop_stage Presenter::place_sheets Presenter::stage_page_route Presenter::stage_paint Presenter::stage_sheets Presenter::stage_shows Presenter::sync_shift Presenter::sync_stage Presenter::top_sheet"],
+    ["painted:host/painted/src/presenter/stage/flights.rs", "Presenter::pairs Presenter::remember_pops Presenter::settle_shift Presenter::unpose_flights"],
   ]),
   group("picture results", ["one-shot"], "pending image/picture source, decode generation and current presentation consumers", "UI-owned",
     "The named painted adapter reads or updates the current Presenter through the runner or its Host forwarding API. host/painted/src/image.rs and image/{workers,remote,package}.rs own pending image/decode work and current consumers; canvas picture/stream adapters target the reader. Cache bytes surviving a view do not make its presentation continuation durable.", [
@@ -1398,7 +1400,7 @@ export const classifications = [
       "exact_frame_health_worked history_status hitch record record_at requested_period reset snapshot stop take_maxima worked"],
     ["runner:runner/src/perf.rs", "reply"],
     ["runner:runner/src/runner/console.rs", "Console::mark Console::name Console::named"],
-    ["runner:runner/src/runner/faults.rs", "Faults::answer Faults::answer_method Faults::arm Faults::from_env Faults::holds Faults::is_empty Faults::json Faults::parse Faults::pass Faults::spec Faults::take"],
+    ["runner:runner/src/runner/faults.rs", "Faults::answer Faults::answer_method Faults::answer_stream_method Faults::arm Faults::from_env Faults::holds Faults::is_empty Faults::json Faults::parse Faults::pass Faults::pass_stream Faults::spec Faults::take"],
     ["runner:runner/src/stream_timing.rs", "committed decoded entered received report start"],
   ]),
   group("identity bookkeeping", ["one-shot"], "local cursor, metric, cache generation or diagnostic count; not a request ticket", "UI-owned",

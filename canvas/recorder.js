@@ -97,20 +97,25 @@ function hsl(h, s, l) {
   const f = (n) => { const k = (n + h / 30) % 12, a = s * Math.min(l, 1 - l); return l - a * Math.min(Math.max(Math.min(k - 3, 9 - k), -1), 1); };
   return [f(0), f(8), f(4)];
 }
+// CSS white space is space, tab, LF, CR and FF alone (CSS Syntax 3 §4.2;
+// color/src/lib.rs `SPACE`): JavaScript's `trim()` and `\s` also take
+// U+00A0, U+FEFF and the like, which Chrome refuses in a colour.
+const cssTrim = (s) => s.replace(/^[ \t\n\r\f]+|[ \t\n\r\f]+$/g, "");
+const cssWords = (s) => cssTrim(s).split(/[ \t\n\r\f]+/);
 function functional(name, body) {
-  body = body.trim();
+  body = cssTrim(body);
   const legacy = body.includes(",");
   let parts, alpha;
   if (legacy) {
-    parts = body.split(",").map((p) => p.trim());
+    parts = body.split(",").map(cssTrim);
     // `none` is the space-separated syntax's alone (CSS Color 4 §4.1.2).
     if (parts.some((p) => !p || p.includes(" ") || p.includes("/") || p === "none")) return null;
     if (parts.length === 4) alpha = parts.pop(); else if (parts.length !== 3) return null;
   } else {
     const [main, a] = body.includes("/") ? body.split("/") : [body, undefined];
-    if (a !== undefined && !a.trim()) return null;
-    alpha = a === undefined ? undefined : a.trim();
-    parts = main.trim().split(/\s+/);
+    if (a !== undefined && !cssTrim(a)) return null;
+    alpha = a === undefined ? undefined : cssTrim(a);
+    parts = cssWords(main);
     if (parts.length !== 3) return null;
   }
   const c = parts.map((p, i) => component(p, i === 0 && name !== "rgb" && name !== "rgba"));
@@ -168,15 +173,15 @@ const WIDE_SPACES = { srgb: 4, "srgb-linear": 5, "display-p3": 6, xyz: 7, "xyz-d
 function wide(name, body) {
   let space = null, kind;
   if (name === "color") {
-    const t = body.trimStart(), end = t.search(/\s/);
+    const t = body.replace(/^[ \t\n\r\f]+/, ""), end = t.search(/[ \t\n\r\f]/);
     if (end < 0) return null;
     space = t.slice(0, end); body = t.slice(end); kind = WIDE_SPACES[space];
   } else kind = WIDE[name];
   if (kind === undefined) return null;
   if (body.includes(",")) return undefined;
   const [main, a] = body.includes("/") ? body.split("/") : [body, undefined];
-  if (a !== undefined && !a.trim()) return undefined;
-  const parts = main.trim().split(/\s+/);
+  if (a !== undefined && !cssTrim(a)) return undefined;
+  const parts = cssWords(main);
   if (parts.length !== 3) return undefined;
   const c = parts.map((p, i) => component(p, i === 2 && (kind === 1 || kind === 3)));
   if (c.some((x) => !x)) return undefined;
@@ -191,7 +196,7 @@ function wide(name, body) {
   if (kind === 2 || kind === 3) v[0] = Math.min(1, Math.max(0, v[0]));
   if (kind === 1 || kind === 3) { v[1] = Math.max(0, v[1]); v[2] = ((v[2] % 360) + 360) % 360; }
   let alpha = 1;
-  if (a !== undefined) { const x = component(a.trim()); if (!x) return undefined; alpha = x.pct !== undefined ? x.pct / 100 : x.num; }
+  if (a !== undefined) { const x = component(cssTrim(a)); if (!x) return undefined; alpha = x.pct !== undefined ? x.pct / 100 : x.num; }
   alpha = Math.min(1, Math.max(0, alpha));
   const rad = (d) => d * Math.PI / 180;
   const lin = kind === 0 ? labToLinear(v[0], v[1], v[2]) : kind === 1 ? labToLinear(v[0], v[1] * Math.cos(rad(v[2])), v[1] * Math.sin(rad(v[2])))
@@ -205,8 +210,8 @@ function wide(name, body) {
   const out = [...lin.map((x) => channel(fromLinear(x) * 255)), Math.round(alpha * 255) / 255];
   out.lin = lin;
   // A component written `none` is missing (CSS Color 4 §4.4): 0 in the pixels, `none` in the text.
-  const shown = (t, n) => (t.trim() === "none" ? "none" : jsNumber(n));
-  const alphaText = a !== undefined && a.trim() === "none" ? " / none" : alpha < 1 ? ` / ${jsNumber(alpha)}` : "";
+  const shown = (t, n) => (cssTrim(t) === "none" ? "none" : jsNumber(n));
+  const alphaText = a !== undefined && cssTrim(a) === "none" ? " / none" : alpha < 1 ? ` / ${jsNumber(alpha)}` : "";
   out.text = `${space ? `color(${space === "xyz" ? "xyz-d65" : space} ` : `${name}(`}${v.map((n, i) => shown(parts[i], n)).join(" ")}${alphaText})`;
   return out;
 }
@@ -222,17 +227,17 @@ function operands(c, p3) {
 }
 /** A CSS colour as `[r, g, b, a]` (a wide one with its `.text`), `"current"`, or null. */
 export function parseColor(input) {
-  const s = String(input).trim().toLowerCase();
+  const s = cssTrim(String(input)).toLowerCase();
   if (s === "currentcolor") return "current";
   if (s === "transparent") return [0, 0, 0, 0];
   if (s.startsWith("#")) return hexColor(s.slice(1));
   const open = s.indexOf("(");
   if (open >= 0) {
     // No white space before a function's `(` (CSS Syntax 3 §4.3.4).
-    if (!s.endsWith(")") || /\s$/.test(s.slice(0, open))) return null;
-    const w = wide(s.slice(0, open).trim(), s.slice(open + 1, -1));
+    if (!s.endsWith(")") || /[ \t\n\r\f]$/.test(s.slice(0, open))) return null;
+    const w = wide(s.slice(0, open), s.slice(open + 1, -1));
     if (w !== null) return w ?? null;
-    return functional(s.slice(0, open).trim(), s.slice(open + 1, -1));
+    return functional(s.slice(0, open), s.slice(open + 1, -1));
   }
   const i = NAMED.indexOf(s);
   return i >= 0 && i % 2 === 0 ? hexColor(NAMED[i + 1]) : null;

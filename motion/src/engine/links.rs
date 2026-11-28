@@ -156,6 +156,7 @@ impl Engine {
             dirty: Default::default(),
             animations: Default::default(),
             animating: Default::default(),
+            newly_clocked: Default::default(),
             lowered: Default::default(),
             forced: Default::default(),
             held: Default::default(),

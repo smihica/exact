@@ -81,6 +81,10 @@ final class DragInIOSTests: XCTestCase {
         }
         return provider
     }
+    /// Exact's type, last on a node's file item (LLP 1094.000 D4).
+    private func mark(_ provider: NSItemProvider) {
+        provider.registerDataRepresentation(forTypeIdentifier: NodeItem.type, visibility: .all) { done in done(Data(), nil); return nil }
+    }
     /// Waits until `heard` has `count` events, running the main queue.
     private func hear(_ count: Int, timeout: TimeInterval = 10) { until(timeout: timeout) { heard.count >= count } }
     private func until(timeout: TimeInterval = 10, _ done: () -> Bool) {
@@ -117,6 +121,19 @@ final class DragInIOSTests: XCTestCase {
         let mail = provider([NSURL(string: "mailto:a@example.com")!])
         mail.registerFileRepresentation(forTypeIdentifier: UTType.jpeg.identifier, fileOptions: [], visibility: .all) { done in done(nil, false, nil); return nil }
         XCTAssertEqual(DropItems.kind(of: mail), .words(url: true, text: false), "a non-file link beside a file gives its link")
+        // An Exact node's file item: its file, then its link and text, then Exact's type (LLP 1094.000 D4)
+        let card = fileProvider(pdf, type: .pdf)
+        ([NSURL(string: "https://example.com/fuji")!, "Mount Fuji" as NSString] as [NSItemProviderWriting]).forEach { card.registerObject($0, visibility: .all) }
+        XCTAssertEqual(DropItems.kind(of: card), .words(url: true, text: true), "without Exact's type, such an item gives its words")
+        mark(card)
+        XCTAssertEqual(DropItems.kind(of: card), .fileAndWords(UTType.pdf.identifier, url: true, text: true), "with it, every form")
+        let oddCard = fileProvider(text, type: odd)
+        oddCard.registerObject("notes" as NSString, visibility: .all)
+        mark(oddCard)
+        XCTAssertEqual(DropItems.kind(of: oddCard), .fileAndWords(odd.identifier, url: false, text: true), "a dynamic type leads too")
+        let notes = fileProvider(text, type: .plainText)
+        mark(notes)
+        XCTAssertEqual(DropItems.kind(of: notes), .words(url: false, text: true), "a text file, read as text as any")
         XCTAssertEqual(DropItems.kind(of: provider([NSURL(fileURLWithPath: text.path)])), .none, "a bare file URL")
     }
 
@@ -141,6 +158,28 @@ final class DragInIOSTests: XCTestCase {
         wait(for: [read], timeout: 10)
         drain()
         XCTAssertTrue(said.contains { $0.contains("did not arrive") } && said.contains { $0.contains("is a folder") }, "\(said)")
+    }
+
+    /// An Exact node's card, one item of its file, link and text (LLP 1094.000
+    /// D4), drops all three; the item without Exact's type drops its words.
+    func testAnExactCardDropsItsFileLinkAndText() throws {
+        let photo = try fixture("fuji.pdf", "%PDF-1.4 fuji")
+        let card = { (exact: Bool) -> NSItemProvider in
+            let p = self.fileProvider(photo, type: .pdf)
+            ([NSURL(string: "https://example.com/fuji")!, "Mount Fuji" as NSString] as [NSItemProviderWriting]).forEach { p.registerObject($0, visibility: .all) }
+            if exact { self.mark(p) }
+            return p
+        }
+        for exact in [true, false] {
+            let read = expectation(description: "read")
+            DropItems.read([card(exact)], log: { _ in }) { files, text, url, _ in
+                XCTAssertEqual(files.map(\.lastPathComponent), exact ? ["fuji.pdf"] : [], "Exact's type \(exact)")
+                XCTAssertEqual(text, "Mount Fuji")
+                XCTAssertEqual(url, "https://example.com/fuji")
+                read.fulfill()
+            }
+            wait(for: [read], timeout: 10)
+        }
     }
 
     /// A drag's callbacks through the window's interaction reach the column's
@@ -368,6 +407,50 @@ final class DragInIOSTests: XCTestCase {
         XCTAssertFalse(heard.contains { $0.hasPrefix("1:38") }, "\(heard)")
     }
 
+    /// LLP 1094.000 D16: the app's own drag runs its source's `dragstart`
+    /// before its first enter here, and its `dragend` hears whether the
+    /// app's own drop was delivered, once that drop has landed.
+    func testTheAppsOwnDragStartsBeforeItsEnterAndEndsAfterItsDropLands() throws {
+        let p = presenter(column: ["drop", "dragenter", "dragleave"])
+        let drops = try drops(p), point = try XCTUnwrap(p.views[1]).convert(below, to: nil), gate = DispatchSemaphore(value: 0)
+        let own = OwnDrag { [unowned self] in heard.append("start") }, local = PointDragSession(at: point, in: window)
+        local.localContext = own
+        let session = Session([fileProvider(try fixture("a.pdf", "%PDF-1.4"), type: .pdf, gate: gate), provider(["with a file" as NSString])], at: point)
+        session.local = local
+        drops.dropInteraction(interaction, sessionDidEnter: session)
+        XCTAssertEqual(heard, ["start", "1:55"])
+        drops.dropInteraction(interaction, performDrop: session)
+        drops.dropInteraction(interaction, sessionDidEnd: session)
+        // UIKit's end comes before the drop's items arrive: the source's `dragend` waits for the drop
+        own.ended(taken: true) { [unowned self] taken in heard.append("end \(taken)") }
+        XCTAssertEqual(heard, ["start", "1:55"])
+        gate.signal()
+        hear(4)
+        XCTAssertEqual(heard, ["start", "1:55", #"1:38:[[],"with a file",""]"#, "end true"])
+        // A drop whose node is gone by the time its items arrive was not delivered, though UIKit took it
+        heard = []
+        let next = OwnDrag { [unowned self] in heard.append("start") }, nextLocal = PointDragSession(at: point, in: window)
+        nextLocal.localContext = next
+        let gone = Session([fileProvider(try fixture("b.pdf", "%PDF-1.4"), type: .pdf, gate: gate)], at: point)
+        gone.local = nextLocal
+        drops.dropInteraction(interaction, sessionDidEnter: gone)
+        drops.dropInteraction(interaction, performDrop: gone)
+        next.ended(taken: true) { [unowned self] taken in heard.append("end \(taken)") }
+        p.apply(wireBatch([["op": "destroy", "id": 1]]))
+        gate.signal()
+        hear(3)
+        XCTAssertEqual(heard, ["start", "1:55", "end false"])
+        // UIKit's drop where no node takes it now delivers nothing, whatever UIKit reports
+        heard = []
+        let last = OwnDrag { [unowned self] in heard.append("start") }, lastLocal = PointDragSession(at: point, in: window)
+        lastLocal.localContext = last
+        let missed = Session([provider(["late" as NSString])], at: CGPoint(x: 200, y: 600))
+        missed.local = lastLocal
+        drops.dropInteraction(interaction, performDrop: missed)
+        last.ended(taken: true) { [unowned self] taken in heard.append("end \(taken)") }
+        XCTAssertEqual(heard, ["start", "end false"])
+    }
+
     func testAFieldWhoseNodeDeclaresDropGivesUpItsOwnTextDrop() throws {
         let p = presenter(column: ["drop"], editor: ["input", "drop"])
         let editor = try XCTUnwrap(p.views[2]?.textArea)
@@ -476,7 +559,9 @@ private final class Session: NSObject, UIDropSession {
     var isRestrictedToDraggingApplication: Bool { false }
     func hasItemsConforming(toTypeIdentifiers typeIdentifiers: [String]) -> Bool { false }
     func canLoadObjects(ofClass aClass: any NSItemProviderReading.Type) -> Bool { false }
-    var localDragSession: (any UIDragSession)? { nil }
+    /// The drag session when a node of the app began the drag.
+    var local: UIDragSession?
+    var localDragSession: (any UIDragSession)? { local }
     var progressIndicatorStyle: UIDropSessionProgressIndicatorStyle = .none
     func loadObjects(ofClass aClass: any NSItemProviderReading.Type, completion: @escaping ([any NSItemProviderReading]) -> Void) -> Progress { Progress() }
     let progress = Progress()

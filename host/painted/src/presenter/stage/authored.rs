@@ -125,16 +125,22 @@ impl<D: DataSource> Presenter<D> {
             && beneath.is_some_and(|i| sheet_of(kinds, i).is_some());
         let seek = (self.stage.preview.take()).and_then(|p| p.progress_for(old));
         let ms = part.ms();
+        // A part that cuts flies nothing (LLP 1013.004 D1).
         if self.motion_off() || ms <= 0.0 {
             self.stage.shift = None;
             return;
         }
-        let start = now - f64::from(seek.unwrap_or(0.0)) * ms;
+        // The names the routes pair fly beside the part on the platform's
+        // spring, as Compose's fly beside NavHost's own (LLP 1013.004 D2).
+        self.fly_routes(forward, (old, new), &flights::bounds_spring());
+        let start = now - seek.map_or(0.0, |p| self.play_ms(p, ms).min(ms));
         let bar = (self.stage.bar.as_ref())
             .filter(|(route, ..)| *route == old && sheet.is_none())
             .map(|(_, tape, frame)| (tape.clone(), *frame));
         self.stage.shift = Some(Shift {
             forward,
+            // Authored crossings read `authored` directly in `shift_poses` before shared-X `rtl`.
+            rtl: false,
             outgoing: old,
             incoming: new,
             sheet,
@@ -144,6 +150,7 @@ impl<D: DataSource> Presenter<D> {
             authored: Some(part),
             alone,
             container: None,
+            names: None,
             through: false,
             left: Vec::new(),
         });
@@ -169,6 +176,28 @@ impl<D: DataSource> Presenter<D> {
             self.host.navigation.arriving = arriving;
         }
     }
+}
+
+/// The computed direction of the container a route crossing moves inside:
+/// the sheet route for a push/pop inside a sheet, else the stack's parent
+/// (the navigation root or tabpanel), matching Material's `sceneRoot` so
+/// push and pop stay symmetric across mixed-direction routes.
+pub(super) fn shift_rtl(
+    kernel: &exact_kernel::Kernel,
+    stack: &[ViewId],
+    within: Option<usize>,
+) -> bool {
+    let owner = match within {
+        Some(i) => stack.get(i).copied().and_then(|id| kernel.node(id)),
+        None => stack.first().copied().and_then(|id| {
+            let route = kernel.node(id)?;
+            route.parent.and_then(|p| kernel.node(p)).or(Some(route))
+        }),
+    };
+    owner.is_some_and(|n| {
+        n.computed_row(exact_kernel::StyleId::Direction, |s| s.direction)
+            == exact_kernel::Direction::Rtl
+    })
 }
 
 #[cfg(test)]

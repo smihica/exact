@@ -341,6 +341,68 @@ for (const engine of ['chromium', 'firefox', 'webkit']) engineTest[engine](`${en
     expect(seen.transitions).toBe(0);
     expect(seen.rest).toEqual([1, 0, 1, 'rgb(0, 0, 0)', 'rgb(255, 255, 255)']);
     expect(seen.immediate).toEqual([0.5, 40, 0.5, 'rgb(255, 0, 0)', 'rgb(0, 0, 255)']);
+
+    // CSS-wide keywords (e.g. `unset` from a cleared row) must not throw JSON.parse
+    // or count as authored press rows (#2127).
+    const cleared = await page.evaluate(async () => {
+      const root = document.getElementById('exact-root');
+      const errors = [];
+      const onError = e => errors.push(String(e.error ?? e.message ?? e));
+      window.addEventListener('error', onError);
+      try {
+        const keywords = [
+          'unset', 'initial', 'inherit', 'revert', 'revert-layer',
+          '{"scale":42}', '{"scale":[120,0,"cubic-bezier(0.2,inf,0.8,1)"]}',
+          '{"scale":[240,0,"linear,ease"]}', '{"scale":[240,0,"inherit"]}', '{"scale":[240,0,"var(--x)"]}',
+        ];
+        const results = [];
+        for (const kw of keywords) {
+          root.innerHTML = `<div data-exact-on="press" style="--exact-press:0.5;scale:calc(var(--exact-press-factor,1));width:80px;height:40px">Press</div>`;
+          const el = root.firstElementChild, box = el.getBoundingClientRect();
+          el.style.setProperty('--exact-press-timing', kw);
+          const pointer = (type, buttons) => el.dispatchEvent(new PointerEvent(type, {
+            bubbles: true, pointerType: 'mouse', pointerId: 1, isPrimary: true, button: 0, buttons,
+            clientX: box.x + box.width / 2, clientY: box.y + box.height / 2,
+          }));
+          pointer('pointerdown', 1);
+          const a = el.getAnimations().find(x => x.effect.getKeyframes().some(k => '--exact-press-scale-progress' in k));
+          const duration = a?.effect.getTiming().duration ?? null;
+          pointer('pointerup', 0);
+          results.push({ kw, duration });
+        }
+        // Cleared press rows holding `unset` must not register authored press tracks,
+        // and removing cleared inline press properties restores default dim eligibility.
+        root.innerHTML = `<div data-exact-on="press" style="--exact-press:unset;--exact-press-translate:unset;--exact-press-opacity:unset;--exact-press-color:unset;--exact-press-background-color:unset;--exact-press-timing:unset;width:80px;height:40px">Unset</div>`;
+        const clearedEl = root.firstElementChild;
+        exact.hold(clearedEl, 'active');
+        const clearedShown = exact.pressShown(clearedEl);
+        const clearedTracks = clearedEl.getAnimations().map(a => Object.keys(a.effect.getKeyframes()[0]));
+        exact.hold(clearedEl, null);
+        for (const p of ['--exact-press', '--exact-press-translate', '--exact-press-opacity', '--exact-press-color', '--exact-press-background-color']) {
+          clearedEl.style.removeProperty(p);
+        }
+        const restoredDims = Number(getComputedStyle(clearedEl).getPropertyValue('--exact-dims'));
+        return { errors, results, clearedShown, clearedTracks, restoredDims };
+      } finally {
+        window.removeEventListener('error', onError);
+      }
+    });
+    expect(cleared.errors).toEqual([]);
+    expect(cleared.results).toEqual([
+      { kw: 'unset', duration: 120 },
+      { kw: 'initial', duration: 120 },
+      { kw: 'inherit', duration: 120 },
+      { kw: 'revert', duration: 120 },
+      { kw: 'revert-layer', duration: 120 },
+      { kw: '{"scale":42}', duration: 120 },
+      { kw: '{"scale":[120,0,"cubic-bezier(0.2,inf,0.8,1)"]}', duration: 120 },
+      { kw: '{"scale":[240,0,"linear,ease"]}', duration: 120 },
+      { kw: '{"scale":[240,0,"inherit"]}', duration: 120 },
+      { kw: '{"scale":[240,0,"var(--x)"]}', duration: 120 },
+    ]);
+    expect(cleared.clearedShown).toBeNull();
+    expect(cleared.clearedTracks).toEqual([]);
+    expect(cleared.restoredDims).toBe(1);
   } finally {
     await browser.close();
   }

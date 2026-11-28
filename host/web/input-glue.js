@@ -314,6 +314,41 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
   };
   const presses = new Map();
   const DEFAULT_TIMING = [120, 0, "cubic-bezier(.16,1,.3,1)"]; // LLP 1061 D7
+  const CSS_WIDE = /^(?:unset|initial|inherit|revert|revert-layer)$/i;
+  // A cleared or refused custom property can carry a CSS-wide keyword (e.g. `unset`);
+  // treat it as absent rather than an authored press row or JSON timing map.
+  const ownPress = (el, name) => {
+    const value = el.style.getPropertyValue(name).trim();
+    return value && !CSS_WIDE.test(value) ? value : "";
+  };
+  // Validate easing via Web Animations (`KeyframeEffect`) so lists, CSS-wide keywords,
+  // `var()`, and non-finite curves never throw in `Element.animate()`.
+  const validEasing = s => {
+    if (typeof s !== "string" || !s.trim()) return false;
+    if (typeof KeyframeEffect === "function") {
+      try { new KeyframeEffect(null, null, { easing: s }); return true; } catch { return false; }
+    }
+    return typeof CSS === "undefined" || typeof CSS.supports !== "function"
+      || (!s.includes(",") && !CSS_WIDE.test(s.trim()) && !/^\s*var\(/i.test(s) && CSS.supports("animation-timing-function", s));
+  };
+  const validTiming = e => Array.isArray(e) && e.length >= 3
+    && typeof e[0] === "number" && Number.isFinite(e[0]) && e[0] >= 0
+    && typeof e[1] === "number" && Number.isFinite(e[1])
+    && validEasing(e[2]);
+  const parsePressTiming = row => {
+    if (!row) return null;
+    try {
+      const value = JSON.parse(row);
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const entries = Object.entries(value);
+      if (!entries.length) return {};
+      const out = {};
+      for (const [k, v] of entries) if (validTiming(v)) out[k] = v;
+      return Object.keys(out).length ? out : null;
+    } catch {
+      return null;
+    }
+  };
   const DISABLED = ":disabled,[disabled]:not([disabled='false'])";
   const unavailable = el => !el.isConnected || !root.contains(el) || el.closest(`${DISABLED},[data-exiting]`) || inertAncestor(el);
   let held = null;
@@ -392,7 +427,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     // Re-read with only the kept declarations on, under the same key: the look beneath of what isn't kept, and the
     // node's own images and masks.
     if (state.rule) hold(el, state, Object.values(kept).join("; "), []);
-    const cs = getComputedStyle(el), own = name => el.style.getPropertyValue(name) ? cs.getPropertyValue(name).trim() : "";
+    const cs = getComputedStyle(el), own = name => ownPress(el, name) ? cs.getPropertyValue(name).trim() : "";
     // A transition the read itself started (Firefox's transition styles see the animation, so taking a kept
     // declaration off is a change there) toward the very look beneath the kept one was written from: none of the
     // node's, cancelled at once. One toward another look is the base's own move, the node's to time (D8).
@@ -516,7 +551,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     // Each boundary below it eases from the colour it shows (a look's included; its own rule is off) to the press's,
     // resolved in the boundary's modes: the JS target's is a token's property, which resolves there; the wasm host
     // resolves it on each boundary, by the pressed view (`--exact-press-color-below-<view>`, host/web/src/host/looks.rs).
-    const own = el.style.getPropertyValue("--exact-press-color"), view = el.getAttribute("data-view");
+    const own = ownPress(el, "--exact-press-color"), view = el.getAttribute("data-view");
     const pressed = own && view ? `var(--exact-press-color-below-${view}, ${own})` : own;
     below.forEach((b, n) => {
       const base = getComputedStyle(b).color, mark = `${state.key}.${n}`;
@@ -535,7 +570,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     for (const [b, mark] of below) if (b.getAttribute("data-x-pr") === mark) b.removeAttribute("data-x-pr");
   };
   const targets = (el, state) => {
-    const own = row => el.style.getPropertyValue(row);
+    const own = row => ownPress(el, row);
     const authored = PRESS_PAINT ? Object.keys(PAINT_ROWS).filter(p => PAINT_ROWS[p].some(own)) : [];
     state.painted = authored.length > 0;
     if (own("--exact-press")) authored.push("scale");
@@ -654,8 +689,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     el.toggleAttribute("data-pressed", down);
     const current = targets(el, state);
     refreshPaint(el, state);
-    const row = el.style.getPropertyValue("--exact-press-timing");
-    const timings = row ? JSON.parse(row) : null;
+    const timings = parsePressTiming(ownPress(el, "--exact-press-timing"));
     for (const property of new Set([...state.tracks.keys(), ...current])) {
       const timing = property === "button" || property === "dim" ? DEFAULT_TIMING
         : timings ? timings[property] : nativeButton(el) ? null : DEFAULT_TIMING;

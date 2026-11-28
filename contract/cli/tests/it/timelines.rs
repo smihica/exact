@@ -148,13 +148,21 @@ fn a_timeline_drives_paint_rows_only() {
             assert!(error.message.contains("paint rows only"), "{error}");
             assert!(error.message.contains("LLP 1057.003"), "{error}");
         }
-        // Unbound, or bound to the clock, the same keyframes play as ever.
+        // Unbound, or bound to the clock / detached (`auto`, `none`, `unset`, blank),
+        // the same keyframes and endless animations play as ever.
         contract::compile(&app(keyframes, "animation=\"k 1s both\"")).unwrap();
-        contract::compile(&app(
-            keyframes,
-            "animation=\"k 1s both\" animation-timeline=\"auto\"",
-        ))
-        .unwrap();
+        for tl in [
+            "\"auto\"",
+            "\"none\"",
+            "(on ? \"none\" : \"unset\")",
+            "(on ? \"none\" : \"\")",
+        ] {
+            contract::compile(&app(
+                keyframes,
+                &format!("animation=\"k 1s infinite both\" animation-timeline={tl}"),
+            ))
+            .unwrap();
+        }
     }
     for keyframes in [
         "opacity=0.5",

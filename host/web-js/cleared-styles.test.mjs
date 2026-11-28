@@ -676,7 +676,9 @@ component Fam
     if (runtime === 'JS') expect(cleared.timeline).toEqual(['', 'running', ['running'], 'auto']);
     for (const name of ['animation', 'pressed']) {
       expect(cleared[name][2]).toEqual([]);
-      if (runtime === 'JS') expect(cleared[name][0]).toBe('');
+      // Without a synthetic `animation-play-state` companion on CSS timelines,
+      // clearing `animation` to `unset` leaves standard shorthand `unset` (not `paused`).
+      if (runtime === 'JS') expect(cleared[name][0]).toBe('unset');
     }
   }, MAPPED_SOURCE), 120000);
 

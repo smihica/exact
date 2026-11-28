@@ -98,6 +98,8 @@ final class BuiltInShare: ShareHosting {
     func share(_ session: ExactSession, _ args: [Any], source: UInt32?) { session.share(args, source: source) }
     func claimCold(_ session: ExactSession) { session.claimColdShare() }
     func land(_ session: ExactSession) { session.landColdShare() }
+    func claimPending(_ session: ExactSession) { session.claimDeferredInbox() }
+    func sessionDestroyed(_ session: ExactSession) { session.destroyShareState() }
     #if os(iOS)
     func shareLink(_ url: URL, from view: UIView, at rect: CGRect, log: @escaping (String) -> Void) {
         ShareSheet.present([url], title: nil, from: view, at: rect, outcome: log)

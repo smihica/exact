@@ -43,19 +43,32 @@ export async function appFile(path, appId) {
   throw new Error('this page has no app files');
 }
 
+const urlPending = new Map();
 /** An `app:/` source for an `image` or `video` (D7): an object URL for the
  * app's current file in its store, or this page's unstored pick — or '' when
- * there is none. A file that changed gets a new URL; the last one is revoked. */
+ * there is none. A file that changed gets a new URL; the last one is revoked.
+ * Concurrent readers of the same path share the newest in-flight lookup instead
+ * of observing an empty cache while the later read is still pending, and
+ * completed misses retain no map entries. */
 async function appURL(path, appId) {
-  try {
-    const { blob, version } = await appFile(path, appId);
-    return made(path, blob, version);
-  } catch {
-    const was = urls.get(path);
-    if (was) URL.revokeObjectURL(was[0]);
-    urls.delete(path);
-    return ''; // no such file, or not an app:/data|cache|tmp path: nothing to show
-  }
+  let promise;
+  promise = (async () => {
+    try {
+      const { blob, version } = await appFile(path, appId);
+      if (urlPending.get(path) !== promise) return urlPending.get(path) ?? urls.get(path)?.[0] ?? '';
+      return made(path, blob, version);
+    } catch {
+      if (urlPending.get(path) !== promise) return urlPending.get(path) ?? urls.get(path)?.[0] ?? '';
+      const was = urls.get(path);
+      if (was) URL.revokeObjectURL(was[0]);
+      urls.delete(path);
+      return ''; // no such file, or not an app:/data|cache|tmp path: nothing to show
+    } finally {
+      if (urlPending.get(path) === promise) urlPending.delete(path);
+    }
+  })();
+  urlPending.set(path, promise);
+  return promise;
 }
 function made(path, blob, version) {
   const was = urls.get(path);

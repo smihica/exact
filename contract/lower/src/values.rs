@@ -173,7 +173,7 @@ pub(crate) fn describe(e: &StyleValueError) -> String {
         StyleValueError::BadFontFeatures { .. } => "expected normal, or up to sixteen OpenType features as `\"cv05\", \"tnum\" 1, \"liga\" off`: a quoted four-character tag and an optional non-negative integer, `on` or `off` (CSS Fonts 4 §6.12)".into(),
         StyleValueError::BadCornerShape { .. } => "expected one to four of round, squircle, square, bevel, scoop, notch, superellipse(<number>) or -exact-continuous".into(),
         StyleValueError::BadDragTimeline { .. } => "expected none, or a `--name` and an optional axis (`x` or `y`)".into(),
-        StyleValueError::BadAnimationTimeline { .. } => "expected auto, a `--name`, `scroll([nearest | root | self] [block | inline | x | y])` or `view([axis] [inset])`".into(),
+        StyleValueError::BadAnimationTimeline { .. } => "expected auto, none, a `--name`, `scroll([nearest | root | self] [block | inline | x | y])` or `view([axis] [inset])`".into(),
         StyleValueError::BadAnimationRange { .. } => "expected normal, or one or two distinct ends, each normal, a length or percentage, or a range name (cover, contain, entry, exit, entry-crossing, exit-crossing) with an optional length or percentage (`0px 300px`, `entry 20% cover 50%`)".into(),
         StyleValueError::BadPositionTryFallbacks { .. } => "expected none, or comma-separated attempts, each one to three of flip-block, flip-inline and flip-start, applied in order; flip-x, flip-y and named rules are not implemented".into(),
         StyleValueError::BadTimelineScope { .. } => "expected none, all, or `--name`s separated by commas".into(),

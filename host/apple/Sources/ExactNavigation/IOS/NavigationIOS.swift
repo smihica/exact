@@ -53,6 +53,8 @@ final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureR
     private var syncYieldReported = false
     /// A pop UIKit committed with no call Exact heard is followed in the next turn (`followPopsNextTurn`).
     var followOwed = false
+    /// A navigation-bar Back tap queued via `UINavigationItem.backAction` awaits its deferred turn.
+    var backActionPending = false
     private var mounting = false
     private(set) weak var container: NodeView?
     private(set) var routeIDs: [UInt32] = []
@@ -668,6 +670,7 @@ final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureR
             // The split's own transition (`show(_:)`, a rotation) ends where no stack's delegate hears it
             if let transition = split?.controller.transitionCoordinator { runHeld(after: transition) }
             owePress()
+            refreshScrollEdgesInTransition()
             reportCovers()
             return
         }
@@ -712,6 +715,7 @@ final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureR
             if let transition = nav.transitionCoordinator, !nav.stackRoutes.elementsEqual(stack, by: ===) {
                 held = true
                 runHeld(after: transition)
+                refreshScrollEdgesInTransition(in: nav.stackRoutes.compactMap { $0 as? RouteController })
                 continue
             }
             prepareRoutes(stack, in: nav)
@@ -1285,6 +1289,9 @@ final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureR
             guard let self, let navigationController else { return }
             transitionEnded(navigationController, swipe: swipe, cancelled: context.isCancelled)
         }
+        #if os(iOS)
+        crossFlights(transition, to: viewController, in: navigationController)
+        #endif
         // That paints what shows as it starts. A swipe reveals the route a
         // strip at a time, and painting stopped there until the swipe ended
         // (a back swipe showed the list's top half, then its bottom half).
@@ -1473,6 +1480,7 @@ final class NavigationHost: NSObject, UINavigationControllerDelegate, UIGestureR
         controllers.removeAll()
         routeIDs = []
         projectionHeld = false
+        backActionPending = false
         modalWaiting = false
         pendingPress?.pending = false; pendingPress?.settle(); pendingPress = nil
         lastTransition = "idle"; reselected = nil; tabsHeld = false

@@ -179,6 +179,109 @@ component App
     assert_eq!(k.timeline_of(own), Some(NamedTimeline::Inactive));
 }
 
+/// `animation-timeline: none` gives the animation no timeline (CSS Animations
+/// 2), so a fresh one holds time 0 without advancing on the clock (#2106),
+/// `auto -> none -> auto` reveals the underlying style and keeps its clock
+/// start, `scroll() -> none` keeps its progress, and `none`/`unset` do not
+/// restrict animations to finite paint-only keyframes.
+#[test]
+fn animation_timeline_none_does_not_play_on_the_clock() {
+    const APP: &str = r#"keyframes rise
+  from opacity=0.2 translate="0px -10px"
+  to opacity=0.8 translate="0px -50px"
+keyframes grow
+  from r=2
+  to r=8
+component App
+  state mode = "none"
+  action setMode(m: string)
+    mode = m
+  view
+    column testId="page" padding=40 gap=20
+      button "Auto" press=setMode("auto") testId="to-auto"
+      button "None" press=setMode("none") testId="to-none"
+      button "Scroll" press=setMode("scroll()") testId="to-scroll"
+      row testId="none" width=80 height=40 opacity=1 animation="rise 1s linear both" animation-timeline="none"
+      row testId="switch" width=80 height=40 opacity=1 animation="rise 1s linear both" animation-timeline=mode
+      row testId="endless" width=80 height=40 animation="grow 1s linear infinite" animation-timeline=(mode == "auto" ? "unset" : "none")
+      box height=1000 flex-shrink=0
+"#;
+    let mut app = Laid::boot(APP, 300.0, 400.0);
+    let k = app.runner.kernel();
+    let none = k.find_by_test_id("none")[0];
+    assert_eq!(k.timeline_found(none), Some(Found::Missing));
+    assert_eq!(k.timeline_of(none), Some(NamedTimeline::Missing));
+    // Fresh `none` holds keyframe `from` (0.2 / -10px), distinct from underlying (1.0 / 0px),
+    // and never advances on the clock.
+    assert!((app.shown("none", Property::Opacity).x - 0.2).abs() < 1e-9);
+    assert_eq!(app.shown("none", Property::Translate).y, -10.0);
+    assert!((app.shown("switch", Property::Opacity).x - 0.2).abs() < 1e-9);
+    app.engine.advance(2.0).unwrap();
+    app.engine.frame();
+    assert!(
+        (app.engine
+            .sampled_value(app.node("none"), Property::Opacity)
+            .unwrap()
+            .x
+            - 0.2)
+            .abs()
+            < 1e-9
+    );
+    assert!(app.engine.quiescent());
+
+    let press = |app: &mut Laid, id: &str| {
+        let view = {
+            let k = app.runner.kernel();
+            k.node_by_key(k.find_by_test_id(id)[0]).unwrap().id
+        };
+        let receipt = app
+            .runner
+            .dispatch(view, exact_runner::Event::Press)
+            .unwrap();
+        app.runner
+            .kernel()
+            .motion_sync(&receipt)
+            .apply(&mut app.engine)
+            .unwrap();
+        app.place();
+    };
+
+    // `none -> auto`: begins advancing from time 0 at t=2.0.
+    press(&mut app, "to-auto");
+    assert!((app.shown("switch", Property::Opacity).x - 0.2).abs() < 1e-9);
+    app.engine.advance(2.4).unwrap();
+    assert!((app.shown("switch", Property::Opacity).x - 0.44).abs() < 1e-9);
+
+    // `auto -> none`: current time becomes unresolved -> underlying opacity 1.0.
+    press(&mut app, "to-none");
+    assert!((app.shown("switch", Property::Opacity).x - 1.0).abs() < 1e-9);
+    assert!(app.engine.quiescent());
+
+    // `none -> auto`: resumes keeping its t=2.0 start (at t=2.6 -> 60% -> 0.56).
+    app.engine.advance(2.6).unwrap();
+    press(&mut app, "to-auto");
+    assert!((app.shown("switch", Property::Opacity).x - 0.56).abs() < 1e-9);
+
+    // `scroll()` -> `none`: preserves the scroll timeline's progress.
+    press(&mut app, "to-scroll");
+    app.scroll("page", 0.0, 420.0);
+    let scrolled = app.shown("switch", Property::Opacity).x;
+    assert!(scrolled > 0.2 && scrolled < 0.8, "scrolled={scrolled}");
+    press(&mut app, "to-none");
+    app.scroll("page", 0.0, 0.0);
+    app.engine.advance(5.0).unwrap();
+    app.engine.frame();
+    assert!(
+        (app.engine
+            .sampled_value(app.node("switch"), Property::Opacity)
+            .unwrap()
+            .x
+            - scrolled)
+            .abs()
+            < 1e-9
+    );
+}
+
 /// `scroll()` finds the nearest scroll container; with none above it, the
 /// page's: a root the page scrolls, over the document less the viewport.
 #[test]

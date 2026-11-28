@@ -92,6 +92,105 @@ final class OwnerUpdateIOSTests: XCTestCase {
         }
     }
 
+    /// A session made with stage 5's owner layout lays out under it (LLP 1123, "stage 5, the switch"): an edge cover
+    /// on its route's root, an owner by its block, pads nothing, where in a session made without it the cover moves
+    /// the root's children down, as on main.
+    func testASessionMadeWithTheOwnerLayoutLaysOutUnderIt() throws {
+        var moved: [[UInt32]] = []
+        for on in [false, true] {
+            let session = try fixture(ownerLayout: on)
+            XCTAssertEqual(session.ownerLayout, on)
+            let (route, _) = try firstRoute(session)
+            let children = Set(route.node.subviews.compactMap { ($0 as? NodeView)?.id })
+            let batch = session.runtime.covers([(route.node.id, .edges(.init(top: 50, right: 0, bottom: 0, left: 0)))])
+            XCTAssertNil(batch.error)
+            moved.append(batch.ops.filter { $0.op == .frame && children.contains($0.id) }.map(\.id))
+            session.destroy()
+            sessions.removeAll { $0 === session }
+            window?.isHidden = true
+        }
+        XCTAssertFalse(moved[0].isEmpty, "the cover moves the root's children")
+        XCTAssertEqual(moved[1], [], "the owner's root takes no padding from its cover")
+    }
+
+    /// The session's update is the session view's in the document's space (LLP 1123 D2): its band is the safe area
+    /// where the document takes the whole view, as under the fixture's native container; its chain starts at the
+    /// controller holding the session view, the window's root a relation; the keyboard and the regions are where a
+    /// person sees them, the page scrolled or not, their margins scaled with the viewport; it reports no window map; and
+    /// the kernel takes it.
+    func testTheSessionsUpdateIsTheSessionViewsInTheDocument() throws {
+        let session = try fixture()
+        let view = try XCTUnwrap(sessionView), p = session.presenter
+        let edges = { (i: UIEdgeInsets) in OwnerUpdateWire.Edges(top: i.top, right: i.right, bottom: i.bottom, left: i.left) }
+        // A safe area with no two edges alike, whatever the window gives
+        let host = try XCTUnwrap(window?.rootViewController)
+        host.additionalSafeAreaInsets = UIEdgeInsets(top: 40, left: 12, bottom: 30, right: 8)
+        host.view.layoutIfNeeded()
+        view.layoutIfNeeded()
+        XCTAssertEqual(p.viewport.convert(p.viewport.bounds.inset(by: p.pageMargins), to: view), view.bounds, "the document takes the whole view")
+        let update = p.sessionUpdate(of: view)
+        XCTAssertGreaterThanOrEqual(view.safeAreaInsets.top, 40)
+        XCTAssertEqual(update.band, edges(view.safeAreaInsets))
+        XCTAssertEqual(update.chain.first?.target.id, TargetIds.id(of: host.view), "the hosting controller's view")
+        XCTAssertEqual(update.relations.first { $0.relation == OwnerUpdateIOS.Relation.session }?.target.id, TargetIds.id(of: view))
+        // The page names no `interactive-widget`: UIKit's own behavior, sent as `resizes-content`
+        XCTAssertEqual(p.keyboardPolicy, "resizes-content")
+        XCTAssertEqual(update.keyboardPolicy, .resizesContent)
+        XCTAssertNotNil(update.configuration)
+        XCTAssertNil(session.runtime.ownerReports(session: update.encode()).error)
+        XCTAssertNil(update.windowMap)
+        // The conversion the keyboard and the regions take puts the viewport's visible origin at the document's, the
+        // page scrolled or not
+        for offset in [CGFloat(0), 30] {
+            p.viewport.contentOffset.y = offset
+            XCTAssertEqual(p.viewport.bounds.minY, offset, "the page scrolled")
+            let seen = p.documentRect(CGRect(origin: p.viewport.convert(p.viewport.bounds.origin, to: nil), size: CGSize(width: 10, height: 10)), from: nil)
+            XCTAssertEqual(seen.origin.x, -p.pageMargins.left, accuracy: 0.01)
+            XCTAssertEqual(seen.origin.y, -p.pageMargins.top, accuracy: 0.01)
+        }
+        p.viewport.contentOffset.y = 0
+        // A region's frame and margins scale with the viewport: under the agent's explicit size at half scale, twice
+        // the session view's points, its four margins unalike
+        let region = ReservedRegions.Region(id: 1, kind: 1, frame: CGRect(x: 40, y: 100, width: 60, height: 20),
+                                            margins: UIEdgeInsets(top: 2, left: 4, bottom: 6, right: 8), active: true)
+        XCTAssertEqual(p.documentRegion(region, of: view).margins, .init(top: 2, right: 8, bottom: 6, left: 4))
+        p.viewport.transform = CGAffineTransform(scaleX: 0.5, y: 0.5)
+        let scaled = p.documentRegion(region, of: view)
+        p.viewport.transform = .identity
+        XCTAssertEqual(scaled.frame.size, CGSize(width: 120, height: 40))
+        XCTAssertEqual(scaled.margins, .init(top: 4, right: 16, bottom: 12, left: 8))
+        // A controller between the window's root and the session view holds it: its view begins the chain
+        let child = UIViewController()
+        host.addChild(child)
+        host.view.addSubview(child.view)
+        child.didMove(toParent: host)
+        child.view.addSubview(view)
+        let held = p.sessionUpdate(of: view)
+        XCTAssertEqual(held.chain.first?.target.id, TargetIds.id(of: child.view))
+        XCTAssertEqual(held.chain.dropFirst().first?.target.id, TargetIds.id(of: host.view))
+        XCTAssertEqual(held.relations.first { $0.relation == OwnerUpdateIOS.Relation.root }?.target.id, TargetIds.id(of: host.view))
+        host.view.addSubview(view)
+        // A view out of a window with no controller: no keyboard, configuration or regions, no chain, and the session
+        // view still a relation
+        let alone = p.sessionUpdate(of: UIView())
+        XCTAssertEqual(alone.keyboard, .unreported)
+        XCTAssertNil(alone.configuration)
+        XCTAssertNil(alone.regions)
+        XCTAssertTrue(alone.chain.isEmpty)
+        XCTAssertEqual(alone.relations.map(\.relation), [OwnerUpdateIOS.Relation.session])
+    }
+
+    /// The band is how far the unsafe area reaches into the document: the safe area where the document takes the whole
+    /// view, none where it is the safe area, and what a scaled document's own space holds of it.
+    func testTheSessionsBandIsTheUnsafeAreaInTheDocument() {
+        let whole = CGRect(x: 0, y: 0, width: 400, height: 800), safe = whole.inset(by: UIEdgeInsets(top: 40, left: 12, bottom: 30, right: 8))
+        XCTAssertEqual(Presenter.band(document: whole, safe: safe), .init(top: 40, right: 8, bottom: 30, left: 12))
+        XCTAssertEqual(Presenter.band(document: safe, safe: safe), .zero)
+        // The agent's explicit size at half scale: the same safe area holds twice the document's points
+        let scaled = CGRect(x: 0, y: 0, width: 800, height: 1600), safeScaled = scaled.inset(by: UIEdgeInsets(top: 80, left: 24, bottom: 60, right: 16))
+        XCTAssertEqual(Presenter.band(document: scaled, safe: safeScaled), .init(top: 80, right: 16, bottom: 60, left: 24))
+    }
+
     func testTheKernelTakesAnEncodedUpdateAndRefusesATruncatedOne() throws {
         let session = try fixture()
         let (route, view) = try firstRoute(session)
@@ -103,6 +202,46 @@ final class OwnerUpdateIOSTests: XCTestCase {
         XCTAssertNotNil(session.runtime.ownerReports(updates: [(route.node.id, Data(truncated))]).error)
         // And the whole sample, its chain and relations with it, which the kernel decodes alike
         XCTAssertNil(session.runtime.ownerReports(updates: [(route.node.id, update.encode())]).error)
+    }
+
+    /// The session's update encodes as the kernel does (`a_session_update_encodes_to_the_hosts_golden_bytes` pins the
+    /// kernel's bytes for the same update, every field present and no two edges alike), rides the reports' records as
+    /// kind 29 after owners' updates and registrations, and is taken, refused truncated or followed by a byte.
+    func testTheSessionsUpdateEncodesAsTheKernelsAndRidesTheReports() throws {
+        let target = { (id: UInt64, generation: UInt64, insets: OwnerUpdateWire.Edges?) in
+            OwnerUpdateWire.Target(id: id, generation: generation, insets: insets, frame: CGRect(x: 0, y: 0, width: 402, height: 874))
+        }
+        var update = SessionUpdateWire()
+        update.band = .init(top: 59, right: 1, bottom: 34, left: 2)
+        update.chain = [(target(11, 2, .init(top: 59, right: 0, bottom: 34, left: 0)), 4)] // `Kind::Navigation`
+        update.relations = [(3, target(12, 1, nil))] // `Relation::Window`
+        update.keyboard = .shown(frame: CGRect(x: 0, y: 516, width: 402, height: 358), docked: true)
+        update.keyboardPolicy = .resizesVisual
+        update.windowMap = CGAffineTransform(a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 20)
+        update.configuration = 7
+        update.regions = [.init(id: 5, kind: 1, frame: CGRect(x: 10, y: 20, width: 30, height: 40), margins: .init(top: 1, right: 2, bottom: 3, left: 4), active: true)]
+        let bytes = update.encode()
+        XCTAssertEqual(bytes.map { String(format: "%02x", $0) }.joined(), "00006c420000803f0000084200000040010000000b0000000000000002000000000000000100006c420000000000000842000000000100000000000000000000c94300805a440401000000030c000000000000000100000000000000000100000000000000000000c94300805a440200000000000001440000c9430000b3430102010000803f00000000000000000000803f000000000000a0410107000000000000000101000000050000000000000001000020410000a0410000f041000020420000803f00000040000040400000804001")
+        // Its record follows the owners' updates and the registrations, each framed by its view, kind and length
+        let owner = Data([1, 2, 3]), registration = Data([4, 5])
+        let records = Runtime.reportRecords(updates: [(7, owner)], registrations: [registration], session: bytes)
+        let words = { (data: Data) in (0..<data.count / 4).map { i in data.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)) } } }
+        XCTAssertEqual(words(records.prefix(12)), [7, 21, 3])
+        XCTAssertEqual(records.subdata(in: 12..<15), owner)
+        XCTAssertEqual(words(records.subdata(in: 15..<27)), [0, 22, 2])
+        XCTAssertEqual(records.subdata(in: 27..<29), registration)
+        XCTAssertEqual(words(records.subdata(in: 29..<41)), [0, 29, UInt32(bytes.count)])
+        XCTAssertEqual(records.suffix(from: 41), bytes)
+        let session = try fixture()
+        XCTAssertNil(session.runtime.ownerReports(session: bytes).error)
+        XCTAssertNotNil(session.runtime.ownerReports(session: bytes.prefix(bytes.count - 1)).error, "a truncated update")
+        XCTAssertNotNil(session.runtime.ownerReports(session: bytes + Data([0])).error, "an update followed by a byte")
+        XCTAssertNil(session.runtime.ownerReports(session: SessionUpdateWire().encode()).error, "no optional field")
+        // And beside an owner's update and a registration, in one call the kernel takes whole
+        let (route, view) = try firstRoute(session)
+        let margins = OwnerUpdateIOS(margins: OwnerUpdateIOS.sample(controller: route, view: view, session: sessionView).margins).encode()
+        let map = ExactNativeTarget.encode(name: "map", target: target(21, 1, .init(top: 30, right: 0, bottom: 0, left: 0)))
+        XCTAssertNil(session.runtime.ownerReports(updates: [(route.node.id, margins)], registrations: [map], session: bytes).error)
     }
 
     func testARegistrationRefusesAnInvalidOrTakenNameAndFreesItWhenDisposed() throws {
@@ -450,11 +589,11 @@ final class OwnerUpdateIOSTests: XCTestCase {
     }
 
     /// The native fixture booted in a window of the test host's scene, 402 by 874.
-    private func fixture() throws -> ExactSession {
+    private func fixture(ownerLayout: Bool = false) throws -> ExactSession {
         let env = ProcessInfo.processInfo.environment
         let path = try XCTUnwrap(env["EXACT_FIXTURE_PLAN"], "build.mjs --test --ios compiles EXACT_FIXTURE_PLAN")
         let plan = try Data(contentsOf: URL(fileURLWithPath: path))
-        let session = ExactApp.shared.makeSession(label: "owner-update")
+        let session = ExactApp.shared.makeSession(label: "owner-update", ownerLayout: ownerLayout)
         sessions.append(session)
         let view = ExactView(session: session)
         sessionView = view

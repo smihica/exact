@@ -122,13 +122,13 @@ final class FileDragMacTests: XCTestCase {
         XCTAssertEqual(heard, ["1:55", "1:56"])
         // With a drop waiting at the column, its held enter is heard before the field's drop leaves it
         heard = []
-        FileDrag.waits([try XCTUnwrap(p.views[1])])
+        FileDrag.waits([FileDrag.Shown(try XCTUnwrap(p.views[1]))])
         _ = editor.draggingEntered(text)
         XCTAssertEqual(heard, [], "held")
         XCTAssertNil(FileDrag.perform(editor, text))
         editor.draggingEnded(text)
         XCTAssertEqual(heard, ["1:55", "1:56"])
-        FileDrag.lands([try XCTUnwrap(p.views[1])])
+        FileDrag.lands([FileDrag.Shown(try XCTUnwrap(p.views[1]))])
         XCTAssertEqual(heard, ["1:55", "1:56"])
     }
 
@@ -184,20 +184,38 @@ final class FileDragMacTests: XCTestCase {
         let column = try XCTUnwrap(p.views[1]), box = try XCTUnwrap(p.views[3])
         XCTAssertEqual(column.draggingEntered(drag([file], at: middle(box))), .copy)
         FileDrag.ended(dropped: true)
-        FileDrag.waits([column])
+        FileDrag.waits([FileDrag.Shown(column)])
         _ = column.draggingEntered(drag([file], at: middle(box)))
         XCTAssertEqual(heard, ["1:55"], "the newer drag's enter waits")
-        FileDrag.lands([column])
+        FileDrag.lands([FileDrag.Shown(column)])
         XCTAssertEqual(heard, ["1:55", "1:55"])
         column.draggingExited(drag([file], at: NSPoint(x: -20, y: -20)))
         heard = []
         _ = column.draggingEntered(drag([file], at: middle(box)))
         FileDrag.ended(dropped: true)
-        FileDrag.waits([column])
+        FileDrag.waits([FileDrag.Shown(column)])
         _ = column.draggingEntered(drag([file], at: middle(box)))
         column.draggingExited(drag([file], at: NSPoint(x: -20, y: -20)))
-        FileDrag.lands([column])
+        FileDrag.lands([FileDrag.Shown(column)])
         XCTAssertEqual(heard, ["1:55"], "a newer drag that left was neither entered nor left")
+        // A drop that waits over a row a list then renews for another item (LLP 1078) no longer holds the row's
+        // enters: a newer drop over the new item waits on its own, and the old drop's landing leaves it waiting
+        heard = []
+        _ = column.draggingEntered(drag([file], at: middle(box)))
+        FileDrag.ended(dropped: true)
+        let old = [FileDrag.Shown(column)]
+        FileDrag.waits(old)
+        p.renew(1)
+        _ = column.draggingEntered(drag([file], at: middle(box)))
+        FileDrag.ended(dropped: true)
+        let newer = [FileDrag.Shown(column)]
+        FileDrag.waits(newer)
+        _ = column.draggingEntered(drag([file], at: middle(box)))
+        XCTAssertEqual(heard, ["1:55", "1:55"], "the third drag's enter waits for the second drop")
+        FileDrag.lands(old)
+        XCTAssertEqual(heard, ["1:55", "1:55"], "the old drop's landing releases nothing of the new item")
+        FileDrag.lands(newer)
+        XCTAssertEqual(heard, ["1:55", "1:55", "1:55"])
     }
 
     /// An input that is not being edited takes the drag itself (`Field`).
@@ -215,6 +233,164 @@ final class FileDragMacTests: XCTestCase {
 
     /// A dropped file of a type the manifest declares is kept (bookmarked,
     /// on Open Recent); any other, and a folder, is only minted.
+    /// A scroller's clip view is the drag's one destination over it while a
+    /// node hears a drag's events (LLP 1094.000 D15): the page's and a scroll
+    /// node's clip views register and the zone inside them does not; the
+    /// target is the node under the drag's point, whichever view AppKit
+    /// reports to, and the drop through the clip view is the zone's.
+    func testAScrollersClipViewIsTheDragsOneDestinationOverIt() throws {
+        _ = NSApplication.shared
+        let source = """
+        component App
+          state log = ""
+          action entered
+            log = `${log}enter;`
+          action dropped(e: DragEvent)
+            log = `${log}drop:${e.files.length};`
+          view
+            column width="100%" height="100%"
+              scroll testId="list" width=400 height=200 overflow-y="scroll"
+                box testId="zone" width=400 height=100 drop=dropped dragenter=entered
+                  text "Zone" testId="leaf"
+                box testId="below" width=400 height=400
+
+        """
+        let session = ExactApp.shared.makeSession()
+        defer { session.destroy() }
+        let view = ExactView(session: session)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let mount = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        window.contentView = mount
+        view.frame = mount.bounds; mount.addSubview(view)
+        XCTAssertNil(session.boot(plan: try compile(source), size: CGSize(width: 400, height: 300)).error)
+        window.layoutIfNeeded()
+        let p = session.presenter
+        func node(_ id: String) throws -> NodeView { try XCTUnwrap(p.views.values.first { $0.props["testId"] == id }) }
+        let page = try XCTUnwrap(p.viewport.contentView as? DropClipView)
+        let clip = try XCTUnwrap(try node("list").scroll?.contentView as? DropClipView)
+        let zone = try node("zone"), below = try node("below")
+        XCTAssertTrue(page.isDestination && clip.isDestination, "both clip views")
+        XCTAssertFalse(clip.registeredDraggedTypes.isEmpty)
+        XCTAssertTrue(zone.registeredDraggedTypes.isEmpty, "a node inside a clip view registers for nothing")
+        XCTAssertNil(FileDrag.moved(clip, drag([file], at: middle(below))), "nothing takes it below the zone")
+        XCTAssertEqual(FileDrag.moved(page, drag([file], at: middle(zone))), .copy, "an outer clip view AppKit still reports to answers for the point")
+        XCTAssertEqual(FileDrag.moved(clip, drag([file], at: middle(try node("leaf")))), .copy, "a leaf inside the zone gives it the zone's")
+        let info = drag([file], at: middle(zone))
+        XCTAssertEqual(clip.draggingUpdated(info), .copy, "the zone under the point")
+        XCTAssertTrue(clip.performDragOperation(info), "the drop through the clip view")
+        clip.draggingEnded(info)
+        let state = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(session.agent(#"{"op":"state"}"#).utf8)) as? [String: Any])
+        XCTAssertEqual((state["slots"] as? [String: Any])?["log"] as? String, "enter;drop:1;", "is the zone's")
+    }
+
+    /// The clip views stop being destinations once no node hears a drag's
+    /// events, and a scroller made while one does is one (LLP 1094.000 D15).
+    func testTheClipViewsFollowWhetherANodeHearsADrag() throws {
+        _ = NSApplication.shared
+        let p = Presenter()
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = p.viewport
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 5, "kind": "view", "style": ["overflow_y": "scroll"]],
+            ["op": "children", "id": 1, "ids": [5]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 300.0],
+            ["op": "frame", "id": 5, "x": 0.0, "y": 0.0, "w": 400.0, "h": 200.0],
+        ]))
+        let page = try XCTUnwrap(p.viewport.contentView as? DropClipView)
+        let first = try XCTUnwrap(p.views[5]?.scroll?.contentView as? DropClipView)
+        XCTAssertFalse(page.isDestination || first.isDestination, "no node hears a drag's events")
+        p.apply(wireBatch([
+            ["op": "create", "id": 6, "kind": "view", "handlers": ["dragleave"]],
+            ["op": "create", "id": 7, "kind": "view", "style": ["overflow_y": "scroll"]],
+            ["op": "children", "id": 5, "ids": [6, 7]],
+            ["op": "frame", "id": 6, "x": 0.0, "y": 0.0, "w": 400.0, "h": 100.0],
+            ["op": "frame", "id": 7, "x": 0.0, "y": 100.0, "w": 400.0, "h": 100.0],
+        ]))
+        let second = try XCTUnwrap(p.views[7]?.scroll?.contentView as? DropClipView)
+        XCTAssertTrue(page.isDestination && first.isDestination && second.isDestination, "each clip view, a new one's too")
+        XCTAssertTrue(try XCTUnwrap(p.views[6]).registeredDraggedTypes.isEmpty, "the node inside registers for nothing")
+        p.apply(wireBatch([["op": "destroy", "id": 6]]))
+        XCTAssertFalse(page.isDestination || first.isDestination || second.isDestination, "none once no node hears")
+        XCTAssertTrue(first.registeredDraggedTypes.isEmpty)
+    }
+
+    /// A drag that moves into another window leaves the nodes of the window
+    /// it left with their records measured there (LLP 1094.000 D15).
+    func testALeaveAcrossWindowsKeepsTheLeftWindowsPoint() throws {
+        let a = presenter(column: ["drop", "dragenter", "dragleave"])
+        let windowA = try XCTUnwrap(window)
+        var lines: [String] = []
+        a.onClipboard = { id, kind, line in if kind == 56 { lines.append("\(id):\(line)") } }
+        let column = try XCTUnwrap(a.views[1])
+        let inA = middle(try XCTUnwrap(a.views[3]))
+        XCTAssertEqual(FileDrag.moved(column, drag([file], at: inA)), .copy)
+        let b = presenter(column: ["drop"])
+        defer { windowA.close() }
+        XCTAssertEqual(FileDrag.moved(try XCTUnwrap(b.views[1]), drag([file], at: NSPoint(x: 5, y: 5))), .copy)
+        XCTAssertEqual(lines, ["1:\(column.dragLine(inA))"], "the column's leave, at the point it last had in its window")
+    }
+
+    /// An enter whose handler makes a node further out inert skips that
+    /// node's queued enter, and the node owes no leave (LLP 1094.000 D15).
+    func testAnEnterThatMakesAnOuterNodeInertSkipsItsEnter() throws {
+        _ = NSApplication.shared
+        let source = """
+        component App
+          state log = ""
+          state locked = false
+          action innerEnter(e: DragEvent)
+            log = `${log}inner-enter;`
+            locked = true
+          action innerLeave(e: DragEvent)
+            log = `${log}inner-leave;`
+          action outerEnter(e: DragEvent)
+            log = `${log}outer-enter;`
+          action outerLeave(e: DragEvent)
+            log = `${log}outer-leave;`
+          view
+            column testId="outer" width="100%" height="100%" dragenter=outerEnter dragleave=outerLeave inert=locked
+              box testId="inner" width=200 height=100 dragenter=innerEnter dragleave=innerLeave
+
+        """
+        let session = ExactApp.shared.makeSession()
+        defer { session.destroy() }
+        let view = ExactView(session: session)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let mount = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        window.contentView = mount
+        view.frame = mount.bounds; mount.addSubview(view)
+        XCTAssertNil(session.boot(plan: try compile(source), size: CGSize(width: 400, height: 300)).error)
+        window.layoutIfNeeded()
+        let inner = try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == "inner" })
+        let page = try XCTUnwrap(session.presenter.viewport.contentView as? DropClipView)
+        let info = drag([file], at: middle(inner))
+        _ = FileDrag.moved(page, info)
+        XCTAssertNil(FileDrag.perform(page, info), "nothing takes the drop")
+        let state = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(session.agent(#"{"op":"state"}"#).utf8)) as? [String: Any])
+        XCTAssertEqual((state["slots"] as? [String: Any])?["log"] as? String, "inner-enter;inner-leave;")
+    }
+
+    /// A release in another window that nothing takes sends the leaves of
+    /// the window the drag left with their records measured there.
+    func testAReleaseInAnotherWindowLeavesWithTheLeftWindowsPoint() throws {
+        let a = presenter(column: ["drop", "dragenter", "dragleave"])
+        let windowA = try XCTUnwrap(window)
+        defer { windowA.close() }
+        var lines: [String] = []
+        a.onClipboard = { id, kind, line in if kind == 56 { lines.append("\(id):\(line)") } }
+        let column = try XCTUnwrap(a.views[1])
+        let inA = middle(try XCTUnwrap(a.views[3]))
+        XCTAssertEqual(FileDrag.moved(column, drag([file], at: inA)), .copy)
+        let b = presenter(column: [])
+        XCTAssertNil(FileDrag.perform(try XCTUnwrap(b.views[1]), drag([file], at: NSPoint(x: 5, y: 5))), "nothing in this window takes it")
+        XCTAssertEqual(lines, ["1:\(column.dragLine(inA))"], "the column's leave, at the point it last had in its window")
+    }
+
     func testOnlyADeclaredTypeIsKept() {
         let notes = URL(fileURLWithPath: "/tmp/a.notes"), other = URL(fileURLWithPath: "/tmp/b.zip"), folder = URL(fileURLWithPath: "/tmp/photos", isDirectory: true)
         var kept: [String] = [], minted: [String] = []
@@ -310,6 +486,50 @@ final class FileDragMacTests: XCTestCase {
         XCTAssertEqual(log, "enter;drop:Japan\nMount Fuji|https://example.com/fuji|0;")
     }
 
+    /// An Exact node's file item, its file with its link and title and
+    /// `NodeItem.type` (LLP 1094.000 D5), drops all three; the same item
+    /// without that type drops its file alone (LLP 1094.001 D3).
+    func testAnExactNodesFileItemDropsItsFileLinkAndText() throws {
+        _ = NSApplication.shared
+        let source = """
+        component App
+          state log = ""
+          action dropped(e: DragEvent)
+            log = `${log}drop:${e.text}|${e.url}|${e.files.length};`
+          view
+            column testId="column" width="100%" height="100%" drop=dropped
+
+        """
+        for exact in [true, false] {
+            let session = ExactApp.shared.makeSession()
+            defer { session.destroy() }
+            let view = ExactView(session: session)
+            window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let mount = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            window.contentView = mount
+            view.frame = mount.bounds; mount.addSubview(view)
+            XCTAssertNil(session.boot(plan: try compile(source), size: CGSize(width: 400, height: 300)).error)
+            window.layoutIfNeeded()
+            let column = try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == "column" })
+            let board = NSPasteboard(name: .init("exact-test-\(UUID().uuidString)"))
+            board.clearContents()
+            let item = NSPasteboardItem()
+            item.setString(file.absoluteString, forType: .fileURL)
+            item.setString("https://example.com/fuji", forType: .URL)
+            item.setString("Mount Fuji", forType: .string)
+            if exact { item.setData(Data(), forType: .init(NodeItem.type)) }
+            board.writeObjects([item])
+            let info = DraggingInfo(board: board, location: column.convert(NSPoint(x: column.bounds.midX, y: column.bounds.midY), to: nil), window: window, operations: .copy)
+            XCTAssertEqual(column.draggingEntered(info), .copy)
+            XCTAssertTrue(column.performDragOperation(info), "the column took the drop")
+            column.draggingEnded(info)
+            let state = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(session.agent(#"{"op":"state"}"#).utf8)) as? [String: Any])
+            let log = try XCTUnwrap((state["slots"] as? [String: Any])?["log"] as? String)
+            XCTAssertEqual(log, exact ? "drop:Mount Fuji|https://example.com/fuji|1;" : "drop:||1;")
+        }
+    }
+
     private func compile(_ source: String) throws -> Data {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -358,6 +578,66 @@ final class FileDragMacTests: XCTestCase {
         XCTAssertEqual(written.lastPathComponent, "image.png")
         XCTAssertEqual(try Data(contentsOf: written), converted)
     }
+
+    /// LLP 1094.000 D16: the app's own drag, which the Mac's drop side
+    /// refuses (D5), runs its source's `dragstart` before the first enter,
+    /// and at its end the leave the drop side deferred goes before the
+    /// source's `dragend`.
+    func testTheAppsOwnDragStartsBeforeItsEnterAndEndsAfterItsLeave() throws {
+        let p = presenter(column: ["dragenter", "dragleave"])
+        let column = try XCTUnwrap(p.views[1]), source = OwnSource()
+        source.own = OwnDrag { [unowned self] in heard.append("start") }
+        let info = DraggingInfo(board: drag([], at: .zero, text: "Mount Fuji").board, location: middle(try XCTUnwrap(p.views[3])), window: window,
+                                operations: [], source: source)
+        XCTAssertNil(FileDrag.moved(column, info), "the app's own drag takes no drop in the app")
+        XCTAssertEqual(heard, ["start", "1:55"])
+        // AppKit's exit at a point still in the window lets go a moment later
+        FileDrag.exited(column, info)
+        XCTAssertEqual(heard, ["start", "1:55"])
+        source.own?.ended(taken: false) { [unowned self] taken in heard.append("end \(taken)") }
+        XCTAssertEqual(heard, ["start", "1:55", "1:56", "end false"])
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(heard, ["start", "1:55", "1:56", "end false"], "the deferred exit is stale, and the start went once")
+        // A start whose handler renews the node under the drag for another item (LLP 1078): the old item's enter,
+        // taken before the handler ran, does not reach the new one
+        heard = []
+        let renewing = OwnSource()
+        renewing.own = OwnDrag { [unowned self] in heard.append("start"); p.renew(1) }
+        let next = DraggingInfo(board: info.board, location: info.location, window: window, operations: [], source: renewing)
+        XCTAssertNil(FileDrag.moved(column, next))
+        XCTAssertEqual(heard, ["start"])
+        _ = FileDrag.moved(column, next)
+        XCTAssertEqual(heard, ["start", "1:55"], "the next report finds the node as it is now")
+        FileDrag.ended()
+        // An enter a waiting drop holds sends nothing, so the start waits too, until the enter is heard
+        heard = []
+        let waiting = OwnSource()
+        waiting.own = OwnDrag { [unowned self] in heard.append("start") }
+        let held = DraggingInfo(board: info.board, location: info.location, window: window, operations: [], source: waiting)
+        let landing = [FileDrag.Shown(column)]
+        FileDrag.waits(landing)
+        _ = FileDrag.moved(column, held)
+        XCTAssertEqual(heard, [], "nothing sent, nothing started")
+        FileDrag.lands(landing)
+        XCTAssertEqual(heard, ["start", "1:55"])
+        FileDrag.ended()
+        // A held enter whose node the start's handler makes inert is heard no more, nor its leave
+        heard = []
+        let inerting = OwnSource()
+        inerting.own = OwnDrag { [unowned self] in heard.append("start"); p.apply(wireBatch([["op": "props", "id": 1, "set": ["inert": "true"]]])) }
+        let inert = DraggingInfo(board: info.board, location: info.location, window: window, operations: [], source: inerting)
+        let still = [FileDrag.Shown(column)]
+        FileDrag.waits(still)
+        _ = FileDrag.moved(column, inert)
+        FileDrag.lands(still)
+        FileDrag.ended()
+        XCTAssertEqual(heard, ["start"])
+    }
+}
+
+/// The source of a drag a node of the app began, as the drop side meets it.
+private final class OwnSource: NSObject, OwnDragSource {
+    var own: OwnDrag?
 }
 
 /// An `NSDraggingInfo` for a drag at a window point, as AppKit hands one.
@@ -365,8 +645,9 @@ private final class DraggingInfo: NSObject, NSDraggingInfo {
     let board: NSPasteboard, location: NSPoint
     weak var window: NSWindow?
     let operations: NSDragOperation
-    init(board: NSPasteboard, location: NSPoint, window: NSWindow, operations: NSDragOperation = .copy) {
-        self.board = board; self.location = location; self.window = window; self.operations = operations
+    let source: Any?
+    init(board: NSPasteboard, location: NSPoint, window: NSWindow, operations: NSDragOperation = .copy, source: Any? = nil) {
+        self.board = board; self.location = location; self.window = window; self.operations = operations; self.source = source
     }
     var draggingDestinationWindow: NSWindow? { window }
     var draggingSourceOperationMask: NSDragOperation { operations }
@@ -374,7 +655,7 @@ private final class DraggingInfo: NSObject, NSDraggingInfo {
     var draggedImageLocation: NSPoint { location }
     var draggedImage: NSImage? { nil }
     var draggingPasteboard: NSPasteboard { board }
-    var draggingSource: Any? { nil }
+    var draggingSource: Any? { source }
     var draggingSequenceNumber: Int { 1 }
     func slideDraggedImage(to screenPoint: NSPoint) {}
     var draggingFormation: NSDraggingFormation = .default

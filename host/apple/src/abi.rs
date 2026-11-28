@@ -879,9 +879,9 @@ impl<D: DataSource> Bridge<D> {
         self.install_presence(
             &mut candidate.host,
             candidate.bindings.as_ref(),
-            candidate.presence,
+            candidate.presence.take(),
         );
-        candidate.host.commit_boot();
+        self.commit_candidate_boot(&mut candidate);
         if let Some(live) = &self.host {
             candidate
                 .host
@@ -915,7 +915,11 @@ impl<D: DataSource> Bridge<D> {
         self.wake = candidate.hooks.wake.map(|w| (w, candidate.hooks.wake_ctx));
         self.executor = executor;
         self.restore_window.clear();
-        let batch = self.replace_host(candidate.host, candidate.batch);
+        let batch = self.replace_host_plan(
+            candidate.host,
+            candidate.batch,
+            candidate.carried_from.as_ref(),
+        );
         self.launch_layout.insets = None;
         self.adopt_app_module();
         self.parked.clear();
@@ -1001,8 +1005,9 @@ impl<D: DataSource> Bridge<D> {
             // a file drag's enter (55) and leave (56), a paste with files (57), an iframe's record (58), an atom's press (59),
             // the history swipe the Mac tracks (60), swipeleft (61), a scroll
             // drag's start (62) and release (63), pointercancel (65), swipe (66),
-            // pinch (67) and pinchrelease (68) (`Event::of_host_kind`).
-            6 | 10 | 13 | 19 | 20 | 21 | 28..=38 | 40..=44 | 46..=48 | 50..=63 | 65..=68 => {
+            // pinch (67) and pinchrelease (68), and a drag source's start (69)
+            // and end (70) (`Event::of_host_kind`).
+            6 | 10 | 13 | 19 | 20 | 21 | 28..=38 | 40..=44 | 46..=48 | 50..=63 | 65..=70 => {
                 match Event::of_host_kind(kind, &payload) {
                     Ok(event) => event,
                     Err(error) => return self.refuse(error),

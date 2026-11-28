@@ -126,7 +126,7 @@ fn a_cold_share_shows_its_text_first_with_its_files_pending_then_they_land() {
     assert_eq!(text_of(&r, "counts"), ["0 2 1"]);
     // The copies land: the files answer under their stored names, never the sender's.
     for (token, files) in claimed.copy(&shared, true) {
-        r.set_shared(&token, files).unwrap();
+        r.set_shared([(token.as_str(), files)]).unwrap();
     }
     assert_eq!(text_of(&r, "counts"), ["2 0 1"]);
     let files = text_of(&r, "file");
@@ -164,12 +164,12 @@ fn a_cold_share_shows_its_text_first_with_its_files_pending_then_they_land() {
         format!("/share?files={}", share_in::token(7.0, 1))
     );
     for (token, files) in again.tokens.clone() {
-        r.set_shared(&token, files).unwrap();
+        r.set_shared([(token.as_str(), files)]).unwrap();
     }
     navigate(&mut r, &again.location);
     assert_eq!(text_of(&r, "counts"), ["0 1 0"]);
     for (token, files) in again.copy(&shared, false) {
-        r.set_shared(&token, files).unwrap();
+        r.set_shared([(token.as_str(), files)]).unwrap();
     }
     assert_eq!(
         text_of(&r, "file"),
@@ -193,14 +193,14 @@ fn a_warm_share_navigates_and_a_token_not_set_this_launch_answers_none() {
     // A token set while the route shows it is read at once, pending then landed.
     let token = share_in::token(1.0, 3);
     navigate(&mut r, &format!("/share?text=new&files={token}"));
-    r.set_shared(
-        &token,
+    r.set_shared([(
+        token.as_str(),
         SharedFiles {
             files: Vec::new(),
             dropped: 0,
             pending: 1,
         },
-    )
+    )])
     .unwrap();
     assert_eq!(text_of(&r, "counts"), ["0 1 0"]);
     let picked = Picked {
@@ -212,14 +212,14 @@ fn a_warm_share_navigates_and_a_token_not_set_this_launch_answers_none() {
         height: None,
         duration: None,
     };
-    r.set_shared(
-        &token,
+    r.set_shared([(
+        token.as_str(),
         SharedFiles {
             files: vec![picked],
             dropped: 0,
             pending: 0,
         },
-    )
+    )])
     .unwrap();
     assert_eq!(text_of(&r, "counts"), ["1 0 0"]);
     // A path outside app:/tmp/shared/ is refused and changes nothing.
@@ -233,7 +233,7 @@ fn a_warm_share_navigates_and_a_token_not_set_this_launch_answers_none() {
         height: None,
         duration: None,
     });
-    assert!(r.set_shared(&token, outside).unwrap().is_none());
+    assert!(r.set_shared([(token.as_str(), outside)]).unwrap().is_none());
     assert_eq!(text_of(&r, "counts"), ["1 0 0"]);
 }
 

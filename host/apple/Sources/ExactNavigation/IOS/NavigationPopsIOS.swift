@@ -178,13 +178,35 @@ extension NavigationHost {
         // pixels as drawn, and under them its views, until UIKit takes its view out of the window, as a sheet's views
         // stay while UIKit dismisses it. An editor among them stays focused while UIKit moves the keyboard away, as
         // the outgoing editor of UIKit's own pop does.
+        #if os(iOS)
+        let destroyed = Set(batch.ops.filter { $0.op == .destroy }.map(\.id))
+        #endif
         for op in batch.ops where op.op == .destroy {
             guard let c = controllers[op.id], c.viewIfLoaded?.window != nil else { continue }
+            #if os(iOS)
+            // The names the pop will fly to the route it reveals, kept before the batch removes them (LLP 1013.004 D3).
+            let kept = c.navigationController?.viewControllers.last { ($0 as? RouteController).map { !destroyed.contains($0.node.id) } ?? true }
+            // On top, or popping already: UIKit's Back button reaches the router as its pop begins.
+            let nav = c.navigationController
+            if nav?.viewControllers.last === c || nav?.transitionCoordinator?.viewController(forKey: .from) === c, let beneath = kept?.viewIfLoaded {
+                presenter.flightHost.hold(leaving: c.view, arriving: beneath, zoom: c.zoomSource)
+            }
+            #endif
             c.freeze()
             c.retire()
             retiringRoutes.add(c)
         }
     }
+
+    #if os(iOS)
+    /// Fly the names both routes hold alongside `transition`, unless it zooms (LLP 1013.004 D3), cut out of the
+    /// picture of a route the app removed: drawn again, that route would show the views its batch emptied.
+    func crossFlights(_ transition: UIViewControllerTransitionCoordinator, to viewController: UIViewController, in nav: UINavigationController) {
+        guard let from = transition.viewController(forKey: .from) as? RouteController, let to = viewController as? RouteController else { return }
+        let zoom = (nav.viewControllers.contains(from) ? to : from).zoomSource
+        _ = presenter.flightHost.cross(transition, leaving: from.view, arriving: to.view, zoom: zoom, picture: from.frozen)
+    }
+    #endif
 
     /// The nodes of removed routes UIKit still shows (`prepare`).
     var retiringRoots: [NodeView] { retiringRoutes.allObjects.compactMap(\.retiringRoot) }
@@ -336,6 +358,7 @@ extension RouteController {
         snapshot.autoresizingMask = [.flexibleWidth, .flexibleBottomMargin]
         view.addSubview(snapshot)
         snapshot.setPaintForeground()
+        frozen = snapshot
     }
 }
 #endif

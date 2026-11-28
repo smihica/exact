@@ -15,7 +15,12 @@
 // that is the shown box (`FlightScale`). `land` puts it back.
 #if os(iOS) || os(tvOS)
 import UIKit
+import ExactCore
 import ExactKit
+
+/// A leaver held for a route change (`BuiltInFlights.holds`), with its destination's id then: the list pool can rebind
+/// that view to another row before the transition starts.
+struct Hold { let view: NodeView, to: NodeView, toID: UInt32, source: FlightSource, lines: CGRect, picture: UIView? }
 
 /// Where a leaver was shown when its name moved on.
 struct FlightSource {
@@ -43,10 +48,16 @@ final class Flight {
     /// its radius and its clip (D4.4).
     var clip: UIView?
     var geometry: BatchOp?
-    var saved: (interaction: Bool, hidden: Bool)?
+    var saved: (interaction: Bool, hidden: Bool, alpha: CGFloat)?
     /// Tree position snapshotted before lifting so nested flights order outer-to-inner (LLP 1156.008.001 A2).
     var ancestorDepth: Int = 0
     var preOrder: [Int] = []
+    /// A route change's (LLP 1013.004 D3): its transition lifts it, and a text scales by its lines' width,
+    /// not its box's, which can be the row's width at one end and its words' at the other.
+    var crossing = false
+    /// A route change's picture of the leaver and its `flightLines` in it, which dissolves into the arriver
+    /// in the clip (LLP 1013.004 D3 step 4).
+    var fade: (view: UIView, content: CGRect)?
     init(id: UInt32, source: FlightSource) { self.id = id; self.source = source }
 }
 
@@ -60,15 +71,20 @@ final class FlightLayer: UIView {
 final class BuiltInFlights: FlightHosting {
     weak var presenter: Presenter?
     var flights: [UInt32: Flight] = [:]
+    /// Leavers of a route the batch destroys, kept for the transition that starts with it (`holdFlights`), with
+    /// their pair's destination, where each showed then, its text's lines and its picture: the destroy takes an
+    /// image's raster, a text's layout and embedded content.
+    var holds: [ObjectIdentifier: Hold] = [:]
     init(_ presenter: Presenter) { self.presenter = presenter }
     var isEmpty: Bool { flights.isEmpty }
     func begin(_ op: BatchOp) { presenter?.beginFlight(op) }
-    func land(_ id: UInt32) { if let f = flights[id] { presenter?.landFlight(f) } }
-    func present(_ id: UInt32, _ progress: CGFloat) { presenter?.presentFlight(id, progress) }
+    // A route change's flight took the id from an in-page one, whose animation goes on: the transition lands it.
+    func land(_ id: UInt32) { if let f = flights[id], !f.crossing { presenter?.landFlight(f) } }
+    func present(_ id: UInt32, _ progress: CGFloat) { if flights[id]?.crossing != true { presenter?.presentFlight(id, progress) } }
     func forget(_ id: UInt32) { presenter?.forgetFlight(id) }
     func batchApplied() { presenter?.flightsBatchApplied() }
     func landInside(_ view: UIView) { presenter?.landFlights(inside: view) }
-    func reset() { presenter?.resetFlights() }
+    func reset() { holds = [:]; presenter?.resetFlights() }
     func isFlying(_ view: NodeView) -> Bool { presenter?.isFlying(view) ?? false }
     func hasFlyingAncestor(_ view: UIView) -> Bool {
         guard !flights.isEmpty else { return false }
@@ -83,6 +99,14 @@ final class BuiltInFlights: FlightHosting {
     func slot(of view: NodeView) -> UIView? { flights[view.id].flatMap { $0.view === view ? $0.slot : nil } }
     func owns(_ view: UIView) -> Bool { flights.values.contains { $0.container === view || $0.slot === view } }
     func frame(_ op: BatchOp) -> Bool { presenter?.flightFrame(op) ?? false }
+    #if os(iOS)
+    func hold(leaving: UIView, arriving: UIView, zoom: String?) {
+        presenter?.holdFlights(leaving: leaving, arriving: arriving, zoom: zoom)
+    }
+    func cross(_ coordinator: UIViewControllerTransitionCoordinator, leaving: UIView, arriving: UIView, zoom: String?, picture: UIView?) -> Bool {
+        presenter?.crossFlights(coordinator, leaving: leaving, arriving: arriving, zoom: zoom, picture: picture) ?? false
+    }
+    #endif
 }
 
 extension Presenter {
@@ -123,6 +147,13 @@ extension Presenter {
             flights[id] = Flight(id: id, source: FlightSource(rect: .null, radius: 0))
             return
         }
+        let source = flightSource(leaver)
+        if let old = flights[id] { landFlight(old) }
+        flights[id] = Flight(id: id, source: source)
+    }
+
+    /// Where `leaver` shows now, as a flight starts from it.
+    func flightSource(_ leaver: NodeView) -> FlightSource {
         var source = FlightSource(rect: Self.shownRect(leaver), radius: leaver.cornerRadii(in: leaver.bounds).max() ?? 0)
         if let flying = flights.values.first(where: { $0.view === leaver }), let look = leaver.flightLook {
             // A flight interrupted: from where it is now.
@@ -145,8 +176,7 @@ extension Presenter {
             source.raster = leaver.raster
         }
         source.root = ViewPresentation.root(of: leaver)
-        if let old = flights[id] { landFlight(old) }
-        flights[id] = Flight(id: id, source: source)
+        return source
     }
 
     /// The `flight` progress the host presents this frame.
@@ -197,7 +227,7 @@ extension Presenter {
     /// After the batch: snapshot ancestry, lift new flights outer-to-inner,
     /// enforce outer-to-inner z-order in each FlightLayer, then show every flight.
     func flightsBatchApplied() {
-        let pending = flights.values.filter { $0.view == nil && $0.slot == nil }
+        let pending = flights.values.filter { $0.view == nil && $0.slot == nil && !$0.crossing }
         for f in pending {
             if let view = views[f.id] {
                 let key = flightTreeKey(view)
@@ -266,6 +296,7 @@ extension Presenter {
         if let s = f.saved {
             view.isUserInteractionEnabled = s.interaction
             view.accessibilityElementsHidden = s.hidden
+            view.alpha = s.alpha
         }
         // Its clip and corners are its style's as it lands, not as they were
         // at lift. An image flew clipped by its own layer, and a style in
@@ -308,7 +339,8 @@ extension Presenter {
         flights = [:]
     }
 
-    private func liftFlight(_ f: Flight) {
+    /// `container`: a route change's transition container (LLP 1013.004 D3), else the presentation's root.
+    func liftFlight(_ f: Flight, in container: UIView? = nil) {
         // A document root is placed by `roots`, not by a parent: it lands in place.
         guard let view = views[f.id], let parent = view.superview, parent !== root, view.window != nil, !f.source.rect.isNull,
               !DisplayPreferences.reducedMotion else {
@@ -330,16 +362,17 @@ extension Presenter {
         // re-reads its slot each frame, so it follows.
         afterBatch { [weak self, weak slot, weak f] in
             guard let self, let slot, let f else { return }
-            self.scrollIntoView(slot)
+            // A route change's destination is where its route puts it.
+            if !f.crossing { self.scrollIntoView(slot) }
             self.showFlight(f)
         }
-        guard let own = ViewPresentation.root(of: parent) else { slot.removeFromSuperview(); flights.removeValue(forKey: f.id); return }
+        guard let own = container ?? ViewPresentation.root(of: parent) else { slot.removeFromSuperview(); flights.removeValue(forKey: f.id); return }
         // The flight goes in B's presentation (D4 step 3), unless A's encloses
         // it: then in A's, so a photo closing from an overlay above the routes
         // into a thumbnail in a route stays above that overlay as it fades,
         // as UIKit's and Signal's zooms keep the image above their backdrops.
         // A flight inside one modal still stays inside it.
-        let root = f.source.root.flatMap { outer in own !== outer && own.isDescendant(of: outer) ? outer : nil } ?? own
+        let root = container ?? f.source.root.flatMap { outer in own !== outer && own.isDescendant(of: outer) ? outer : nil } ?? own
         let layer = root.subviews.last as? FlightLayer ?? {
             let l = FlightLayer(frame: root.bounds)
             l.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -351,7 +384,7 @@ extension Presenter {
             l.setPaintForeground()
             return l
         }()
-        f.saved = (view.isUserInteractionEnabled, view.storedAccessibilityElementsHidden)
+        f.saved = (view.isUserInteractionEnabled, view.storedAccessibilityElementsHidden, view.alpha)
         f.view = view
         f.parent = parent
         f.slot = slot
@@ -372,6 +405,7 @@ extension Presenter {
             clip.layer.masksToBounds = true
             layer.addSubview(clip)
             clip.addSubview(view)
+            if let fade = f.fade { clip.addSubview(fade.view) }
             f.clip = clip
             view.flightLook = FlightLook(image: CGRect(origin: .zero, size: size), scale: 1)
         }
@@ -406,11 +440,14 @@ extension Presenter {
         return current.convert(rect, to: layer)
     }
 
-    private func showFlight(_ f: Flight) {
+    func showFlight(_ f: Flight) {
         guard let view = f.view, let slot = f.slot, let layer = f.container else { return }
         let p = f.progress
         let from = layer.convert(f.source.rect, from: nil)
-        let to = restingRect(of: slot, in: layer)
+        var to = restingRect(of: slot, in: layer)
+        // A route change's lands where its route is drawn now, which UIKit is still sliding, so it reaches its
+        // place with the page and never shows past the page's edge.
+        if f.crossing, let s = slot.layer.presentation(), let l = layer.layer.presentation() { to = s.convert(s.bounds, to: l) }
         func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * p }
         let shown = CGRect(x: mix(from.minX, to.minX), y: mix(from.minY, to.minY),
                            width: max(0, mix(from.width, to.width)), height: max(0, mix(from.height, to.height)))
@@ -426,10 +463,41 @@ extension Presenter {
             clip.layer.cornerRadius = mix(f.source.radius, (view.cornerRadii(in: CGRect(origin: .zero, size: layout)).max() ?? 0) * ratio)
             view.transform = .identity
             view.bounds = CGRect(origin: .zero, size: layout)
-            let a = view.layer.anchorPoint
-            view.layer.position = CGPoint(x: a.x * layout.width * s, y: a.y * layout.height * s)
-            view.transform = CGAffineTransform(scaleX: s, y: s)
-            view.flightLook = FlightLook(image: CGRect(origin: .zero, size: layout), scale: s)
+            func place(_ v: UIView, scale: CGFloat, at origin: CGPoint) {
+                let a = v.layer.anchorPoint
+                v.transform = .identity
+                v.layer.position = CGPoint(x: origin.x + a.x * v.bounds.width * scale, y: origin.y + a.y * v.bounds.height * scale)
+                v.transform = CGAffineTransform(scaleX: scale, y: scale)
+            }
+            guard let fade = f.fade else {
+                place(view, scale: s, at: .zero)
+                view.flightLook = FlightLook(image: CGRect(origin: .zero, size: layout), scale: s)
+                CATransaction.commit()
+                return
+            }
+            let size = fade.view.bounds.size
+            if view.kind == "text" {
+                // Each end's text scaled so its lines are as wide as the other's, where its alignment puts them,
+                // and centred on them, as Compose's scaleToBounds scales a text: the same words land on each
+                // other, only their weight differing.
+                let mine = view.flightLines, r = from.width / max(size.width, 1)
+                let c = CGRect(x: mix(from.minX + fade.content.minX * r, to.minX + mine.minX * ratio),
+                               y: mix(from.minY + fade.content.midY * r, to.minY + mine.midY * ratio),
+                               width: mix(fade.content.width * r, mine.width * ratio), height: 0)
+                let sa = c.width / max(mine.width, 1), sf = c.width / max(fade.content.width, 1)
+                place(view, scale: sa, at: CGPoint(x: c.minX - shown.minX - mine.minX * sa, y: c.minY - shown.minY - mine.midY * sa))
+                place(fade.view, scale: sf, at: CGPoint(x: c.minX - shown.minX - fade.content.minX * sf, y: c.minY - shown.minY - fade.content.midY * sf))
+                view.flightLook = FlightLook(image: CGRect(origin: .zero, size: layout), scale: sa)
+            } else {
+                place(view, scale: s, at: .zero)
+                place(fade.view, scale: FlightScale.of(shown: shown.size, layout: size) ?? 1, at: .zero)
+                view.flightLook = FlightLook(image: CGRect(origin: .zero, size: layout), scale: s)
+            }
+            // Early in the flight, each end at full strength half that time, as the Android reader dissolves,
+            // so content alike at both ends does not dim.
+            let t = min(max((p - 0.2) / 0.4, 0), 1)
+            fade.view.alpha = min(1, 2 * (1 - t))
+            view.alpha = min(1, 2 * t) * (f.saved?.alpha ?? 1)
             CATransaction.commit()
             return
         }
@@ -487,6 +555,22 @@ extension Presenter {
         func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * p }
         return CGRect(x: mix(start.minX * from.width, end.minX * to.width), y: mix(start.minY * from.height, end.minY * to.height),
                       width: mix(start.width * from.width, end.width * to.width), height: mix(start.height * from.height, end.height * to.height))
+    }
+}
+
+extension NodeView {
+    /// Where a text's lines are laid out in it, from the leftmost line's start to the rightmost's end, as its
+    /// alignment puts them; another view's content box.
+    var flightLines: CGRect {
+        let box = paragraphBox()
+        guard kind == "text", let p = paragraphLayout(), !p.lines.isEmpty else { return contentBox() }
+        let align = paragraphSpec().align
+        let spans = p.lines.indices.map { i -> (CGFloat, CGFloat) in
+            let x = box.minX + p.origin(i, align: align, width: box.width)
+            return (x, x + CGFloat(CTLineGetTypographicBounds(p.lines[i], nil, nil, nil)) - CGFloat(CTLineGetTrailingWhitespaceWidth(p.lines[i])))
+        }
+        let lo = spans.map(\.0).min() ?? box.minX, hi = spans.map(\.1).max() ?? box.maxX
+        return CGRect(x: lo, y: box.minY, width: hi - lo, height: p.height)
     }
 }
 #endif

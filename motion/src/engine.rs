@@ -301,6 +301,9 @@ pub struct Engine {
     // must still advance: some animation running and not yet ended.
     animations: BTreeMap<u64, Vec<AnimationPlay>>,
     animating: BTreeSet<u64>,
+    // Nodes whose unbound plays started since the last frame; drained in
+    // `frame()` after `seek_timelines()` so steady-state frames do O(1) work.
+    newly_clocked: Vec<u64>,
     // Indexed by property; past the wire's for `Property::Layout` and `d`,
     // which no animation names and nothing lowers.
     lowered: [bool; Property::SLOTS],
@@ -766,6 +769,7 @@ impl Engine {
         // A timeline's consumers are held where its source now is, so this
         // frame carries both (LLP 1057.003 D2).
         self.seek_timelines();
+        self.mark_clocked_animations();
         let mut dirty: Vec<_> = std::mem::take(&mut self.dirty).into_iter().collect();
         dirty.sort_unstable();
         dirty
