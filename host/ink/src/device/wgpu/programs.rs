@@ -38,13 +38,14 @@ impl Class {
 }
 
 // Unlisted kinds, brushes and flags use the general program.
-pub(super) const CLASSES: [Class; 13] = [
+pub(super) const CLASSES: [Class; 14] = [
     Class::new(Kind::RoundedRect, Brush::Solid, 0),
     Class::new(Kind::RoundedRect, Brush::Image, flags::CLIP0),
     Class::new(Kind::Glyph, Brush::Solid, 0),
     Class::new(Kind::Layer, Brush::Image, 0),
     Class::new(Kind::RoundedRect, Brush::Solid, CLIPS),
     Class::new(Kind::Ring, Brush::Solid, CLIPS),
+    Class::new(Kind::Shadow, Brush::Solid, flags::CLIP1),
     Class::new(Kind::Shadow, Brush::Solid, CLIPS),
     Class::new(Kind::Glyph, Brush::Solid, CLIPS | flags::COLOR_GLYPH),
     Class::new(Kind::Coverage, Brush::Solid, CLIPS),
