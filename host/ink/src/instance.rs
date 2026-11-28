@@ -316,7 +316,7 @@ impl Frame {
     }
 }
 
-fn raster_rect(instance: &Instance) -> Option<[f32; 4]> {
+pub(crate) fn raster_rect(instance: &Instance) -> Option<[f32; 4]> {
     let [x, y, w, h] = instance.rect;
     let [a, b, c, d, tx, ty] = instance.xform;
     // Use the batch scissor where CPU and shader arithmetic can disagree
