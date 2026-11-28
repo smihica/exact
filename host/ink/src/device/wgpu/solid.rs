@@ -1,5 +1,5 @@
-//! Draw a large solid interior without running its edge coverage shader.
-use crate::instance::{Instance, Scissor};
+//! Split large fills and outer shadows where the interior coverage is constant.
+use crate::instance::{flags, raster_rect, Instance, Kind, Scissor};
 
 fn interior(i: &Instance, scissor: Scissor) -> Option<Scissor> {
     let [sx, skew_y, skew_x, sy, tx, ty] = i.xform;
@@ -28,17 +28,58 @@ fn interior(i: &Instance, scissor: Scissor) -> Option<Scissor> {
     // miss the arcs. Round the scissor inward so no boundary pixel changes.
     let radius = i.radii.into_iter().fold(0f32, f32::max);
     let margin = (radius + 1.).max(4. * (sx.recip() + sy.recip()) + 1.);
-    let left = ((x + margin) * sx + tx).ceil().max(0.) as u32;
-    let top = ((y + margin) * sy + ty).ceil().max(0.) as u32;
-    let right = ((right - margin) * sx + tx).floor().max(0.) as u32;
-    let bottom = ((bottom - margin) * sy + ty).floor().max(0.) as u32;
+    sizeable_interior(
+        [
+            (x + margin) * sx + tx,
+            (y + margin) * sy + ty,
+            (right - margin) * sx + tx,
+            (bottom - margin) * sy + ty,
+        ],
+        scissor,
+    )
+}
+
+fn shadow_interior(i: &Instance, scissor: Scissor) -> Option<Scissor> {
+    let sigma = i.param[0];
+    if i.flags != flags::CLIP1
+        || !(sigma == 0. || sigma >= 1.0e-30)
+        || !i.color.iter().all(|c| c.is_finite())
+    {
+        return None;
+    }
+    let [x, y, w, h] = i.clip1;
+    let (right, bottom) = (x + w, y + h);
+    if ![x, y, right, bottom].iter().all(|v| v.abs() < 32768.) {
+        return None;
+    }
+    let radius = i.clip_radii[2..]
+        .iter()
+        .map(|packed| (packed & 65535).max(packed >> 16))
+        .max()
+        .unwrap_or(0) as f32
+        / 16.;
+    // clip1 is in device pixels. shape_coverage returns exactly one this
+    // far inside it, so the outer shadow contributes zero under source-over.
+    let margin = (radius + 1.).max(5.);
+    let quad = Scissor::from_rect(raster_rect(i)?);
+    sizeable_interior(
+        [x + margin, y + margin, right - margin, bottom - margin],
+        scissor.intersect(quad),
+    )
+}
+
+fn sizeable_interior([left, top, right, bottom]: [f32; 4], scissor: Scissor) -> Option<Scissor> {
+    let left = left.ceil().max(0.) as u32;
+    let top = top.ceil().max(0.) as u32;
+    let right = right.floor().max(0.) as u32;
+    let bottom = bottom.floor().max(0.) as u32;
     let inner = scissor.intersect(Scissor {
         x: left,
         y: top,
         width: right.saturating_sub(left),
         height: bottom.saturating_sub(top),
     });
-    // Only split the instanced run to draw the interior and rim for sizeable fills.
+    // Keep small visible interiors in the original instanced draw.
     (inner.width >= 32 && inner.height >= 32).then_some(inner)
 }
 
@@ -50,18 +91,26 @@ pub(super) fn draw(
     start: u32,
     run: &[Instance],
 ) {
+    let shadow = run[0].kind_brush == Kind::Shadow as u32;
     let mut pending = start;
     for (index, instance) in (start..).zip(run) {
-        let Some(center) = interior(instance, s) else {
+        let center = if shadow {
+            shadow_interior(instance, s)
+        } else {
+            interior(instance, s)
+        };
+        let Some(center) = center else {
             continue;
         };
         if pending < index {
             pass.draw(0..4, pending..index);
         }
-        pass.set_scissor_rect(center.x, center.y, center.width, center.height);
-        pass.set_pipeline(solid);
-        pass.draw(0..4, index..index + 1);
-        pass.set_pipeline(edge);
+        if !shadow {
+            pass.set_scissor_rect(center.x, center.y, center.width, center.height);
+            pass.set_pipeline(solid);
+            pass.draw(0..4, index..index + 1);
+            pass.set_pipeline(edge);
+        }
         let (right, bottom) = (s.x + s.width, s.y + s.height);
         let (inner_right, inner_bottom) = (center.x + center.width, center.y + center.height);
         for (l, t, r, b) in [
@@ -170,3 +219,6 @@ fn solid_interiors_match_the_edge_shader_on_the_whole_frame() {
         .unwrap();
     assert_eq!(device.readback(target).unwrap(), expected);
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod shadow_tests;
