@@ -659,8 +659,9 @@ impl Wgpu {
                 pass.set_pipeline(pipeline);
                 let end = start + run.len() as u32;
                 if selected.is_some()
-                    && run[0].kind_brush == Kind::RoundedRect as u32
-                    && run[0].flags == 0
+                    && ((run[0].kind_brush == Kind::RoundedRect as u32 && run[0].flags == 0)
+                        || (run[0].kind_brush == Kind::Shadow as u32
+                            && run[0].flags == flags::CLIP1))
                 {
                     solid::draw(&mut pass, pipeline, &self.solid_pipeline, s, start, run);
                 } else {
