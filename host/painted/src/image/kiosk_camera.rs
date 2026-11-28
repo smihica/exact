@@ -154,6 +154,14 @@ impl Drop for Camera {
 }
 
 impl super::Images {
+    pub(super) fn camera_source(&self) -> Option<&'static str> {
+        self.camera.enabled.then_some(SOURCE)
+    }
+
+    pub(super) fn stop_camera(&mut self) {
+        self.camera.request(false);
+    }
+
     pub(super) fn sync_camera(&mut self) {
         self.camera
             .request(self.views.values().any(|v| v.source == SOURCE && v.visible));

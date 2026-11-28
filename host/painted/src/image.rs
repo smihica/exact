@@ -650,7 +650,6 @@ impl Images {
             self.remove(id);
             self.posters.remove(&id);
         }
-        #[cfg(target_os = "linux")]
         self.sync_camera();
         reports.extend(self.poll());
         self.natural(reports)
@@ -732,20 +731,15 @@ impl Images {
         if let Some(text) = &self.painter {
             self.backend.finish_pictures(text);
         }
-        let mut reports = Vec::new();
-        #[cfg(target_os = "linux")]
-        reports.extend(self.poll_camera());
-        let scale = self.scale;
+        let mut reports = self.poll_camera();
+        let (scale, camera) = (self.scale, self.camera_source());
         for (id, view) in &mut self.views {
-            #[cfg(target_os = "linux")]
-            if self.camera.enabled && view.source == kiosk_camera::SOURCE {
-                continue;
-            }
             // (An `error` ends its source assignment: nothing more is asked.)
             if self.boot_visible_only && !view.visible
                 || view.source.is_empty()
                 || view.symbol_size.is_some()
                 || self.package.serves(&view.source)
+                || camera == Some(view.source.as_str())
                 || view.errored
             {
                 continue;
@@ -1092,15 +1086,13 @@ impl Images {
         }
         // A package's picture is answered through the host's turn, not the
         // workers: nothing here to wait on.
+        let camera = self.camera_source();
         self.views.values().any(|v| {
-            #[cfg(target_os = "linux")]
-            if self.camera.enabled && v.source == kiosk_camera::SOURCE {
-                return false;
-            }
             (!self.boot_visible_only || v.visible && !v.errored)
                 && !v.source.is_empty()
                 && !is_symbol(&v.source)
                 && !self.package.serves(&v.source)
+                && camera != Some(v.source.as_str())
                 && match v
                     .source_id
                     .as_ref()
@@ -1280,8 +1272,7 @@ impl Images {
     }
     /// Retire this generation. Old worker/backing ownership remains charged.
     pub fn reset(&mut self) {
-        #[cfg(target_os = "linux")]
-        self.camera.request(false);
+        self.stop_camera();
         self.backend.retire(self.generation);
         self.canvas_reads.clear();
         self.canvas_answers.clear();

@@ -794,6 +794,22 @@ impl super::Images {
     pub(crate) fn wake_fd(&self) -> std::os::fd::RawFd {
         self.backend.wake_fd()
     }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn camera_source(&self) -> Option<&'static str> {
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn stop_camera(&mut self) {}
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn sync_camera(&mut self) {}
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn poll_camera(&mut self) -> Vec<super::Report> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
