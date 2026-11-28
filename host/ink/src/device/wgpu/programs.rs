@@ -67,6 +67,16 @@ pub(super) fn class(instance: &Instance) -> Option<usize> {
     })
 }
 
+pub(super) fn clip1_radii(i: &Instance) -> [f32; 4] {
+    [
+        i.clip_radii[2] & 65535,
+        i.clip_radii[2] >> 16,
+        i.clip_radii[3] & 65535,
+        i.clip_radii[3] >> 16,
+    ]
+    .map(|r| r as f32 / 16.)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
