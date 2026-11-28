@@ -11,6 +11,66 @@ Read [KIOSK.md](../KIOSK.md) for runtime switches, prototype limits and checks.
 This memo maps the changes to their code and assesses what is worth sharing
 upstream. The assessments are the fork's, not acceptance decisions by Exact's maintainers.
 
+## Drawing only the exterior of an analytic shadow (2026-11-28)
+
+We tested whether skipping the transparent center of an outer box shadow could
+preserve its appearance at fractional positions and bring the photo list to
+60 Hz. Stock Ink already skips the blur integral deep inside the box. It still
+rasterizes the center of the quad. The experiment leaves the shader, vertices,
+and sample positions alone and draws the original quad through up to four
+disjoint scissors. The visible edges keep their analytic coverage. Small or
+ineligible shadows keep their original draw.
+
+We built the same release app against stock
+[upstream `a63357bec`](https://github.com/expo/exact/tree/a63357bec) and against
+that revision plus the scissor change. Both used Ink/Vulkan with direct KMS
+on the same Pi 4 and 800 × 1280 UI. After warming the same photo rows, we
+replayed a 16-second wheel scroll in stock–scissors–scissors–stock order.
+Displayed fps comes from completed page flips. GPU time is the V3D render-engine
+counter divided by the number of completed flips.
+
+| Analytic shadow | Displayed fps, runs 1 / 2 | GPU ms per displayed frame, runs 1 / 2 |
+| --- | ---: | ---: |
+| Stock | 20.57 / 20.57 | 48.37 / 48.38 |
+| Same quad, exterior scissors | 23.21 / 23.23 | 42.83 / 42.85 |
+
+After warming the list, we requested four settled positions a third of a
+device pixel apart. At each position, all 1,024,000 displayed RGB pixels
+matched stock. Moving from the first to the second position changed 152,609
+pixels within each build. The comparison exercised actual motion. A separate
+Pi Vulkan test compared RGBA output against the original analytic draw during
+fractional translation and zoom. A diagnostic fragment shader also confirmed
+that the excluded center received no fragments while the rim remained visible.
+
+Skipping the center saves about 5.54 ms of GPU work per displayed frame on
+this list. A 60 Hz refresh leaves 16.67 ms for a frame. The roughly 60 fps
+from the earlier [texture-cache experiment](#blurred-shadows-on-upstream-main-2026-11-27)
+includes reuse of the blurred edges and a fixed shader for the cached texture.
+The scissor experiment evaluates those edges on every frame.
+
+We also rendered plain shadows offscreen on the same Pi with no app or
+presentation loop. Each scene used one material batch on a 1280 × 800 target.
+Per run, we warmed 30 frames and waited for GPU completion on each of the next
+240. The table gives mean V3D render time across the two runs per build, in
+stock–scissors–scissors–stock order. Readback was outside the timed loop. The
+full output matched stock for both scenes.
+
+| Scene | Stock GPU ms/frame | Exterior scissors GPU ms/frame |
+| --- | ---: | ---: |
+| Six 360 × 240 shadows, radius 24, sigma 12 | 34.18 | 30.54 |
+| Eighty 96 × 64 shadows, radius 8, sigma 4 | 45.64 | 43.39 |
+
+A separate experiment [splits the quad geometry](https://github.com/smihica/exact/commit/aba7031d7dc3391de32dc597be2c21b6d63746cf)
+into up to four instances so adjacent shadows can still share a draw. On the
+same list it reached 22.83 / 22.87 displayed fps and 43.55 / 43.44 GPU ms.
+The branches also differ in which shadows qualify for splitting. Against stock,
+the Pi list captures differed at 53 pixels at +⅓ px and 68 pixels at +⅔ px,
+by at most 1/255 per channel. The 0 and +1 px captures matched. A software
+Vulkan test also found differences at 0.1 px translation. New triangles change
+how the fragment inputs are interpolated. The linked implementation
+adds a coordinate-range guard after these timings to avoid losing part of an
+edge under large, canceling transforms.
+
 ## Blurred shadows on upstream main (2026-11-27)
 
 The fork merged [`8dd84a33b`](https://github.com/expo/exact/tree/8dd84a33b). It now uses
