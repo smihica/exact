@@ -29,7 +29,6 @@ mod memory_tests;
 #[cfg(all(test, not(windows)))]
 mod ordered_tests;
 mod rows;
-mod shadows;
 #[cfg(all(test, not(windows)))]
 mod stream_tests;
 mod svg;
@@ -63,7 +62,6 @@ pub struct Ink {
     last_ms: (f64, f64),
     statistics: StatisticsReader,
     rows: rows::Rows,
-    shadows: shadows::Shadows,
 }
 
 impl Ink {
@@ -108,9 +106,6 @@ impl Ink {
             last_ms: (0., 0.),
             statistics: StatisticsReader::default(),
             rows: rows::Rows::default(),
-            shadows: shadows::Shadows::new(
-                std::env::var("KIOSK_SHADOW_CACHE").as_deref() == Ok("1"),
-            ),
         }
     }
 
@@ -203,24 +198,10 @@ impl Ink {
                 .push(instance.translated(capture.offset(self.scale)), bindings);
             return Ok(());
         }
-        // Kept rows retain geometry so their cache textures can be retired.
-        let (instance, bindings) = if instance.kind_brush == Kind::Shadow as u32 {
-            self.cached_shadow(instance, Self::shadow_reach(instance.param[0]))?
-        } else {
-            (instance, bindings)
-        };
-        let bands = instance.flags & flags::RASTERED_SHADOW != 0 && self.shadows.bands;
-        let push = |encoder: &mut Encoder| {
-            if bands {
-                encoder.push_parts(instance, bindings, Self::shadow_bands)
-            } else {
-                encoder.push(instance, bindings)
-            }
-        };
-        if push(&mut self.encoder).is_err() {
+        if self.encoder.push(instance, bindings).is_err() {
             let clip = self.combined_clip(None)?;
             self.encoder.push_combined_clip(clip);
-            let result = push(&mut self.encoder);
+            let result = self.encoder.push(instance, bindings);
             self.encoder.pop_clip();
             result.map_err(|_| Error::Invalid("instance clips".into()))?;
         }
@@ -526,7 +507,6 @@ impl Backend for Ink {
             if let Some(target) = self.rotated_target.take() {
                 self.device.retire_texture(target)?;
             }
-            self.shadows.trim(&mut self.device)?;
             self.images.trim(&mut self.device)?;
             self.pool.trim(&mut self.device)
         })();
@@ -562,7 +542,6 @@ impl Backend for Ink {
             {
                 return Err(Error::Invalid("frame dimensions or scale".into()));
             }
-            self.shadows.begin(&mut self.device)?;
             self.paths.begin(&mut self.device)?;
             self.glyphs.begin(&mut self.device)?;
             self.ramps.begin(&mut self.device)?;
@@ -639,7 +618,7 @@ impl Backend for Ink {
         {
             return false;
         }
-        let reach = Self::shadow_reach(sigma);
+        let reach = 3. * sigma.max(0.) + 1.;
         let (x, y, w, h) = shape.rect;
         let mut i = Instance::new(
             Kind::Shadow,

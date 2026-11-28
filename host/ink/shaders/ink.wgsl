@@ -4,7 +4,6 @@
 override SPECIALIZED: bool = false;
 override KIND_BRUSH: u32 = 0u;
 override FLAGS_MASK: u32 = 4294967295u;
-override FLAGS_SET: u32 = 0u;
 
 struct Viewport { size: vec2<f32>, pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> viewport: Viewport;
@@ -224,7 +223,7 @@ fn stop_ramp(t: f32, row: i32) -> vec4<f32> {
 }
 
 fn selectors(v: Vertex) -> vec2<u32> {
-    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, (v.data.y & FLAGS_MASK) | FLAGS_SET); }
+    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, v.data.y & FLAGS_MASK); }
     return v.data;
 }
 
@@ -447,17 +446,7 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     var color = brush(v, data, dx, dy);
     var clip1 = 1.0;
     if (flags & 128u) != 0u {
-        let lo = v.clip1.xy;
-        let hi = lo + v.clip1.zw;
-        let q = abs(v.position.xy - (lo + hi) * 0.5) - v.clip1.zw * 0.5;
-        let reach = max(max(abs(lo.x), abs(lo.y)), max(abs(hi.x), abs(hi.y)));
-        // Cached outer shadows use CSS-reduced clips. Beyond this margin their
-        // coverage is already zero, including the derivative-based AA fringe.
-        if kind == 2u && (flags & 2u) != 0u && max(q.x, q.y) >= 4.0 && reach < 32768.0 {
-            clip1 = 0.0;
-        } else {
-            clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
-        }
+        clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
     }
     switch kind {
         case 0u: { alpha = shape_coverage(v.local, v.rect, v.radii, pixel); }
@@ -471,9 +460,7 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
             // which the 0 would not cancel.
             let sigma = v.param.x;
-            // A rastered shadow already carries coverage in the image alpha.
-            if (flags & 2u) == 0u
-                && ((flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30)) {
+            if (flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30) {
                 alpha = shadow(v.local, v.uv, v.radii, sigma, pixel);
             }
         }

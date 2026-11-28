@@ -28,8 +28,6 @@ pub enum Brush {
 
 pub mod flags {
     pub const TINT: u32 = 1;
-    /// The sampled image already includes the shape coverage of this outer shadow.
-    pub const RASTERED_SHADOW: u32 = 1 << 1;
     pub const STOP_RAMP: u32 = 1 << 2;
     pub const REPEAT: u32 = 1 << 3;
     pub const PIXELATED: u32 = 1 << 26;
@@ -537,16 +535,10 @@ impl Encoder {
     }
 
     /// Re-clips an instance, including clips recorded inside a kept row (D4).
-    pub fn push(&mut self, instance: Instance, bindings: Bindings) -> Result<(), NeedsLayer> {
-        self.push_parts(instance, bindings, std::iter::once)
-    }
-
-    /// Apply the effective clip once before splitting a draw into pieces.
-    pub fn push_parts<I: IntoIterator<Item = Instance>>(
+    pub fn push(
         &mut self,
         mut instance: Instance,
         mut bindings: Bindings,
-        parts: impl FnOnce(Instance) -> I,
     ) -> Result<(), NeedsLayer> {
         if self.state.needs_layer {
             return Err(NeedsLayer);
@@ -574,23 +566,23 @@ impl Encoder {
         if scissor.width == 0 || scissor.height == 0 {
             return Ok(());
         }
-        for instance in parts(instance) {
-            let replace = instance.flags & (flags::REPLACE | flags::BLEND_MASK) != 0;
-            let index = u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
-            if let Some(batch) = self.frame.batches.last_mut().filter(|b| {
+        let replace = instance.flags & (flags::REPLACE | flags::BLEND_MASK) != 0;
+        let index = u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
+        if let Some(batch) =
+            self.frame.batches.last_mut().filter(|b| {
                 !replace && !b.replace && b.scissor == scissor && b.bindings == bindings
-            }) {
-                batch.instances.end = index + 1;
-            } else {
-                self.frame.batches.push(Batch {
-                    replace,
-                    instances: index..index + 1,
-                    scissor,
-                    bindings,
-                });
-            }
-            self.frame.instances.push(instance);
+            })
+        {
+            batch.instances.end = index + 1;
+        } else {
+            self.frame.batches.push(Batch {
+                replace,
+                instances: index..index + 1,
+                scissor,
+                bindings,
+            });
         }
+        self.frame.instances.push(instance);
         Ok(())
     }
 
