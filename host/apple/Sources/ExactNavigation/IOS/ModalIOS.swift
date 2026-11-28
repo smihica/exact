@@ -220,6 +220,14 @@ final class ModalController: UIViewController, UIGestureRecognizerDelegate {
         container.addGestureRecognizer(tap)
         backdropTap = tap
     }
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        // Some dismissals finish without the adaptive presentation delegate callback.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, presentingViewController == nil else { return }
+            host?.platformDidDismiss(self)
+        }
+    }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         if CanvasInputs.owns(touch.view) { return false }
         guard let container = presentationController?.containerView,
@@ -308,6 +316,30 @@ final class ModalController: UIViewController, UIGestureRecognizerDelegate {
         scheduleTerminalSyncIfNeeded()
         #endif
     }
+    #if os(iOS)
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        if isBeingPresented { cross(opening: true) }
+    }
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        if isBeingDismissed { cross(opening: false) }
+    }
+    /// The `navigationSource` it zooms by, whose element the zoom carries.
+    var zoomSource: String? {
+        guard #available(iOS 18.0, *), preferredTransition != nil else { return nil }
+        return route?.props["navigationSource"]
+    }
+    /// A full-screen route and the screen beneath fly the names both hold, alongside the presentation or the
+    /// dismissal, unless it zooms (LLP 1013.004 D3). A sheet slides alone.
+    private func cross(opening: Bool) {
+        guard modalPresentationStyle == .overFullScreen, let coordinator = transitionCoordinator, let presenter = host?.presenter,
+              let beneath = presentingViewController?.view else { return }
+        // A Close froze the route with what now flies.
+        _ = presenter.flightHost.cross(coordinator, leaving: opening ? beneath : view, arriving: opening ? view : beneath, zoom: zoomSource,
+                                       picture: opening ? nil : pixels)
+    }
+    #endif
     func freeze() {
         guard isViewLoaded, let pixels = view.snapshotView(afterScreenUpdates: false) else { return }
         pixels.frame = view.bounds
@@ -519,6 +551,12 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
         }) {
             let controller = layer.controller
             layer.sampleLanding?()
+            #if os(iOS)
+            // The names the dismissal will fly, kept before the batch removes them (LLP 1013.004 D3).
+            if controller.modalPresentationStyle == .overFullScreen, let beneath = controller.presentingViewController?.view {
+                presenter.flightHost.hold(leaving: controller.view, arriving: beneath, zoom: controller.zoomSource)
+            }
+            #endif
             controller.freeze()
             controller.retiringRoot = layer.route
             controller.retiringNavigation = presenter.navigationHost.preserveModalContent(in: controller)
@@ -687,7 +725,7 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
         // The presenting screen stays where it is, inert while the sheet is modal (HTML modal dialogs)
         syncBackground(layer)
         let controller = layer.controller
-        if #available(iOS 18.0, tvOS 18.0, *), layer.kind == "fullscreen", route.props["navigationSource"] != nil {
+        if #available(iOS 18.0, tvOS 18.0, *), layer.kind == "fullscreen", route.props["navigationSource"]?.isEmpty == false {
             let options = UIViewController.Transition.ZoomOptions()
             let landing = ZoomLanding()
             options.interactiveDismissShouldBegin = { [weak self, weak route] context in
@@ -921,7 +959,11 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
     }
 
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        guard let layer = layers.last, layer.controller === presentationController.presentedViewController else { return }
+        platformDidDismiss(presentationController.presentedViewController)
+    }
+
+    fileprivate func platformDidDismiss(_ controller: UIViewController) {
+        guard let layer = layers.last, layer.controller === controller, !layer.alreadyDismissed else { return }
         HostLog.note(presenter.session, "presentation: the person dismissed the \(layer.kind) \(layer.route.props["navigationKey"] ?? "?")")
         closing = true
         presenter.cancelPendingFocus()

@@ -508,6 +508,10 @@ function apply(batch) {
               if (messages++ === 0) {
                 first();
               }
+              if (m.head) {
+                safelyFulfill(requestIncarnation, op.ticket, 11, m.status, "", encoder.encode(JSON.stringify([...m.headers])));
+                return;
+              }
               batch.push(m);
               if (m.more) {
                 return;
@@ -926,6 +930,10 @@ function apply(batch) {
             root.replaceChildren(...roots);
           }
           syncViewportFit();
+          break;
+        }
+        case "streamFailure": {
+          globalThis.exact.faults?.countStreamCreditByPrefix?.(op.prefix, op.method ?? null, op.url, !!op.hit, op.failure !== false);
           break;
         }
         case "at": {

@@ -11,7 +11,11 @@ class TranslationTest {
     private fun code(tag: String) = Languages.listed(Languages.canonical(tag)!!, listed)?.let(Languages::mlkitCode)
 
     @Test fun canonicalisesAsBcp47() {
-        assertEquals("zh-TW", Languages.canonical("zh_tw"))
+        assertEquals("zh-TW", Languages.canonical("zh-tw"))
+        // Not structurally valid BCP 47: the web's Translator and LanguageDetector throw a RangeError for these.
+        assertNull(Languages.canonical("zh_tw"))
+        assertNull(Languages.canonical("en_US"))
+        assertNull(Languages.canonical("sr-Latn_RS"))
         assertEquals("sr-Latn-RS", Languages.canonical("SR-latn-rs"))
         assertNull(Languages.canonical(""))
         assertNull(Languages.canonical("e"))

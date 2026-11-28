@@ -2260,15 +2260,26 @@ out (LLP 1157).
   memory, and `test` and `verify` start it (`apps/mosaic/server.ts`); its
   `app.json` needs `"server": { "database": false }`, since the stand-in keeps
   no database. A function's second argument is who asks, `{ identity }`: the
-  `sub` of the JWT the client sent, unchecked, or `null` signed out. Convex's
+  `sub` of the JWT the client sent, unchecked, or `null` signed out. The
+  stand-in takes the socket on any path that ends in `/sync`, and Convex's
   HTTP API answers too (`POST /api/mutation`, `/api/query`, `/api/action`,
   `Authorization: Bearer <jwt>`), so a test's `request` can write as another
-  client; `http: (request) => Response | undefined` answers the app's other
-  routes (an auth endpoint), with CORS headers added. Keep the
+  client; after both, `http: (request) => Response | undefined` answers the
+  app's other routes (an auth endpoint), with CORS headers added. Keep the
   rules both run in a file with no Convex import (`convex/tiles.ts`). Each
   test starts an empty stand-in, including with `database: false`. Remote
   servers stay shared. Only `test` and `agent --test` share an ancestor's server,
   saying so; `verify` refuses an answering local server, including an ancestor's.
+- **The socket origin of a test build.** `test` and `verify` start the
+  stand-in at the socket origin the build reads, when that origin is a loopback
+  address with a port (`ws://127.0.0.1:3210`). With a cloud origin, no stand-in
+  starts and the tests run against that deployment. A setting
+  (`"env": ["CONVEX_SOCKET_URL"]` in app.json, read as
+  `import.meta.env.CONVEX_SOCKET_URL`) has the same value in a test or check
+  build as in any build: the environment's, else `.env.local`'s, else `.env`'s,
+  else the default in app.ts. Give tests, checks and drives the stand-in's
+  origin in the environment:
+  `CONVEX_SOCKET_URL=ws://127.0.0.1:3210 bun exact.mjs verify`.
 - **Driving a native host against a real deployment.** The driver seeds a
   native host's randomness (`EXACT_AGENT_SEED`, 1 by default), so two launches
   draw the same session id and Convex answers the second's writes with the
@@ -3141,6 +3152,7 @@ lists any literal colour, font size or weight an app's `.contract` files still w
 | `button` (`buttonStyle`, native by default) | `UIButton` |
 | `list appearance="auto" listStyle="inset-grouped"` of `section`s (`header`, rows, `footer`) | `UICollectionView` list, as Settings ([human guide](contract-for-humans.md#choosing-a-native-button)); a row of your own parts starts and ends at the cell's margin, as UIKit's own rows do, so write no padding at its ends. Android shows Material's list items, with no line between rows |
 | the same, `listStyle="plain"`, each `section`'s `header` one letter (Contacts) | the list with UIKit's A–Z section index at its trailing edge, when every section has a row; sections above the letters (Favorites) stay out of it; a name that starts with no letter A–Z goes under `#`, not nowhere. Its headers pin as the list scrolls, over UIKit's blur; a `grouped` list's scroll away |
+| the same, `listStyle="sidebar"`, a list of places to go (folders, sections) | UIKit's sidebar list (`.sidebar`) at every width: its ground, no separators; the web, the Mac and the painted hosts draw the plain list |
 | a `section`'s `header` holding boxes of your own, not one `text`: `header` › `row gap=8 align-items="center"` › a sized `image` (or a box around one) and a `text` | UIKit's header holding your views (an avatar beside a name), laid out as you wrote them and starting at the cell's margin, so write no padding at its ends; a `padding-left` or `padding-right` you write is from the card's edge, as UIKit's header view spans the card (16 for a hand-built view pinned 16 inside it). Above and below them is UIKit's header inset, 10 points; `padding-top` and `padding-bottom` on the `header` replace it (12 for a hand-built header view's). Pinned in a plain list as a one-text header is, and one VoiceOver heading named by its texts (a header that holds a button keeps each part its own element). Several bare `text`s are refused: put them in a `row` or a `column`. A `footer` holds one `text` |
 | `list` with no `appearance`, its rows down the page (each child is a row) | a plain list's cells: UIKit's separators, the cell's grey ground while a row is pressed, the row selected under the screen it pushed. Draw none of it, and no inset either: a row's content stands at the cell's margin (16 at each end; UIKit's, 20 in an iPhone's landscape) where you write no padding, the row `border-box` (LLP 1138); write a padding to choose your own. The row is your box; a border you write on a row is yours and replaces the separator there (`border-bottom="none"`: none), and `appearance="none"` keeps rows of your own (a transcript, a feed of cards). The Mac shows a table, the web and the Linux desktop one line between rows, Android none (LLP 1115.000 D16) |
 | `delete=remove(id)` on either list's row (`disabled` beside it: no delete) | the cell's swipe action Delete, which a full swipe performs (`contract vocab swipe`) |
@@ -5039,6 +5051,14 @@ main navigationKey=`${top(nav).id}` navigationBack="close" navigate=follow displ
   - **Android's top app bar and tvOS's bar leave out a readout**, and Android also leaves
     out the title's avatar, glyph-line subtitles and tap on the title (plain-text subtitles
     after the heading project into Material's small top app bar, LLP 1115.001 D11).
+    Projected bars own their container height on every projecting host (UIKit's bar on iOS,
+    AppKit's toolbar and 48 pt sheet title row on macOS, and Material 3's 64 dp small app
+    bar expanding with `font_scale` on Android pushed and `modal` sheet routes) and ignore
+    `height` or `min-height` written on `header`. When a route needs a specific authored bar
+    height (such as a 56 dp compact sheet toolbar), set `navigationBar="none"` on the route
+    or `appearance="none"` on `header` and size it in flow (for example `min-height=56`, so
+    large text still grows the header while keeping the sheet's native container, scrim,
+    detents, drag gestures and TalkBack pane title).
     The Mac's toolbar takes a header only when it has a place for every part: the heading, the first text
     after it (in a box or not) as the window's subtitle, buttons whose face is words,
     symbols, dots and at most one picture, readouts of words, symbols and dots, one
@@ -5425,8 +5445,8 @@ and `then`s (`TIMER_FIRE_LIMIT`), those that change nothing included; the rest i
 refused, what committed is kept, and the clock stays at the last one's time. A
 fast `every` under a long `clock +N` can reach it: tick slower or move the clock in steps.
 A firing whose action changes nothing commits nothing: it wrote no state a new value, and
-sent, refreshed and commanded nothing. Where a binding, derive or resource argument reads
-`performanceNow()`, every firing commits and shows the time.
+sent, refreshed and commanded nothing. Where a binding, derive, or a resource's argument,
+`when` or `for … in` list reads `performanceNow()`, every firing commits and shows the time.
 
 Use `change(action)` for work that must follow an input change, such as reading
 layout or issuing a host command:
@@ -5629,8 +5649,9 @@ component App
 
 - **Timelines:** `scroll-timeline` (or `-name` and `-axis`) on a scroller is its offset;
   `view-timeline` (`-name`, `-axis`, `-inset`) on any node is that node crossing its nearest
-  scroller. `animation-timeline` names one, or is `scroll()` or `view()`; a sibling's name
-  needs `timeline-scope` on a shared ancestor. One timeline per node and kind.
+  scroller. `animation-timeline` names one, or is `scroll()`, `view()`, or `none` (detached,
+  so the animation never advances on the clock); a sibling's name needs `timeline-scope` on a
+  shared ancestor. One timeline per node and kind.
 - **Ranges:** `animation-range` takes lengths and percentages of the timeline, and on a view
   timeline `cover`, `contain`, `entry`, `exit`, `entry-crossing` and `exit-crossing`, each
   with an optional length or percentage.
@@ -6941,9 +6962,10 @@ report.
 
 `perf frames health` exposes the metrics. `state.frameHealthUI` contains only the
 card's visibility and window-local bounds, marked as host controls outside app nodes.
-On iOS 18 and later the card's face shows every UI update of the app on its screen and
-the main thread's work, which it measures only while it shows; `perf frames` reports
-Exact's own frames (LLP 1079.000 §7.4).
+On iOS 18 and later the card's face shows every UI update of the app on its screen, how
+much of each window's time the main thread was held up past one refresh, and its longest
+hold-up, which it measures only while it shows; `perf frames` reports Exact's own frames
+(LLP 1079.000 §7.4).
 Embedders opt in by passing a host view as `DevMenu.install`'s `frameHealthContainer`.
 
 `app.json` may set `"frame_health": { "mode": "off" }` or `"core"`. Without a mode, a
@@ -7700,9 +7722,15 @@ Fixtures keep request validation, file-read grants and upload limits, deadlines,
 response limits and native HTTP caching. Native prefetch and its foreground
 fallback use the same fixture. A web response and its clones keep the request URL
 and read-only headers.
-Unmatched URLs still go to the network. These are immediate, buffered responses;
-streams, redirects and `exactBodyTo` are not supported. See the
-[authored-test grammar](contract-grammar.md#authored-tests) for limits.
+Unmatched URLs still go to the network. `answer fetch` covers buffered HTTP
+responses; redirects and `exactBodyTo` are not supported. For HTTP(S)
+`exactStream` event and byte streams, use `answer stream "<prefix>" [method POST]
+with 200` followed by indented `event`, `bytes`, `end` or `fail` lines with
+cumulative `after <ms>` delays, and `pass stream "<prefix>"` to disarm it.
+`after 0` events land on `clock data`; later events park across `clock settle`
+and advance on `clock +<ms>`, letting a test interact mid-stream without a live
+server. See the [authored-test grammar](contract-grammar.md#authored-tests) for
+limits.
 
 To write through the app's own server as another person, `request POST "/items"
 {"title": "Bread"} as grace` is the driver calling it (`Authorization: Bearer grace`,

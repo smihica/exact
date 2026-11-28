@@ -4,7 +4,6 @@
 override SPECIALIZED: bool = false;
 override KIND_BRUSH: u32 = 0u;
 override FLAGS_MASK: u32 = 4294967295u;
-override FLAGS_SET: u32 = 0u;
 
 struct Viewport { size: vec2<f32>, pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> viewport: Viewport;
@@ -224,7 +223,7 @@ fn stop_ramp(t: f32, row: i32) -> vec4<f32> {
 }
 
 fn selectors(v: Vertex) -> vec2<u32> {
-    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, (v.data.y & FLAGS_MASK) | FLAGS_SET); }
+    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, v.data.y & FLAGS_MASK); }
     return v.data;
 }
 
@@ -447,17 +446,7 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     var color = brush(v, data, dx, dy);
     var clip1 = 1.0;
     if (flags & 128u) != 0u {
-        let lo = v.clip1.xy;
-        let hi = lo + v.clip1.zw;
-        let q = abs(v.position.xy - (lo + hi) * 0.5) - v.clip1.zw * 0.5;
-        let reach = max(max(abs(lo.x), abs(lo.y)), max(abs(hi.x), abs(hi.y)));
-        // Cached outer shadows use CSS-reduced clips. Beyond this margin their
-        // coverage is already zero, including the derivative-based AA fringe.
-        if kind == 2u && (flags & 2u) != 0u && max(q.x, q.y) >= 4.0 && reach < 32768.0 {
-            clip1 = 0.0;
-        } else {
-            clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
-        }
+        clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
     }
     switch kind {
         case 0u: { alpha = shape_coverage(v.local, v.rect, v.radii, pixel); }
@@ -471,9 +460,7 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
             // which the 0 would not cancel.
             let sigma = v.param.x;
-            // A rastered shadow already carries coverage in the image alpha.
-            if (flags & 2u) == 0u
-                && ((flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30)) {
+            if (flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30) {
                 alpha = shadow(v.local, v.uv, v.radii, sigma, pixel);
             }
         }
@@ -524,3 +511,95 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
 }
 
 @fragment fn fs_flat_fill(v: Vertex) -> @location(0) vec4<f32> { return v.color; }
+
+// Monotonic logistic minimax fit to the standard normal CDF Phi(x) on [-5.5, 5.5]
+// (max absolute error < 2e-5; clamping prevents high-order sign reversal in the tails).
+fn fast_cdf(x: f32) -> f32 {
+    let cx = clamp(x, -5.5, 5.5);
+    let x2 = cx * cx;
+    let z = cx * (2.3017045 + x2 * (0.1062112 - 0.0009161 * x2));
+    return 1.0 / (1.0 + exp2(-z));
+}
+
+// Separable 2D Gaussian integral for large rounded rectangles admitted by
+// programs::fast_shadow: straight bands evaluate in closed form, and corner
+// arcs use 3-point Gauss-Legendre quadrature over the nearest mirrored corner.
+fn fast_shadow_alpha(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, sigma: f32) -> f32 {
+    let inv_s = 1.0 / sigma;
+    let hi = rect.xy + rect.zw;
+    let dl = p - rect.xy;
+    let dr = hi - p;
+    // Horizontal straight band: 4.5 sigma clear of both sides keeps ix within 7e-6 of 1.
+    let ml = max(radii.x, radii.w) + 4.5 * sigma;
+    let mr = max(radii.y, radii.z) + 4.5 * sigma;
+    if dl.x >= ml && dr.x >= mr {
+        return clamp(fast_cdf(dl.y * inv_s) - fast_cdf(-dr.y * inv_s), 0.0, 1.0);
+    }
+    // Vertical straight band: 4.0 sigma clear of top/bottom corner arcs; ix is explicit.
+    let mt = max(radii.x, radii.y) + 4.0 * sigma;
+    let mb = max(radii.z, radii.w) + 4.0 * sigma;
+    if dl.y >= mt && dr.y >= mb {
+        let ix = fast_cdf(dr.x * inv_s) - fast_cdf(-dl.x * inv_s);
+        let iy = fast_cdf(dl.y * inv_s) - fast_cdf(-dr.y * inv_s);
+        return clamp(ix * iy, 0.0, 1.0);
+    }
+    let rx = select(radii.xw, radii.yz, dr.x < dl.x);
+    let r = select(rx.x, rx.y, dr.y < dl.y);
+    let q = min(dl, dr);
+    let l0 = max(0.0, q.y - 4.0 * sigma);
+    let l1 = min(rect.w, q.y + 4.0 * sigma);
+    var alpha = 0.0;
+    let s0 = max(l0, r);
+    if l1 > s0 {
+        let ix = fast_cdf(q.x * inv_s) - fast_cdf((q.x - rect.z) * inv_s);
+        alpha += ix * (fast_cdf((q.y - s0) * inv_s) - fast_cdf((q.y - l1) * inv_s));
+    }
+    let a1 = min(l1, r);
+    if a1 > l0 {
+        let mid = 0.5 * (l0 + a1);
+        let half_span = 0.5 * (a1 - l0);
+        let rs = r * inv_s;
+        // 3-point Gauss-Legendre nodes (±sqrt(3/5), 0) and weights (5/9, 8/9, 5/9);
+        // -0.72134752 = -0.5 / ln(2) converts exp(-0.5 * y^2) to exp2.
+        let n0 = 0.774596669;
+        var acc = 0.0;
+        for (var k = 0u; k < 3u; k++) {
+            let xk = select(select(-n0, 0.0, k == 1u), n0, k == 2u);
+            let wk = select(0.55555556, 0.88888889, k == 1u);
+            let line = mid + half_span * xk;
+            let ls = line * inv_s;
+            let x_edge_s = rs - sqrt(max(ls * (2.0 * rs - ls), 0.0));
+            let y = (q.y - line) * inv_s;
+            acc += wk * fast_cdf(q.x * inv_s - x_edge_s) * exp2(-0.72134752 * y * y);
+        }
+        // 0.39894228 = 1 / sqrt(2 * pi).
+        alpha += acc * (0.39894228 * inv_s) * half_span;
+    }
+    return clamp(alpha, 0.0, 1.0);
+}
+
+// Analytical rounded-box SDF (Inigo Quilez) with linear 0.5 - dist / width AA
+// for device-space clip1 boxes guarded by programs::fast_shadow (w, h >= 4 and
+// every corner radius in [1.5, min(w, h) / 2]).
+fn rounded_box_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
+    let dl = p - rect.xy;
+    let dr = rect.xy + rect.zw - p;
+    let rx = select(radii.xw, radii.yz, dr.x < dl.x);
+    let r = select(rx.x, rx.y, dr.y < dl.y);
+    let q = vec2<f32>(r) - min(dl, dr);
+    let m = max(q, vec2<f32>(0.0));
+    let len = length(m);
+    let dist = min(max(q.x, q.y), 0.0) + len - r;
+    let width = select(1.0, (m.x + m.y) / max(len, 0.00001), len > 0.00001);
+    return clamp(0.5 - dist / width, 0.0, 1.0);
+}
+
+@fragment
+fn fs_fast_shadow(v: Vertex) -> @location(0) vec4<f32> {
+    let clip1 = rounded_box_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw));
+    var alpha = 0.0;
+    if clip1 < 1.0 {
+        alpha = fast_shadow_alpha(v.local, v.uv, v.radii, v.param.x) * (1.0 - clip1);
+    }
+    return v.color * alpha;
+}

@@ -9,12 +9,20 @@ routes nav
   home "/"
   sheet "/sheet"
   detail "/detail"
+  cover "/cover"
+  coverNav "/cover-nav"
 
 component BarInsets
   action open
     nav = push(nav, "/sheet")
   action more
     nav = push(nav, "/detail")
+  action openCover
+    nav = push(nav, "/cover")
+  action openCoverNav
+    nav = push(nav, "/cover-nav")
+  action back
+    nav = back(nav)
   view
     main navigationKey=`${top(nav).id}` width="100%" height="100%"
       for e in stack(nav) key=e.id
@@ -31,6 +39,10 @@ component BarInsets
                   text "Open"
                 button press=more testId="more"
                   text "More"
+                button press=openCover testId="open-cover"
+                  text "Cover"
+                button press=openCoverNav testId="open-cover-nav"
+                  text "CoverNav"
               scroll id="list" flex=1 min-height=0 testId="list"
                 for i in range(30) key=i
                   text `Row ${i}` padding=12
@@ -43,4 +55,16 @@ component BarInsets
         if e.name == "sheet"
           column navigationKey=`${e.id}` navigationPresentation="modal" testId="sheet" display="flex" flex-direction="column"
             column height="var(--exact-safe-area-inset-bottom)" testId="sheet-probe"
+        if e.name == "cover"
+          column navigationKey=`${e.id}` navigationPresentation="fullscreen" navigationBar="none" testId="cover" position="absolute" inset=0 -exact-safe-area="none" background-color="Canvas"
+            row testId="cover-bar" padding-top="var(--exact-safe-area-inset-top)" height=44 align-items="center"
+              button press=back testId="close-cover"
+                text "Close"
+        if e.name == "coverNav"
+          column navigationKey=`${e.id}` navigationPresentation="fullscreen" testId="cover-nav" position="absolute" inset=0 -exact-safe-area="none" background-color="Canvas"
+            header
+              text "Modal Bar" role="heading" aria-level=1
+              button press=back testId="close-cover-nav"
+                text "Done"
+            box testId="cover-nav-probe" height="var(--exact-safe-area-inset-top)" width=4
       column position="absolute" top=0 right=0 width=4 height="var(--exact-safe-area-inset-top)" testId="root-probe"

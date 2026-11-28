@@ -7,10 +7,9 @@
 // views are carried into their cell, and every batch sees that hierarchy.
 import ExactKit
 
-/// The grouped lists capability (LLP 1047.001 D4): an app's composition
-/// links this module only when its plan has a grouped list, and installs it
-/// before any session is made. On macOS a grouped list is its authored
-/// nodes, and installing it does nothing.
+/// The grouped lists capability (LLP 1047.001 D4): an app's composition links this module only when its plan has a
+/// grouped list, and installs it before any session is made. On macOS a grouped list is its authored nodes, and
+/// installing it does nothing.
 public enum ExactGroupedLists {
     public static func install() {
         #if os(iOS) || os(tvOS)
@@ -199,11 +198,11 @@ struct GroupedListModel: Equatable {
         animates = o["animates"] as? Bool ?? false
     }
     var appearance: UICollectionLayoutListConfiguration.Appearance {
-        // tvOS has no inset grouped list.
+        // tvOS has no inset grouped list and no sidebar list, so a sidebar is its plain list (LLP 1127 D22).
         #if os(tvOS)
-        switch style { case "plain": .plain; default: .grouped }
+        switch style { case "plain", "sidebar": .plain; default: .grouped }
         #else
-        switch style { case "plain": .plain; case "grouped": .grouped; default: .insetGrouped }
+        switch style { case "plain": .plain; case "grouped": .grouped; case "sidebar": .sidebar; default: .insetGrouped }
         #endif
     }
 }
@@ -512,8 +511,8 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
     /// 1115 §2), as it replaces the sheet's grouped ground on the other hosts (LLP 1084 D7): the list's own layer paints
     /// it in its box and UIKit's grounds are clear, so `transparent` shows what is behind the list around its cards.
     private var writesGround = false
-    /// In a split's list column beside its detail: UIKit's sidebar list (GroupedSidebarIOS.swift).
-    var sidebar = false
+    /// In a split's list column beside its detail: UIKit's sidebar list, and on its material (GroupedSidebarIOS.swift).
+    var sidebar = false, onMaterial = false
     /// The theme's roles this list last drew with (LLP 1095 D4): a new table
     /// (an update, a dev reload) configures every row and the layout again.
     private var theme = ThemeRoles.generation
@@ -566,7 +565,7 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
     /// The list's background past the viewport's edges (`hem`), and the
     /// list's colours it was painted from.
     private var skirt: UIView?
-    private var skirtKey: [CGColor?] = []
+    private var skirtKey: (colours: [CGColor?], writes: Bool, material: Bool)?
     #endif
     /// Whether `view` is this list's background past the viewport's edges.
     func owns(skirt view: UIView) -> Bool {
@@ -643,15 +642,15 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
     }
 
     /// The theme's ground for the list's appearance where it replaces the platform's (LLP 1095 D4): a plain list's is
-    /// the page's (`UIColor.platformBackground`), a grouped one's the grouped role.
+    /// the page's (`UIColor.platformBackground`), a grouped one's the grouped role; a sidebar's is UIKit's.
     private var themeGround: UIColor? {
         let root = host.presenter.root
-        return model.appearance == .plain ? ThemeRoles.color("background", in: root) ?? ThemeRoles.color("Canvas", in: root)
+        return authoredSidebar ? nil : model.appearance == .plain ? ThemeRoles.color("background", in: root) ?? ThemeRoles.color("Canvas", in: root)
             : ThemeRoles.color("grouped-background", in: root)
     }
     #if os(iOS)
     /// The ground where none is written: the theme's, else UIKit's for the list's appearance.
-    private var platformGround: UIColor { themeGround ?? (model.appearance == .plain ? .systemBackground : .systemGroupedBackground) }
+    private var platformGround: UIColor { themeGround ?? sidebarGround ?? (model.appearance == .plain ? .systemBackground : .systemGroupedBackground) }
     #endif
 
     /// Each section's header and footer exist only where it has the text.
@@ -660,12 +659,12 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
             guard let self else { return nil }
             var c = UICollectionLayoutListConfiguration(appearance: listAppearance)
             // Clear where the author wrote one (`writesGround`), else the theme's; nil leaves UIKit's, a sidebar's always.
-            if !sidebar, let ground = writesGround ? .clear : themeGround { c.backgroundColor = ground }
+            if !hostSidebar, let ground = writesGround ? .clear : themeGround { c.backgroundColor = ground }
             let s = section(at: index)
             c.headerMode = s?.hasHeader == true ? .supplementary : .none
             c.footerMode = s?.footer == nil ? .none : .supplementary
             #if !os(tvOS)
-            c.showsSeparators = !sidebar && (s?.card ?? true)
+            if !sidebarList { c.showsSeparators = s?.card ?? true }
             // Where a row's author wrote the edge under it, a carried row
             // shows that edge instead of UIKit's line (LLP 1084 D7), as a
             // hand-built cell hides its separator. A standard cell draws no
@@ -746,8 +745,8 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
         let previous = model, old = rows
         let rethemed = theme != ThemeRoles.generation
         theme = ThemeRoles.generation
-        let writes = owner.wrote("background_color"), flipped = followSidebar()
-        let restyled = next.style != previous.style || rethemed || writes != writesGround || flipped
+        let writes = owner.wrote("background_color"), flipped = followSidebar(), relooked = flipped && !authoredSidebar
+        let restyled = next.style != previous.style || rethemed || writes != writesGround || relooked
         writesGround = writes
         model = next
         rows = Dictionary(next.sections.flatMap { $0.rows }.map { ($0.view, $0) }, uniquingKeysWith: { a, _ in a })
@@ -775,7 +774,7 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
         // row moved between sections) is configured again.
         let wasCarded = Dictionary(previous.sections.flatMap { s in s.rows.map { ($0.view, s.card) } }, uniquingKeysWith: { a, _ in a })
         let recarded = Set(next.sections.flatMap { s in s.rows.compactMap { r in wasCarded[r.view].flatMap { $0 != s.card ? r.view : nil } } })
-        let changed = snapshot.itemIdentifiers.filter { id in rethemed || flipped || old[id].map { $0 != rows[id] || looking[id] != looks[id] || recarded.contains(id) } ?? false }
+        let changed = snapshot.itemIdentifiers.filter { id in rethemed || relooked || flipped && rows[id]?.accessory == "disclosure" || old[id].map { $0 != rows[id] || looking[id] != looks[id] || recarded.contains(id) } ?? false }
         looks = looking
         // A row whose switch is firing is reconfigured once its action has
         // returned: rebuilding its accessories would take the switch out of
@@ -806,9 +805,9 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
         let regapped = previous.sections.map(\.spaceAbove) != next.sections.map(\.spaceAbove) || previous.spaceBelow != next.spaceBelow
         if restyled { collection.setCollectionViewLayout(layout(), animated: false) }
         #if os(iOS)
-        // The collection view's own background shows through a clear section ground and below a short list, and UIKit
-        // gives it the appearance's ground only for a layout with none of its own, so it is set here.
-        let ground: UIColor? = sidebar ? nil : writesGround ? .clear : platformGround
+        // The collection view's own background shows through a clear section ground and below a short list. It is written,
+        // clear over the sidebar material: for nil UIKit gives the appearance's ground, opaque after a style change in place.
+        let ground: UIColor? = material || writesGround ? .clear : platformGround
         if collection.backgroundColor != ground { collection.backgroundColor = ground }
         #endif
         // An unchanged snapshot can reset UIKit's estimated geometry and
@@ -1009,10 +1008,11 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
             return made
         }()
         // The list's own background in each appearance, as its layer paints it: the author's, else the platform's.
-        let sides = [owner.cgColor("background_color", dark: false), owner.cgColor("background_color", dark: true)]
-        if sides != skirtKey || view.backgroundColor == nil {
+        let sides = (colours: [owner.cgColor("background_color", dark: false), owner.cgColor("background_color", dark: true)], writes: writesGround, material: material)
+        if skirtKey.map({ $0 != sides }) ?? true || view.backgroundColor == nil {
             skirtKey = sides
             view.backgroundColor = UIColor { [weak self, weak owner] traits in
+                if let self, !writesGround, let ground = sidebarGround { return ground.resolvedColor(with: traits) }
                 if let colour = owner?.cgColor("background_color", dark: traits.userInterfaceStyle == .dark) { return UIColor(cgColor: colour) }
                 // A background written with no colour (`initial`) is none, as the list's box is.
                 guard let self, !writesGround else { return .clear }
@@ -1113,13 +1113,14 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
         if card(of: id) {
             cell.configurationUpdateHandler = nil
             var card = cell.defaultBackgroundConfiguration()
-            if let fill = ThemeRoles.color("secondary-grouped-background", in: host.presenter.root) { card.backgroundColor = fill }
+            if !authoredSidebar, let fill = ThemeRoles.color("secondary-grouped-background", in: host.presenter.root) { card.backgroundColor = fill }
             cell.backgroundConfiguration = card
         } else {
             cell.configurationUpdateHandler = { [weak self] cell, state in
                 let highlights = row.pressable && !row.disabled && Self.pressIsCells(row, self?.host.presenter.views[id])
-                cell.backgroundConfiguration = highlights && (state.isHighlighted || state.isSelected)
-                    ? cell.defaultBackgroundConfiguration().updated(for: state) : .clear()
+                var ground = highlights && (state.isHighlighted || state.isSelected) ? cell.defaultBackgroundConfiguration().updated(for: state) : .clear()
+                if let insets = (cell as? GroupedCell)?.listInsets.background { ground.backgroundInsets = insets } // UIKit runs this after the cell gave them
+                cell.backgroundConfiguration = ground
             }
             cell.backgroundConfiguration = .clear()
         }
@@ -1136,7 +1137,7 @@ final class GroupedListView: NSObject, UICollectionViewDelegate {
         cell.height = nil
         cell.minimumHeight = minimum(of: id)
         heights[id] = nil
-        var c: UIListContentConfiguration = row.subtitle ? .subtitleCell() : row.secondary != nil ? .valueCell() : .cell()
+        var c = standardContent(row)
         c.image = row.symbol.flatMap { FaceSymbol.image($0, points: GroupedCell.pathPoints(cell.traitCollection)) }
         // An svg-only icon's path (stage 9 A2): the layout space UIKit gives
         // an SF Symbol here (an image is laid out at its own size, a symbol

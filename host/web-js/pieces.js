@@ -5,7 +5,7 @@ import { committedCanvas } from './request-send.js';
 import { releaseAsset as rel } from './elements.js';
 import { liveById, sheetLeaves, inertAncestor } from './navigation.js';
 import { startDecoration, decorationPiece } from './editor.js';
-import { Owner, onEnd, effect, eq, say, inflight, data, journal, After, Before, Finishes, Hosts, Probes, Media } from './rt.js';
+import { Owner, onEnd, onMount, preparedScope, effect, eq, say, inflight, data, journal, After, Before, Finishes, Hosts, Probes, Media } from './rt.js';
 import { clock, advance } from './clock.js';
 import { Views, Ids, viewId, Hooks } from './tree.js';
 import { OnHooks } from './events.js';
@@ -21,22 +21,33 @@ const loads = {};
 
 function gpuBinding(e, name) {
   const id = viewId(e);
+  let alive = true,
+    queuedMount = false,
+    latest;
   e.exactSurfaceName = name;
   onEnd(() => {
+    alive = false;
+    latest = undefined;
+    const pending = globalThis.exact?.pendingSurfaces;
+    if (pending) {
+      const idx = pending.findIndex(p => p.id === id);
+      if (idx >= 0) pending.splice(idx, 1);
+    }
     try {
       globalThis.exact?.gpu?.destroy(id);
     } catch (err) {
       say(`gpu: ${err.message}`);
     }
   });
-  return v => {
+  const publish = v => {
+    if (!alive) return;
     const x = (globalThis.exact ??= {});
     // Published after the commit applied, as the runner publishes surface
     // inputs: the canvas is in the document by then.
     if (x.gpu)
       return queueMicrotask(() => {
         try {
-          e.isConnected && x.gpu.surface(id, name, v);
+          alive && Views.get(id) === e && e.isConnected && x.gpu.surface(id, name, v);
         } catch (err) {
           say(`gpu: ${err.message}`);
         }
@@ -82,6 +93,26 @@ function gpuBinding(e, name) {
         .then(() => x.gpu?.settled?.()), err => say(`gpu: ${err.message}`)).finally(() => inflight.n--);
     }
   };
+  return v => {
+    if (queuedMount) {
+      // A mount hook is still queued (either in a prepared scope or awaiting end-of-flush drain):
+      // update `latest` in place so the hook publishes the newest value once, in order.
+      latest = v;
+      return;
+    }
+    if (preparedScope()) {
+      latest = v;
+      queuedMount = true;
+      onMount(() => {
+        const next = latest;
+        latest = undefined;
+        queuedMount = false;
+        publish(next);
+      });
+      return;
+    }
+    publish(v);
+  };
 }
 export function gs(e, name, values) {
   const bind = gpuBinding(e, name);
@@ -119,7 +150,8 @@ export function gsc(e, name, values, colors) {
     const inputs = Object.values(args).map(value => value?.color ?? value);
     if (!eq(previous, inputs)) { previous = inputs; bind(args); }
   };
-  const schedule = () => { if (frame == null) frame = requestAnimationFrame(update); };
+  const readKey = {};
+  const schedule = () => onMount(() => { if (frame == null) frame = requestAnimationFrame(update); }, readKey);
   const transitioned = event => { if (event.target === e && event.pseudoElement === "::before") schedule(); };
   e.addEventListener("transitionend", transitioned);
   effect(() => { base = values(); schedule(); });
@@ -136,21 +168,25 @@ export function gsc(e, name, values, colors) {
 const CanvasMounts = new Set();
 export const canvasCommitted = (surface, active = () => true, encoding = {}) => committedCanvas(surface, active, Finishes, () => loads.Canvas2d, CanvasMounts, encoding);
 export function c2(e, name, values, types, names) {
-  const c = { e, name, types, names, mounted: clock.now, args: null };
-  CanvasMounts.add(c);
-  onEnd(() => { CanvasMounts.delete(c); loads.Canvas2d?.then(m => m?.gone(c)); });
+  const c = { e, name, types, names, mounted: clock.now, args: null }, argsKey = {};
+  onMount(() => {
+    CanvasMounts.add(c);
+    onEnd(() => { CanvasMounts.delete(c); loads.Canvas2d?.then(m => m?.gone(c)); });
+  });
   effect(() => {
     c.args = values();
     if (typeof requestAnimationFrame !== 'function' || globalThis.__exactRender) return;
-    if (!loads.Canvas2d) {
-      inflight.n++;
-      loadOnce(loads, "Canvas2d", () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
-        .then(() => import('./canvas2d.js'))
-        .then(m => m.engine({ data, clock, inflight, journal, advance, After, views: Views, viewId, wall: Link.wall })), err => say(`canvas2d: ${err.message}`)).finally(() => inflight.n--);
-    }
-    // After the commit applied, as the runner publishes surface inputs, and before the canvas module's restyle
-    // (`After`).
-    loads.Canvas2d.then(m => m?.args(c));
+    onMount(() => {
+      if (!loads.Canvas2d) {
+        inflight.n++;
+        loadOnce(loads, "Canvas2d", () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+          .then(() => import('./canvas2d.js'))
+          .then(m => m.engine({ data, clock, inflight, journal, advance, After, views: Views, viewId, wall: Link.wall })), err => say(`canvas2d: ${err.message}`)).finally(() => inflight.n--);
+      }
+      // After the commit applied, as the runner publishes surface inputs, and before the canvas module's restyle
+      // (`After`).
+      loads.Canvas2d.then(m => m?.args(c));
+    }, argsKey);
   });
 }
 /** A canvas's computed `bitmap-width`, `bitmap-height`, `color-space` or `color-type` (LLP 1056 D6; LLP 1100 D12a), as
@@ -196,27 +232,29 @@ export function nm(e) {
         return { name: this.name, state: this.state, ...(this.error ? { error: this.error } : {}) };
       },
     });
-  onEnd(() => {
-    st.destroyed = true;
-    loads.Native?.then(
-      h => h.destroy(e),
-      () => {},
-    );
+  onMount(() => {
+    onEnd(() => {
+      st.destroyed = true;
+      loads.Native?.then(
+        h => h.destroy(e),
+        () => {},
+      );
+    });
+    // In flight until the module is attached and its first events are in (`clock settle` waits for them).
+    inflight.n++;
+    (loadOnce(loads, "Native", () => painted()
+      .then(() => import('./native.js'))
+      .then(m => m.viewHost(say, () => data.appId))))
+      .then(
+        h => h.attach(e),
+        err => {
+          st.state = 'unavailable';
+          st.error = String(err?.message ?? err);
+          say(`native ${st.name} #${id}: unavailable: ${st.error}`);
+        },
+      )
+      .finally(() => setTimeout(() => inflight.n--));
   });
-  // In flight until the module is attached and its first events are in (`clock settle` waits for them).
-  inflight.n++;
-  (loadOnce(loads, "Native", () => painted()
-    .then(() => import('./native.js'))
-    .then(m => m.viewHost(say, () => data.appId))))
-    .then(
-      h => h.attach(e),
-      err => {
-        st.state = 'unavailable';
-        st.error = String(err?.message ?? err);
-        say(`native ${st.name} #${id}: unavailable: ${st.error}`);
-      },
-    )
-    .finally(() => setTimeout(() => inflight.n--));
 }
 // ---------------------------------------------------------------- presence (LLP 1063)
 // `-exact-exit-animation` and `-exact-layout-transition`: the web host's own presence-glue.js, fetched after the first
@@ -256,7 +294,7 @@ const Created = [];
 /** Load the presence piece after first paint, for `e` (a view that declares a row it reads), or for none: a plan with
  * a route's own entrance or exit asks at boot (LLP 1013.001). */
 export function pr(e) {
-  if (e) Created.push(e);
+  if (e) return onMount(() => { Created.push(e); pr(); });
   if (Presence || typeof requestAnimationFrame !== 'function' || globalThis.__exactRender) return;
   inflight.n++;
   Presence = new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
@@ -447,7 +485,7 @@ export const x_rangeFrame = (id, start, end) => {
     bits = Geo ? Geo.range(liveById(id), start, end, out) : 0;
   return bits & 1 ? [...out, !!(bits & 2), false] : [0, 0, 0, 0, false, true];
 };
-export const decorate = e => startDecoration(e, { own: Owner, onEnd, inflight, say });
+export const decorate = e => startDecoration(e, { own: Owner, onEnd, onMount, inflight, say });
 /** `elementFromPoint(x,y)` (LLP 1094 D10): nearest front-most untransformed id at a viewport point; none before
  * loading. `elementsFromPoint` returns every one. */
 export const x_elementFromPoint = (x, y) => {
@@ -463,99 +501,101 @@ export const x_elementsFromPoint = (x, y) => Geo?.namedPoints(x, y) ?? [];
 export function mde(e) {
   if (typeof requestAnimationFrame !== 'function' || globalThis.__exactRender) return;
   const own = Owner;
-  let cur = e, obs = null, dead = false;
-  onEnd(() => {
-    dead = true;
-    e._exactEditor = null;
-    obs?.disconnect();
-    obs = null;
-    cur?.exactMarkup?.destroy();
-  });
-  inflight.n++;
-  if (!loads.Editor) {
-    loadOnce(loads, "Editor", () => import('./markup-editor.js').then(() => globalThis.exact.installMarkupEditor));
-    Hosts.format = (id, name, arg) => (loads.Editor ?? Promise.reject(new Error('markup editor: unavailable'))).then(() => liveById(id)?.exactMarkup?.format(name, arg ?? ''));
-  }
-  loads.Editor.then(install => {
-    if (dead || own?.gone || !e.isConnected) return;
-    const id = viewId(e);
-    install(e, {
-      live: n => !dead && n.isConnected,
-      replace(n) {
-        replaceRowNode(cur, n);
-        replaced(cur, n);
-        cur = n;
-        e._exactEditor = n;
-        Ids.set(n, id);
-        Views.set(id, n);
-        e.$markup = n.exactMarkup;
-        Object.defineProperties(e, {
-          value: {
-            configurable: true,
-            get: () => n.value,
-            set: v => {
-              n.value = v;
-            },
-          },
-          ...Object.fromEntries(
-            ['selectionStart', 'selectionEnd', 'selectionDirection'].map(k => [
-              k,
-              { configurable: true, get: () => n[k] },
-            ]),
-          ),
-        });
-        for (const t of [
-          'input',
-          'beforeinput',
-          'selectionchange',
-          'change',
-          'focus',
-          'blur',
-          'keydown',
-          'pointerenter',
-          'pointerleave',
-          'click',
-          'atompress',
-        ])
-          n.addEventListener(
-            t,
-            ev => {
-              const forwarded = new ev.constructor(t, ev);
-              forwarded.$stopped = ev.$stopped;
-              if (ev.defaultPrevented) forwarded.preventDefault();
-              if (!e.dispatchEvent(forwarded)) ev.preventDefault();
-              if (forwarded.$stopped) ev.$stopped = true;
-            },
-            // before the editor applies its own key default
-            t === 'keydown',
-          );
-        // Forward clipboard events with the original trusted ClipboardEvent so
-        // live clipboardData items/files survive and stopPropagation/preventDefault
-        // act on the real event (LLP 1156.008.000 D5.1).
-        for (const t of ['paste', 'copy', 'cut'])
-          n.addEventListener(t, ev => {
-            const handlers = e._exactClipboard?.[t];
-            if (!handlers?.length) return;
-            for (const h of handlers) h(ev);
-          });
-        obs?.disconnect();
-        obs = new MutationObserver(ms => {
-          for (const m of ms) {
-            const v = e.getAttribute(m.attributeName);
-            v == null ? n.removeAttribute(m.attributeName) : n.setAttribute(m.attributeName, v);
-          }
-          n.exactMarkup?.sync();
-        });
-        obs.observe(e, { attributes: true });
-      },
-      select: (n, p) => {
-        const [formats, mixed, unavailable, atom, ...link] = p.split('\n');
-        e.$select?.([formats, mixed === '1', link.join('\n'), unavailable, atom ?? '']);
-      },
+  onMount(() => {
+    let cur = e, obs = null, dead = false;
+    onEnd(() => {
+      dead = true;
+      e._exactEditor = null;
+      obs?.disconnect();
+      obs = null;
+      cur?.exactMarkup?.destroy();
     });
-  })
-    .catch(err => say(`markup editor: ${err.message}`))
-    .finally(() => inflight.n--);
+    inflight.n++;
+    if (!loads.Editor) {
+      loadOnce(loads, "Editor", () => import('./markup-editor.js').then(() => globalThis.exact.installMarkupEditor));
+      Hosts.format = (id, name, arg) => (loads.Editor ?? Promise.reject(new Error('markup editor: unavailable'))).then(() => liveById(id)?.exactMarkup?.format(name, arg ?? ''));
+    }
+    loads.Editor.then(install => {
+      if (dead || own?.gone || !e.isConnected) return;
+      const id = viewId(e);
+      install(e, {
+        live: n => !dead && n.isConnected,
+        replace(n) {
+          replaceRowNode(cur, n);
+          replaced(cur, n);
+          cur = n;
+          e._exactEditor = n;
+          Ids.set(n, id);
+          Views.set(id, n);
+          e.$markup = n.exactMarkup;
+          Object.defineProperties(e, {
+            value: {
+              configurable: true,
+              get: () => n.value,
+              set: v => {
+                n.value = v;
+              },
+            },
+            ...Object.fromEntries(
+              ['selectionStart', 'selectionEnd', 'selectionDirection'].map(k => [
+                k,
+                { configurable: true, get: () => n[k] },
+              ]),
+            ),
+          });
+          for (const t of [
+            'input',
+            'beforeinput',
+            'selectionchange',
+            'change',
+            'focus',
+            'blur',
+            'keydown',
+            'pointerenter',
+            'pointerleave',
+            'click',
+            'atompress',
+          ])
+            n.addEventListener(
+              t,
+              ev => {
+                const forwarded = new ev.constructor(t, ev);
+                forwarded.$stopped = ev.$stopped;
+                if (ev.defaultPrevented) forwarded.preventDefault();
+                if (!e.dispatchEvent(forwarded)) ev.preventDefault();
+                if (forwarded.$stopped) ev.$stopped = true;
+              },
+              // before the editor applies its own key default
+              t === 'keydown',
+            );
+          // Forward clipboard events with the original trusted ClipboardEvent so
+          // live clipboardData items/files survive and stopPropagation/preventDefault
+          // act on the real event (LLP 1156.008.000 D5.1).
+          for (const t of ['paste', 'copy', 'cut'])
+            n.addEventListener(t, ev => {
+              const handlers = e._exactClipboard?.[t];
+              if (!handlers?.length) return;
+              for (const h of handlers) h(ev);
+            });
+          obs?.disconnect();
+          obs = new MutationObserver(ms => {
+            for (const m of ms) {
+              const v = e.getAttribute(m.attributeName);
+              v == null ? n.removeAttribute(m.attributeName) : n.setAttribute(m.attributeName, v);
+            }
+            n.exactMarkup?.sync();
+          });
+          obs.observe(e, { attributes: true });
+        },
+        select: (n, p) => {
+          const [formats, mixed, unavailable, atom, ...link] = p.split('\n');
+          e.$select?.([formats, mixed === '1', link.join('\n'), unavailable, atom ?? '']);
+        },
+      });
+    })
+      .catch(err => say(`markup editor: ${err.message}`))
+      .finally(() => inflight.n--);
+  });
 }
 /** Press feedback (LLP 1061): the web host's input piece shows it, from
  * the node's own `--exact-press` (css.rs). */

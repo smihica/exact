@@ -54,7 +54,7 @@ impl Recorder {
         self.shared.active = active;
         let mut words = vec![
             STATE,
-            3 + state.frames.len() as u32 * 6 + state.alive.len() as u32 * 2,
+            3 + state.frames.len() as u32 * 11 + state.alive.len() as u32 * 2,
             u32::from(state.reduced),
             state.frames.len() as u32,
         ];
@@ -64,6 +64,9 @@ impl Recorder {
                 words.extend([key as u32, (key >> 32) as u32]);
             }
             words.extend([f.progress.to_bits(), f.ancestor_opacity.to_bits()]);
+            let [sx, sy, x, y] = f.unpose;
+            words.extend([sx, sy, x * self.scale, y * self.scale].map(f32::to_bits));
+            words.push(u32::from(f.dissolve));
         }
         words.push(state.alive.len() as u32);
         for key in &state.alive {
@@ -147,6 +150,21 @@ impl Recorder {
         });
         self.direct.isolation += 1;
         true
+    }
+
+    /// The open definition's content box becomes its lines' (header words 24 to 27).
+    pub(super) fn shared_content(&mut self, content: Rect4, transform: Transform) {
+        let r = crate::paint::bbox(transform, content);
+        let (origin, scale) = (self.origin, self.scale);
+        if let Some(open) = self.shared.open.last_mut() {
+            let words = [
+                (r.0 - origin.0) * scale,
+                (r.1 - origin.1) * scale,
+                r.2 * scale,
+                r.3 * scale,
+            ];
+            open.header[24..28].copy_from_slice(&words.map(f32::to_bits));
+        }
     }
 
     pub(super) fn shared_close(&mut self) {
@@ -290,6 +308,71 @@ mod tests {
         );
         r.row_free(2);
         assert!(!r.shared.rows.contains_key(&2));
+    }
+
+    #[test]
+    fn a_named_box_takes_the_band_its_background_reaches_into() {
+        // The page starts under the 24 point status bar, which a red box fills
+        // and a box with no background leaves alone.
+        for (background, want) in [
+            (" background-color=\"#ff0000\"", (-24.0, 124.0)),
+            ("", (0.0, 100.0)),
+        ] {
+            let app = format!(
+                "component App\n  view\n    main width=\"100%\" height=\"100%\"\n      box sharedElement=\"hero\" height=100{background}\n"
+            );
+            let (mut p, error) = Presenter::boot_with(
+                &crate::test_plan(&app),
+                (),
+                (400., 800.),
+                1.,
+                std::path::PathBuf::new(),
+                PainterChoice::Canvas,
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            let window = crate::presenter::Window {
+                size: (400., 800.),
+                bars: [24., 0., 16., 0.],
+                cutout: [0.; 4],
+                keyboard: [0.; 4],
+                gestures: [0.; 4],
+            };
+            assert!(p.set_window(window).is_none());
+            p.frame();
+            let ops = take();
+            let def = sets(&ops)[0];
+            let [y, h] = [8, 10].map(|i| f32::from_bits(def[i]));
+            assert_eq!((y, h), want, "{background}");
+        }
+    }
+
+    #[test]
+    fn a_labels_content_is_its_lines_where_they_align() {
+        for (align, share) in [("start", 0.0), ("center", 0.5), ("end", 1.0)] {
+            let app = format!("component App\n  view\n    text \"Hi\" sharedElement=\"name\" width=300 padding=20 text-align=\"{align}\"\n");
+            let (mut p, error) = Presenter::boot_with(
+                &crate::test_plan(&app),
+                (),
+                (400., 800.),
+                1.,
+                std::path::PathBuf::new(),
+                PainterChoice::Canvas,
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            p.frame();
+            let ops = take();
+            let def = sets(&ops)[0];
+            let [x, _, w, h] = [24, 25, 26, 27].map(|i| f32::from_bits(def[i]));
+            // A short word in a 300 wide content box at 20: its lines, where it aligns them.
+            assert_eq!(def[17], 6, "a label");
+            assert!(w > 0.0 && w < 60.0 && h > 0.0, "{align}: {w} {h}");
+            assert!(
+                (x - (20.0 + share * (300.0 - w))).abs() < 0.5,
+                "{align}: {x} {w}"
+            );
+        }
     }
 
     #[test]
@@ -738,7 +821,7 @@ component App
             p.frame();
             let ops = take();
             if ops[0] == STATE {
-                let names = 5 + ops[3] as usize * 6;
+                let names = 5 + ops[3] as usize * 11;
                 state = (
                     ops[3],
                     ops[names..names + ops[names - 1] as usize * 2]
@@ -1132,7 +1215,7 @@ component App
             "capture source before any frees or node mutations"
         );
         assert_eq!(after[3], 2, "parent and child have their own flights");
-        assert_eq!(after[16], 2, "only the arriving names remain alive");
+        assert_eq!(after[26], 2, "only the arriving names remain alive");
         let mut arrived = Vec::new();
         definitions(&after, &mut arrived);
         assert_eq!(arrived.len(), 2);

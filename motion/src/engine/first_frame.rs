@@ -330,6 +330,9 @@ impl Engine {
                     };
                     play.pending = None;
                     play.clock_wait = false;
+                    if !play.exit && play.hold.is_none() {
+                        play.clocked = true;
+                    }
                     any = true;
                 }
             }

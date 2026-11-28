@@ -116,9 +116,19 @@ impl Em<'_> {
         if !self.paint || kind.is_svg_element() || kind.is_metadata() {
             return;
         }
-        if let Some((name, value)) = crate::paint::binding(self.plan, kind, b, |parser| {
-            parser.emit(self.plan, &mut self.uses)
-        }) {
+        let needs_props = b.kind == BindingKind::Style
+            && b.id == StyleId::PressScale as u16
+            && self.plan.theme.iter().any(|r| r.kind == 2);
+        let props: Option<&[(String, String)]> = if needs_props {
+            Some(self.answers.properties())
+        } else {
+            Some(&[])
+        };
+        if let Some((name, value)) =
+            crate::paint::binding_with_props(self.plan, kind, b, props, |parser| {
+                parser.emit(self.plan, &mut self.uses)
+            })
+        {
             let f = if b.kind == BindingKind::Style && b.id == StyleId::BackdropFilter as u16 {
                 format!("()=>{}(({f})(),false)", self.uses.rt("backdropValue"))
             } else {
@@ -133,15 +143,26 @@ impl Em<'_> {
     }
 
     /// A development build's binding `k` of node `i`, counted (LLP 1079 D1,
-    /// perf.js): declared once, as `p{i}_{k}`, which every write it feeds
-    /// reads, so a mapped write does not make a counter per evaluation.
-    pub(super) fn counted(&mut self, i: u32, k: usize, f: String) -> String {
+    /// perf.js): declared once, which every write it feeds reads, so a mapped
+    /// write does not make a counter per evaluation.
+    pub(super) fn counted(
+        &mut self,
+        i: u32,
+        e: &str,
+        k: usize,
+        scope: &crate::code::Scope,
+        f: String,
+    ) -> String {
         if !self.site_attrs {
             return f;
         }
         let pf = self.uses.rt("pf");
-        let _ = write!(self.out, "const p{i}_{k}={pf}({i},{f});");
-        format!("p{i}_{k}")
+        let site = self.site_number(scope, i);
+        let name = e
+            .strip_prefix('e')
+            .map_or_else(|| format!("p{e}_{k}"), |n| format!("p{n}_{k}"));
+        let _ = write!(self.out, "const {name}={pf}({site},{f});");
+        name
     }
 
     pub(super) fn style_row(
@@ -165,11 +186,18 @@ impl Em<'_> {
         let press = parts.css.contains("--exact-press:")
             || binding(StyleId::PressScale)
                 .is_some_and(|b| style::literal(plan, plan.code(b.expr)).is_none());
-        // A clock (LLP 1055.002) plays on the page's timeline: only a drag
-        // timeline's consumer is paused for the drag to seek.
+        let has_press = exact_web::css::PRESS_ROWS
+            .iter()
+            .any(|(id, _)| binding(*id).is_some());
+        // A clock (LLP 1055.002) plays on the page's timeline: only a non-clock
+        // timeline needs `after_shorthand` and (with drag timelines) pausing.
+        // Dynamic expressions (e.g. a state variable) have no literal value and
+        // may evaluate to any timeline at runtime, so treat them as timelines.
         let clock = |s: &str| s.trim_start().starts_with("-exact-clock(");
-        let timeline = binding(StyleId::AnimationTimeline)
-            .is_some_and(|t| style::can_be(plan, plan.code(t.expr), &|s| !clock(s)));
+        let timeline = binding(StyleId::AnimationTimeline).is_some_and(|t| {
+            style::literal(plan, plan.code(t.expr))
+                .map_or(true, |v| v.as_str().is_some_and(|s| !clock(s)))
+        });
         let id = StyleId::from_bit(b.id as u32).ok_or("unknown style row")?;
         let kind = NodeType::from_wire(row.node_type).ok_or("unknown node type")?;
         let leading = (id == StyleId::LineHeight).then(|| {
@@ -418,11 +446,20 @@ impl Em<'_> {
                     StyleId::PressBackgroundColor => "--exact-press-background-color",
                     _ => "--exact-press-color",
                 };
-                let none = "v==null||/^\\s*unset\\s*$/i.test(v)?null:";
-                one(name, Some(match &cm {
-                    Some(cm) => format!("v=>{none}{cm}(v)"),
-                    None => format!("v=>{none}v"),
-                }))
+                let numeric = matches!(id, StyleId::PressOpacity | StyleId::PressOpacityTo);
+                let check = format!(
+                    "v=>{{if(v==null)return null;const r={};if(r==null)return null;const t=String(r).trim();if(!t||/^(?:unset|initial|inherit|revert|revert-layer)$/i.test(t))return null;{}return r}}",
+                    match &cm {
+                        Some(cm) => format!("{cm}(v)"),
+                        None => "v".to_string(),
+                    },
+                    if numeric {
+                        "if(!Number.isFinite(Number(t))&&!/^(?:[+-]?(?:\\d+\\.?\\d*|\\.\\d+)%|(?:var|calc)\\()/i.test(t))return null;"
+                    } else {
+                        ""
+                    }
+                );
+                one(name, Some(check))
             }
             // @ref LLP 1116.001 D1.4, LLP 1077 D12 — what navigation.js `fitText` and
             // `playSymbolEffects` read, inline.
@@ -441,12 +478,13 @@ impl Em<'_> {
                 }
                 let press = self.uses.rt("pressFeedback");
                 let _ = write!(self.out, "{press}();");
+                let invalid = "v==null||!String(v).trim()||/^\\s*(?:unset|initial|inherit|revert|revert-layer)\\s*$/i.test(String(v))||(Number.isFinite(Number(v))?Number(v)===1:!/^\\s*(?:var|calc)\\(/i.test(String(v)))";
                 vec![
-                    ("--exact-press".into(), String::new(), Some("v=>v==null||v===1||/^\\s*unset\\s*$/i.test(v)?null:v".into())),
+                    ("--exact-press".into(), String::new(), Some(format!("v=>{invalid}?null:v"))),
                     (
                         "scale".into(),
                         String::new(),
-                        Some("v=>v==null||v===1||/^\\s*unset\\s*$/i.test(v)?null:\"calc(var(--exact-scale,1) * var(--exact-press-factor,1)) calc(var(--exact-scale-y,1) * var(--exact-press-factor,1))\"".into()),
+                        Some(format!("v=>{invalid}?null:\"calc(var(--exact-scale,1) * var(--exact-press-factor,1)) calc(var(--exact-scale-y,1) * var(--exact-press-factor,1))\"")),
                     ),
                 ]
             }
@@ -508,7 +546,7 @@ impl Em<'_> {
                     String::new(),
                     Some(format!("v=>v==null||/^\\s*none\\s*$/i.test(v)?null:v.split(/,(?![^(]*\\))/).map(p=>p.replace(/[\\w-]+/g,n=>{names}.includes(n)?n+\"-exact-press\":n)).join(\",\")")),
                 )];
-                if timeline {
+                if timeline && self.drag_timelines {
                     w.push(("animation-play-state".into(), String::new(), Some("v=>v==null||/^\\s*none\\s*$/i.test(v)?null:\"paused\"".into())));
                 }
                 w
@@ -517,7 +555,7 @@ impl Em<'_> {
                 let spring = self.uses.constant("$transitionSpring", style::transition_spring);
                 let entries = self.uses.constant("$transitionEntries", || style::transition_entries(&spring));
                 let mut writes = one("transition", Some(self.uses.share('m', style::transition_map(&entries, press, shift))));
-                if exact_web::css::PRESS_ROWS.iter().any(|(id, _)| binding(*id).is_some()) {
+                if has_press {
                     let parser = crate::paint::Parser::Transition.emit(plan, &mut self.uses);
                     let map = crate::paint::press_timing_map(&parser, &spring, b.written);
                     writes.extend(one("--exact-press-timing", Some(self.uses.share('m', map))));
@@ -588,12 +626,21 @@ impl Em<'_> {
         // range, so read them live again after it.
         if id == StyleId::Animation && timeline {
             let getter = self.bound(i, e, &binding(StyleId::AnimationTimeline).unwrap(), scope)?;
-            for (name, _, map) in &mut writes {
-                if name == "animation-play-state" {
-                    let inner = map.take().unwrap();
-                    *map = Some(format!(
-                        "v=>({inner})(v)==null?null:({play_state})(({getter})())"
-                    ));
+            writes.push((
+                "--exact-animation-play-state".into(),
+                String::new(),
+                Some(style::AUTHORED_PLAY_STATE.into()),
+            ));
+            if !self.drag_timelines {
+                writes.retain(|(name, _, _)| name != "animation-play-state");
+            } else {
+                for (name, _, map) in &mut writes {
+                    if name == "animation-play-state" {
+                        let inner = map.take().unwrap();
+                        *map = Some(format!(
+                            "v=>({inner})(v)==null?null:({play_state})(({getter})())"
+                        ));
+                    }
                 }
             }
             let range = (binding(StyleId::AnimationRange))
@@ -673,7 +720,7 @@ impl Em<'_> {
             format!("()=>{{const v=({f})();return typeof v===\"string\"&&!v.trim()?\"unset\":v}}")
         });
         let f = clear.as_deref().unwrap_or(f);
-        let clear_css = style::clear_css(id, press);
+        let clear_css = style::clear_css(id, press, has_press);
         for (name, unit, map) in writes {
             let modes = self.answers.modes;
             let channel = crate::modes::CHANNELS
@@ -883,6 +930,7 @@ pub(super) fn presence_decls(css: &mut String) -> String {
             .chain(&[
                 "--exact-drag-timeline:",
                 "--exact-animation-timeline:",
+                "--exact-animation-play-state:",
                 // A synced animation's clock (LLP 1055.002), read the same way.
                 "--exact-animation-clock:",
                 "--exact-animation-range:",

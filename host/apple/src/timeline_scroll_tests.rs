@@ -87,3 +87,55 @@ fn a_consumer_mounted_after_its_scroller_scrolled_starts_where_it_stands() {
         (1.0, 1.0)
     );
 }
+
+const PAUSED_APP: &str = r##"keyframes fade
+  from opacity=0
+  to opacity=1
+component App
+  state shown = false
+  action show
+    shown = true
+  view
+    column width=390
+      button press=show testId="show" height=44 flex-shrink=0
+        text "Show"
+      column testId="list" overflow-y="auto" height=100 flex-shrink=0
+        view height=400 flex-shrink=0
+        if shown
+          view testId="inner" height=4 flex-shrink=0 opacity=0.25 animation="fade 1s linear both paused" animation-timeline="scroll()"
+      view height=1700 flex-shrink=0
+      if shown
+        view testId="paged" height=4 flex-shrink=0 opacity=0.25 animation="fade 1s linear both paused" animation-timeline="scroll(root)"
+"##;
+
+#[test]
+fn a_paused_consumer_mounted_after_its_scroller_scrolled_locks_at_that_offset() {
+    let plan = contract::compile(PAUSED_APP).unwrap().encode();
+    let (mut host, _) = Host::boot(
+        &plan,
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        390.0,
+        844.0,
+    )
+    .unwrap();
+    let list = id(&host, "list");
+    host.runner_mut().scrolled(Some(list), 0.0, 150.0);
+    host.runner_mut().scrolled(None, 0.0, 500.0);
+    let _ = host.dispatch_at(id(&host, "show"), Event::Press, 100.0);
+    assert!(
+        (opacity(&host, "inner") - 150.0 / 304.0).abs() < 1e-9,
+        "{}",
+        opacity(&host, "inner")
+    );
+    assert!(
+        (opacity(&host, "paged") - 500.0 / 1004.0).abs() < 1e-9,
+        "{}",
+        opacity(&host, "paged")
+    );
+    // Further scrolling must leave both paused consumers locked at their mount offsets.
+    let _ = host.timeline_scrolled(Some(list), 0.0, 304.0);
+    let _ = host.timeline_scrolled(None, 0.0, 1004.0);
+    assert!((opacity(&host, "inner") - 150.0 / 304.0).abs() < 1e-9);
+    assert!((opacity(&host, "paged") - 500.0 / 1004.0).abs() < 1e-9);
+}

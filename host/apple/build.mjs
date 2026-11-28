@@ -56,6 +56,7 @@ import { keptCrates } from './crates.mjs';
 import { appleCargo } from '../../scripts/cargo-check.mjs';
 import { linkedPlanArgs, placeLinkedPlan } from '../../scripts/linked-plan.mjs';
 import { fitReservedPlan, repackBase, repackReceipt, reservedPlan } from './native-extras.mjs';
+import { fitEntitlements, reserveEntitlements } from './sections.mjs';
 import { shippedReceipt } from './buildinfo.mjs';
 import { appleDeadStrip, recordMinimumOS, stripForDistribution, stripProductionExecutable, appleComposition, appleProduction, appleLaunchFrameworks, appleLaunchLinkArgs, assertCapabilityFrameworks, assertLinkedSdk, compiledTargets, deploymentTargets, iosSimulatorTarget, linksByPlan } from './link.mjs';
 export { appIcon, appleEmbedOnly, iosAssets, shippedReceipt, documentTypes, exportedTypes, importedTypes, stripForDistribution, stripProductionExecutable };
@@ -141,14 +142,14 @@ export const macTriple = `${process.arch === 'arm64' ? 'arm64' : 'x86_64'}-apple
 export const moduleTripleFor = (app, ios, device = false, tv = false, targets = deploymentTargets(app)) =>
   ios ? iosTripleFor(app, device, tv, targets.ios) : `${macTriple}${targets.macos}`;
 /** App-owned Apple paths, shared by builder and launchers. @ref LLP 1036.000 §2 */
-export function appleArtifacts(app, { destination = 'macos', composition, trust = process.env.EXACT_UPDATE_TRUST ?? 'development', host = false, optimize } = {}) {
+export function appleArtifacts(app, { destination = 'macos', composition, trust = process.env.EXACT_UPDATE_TRUST ?? 'development', host = false, optimize, unsigned = false } = {}) {
   if (!['macos', 'ios-simulator', 'ios', 'tvos-simulator', 'tvos'].includes(destination)) throw new Error(`unknown Apple destination ${destination}`);
   const platform = destination === 'macos' ? 'macos' : 'ios';
   composition ??= app.manifest.deploy?.store?.[platform] === '0' || (platform === 'macos' && process.env.EXACT_APPSTORE === '1') ? 'embedded' : 'updating';
   if (!['embedded', 'updating'].includes(composition) || !['development', 'production'].includes(trust)) throw new Error('invalid Apple composition or trust policy');
   const target = destination === 'macos' ? bakeTarget('macos') : destination === 'ios' ? 'aarch64-apple-ios' : destination === 'tvos-simulator' ? tvosTarget : destination === 'tvos' ? tvosDeviceTarget : iosTarget;
   const owner = resolve(process.env.EXACT_APPLE_OUTPUT ?? resolve(app.target, 'clients'), appSourceKey(app), app.id);
-  const namespace = resolve(owner, destination, target, composition, trust);
+  const namespace = resolve(owner, destination, target, composition, trust, ...(unsigned ? ['unsigned'] : []));
   // `product` is the Swift package's; `executable`, what it is linked to, is the app's name, as Xcode's (a sample host keeps its own).
   const product = destination === 'macos' ? (host ? 'ExactHostMac' : 'ExactMac') : (host ? 'ExactHostIOS' : 'ExactIOS');
   const executable = host ? product : appleExecutableName(app, destination !== 'macos');
@@ -168,7 +169,7 @@ export function appleArtifacts(app, { destination = 'macos', composition, trust 
     get swift() { return swift(); }, get swiftLock() { return `${swift()}.lock`; },
     lock: resolve(owner, '.apple-build.lock'), capture: resolve(namespace, 'capture'),
     binary: resolve(products, executable), bundle: destination === 'macos'
-      ? resolve(owner, 'macos', `${host ? appleExecutableName(app) + ' Host' : executable}.app`)
+      ? (unsigned ? resolve(namespace, `${executable}.app`) : resolve(owner, 'macos', `${host ? appleExecutableName(app) + ' Host' : executable}.app`))
       : resolve(products, `${executable}.app`),
     embed: resolve(namespace, 'embed') };
 }
@@ -536,10 +537,10 @@ export function copyAppleGpuProducts(capture, destination, artifacts, archive = 
   }
 }
 
-export function prepareGpuProduct(product, { gpuArtifacts, sha1, app, privacyManifest, frameworkBundles, frameworkPlatform, ios, distribution, preparedGpu }) {
+export function prepareGpuProduct(product, { gpuArtifacts, sha1, app, privacyManifest, frameworkBundles, frameworkPlatform, ios, distribution, unsigned = false, preparedGpu }) {
   const artifact = gpuArtifacts.find(m => m.built === basename(product));
   if (!artifact) throw new Error(`unknown GPU product: ${product}`);
-  const signed = signedGpuProduct(product, { identity: sha1, app, privacyManifest, framework: frameworkBundles ? artifact.framework : null, platform: frameworkPlatform, hardened: !ios && distribution, macDevelopmentSign: !ios && !distribution });
+  const signed = signedGpuProduct(product, { identity: sha1, app, privacyManifest, framework: frameworkBundles ? artifact.framework : null, platform: frameworkPlatform, hardened: !ios && distribution && !unsigned, macDevelopmentSign: !ios && !distribution });
   preparedGpu.set(artifact.built, signed);
   return signed;
 }
@@ -580,6 +581,7 @@ async function main(args, lockHeld = false) {
   const notification = packaged.has('notifications') || !ios || tv || args.includes('--watchos') ? notificationService(app) : null;
   if (ios && !notification) packaged.delete('notifications');
   const notificationRefusal = notificationServicePlatformRefusal(notification, args.includes('--watchos') ? 'watchOS' : tv ? 'tvOS' : ios ? 'ios' : 'macOS'); if (notificationRefusal) { console.error(notificationRefusal.replace(notification.directory, relative(app.dir, notification.directory))); process.exitCode = 1; return; }
+  if (!ios && unsigned && app.manifest.host?.macos?.presenter === 'painted') throw new Error('Mac --unsigned requires the native presenter');
   if (!ios && !args.includes('--watchos') && (args.includes('--painted-benchmark') || app.manifest.host?.macos?.presenter === 'painted')) {
     return (await import('../apple-painted/build.mjs')).buildPainted(app, args, { macInfoPlist });
   }
@@ -653,7 +655,7 @@ async function main(args, lockHeld = false) {
   })() : ios ? '-' : appstore ? (args.includes('--ad-hoc') ? '-' : process.env.EXACT_APPSTORE_ID ?? null) : (distribution ? process.env.EXACT_DEVELOPER_ID ?? null : macIdentity());
   const embedOnly = appleEmbedOnly(args);
   if (!ios && sha1 === '-') widgets = false;
-  if (!ios && !embedOnly) macSigning(app, null, { current: sha1, release: process.env.EXACT_UPDATE_TRUST === 'production' || distribution, distribution, store: appstore ? 'appstore' : null, preflight: true, log: () => {} });
+  if (!ios && !embedOnly) macSigning(app, null, { unsigned, current: sha1, release: process.env.EXACT_UPDATE_TRUST === 'production' || distribution, distribution, store: appstore ? 'appstore' : null, preflight: true, log: () => {} });
   let macWidgets = null;
   const dylib = `lib${gpuCrate.replace(/-/g, '_')}.dylib`;
   // One load name lets the Swift presenter serve every app.
@@ -709,13 +711,13 @@ async function main(args, lockHeld = false) {
   // sharing a target. Claim those names through bake-and-capture only.
   let bakedPlan, paths, swiftNames;
   const development = cargoEnv.EXACT_UPDATE_TRUST === 'development' && args.includes('--url') ? developmentAdmission(app, launchEnv.EXACT_DEV_PLAN) : null;
-  cargoEnv.EXACT_BAKE_OUTPUT = bakeOutput(app, cargoEnv);
+  cargoEnv.EXACT_BAKE_OUTPUT = !ios && unsigned ? resolve(bakeOutput(app, cargoEnv), 'unsigned') : bakeOutput(app, cargoEnv);
   const hermes = ios && existsSync(resolve(app.dir, 'app.ts')) && cargoEnv.EXACT_JS_ENGINE !== 'stub' && hermesBundle(target, cargoEnv);
   if (hermes && !hermes.installed) throw new Error((await import('../../scripts/exact.mjs')).hermesRefusal(hermes, cargoEnv));
   // What the bake is expected to decide (the manifest's store level). The
   // shared Swift scratch is the same whatever it decides; the composition and
   // capture directory name the Swift host's environment before the bake ends.
-  const expected = appleArtifacts(app, { destination, trust: cargoEnv.EXACT_UPDATE_TRUST, optimize: production ? optimize : 'speed' });
+  const expected = appleArtifacts(app, { destination, trust: cargoEnv.EXACT_UPDATE_TRUST, optimize: production ? optimize : 'speed', unsigned: !ios && unsigned });
   const swiftBuildRoot = widgets ? resolve(expected.swift, 'widgets') : expected.swift;
   // Native packages and modules compile the same with or without widgets (nothing of theirs imports ExactKit): their
   // module cache and kept modules are the destination's, shared by both scratches and by every app built for it.
@@ -798,8 +800,9 @@ async function main(args, lockHeld = false) {
   const swiftc = read('xcrun', ['--sdk', sdkName, 'swiftc', '--version']).stdout ?? '';
   // Where SwiftPM puts its products, once it has been asked (below).
   const binAnswer = resolve(swiftBuildRoot, `bin-path-${createHash('sha256').update(JSON.stringify([swiftc, swiftArgs])).digest('hex').slice(0, 16)}`);
-  // The simulator's entitlements go in the executable's text section (below); the arguments name the file.
-  const entitledArgs = (scratch, p) => ios && !device ? ['-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__entitlements', '-Xlinker', resolve(scratch, `${p}-entitlements.plist`)] : [];
+  // The simulator's entitlements go in its text section (below), padded for a repack base (sections.mjs reserveEntitlements).
+  const entitlementsFile = (scratch, p) => resolve(scratch, `${p}-entitlements.plist${reservesPlan() ? '.reserved' : ''}`);
+  const entitledArgs = (scratch, p) => ios && !device ? ['-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__entitlements', '-Xlinker', entitlementsFile(scratch, p)] : [];
   // A development build whose last link in this scratch was this app's starts the product's build here, where
   // it only started ExactKit's compile: when the bake leaves the archive as it was, that build is the link,
   // and the half second SwiftPM takes to find nothing to do is spent beside Cargo, not after it. It holds the
@@ -824,7 +827,7 @@ async function main(args, lockHeld = false) {
     let was = null;
     try { was = JSON.parse(readFileSync(resolve(bin, `${sole}.linked`), 'utf8')); } catch { return null; }
     if (JSON.stringify(was.launchFrameworks) !== JSON.stringify(appleLaunchFrameworks(destination, sole)) || was.intents || (was.library ?? null) !== (library?.sha256 ?? null) || was.libDir !== expected.capture || was.lib !== crate.replace(/-/g, '_') || typeof was.link !== 'string' || !existsSync(resolve(bin, sole)) || !existsSync(resolve(expected.capture, `lib${was.lib}.a`))) return null;
-    if (ios && !device && !existsSync(resolve(expected.scratch, `${sole}-entitlements.plist`))) return null;
+    if (ios && !device && !existsSync(entitlementsFile(expected.scratch, sole))) return null;
     if (was.plan && !existsSync(resolve(expected.scratch, 'plan/app.hbc'))) return null;
     let claim;
     try { claim = claimBuildOutput(app, expected.swiftLock); } catch { return null; }
@@ -880,12 +883,12 @@ async function main(args, lockHeld = false) {
   cargoEnv.EXACT_APPLE_LINK = linksByPlan(production, args) ? 'plan' : 'all'; // what the archive links (link.mjs)
   const hostModules = embedOnly || fixedPlan ? null : buildModules(['exact-svg-raster', ...(metal ? ['exact-canvas-vello'] : []), ...(ios ? [] : ['exact-listen'])], 'host-modules.log'); // the listener: macOS's (LLP 1133.005 §8)
   const buildReceipt = contractLast(() => buildBake(app, ios ? 'ios' : 'macos', target, { env: cargoEnv, profile: cargoProfile, link: !args.includes('--embed'), prepareGpu(product, privacyManifest) {
-    return prepareGpuProduct(product, { gpuArtifacts, sha1, app, privacyManifest, frameworkBundles, frameworkPlatform, ios, distribution, preparedGpu });
+    return prepareGpuProduct(product, { gpuArtifacts, sha1, app, privacyManifest, frameworkBundles, frameworkPlatform, ios, distribution, unsigned, preparedGpu });
   }, captureBake(dir, output, plan) {
     if (cargoEnv.EXACT_FORMA_SWIFT === '1') swiftNames = captureSwiftNames(dir, output, plan);
   }, capture(buildReceipt) {
     const composition = buildReceipt.compat.inputs?.store?.L === '0' ? 'embedded' : 'updating';
-    paths = appleArtifacts(app, { destination, composition, trust: cargoEnv.EXACT_UPDATE_TRUST, optimize: production ? optimize : 'speed' });
+    paths = appleArtifacts(app, { destination, composition, trust: cargoEnv.EXACT_UPDATE_TRUST, optimize: production ? optimize : 'speed', unsigned: !ios && unsigned });
     mkdirSync(paths.namespace, { recursive: true });
     const capture = mkdtempSync(resolve(paths.namespace, '.capture-'));
     cleanup.push(capture);
@@ -925,7 +928,7 @@ async function main(args, lockHeld = false) {
   if (packaged.has('notifications')) assertNotificationServiceGrants(notification, bakedCompat.inputs?.grantCeiling);
   // What only a macOS provisioning profile authorizes (LLP 1133.010 D7), resolved with the widgets' signing: one
   // profile, one team, the identity of that team.
-  const signing = ios ? null : macSigning(app, bakedCompat, { current: sha1, widgets: macWidgets, release: production || distribution, distribution, store: appstore ? 'appstore' : null, sandboxed: args.includes('--sandbox') });
+  const signing = ios ? null : macSigning(app, bakedCompat, { unsigned, current: sha1, widgets: macWidgets, release: production || distribution, distribution, store: appstore ? 'appstore' : null, sandboxed: args.includes('--sandbox') });
   const provisioning = signing?.provisioning ?? null;
   if (signing) { sha1 = signing.sha1; macWidgets = signing.widgets; widgets = !!macWidgets; }
   // What this Apple destination derives from the grants: the bake's, less what tvOS has not, and the host events its signed grants let packages take (LLP 1133.001.000 D2).
@@ -1140,7 +1143,7 @@ async function main(args, lockHeld = false) {
     ['--sdk', sdkFor, 'swiftc', '-module-cache-path', resolve(packagesRoot, 'modules-module-cache'), '-parse-as-library', '-emit-library', swiftOptimization(), '-swift-version', '5', '-module-name', 'ExactAppModules', ...moduleSources, ...(packages.length ? ['-I', packagesIn, '-L', packagesIn, ...packageObjects(packagesIn)] : []), ...packageImports(packagesIn), ...(app.manifest.host?.[forIos ? 'ios' : 'macos']?.swiftPackages?.length ? ['-D', 'SWIFT_PACKAGE', ...packageLink(packagesIn)] : []), ...frameworksFor(forIos, simulator, arch).args, ...(probe ? ['-Xlinker', '-rpath', '-Xlinker', '@loader_path/Frameworks'] : []), ...linkArgs(forIos), ...moduleLibraryLinkArgs({ wrapped: forIos && (production || embedOnly) && !probe }), '-o', out, ...targetArgs];
   const moduleLibraries = modulesBuilt ? frameworksFor(ios, ios && !device, ios ? iosArch : macArch).libraries : [];
   const macTarget = ['-target', moduleTripleFor(app, false)];
-  const { place: placePackages, stop: stopPkg, libraries: packageLibraries, resources: packageResources, frameworks: packageFrameworks, imports: packageImports, link: packageLink, products: packageProducts } = packageCompiler({ packages, packageDir, packageTargets,
+  const { place: placePackages, stop: stopPkg, libraries: packageLibraries, resources: packageResources, frameworks: packageFrameworks, imports: packageImports, link: packageLink, stamp: packageStamp, products: packageProducts } = packageCompiler({ packages, packageDir, packageTargets,
     packageCopies, seam, packagesRoot, swiftc, production, distribution, ios, tv, frameworkBundles,
     app, extensions: buildReceipt.graph.extensions, swiftInputs: buildReceipt.binary.inventories, minimum: { ios: app.manifest.host?.ios?.minimumOS, tvos: app.manifest.host?.ios?.minimumOS,
       macos: app.manifest.host?.macos?.minimumOS } });
@@ -1149,7 +1152,6 @@ async function main(args, lockHeld = false) {
   const ensurePackages = async () => { await packagesReady; if (!packageFrameworksAdded) { packageFrameworksAdded = true; moduleLibraries.push(...packageFrameworks); } };
   const packagesReady = placePackages(packageDir);
   packagesReady.catch(() => {}); background.push(packagesReady);
-  const packageStamp = dir => JSON.stringify([...packages.map(p => [p.module, createHash('sha256').update(readFileSync(resolve(dir, `${p.module}.dylib`))).digest('hex')]), ...packageProducts(dir).map(p => p.digest)]);
   const appModuleTarget = ios ? ['-target', moduleTripleFor(app, true, device, tv), '-sdk', sdk] : macTarget;
   const appModuleTask = modulesBuilt ? ensurePackages().then(() => arm(moduleArgs(sdkName, appModuleTarget, modulesBuilt, ios, ios && !device, ios ? iosArch : macArch), [...moduleSources, ...packageSources], modulesBuilt, frameworkStamp(ios, ios && !device, ios ? iosArch : macArch) + packageStamp(packageDir), true)()) : null;
   appModuleTask?.catch(() => {}); if (appModuleTask) background.push(appModuleTask);
@@ -1179,7 +1181,7 @@ async function main(args, lockHeld = false) {
     await appModuleTask;
     const intentArgs = moduleArgs(sdkName, appModuleTarget, modulesBuilt, ios, ios && !device, ios ? iosArch : macArch);
     const { keyArgs } = normalizeArmArgs(intentArgs, [...moduleSources, ...packageSources], armKeyOptions(modulesBuilt));
-    nativeIntents.push(nativeIntentModule({ moduleName: 'ExactAppModules', binary: modulesBuilt, sources: moduleSources, args: intentArgs, keyArgs, directory: resolve(linkRoot, 'native-intents'), swiftc, runApple }));
+    nativeIntents.push(nativeIntentModule({ moduleName: 'ExactAppModules', binary: modulesBuilt, sources: moduleSources, args: intentArgs, keyArgs, stamp: packageStamp(packageDir), directory: resolve(linkRoot, 'native-intents'), swiftc, runApple }));
     if (nativeIntents.some(Boolean)) intents = buildIntents({ ...intentOptions, nativeModules: nativeIntents });
   }
   // The early build stands when it succeeded and the bake came out as it was expected to.
@@ -1228,7 +1230,7 @@ async function main(args, lockHeld = false) {
         entitled = entitlements({...app, ...owner, widgetTV: tv, widgetHost: p === 'ExactHostIOS'}, null, true, appleReach, { simulator: true, distributed: distribution });
         const ent = resolve(linkRoot, `${p}-entitlements.plist`);
         // Written only when it differs: the early build may be reading it.
-        if (!existsSync(ent) || readFileSync(ent, 'utf8') !== entitled) writeFileSync(ent, entitled);
+        if (!existsSync(ent) || readFileSync(ent, 'utf8') !== entitled) writeFileSync(ent, entitled); if (reservesPlan()) reserveEntitlements(ent);
       }
       // swift build does not see the Rust archive (or that plist, or a linked plan) change, so the executable is
       // dropped to be linked again: 0.4 s, and it was every build's. A development build drops only one linked from
@@ -1248,6 +1250,7 @@ async function main(args, lockHeld = false) {
       const debugMap = device && args.includes('--development') ? read('strip', ['-S', executable]) : null;
       if (debugMap && debugMap.status !== 0) throw new Error(`host/apple: strip -S ${executable} failed: ${debugMap.stderr || debugMap.error?.message || debugMap.status}`);
       if (linkedPlan && !shared && reservesPlan()) fitReservedPlan(executable, linkedPlan.dir);
+      if (entitled && reservesPlan()) fitEntitlements(executable, entitled); // sized as an unreserved link sizes it
       assertAppleIdentity(app, executable, bakedCompat.id, shared && resolve(shared.framework, 'ExactCore'));
       assertLinkedSdk(executable, designCompatible(app, ios ? 'ios' : 'macos') ? COMPATIBLE_SDK[ios ? 'ios' : 'macos'] : read('xcrun', ['--sdk', sdkName, '--show-sdk-version']).stdout.trim());
       // ExactNumerals uses SwiftUI only on iOS/tvOS; the Mac has no linked numerals presenter.
@@ -1346,11 +1349,10 @@ async function main(args, lockHeld = false) {
 
   const bundleTools = {runApple,appleArtifacts, macInfoPlist, copyAppleStaticTrees, writeUsageStrings, receipt, shippedReceipt, assertAppleIdentity, placeAppleArtifact, infoPlist, distributionKeys, copyAppleGpuProducts, entitlements, appClip};
   if (!ios) {
-    const bundlePath = assembleMac({intents, shared, library, moduleLibraries, packageLibraries, packageResources, serviceDylibs, macWidgets, shareTeam: signing.shareTeam, shareProfile: signing.shareProfile, sandbox: signing.sandbox, provisioning, triple: moduleTripleFor(app, ios, device, tv), appleReach, hasWeb, webLoadName, args, app, paths, binDir, libDir, bin, loadName, hasGpu, dylib, moduleDylibs, looseArms, hasSvg, svgLoadName, modulesLoadName, modulesBuilt, svgBuilt, canvasGpuLoadName, canvasGpuBuilt, sha1, linkRoot, swiftc, buildReceipt, development, bakedCompat, rosterKeys, production, distribution, stampSdk, products, composition, sdk, bakedPlan, cleanup}, bundleTools);
-    publishProducts();
-    release();
-    rmSync(webBuildDir, { recursive: true, force: true });
-    console.log(`host/apple: ${paths.binary.replace(root + '/', '')} (${timing()}; ${sha1 && sha1 !== '-' ? 'signed ' + sha1.slice(0, 8) : 'ad-hoc signed'}); GPU: ${gpuNote}; web arm: ${hasWeb ? webLoadName : 'none'}${modulesBuilt ? `; modules: ${modulesLoadName}` : ''}`); if (args.includes('--json')) reportBuilt({ path: bundlePath ?? paths.binary, ...built() });
+    const bundlePath = assembleMac({intents, shared, library, moduleLibraries, packageLibraries, packageResources, serviceDylibs, macWidgets, shareTeam: signing.shareTeam, shareProfile: signing.shareProfile, sandbox: signing.sandbox, provisioning, unsigned, triple: moduleTripleFor(app, ios, device, tv), appleReach, hasWeb, webLoadName, args, app, paths, binDir, libDir, bin, loadName, hasGpu, dylib, moduleDylibs, looseArms, hasSvg, svgLoadName, modulesLoadName, modulesBuilt, svgBuilt, canvasGpuLoadName, canvasGpuBuilt, sha1, linkRoot, swiftc, buildReceipt, development, bakedCompat, rosterKeys, production, distribution, stampSdk, products, composition, sdk, bakedPlan, cleanup}, bundleTools);
+    publishProducts(); release(); rmSync(webBuildDir, { recursive: true, force: true });
+    if (unsigned) console.error('Mac signing input only. Verify grants, provision, sign and notarize before distribution.');
+    console.log(`host/apple: ${(unsigned ? bundlePath : paths.binary).replace(root + '/', '')} (${timing()}; ${sha1 && sha1 !== '-' ? 'signed ' + sha1.slice(0, 8) : 'ad-hoc signed'}); GPU: ${gpuNote}; web arm: ${hasWeb ? webLoadName : 'none'}${modulesBuilt ? `; modules: ${modulesLoadName}` : ''}`); if (args.includes('--json')) reportBuilt({ path: bundlePath ?? paths.binary, ...built(), ...(unsigned ? { requiresResigning: true } : {}) });
     // A live source is explicit (--url or EXACT_DEV_PLAN). The shared web output may belong to another app, and
     // TypeScript edits publish complete URL generations rather than rewriting its initial app.plan.
     if (args.includes('--run')) process.exitCode = runMac(bundlePath ? resolve(bundlePath, 'Contents/MacOS', paths.executable) : paths.binary, { ...env, ...launchEnv, EXACT_ASSETS: paths.capture });
@@ -1493,6 +1495,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(new URL(import
   const args = guardFlags(['--ios', '--device', '--tvos', '--watchos'].some((flag) => process.argv.includes(flag)) ? 'ios' : 'mac', process.argv.slice(2));
   if (args.includes('--phone') && !args.includes('--device')) throw new Error('--phone needs --device; for a simulator use --sim <udid|name> (or EXACT_SIM)');
   useXcode(); if (args.includes('--release')) process.env.EXACT_UPDATE_TRUST = 'production';
-  const oldXcode = process.platform === 'darwin' && args.includes('--test') && xcodeRefusal(args.includes('--ios') ? 'iphonesimulator' : 'macosx');
-  if (oldXcode) { console.error(oldXcode); process.exitCode = 1; } else (args.includes('--test') ? test(args) : main(args)).catch((error) => { console.error(error.rebuild ? `${error.message}: ${rebuildArgs(args)}` : error.message); process.exitCode = 1; });
+  const earlyRefusal = args.includes('--test') ? (appleBuildRefusal(args) || (process.platform === 'darwin' && xcodeRefusal(args.includes('--ios') ? 'iphonesimulator' : 'macosx'))) : null;
+  if (earlyRefusal) { console.error(earlyRefusal); process.exitCode = 1; } else (args.includes('--test') ? test(args) : main(args)).catch((error) => { console.error(error.rebuild ? `${error.message}: ${rebuildArgs(args)}` : error.message); process.exitCode = 1; });
 }

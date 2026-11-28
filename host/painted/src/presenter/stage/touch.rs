@@ -22,9 +22,11 @@
 //! returns to drawn beneath. A cancel puts it back; the commit is Back
 //! itself, whose pop starts from where the preview left the route. Nothing
 //! commits before the gesture does. A route whose exit is declared, pushed
-//! or full screen, previews that exit instead (`authored.rs`).
+//! or full screen, previews that exit instead (`authored.rs`); one zoomed
+//! from a source runs its container's return (`zoom.rs`). One whose pop
+//! flies names stays in place while the gesture seeks them (LLP 1013.004 D4).
 use super::*;
-use exact_motion::{gesture, Value, VelocityTracker};
+use exact_motion::{gesture, Transition, Value, VelocityTracker};
 
 /// A slop of Android's (`ViewConfiguration`'s touch slop, 8 dp).
 const SLOP: f32 = 8.0;
@@ -32,6 +34,15 @@ const SLOP: f32 = 8.0;
 const FLING: f32 = 500.0;
 /// How long a cancelled preview takes to come back.
 const RETURN_MS: f64 = 150.0;
+/// About how long Compose's default bounds spring (stiffness 400, critically
+/// damped) takes to land, ms.
+const SEEK_MS: f64 = 450.0;
+
+/// The bounds spring's value `ms` into it.
+fn spring_at(ms: f64) -> f32 {
+    let w = 20.0 * ms / 1000.0;
+    (1.0 - (1.0 + w) * (-w).exp()) as f32
+}
 
 #[derive(Debug)]
 pub(in crate::presenter) enum Gesture {
@@ -102,6 +113,12 @@ pub(in crate::presenter) struct Preview {
     edge: i32,
     /// Going back to rest, once cancelled.
     release: Option<Glide>,
+    /// The container a zoomed route returns into: the preview runs its
+    /// return, as Compose seeks a shared transition.
+    pub(super) container: Option<zoom::Container>,
+    /// The pop flies names: the gesture seeks them and the route keeps
+    /// its place, as Compose's NavHost seeks its shared transition.
+    flies: bool,
 }
 
 impl Preview {
@@ -173,7 +190,36 @@ impl Preview {
         self.pose_at(self.shown(now), width, height)
     }
 
+    /// Back to rest from where the gesture left it. A container plays its
+    /// entrance back from there, its emphasized path starting gently, as
+    /// Compose seeks a cancelled transition back on its own curve; a page
+    /// returns briskly.
+    fn go_back(&mut self, now: f64, still: bool) {
+        let (ms, curve) = match self.container {
+            Some(_) => (zoom::ENTER, Curve::Standard),
+            None => (RETURN_MS, Curve::Decelerate),
+        };
+        let ms = if still { 0.0 } else { ms };
+        self.release = Some(Glide::new(self.progress, 0.0, now, ms, curve));
+        self.progress = 0.0;
+    }
+
+    /// The curve a cancelled preview's flights go back on: a container's
+    /// own return, so the names stay in the box (LLP 1013.004 D4).
+    fn release_curve(&self) -> Transition {
+        match (self.container, self.release) {
+            (Some(_), Some(g)) => zoom::returning(g.from),
+            _ => flights::bounds_spring(),
+        }
+    }
+
     fn pose_at(&self, p: f32, width: f32, height: f32) -> Pose {
+        if let Some(container) = self.container {
+            return container.pose(false, zoom::emphasized(p), None);
+        }
+        if self.flies {
+            return Pose::REST;
+        }
         let way = if self.edge == 1 { -1.0 } else { 1.0 };
         Pose {
             dx: way * p * (width / 20.0 - 8.0).max(0.0),
@@ -686,11 +732,29 @@ impl<D: DataSource> Presenter<D> {
         match phase {
             0 => {
                 let target = self.preview_target().filter(|_| self.back_previewable());
+                let container = match target {
+                    Some(Target::Page {
+                        outgoing,
+                        incoming,
+                        sheet: None,
+                    }) => (self.host.kernel().node_by_key(incoming))
+                        .and_then(|n| self.return_container(outgoing, n.id)),
+                    _ => None,
+                };
+                let flies = self.host.flights.enabled
+                    && matches!(target, Some(Target::Page { outgoing, .. })
+                    if self.stage.pops.1 == Some(outgoing)
+                        && (self.stage.pops.2.iter()).any(|(from, _)| {
+                            (self.host.flights.recorded)
+                                .contains(&exact_kernel::motion::motion_node(*from))
+                        }));
                 self.stage.preview = target.map(|target| Preview {
                     target,
                     progress,
                     edge,
                     release: None,
+                    container,
+                    flies,
                 });
             }
             1 => {
@@ -702,9 +766,7 @@ impl<D: DataSource> Presenter<D> {
             _ => {
                 let still = self.motion_off();
                 if let Some(p) = &mut self.stage.preview {
-                    let ms = if still { 0.0 } else { RETURN_MS };
-                    p.release = Some(Glide::new(p.progress, 0.0, now_ms, ms, Curve::Decelerate));
-                    p.progress = 0.0;
+                    p.go_back(now_ms, still);
                 }
             }
         }
@@ -717,6 +779,25 @@ impl<D: DataSource> Presenter<D> {
         {
             self.stage.preview = None;
         }
+        // The names the pop would fly follow the gesture (LLP 1013.004 D4).
+        let seeks = (self.stage.preview.as_ref())
+            .filter(|p| p.release.is_none())
+            .and_then(Preview::pair);
+        match seeks {
+            Some((outgoing, _)) if self.stage.pops.1 == Some(outgoing) => {
+                let pairs = self.stage.pops.2.clone();
+                let progress = match self.stage.preview.and_then(|p| p.container) {
+                    Some(_) => zoom::emphasized(progress),
+                    None => spring_at(self.play_ms(progress, 0.0)),
+                };
+                self.host.seek_flights(&pairs, progress);
+            }
+            _ => {
+                let curve = (self.stage.preview.as_ref())
+                    .map_or_else(flights::bounds_spring, Preview::release_curve);
+                self.host.release_flights(&curve, false)
+            }
+        }
         self.stage.preview.is_some()
     }
 
@@ -725,11 +806,20 @@ impl<D: DataSource> Presenter<D> {
     pub(in crate::presenter) fn stage_back_done(&mut self, now: f64) {
         let still = self.motion_off();
         if let Some(p) = self.stage.preview.as_mut().filter(|p| p.release.is_none()) {
-            let ms = if still { 0.0 } else { RETURN_MS };
-            p.release = Some(Glide::new(p.progress, 0.0, now, ms, Curve::Decelerate));
-            p.progress = 0.0;
+            p.go_back(now, still);
             self.dirty = true;
+            let curve = p.release_curve();
+            self.host.release_flights(&curve, false);
         }
+    }
+
+    /// Where predictive Back's `progress` seeks a pop, ms into it: by play
+    /// time, as Compose seeks a transition (`SeekableTransitionState`), which
+    /// lasts as long as its longest part, an exit `exit_ms` long or the
+    /// bounds spring of the names it flies.
+    pub(super) fn play_ms(&self, progress: f32, exit_ms: f64) -> f64 {
+        let flies = self.host.flights.enabled && !self.stage.pops.2.is_empty();
+        f64::from(progress) * if flies { exit_ms.max(SEEK_MS) } else { exit_ms }
     }
 
     /// What Back would close or pop now, where the stage can preview it:

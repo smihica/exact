@@ -18,6 +18,7 @@ impl<D: DataSource> Presenter<D> {
         let next = (overscroll != 0.).then_some((id, overscroll));
         if self.kiosk_overscroll != next {
             self.kiosk_overscroll = next;
+            self.host.flow_damage.repaint();
             self.dirty = true;
         }
         true
@@ -26,6 +27,7 @@ impl<D: DataSource> Presenter<D> {
     /// Remove the visual displacement when the gesture ends or is cancelled.
     pub fn kiosk_clear_overscroll(&mut self) {
         if self.kiosk_overscroll.take().is_some() {
+            self.host.flow_damage.repaint();
             self.dirty = true;
         }
     }

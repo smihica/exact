@@ -8,7 +8,7 @@
 // tree has ended is retired: its player stops and it reports nothing more,
 // so a late `pause`, `timeupdate` or refused play never reaches whatever now
 // holds its place (jukebox F1, F5, F6, F20).
-import { onEnd, inflight, journal, data, clock } from "./rt.js"; import { liveById } from "./navigation.js";
+import { onEnd, onMount, preparedScope, inflight, journal, data, clock } from "./rt.js"; import { liveById } from "./navigation.js";
 import { loadOnce } from '../web/load-once.js';
 
 const loads = {};
@@ -24,9 +24,14 @@ let Install = null;
 const Dirty = new Set();
 const send = e => text => e.dispatchEvent(new CustomEvent("exact-media", { detail: text }));
 function flush() {
-  const later = [];
-  for (const e of Dirty) if (!e.$media.retired) { if (e.isConnected) { Install(e, send(e)); holdUntilPlayable(e); } else later.push(e); }
+  const later = [], batch = [...Dirty];
   Dirty.clear();
+  for (const e of batch) if (!e.$media.retired) {
+    if (e.isConnected) {
+      try { Install(e, send(e)); holdUntilPlayable(e); }
+      catch (err) { journal.push(`media: ${err.message}`); }
+    } else later.push(e);
+  }
   if (later.length) requestAnimationFrame(() => { for (const e of later) install(e); });
 }
 // A load or a seek in flight holds a settle (media-glue.js `mediaHold`, the wasm host's too), one hold at a time.
@@ -38,14 +43,20 @@ function holdUntilPlayable(e) {
   inflight.n++;
   e.$media.release = held.release;
 }
-function install(e) {
+function enqueue(e) {
   if (e.$media.retired) return;
   if (!Dirty.size && Install) queueMicrotask(flush);
   Dirty.add(e);
   if (loads.Glue) return;
   inflight.n++;
   loadOnce(loads, "Glue", () => new Promise(r => requestAnimationFrame(r)).then(() => { globalThis.exact ??= {}; return import("./media-glue.js"); })
-    .then(() => { Install = globalThis.exact.installMedia; flush(); }), err => journal.push(`media: unavailable: ${err.message}`)).finally(() => inflight.n--);
+    .then(() => { Install = globalThis.exact.installMedia; flush(); }), err => { Dirty.clear(); journal.push(`media: unavailable: ${err.message}`); }).finally(() => inflight.n--);
+}
+function install(e) {
+  if (e.$media.mounted) return enqueue(e);
+  // Inside a prepared scope, defer until mount; an async resolution (e.g.
+  // `appSource`) before mount leaves installation to `media()`'s mount hook.
+  if (preparedScope()) onMount(() => enqueue(e), e.$media.installKey);
 }
 /** The glue on its way (the agent waits for it before an operation). */
 export const mediaPiece = () => loads.Glue;
@@ -54,8 +65,22 @@ export function media(e, attrs) {
   if (typeof requestAnimationFrame !== "function" || globalThis.__exactRender) return;
   const props = {};
   for (const k in attrs) if (!k.startsWith("data-")) props[k] = BOOL.has(k) ? "true" : attrs[k];
-  e.$media = { retired: false, app: null, poster: attrs["data-app-poster"] ?? null, command: (name, seconds) => command(e, name, seconds) };
+  e.$media = {
+    retired: false,
+    mounted: false,
+    app: null,
+    appSeq: 0,
+    appPending: false,
+    appQueue: [],
+    poster: attrs["data-app-poster"] ?? null,
+    posterSeq: 0,
+    installKey: {},
+    appKey: {},
+    posterKey: {},
+    command: (name, seconds) => command(e, name, seconds),
+  };
   e.exactMedia = { props, handlers: [] };
+  onMount(() => { e.$media.mounted = true; });
   if (attrs["data-app-src"]) appSource(e, attrs["data-app-src"]);
   if (attrs["data-app-poster"]) appPoster(e, attrs["data-app-poster"]);
   const exitFloating = () => {
@@ -68,7 +93,10 @@ export function media(e, attrs) {
   e.addEventListener("leavepictureinpicture", left);
   onEnd(() => {
     left();
+    Dirty.delete(e);
     e.$media.retired = true;
+    e.$media.appPending = false;
+    e.$media.appQueue.length = 0;
     exitFloating();
     e.$media.release?.();
     globalThis.exact?.removeMedia?.(e);
@@ -82,11 +110,23 @@ export function mediaProp(e, name, v) {
   if (!e.$media) return false;
   if (name === "src") {
     if (v?.startsWith("app:/")) { appSource(e, v); return true; }
+    const changed = e.$media.app != null || e.exactMedia.props.src !== v;
     e.$media.app = null;
+    e.$media.appPending = false;
+    e.$media.appSeq++;
+    e.$media.appQueue.length = 0;
+    // Drop any queued `load` left from a previous source so it cannot reload the replacement URL.
+    if (changed) {
+      e.exactMedia.srcGen = (e.exactMedia.srcGen ?? 0) + 1;
+      if (e.exactMedia.commands?.length) {
+        e.exactMedia.commands = e.exactMedia.commands.filter(([c]) => c !== "load");
+      }
+    }
   }
   if (name === "poster") {
     e.$media.poster = v?.startsWith("app:/") ? v : null;
     if (e.$media.poster) { appPoster(e, v); return true; }
+    e.$media.posterSeq++;
   }
   if (v == null) delete e.exactMedia.props[name]; else e.exactMedia.props[name] = v;
   install(e);
@@ -100,33 +140,64 @@ export function mediaProp(e, name, v) {
 // (`src-not-supported`), as HTML refuses a source it cannot fetch.
 
 const appURL = v => (loadOnce(loads, "Files", () => import(new URL("./picker-glue.js", import.meta.url).href).then(() => globalThis.exact.appURL))).then(f => f(v, data.appId));
-function appSource(e, v, then) {
+function appSource(e, v) {
+  if (e.$media.app !== v) {
+    e.$media.appQueue.length = 0;
+    e.exactMedia.srcGen = (e.exactMedia.srcGen ?? 0) + 1;
+    if (e.exactMedia.commands?.length) {
+      e.exactMedia.commands = e.exactMedia.commands.filter(([c]) => c !== "load");
+    }
+  }
   e.$media.app = v;
-  inflight.n++;
-  appURL(v)
-    .then(url => {
-      if (e.$media.app !== v || e.$media.retired) return;
-      if (e.getAttribute("src") !== (url || v)) e.setAttribute("src", url || v);
-      e.exactMedia.props.src = url || v;
-      then?.();
-      install(e);
-    })
-    .catch(err => journal.push(`media: ${v}: ${err.message}`)).finally(() => inflight.n--);
+  e.$media.appPending = true;
+  const seq = ++e.$media.appSeq;
+  onMount(() => {
+    if (e.$media.appSeq !== seq || e.$media.retired) return;
+    inflight.n++;
+    appURL(v)
+      .then(url => {
+        if (e.$media.appSeq !== seq || e.$media.retired) return;
+        e.$media.appPending = false;
+        if (e.getAttribute("src") !== (url || v)) e.setAttribute("src", url || v);
+        e.exactMedia.props.src = url || v;
+        if (e.$media.appQueue.length) (e.exactMedia.commands ??= []).push(...e.$media.appQueue.splice(0));
+        install(e);
+      })
+      .catch(err => {
+        if (e.$media.appSeq === seq) {
+          e.$media.appPending = false;
+          e.$media.appQueue.length = 0;
+        }
+        journal.push(`media: ${v}: ${err.message}`);
+      }).finally(() => inflight.n--);
+  }, e.$media.appKey);
 }
 // A poster that is the app's own file: shown once it resolves, none if there is none.
 function appPoster(e, v) {
-  inflight.n++;
-  appURL(v).then(url => { if (e.$media.poster === v) { if (url) e.setAttribute("poster", url); else e.removeAttribute("poster"); } })
-    .catch(() => {}).finally(() => inflight.n--);
+  const seq = ++e.$media.posterSeq;
+  onMount(() => {
+    if (e.$media.posterSeq !== seq || e.$media.retired) return;
+    inflight.n++;
+    appURL(v).then(url => { if (e.$media.posterSeq === seq && !e.$media.retired) { if (url) e.setAttribute("poster", url); else e.removeAttribute("poster"); } })
+      .catch(() => {}).finally(() => inflight.n--);
+  }, e.$media.posterKey);
 }
 // `fastSeek(id, seconds)` and `load(id)` (commands.js): queued for the glue,
 // which runs them in order once it has the element. A `load` of an `app:/`
-// source resolves the file again first: one written since shows.
+// source resolves the file again first: one written since shows; any later
+// commands issued while the lookup is in flight wait behind it in FIFO order.
 function command(e, name, seconds) {
   if (e.$media.retired) return;
-  const queue = () => (e.exactMedia.commands ??= []).push([name, seconds]);
-  if (name === "load" && e.$media.app) { appSource(e, e.$media.app, queue); return; }
-  queue();
+  if (name === "load" && e.$media.app) {
+    e.$media.appQueue.push([name, seconds]);
+    appSource(e, e.$media.app);
+    return;
+  }
+  if (e.$media.appPending) {
+    e.$media.appQueue.push([name, seconds]);
+    return;
+  }
+  (e.exactMedia.commands ??= []).push([name, seconds]);
   install(e);
 }
 /** A media event's handler (`on`): its payload, a number for the two that

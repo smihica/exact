@@ -40,6 +40,7 @@ pub(crate) mod margins;
 pub(crate) mod observe;
 mod observed_max;
 pub(crate) mod owner;
+mod owner_layout;
 mod owner_update;
 mod provenance;
 pub(crate) mod readers;
@@ -399,6 +400,8 @@ pub struct Kernel {
     /// before this kernel's measurer measured any: a new one asks about
     /// every symbol again (`measure_symbols`).
     symbol_revision: Option<u64>,
+    /// Paragraphs whose inline-image box changed outside a commit (`inline_image_resized`).
+    pub(crate) inline_image_paragraphs: Vec<NodeKey>,
     /// This kernel as a holder of wide colours, for the table's sweep.
     wide: crate::style::wide::Holder,
 }
@@ -497,6 +500,7 @@ impl Kernel {
             detached: false,
             awaiting: Default::default(),
             symbol_revision: None,
+            inline_image_paragraphs: Vec::new(),
             wide: Default::default(),
         }
     }
@@ -1082,6 +1086,7 @@ impl Kernel {
         self.selectors.clear();
         self.receipts.clear();
         self.awaiting.clear();
+        self.inline_image_paragraphs.clear();
         self.incarnation += 1;
         self.epoch += 1;
         self.wide_changed();
@@ -1116,6 +1121,7 @@ impl Kernel {
             detached: self.detached,
             awaiting: Default::default(),
             symbol_revision: None,
+            inline_image_paragraphs: Vec::new(),
             wide: Default::default(),
         }
         .published()

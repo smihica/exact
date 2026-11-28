@@ -305,12 +305,13 @@ test('wasm GPU and geometry loads retry after a refusal', async () => {
   const glue = readFileSync(new URL('../web/glue.js', import.meta.url), 'utf8');
   const boot = readFileSync(new URL('../web/wasm/boot.js', import.meta.url), 'utf8');
   for (const kind of ['gpu', 'geometry']) {
-    let attempts = 0, installed = 0;
-    const host = {}, lines = [];
+    let attempts = 0, installed = 0, settled = 0;
+    const host = {}, lines = [], geometry = {};
     const bindings = { loadOnce, host, root: {}, requestAnimationFrame: resolve => resolve(),
+      settleGeometry: () => { expect(host.geometry).toBe(geometry); settled++; },
       console: { error: (...args) => lines.push(args) },
       globalThis: { exact: { pendingSurfaces: [{}] } },
-      loadAfterPaint: () => ++attempts === 1 ? Promise.reject(new TypeError('network')) : Promise.resolve(() => { installed++; return {}; }),
+      loadAfterPaint: () => ++attempts === 1 ? Promise.reject(new TypeError('network')) : Promise.resolve(() => { installed++; return geometry; }),
     };
     const run = new Function(...Object.keys(bindings), glueDeclarations(kind === 'gpu' ? glue : boot, [kind === 'gpu' ? 'loadGpuIfNeeded' : 'loadGeometry']) + '; return ' + (kind === 'gpu' ? 'loadGpuIfNeeded' : 'loadGeometry'))(...Object.values(bindings));
     const key = kind === 'gpu' ? 'gpuLoading' : 'geometryLoading';
@@ -318,10 +319,13 @@ test('wasm GPU and geometry loads retry after a refusal', async () => {
     expect(lines.length).toBe(1);
     expect(host[key]).toBeNull();
     expect(attempts).toBe(1);
-    run(); await host[key];
+    expect(settled).toBe(0);
+    run(); run(); await host[key];
     run(); await host[key];
     expect(attempts).toBe(2);
     expect(installed).toBe(kind === 'gpu' ? 0 : 1);
+    expect(settled).toBe(kind === 'gpu' ? 0 : 1);
+    expect(lines.length).toBe(1);
   }
 });
 

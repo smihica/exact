@@ -3,15 +3,15 @@
 //! platform's decoder where there is one — Android's `AImageDecoder`
 //! (libjpeg-turbo, giflib, libwebp; sampled to the plan's size while
 //! decoding, as the platform's own image views decode; an animation's first
-//! frame). Before Android 11 (API 30, `AImageDecoder`'s) the same decoder
-//! through the reader's `ImageDecoder` (`crate::canvas::legacy`). On Android,
-//! an animated GIF or WebP plays
-//! in the platform's own animated drawable, which a reader may draw in the
-//! still's place ([`crate::image::Bitmap::animation_file`]). Windows uses WIC
-//! for these formats, including installed WebP codecs.
+//! frame), Windows' WIC, macOS's ImageIO, and on Linux pure-Rust decoders
+//! (`pure.rs`: `zune-jpeg`, `image-webp`, `gif` frame 0). Before Android 11
+//! (API 30, `AImageDecoder`'s) the same decoder through the reader's
+//! `ImageDecoder` (`crate::canvas::legacy`). On Android, an animated GIF or
+//! WebP plays in the platform's own animated drawable, which a reader may draw
+//! in the still's place ([`crate::image::Bitmap::animation_file`]).
 //!
 //! @ref LLP 1076 §3.4 (the Rust painter on Android)
-use super::png_decode::{DecodePlan, Header};
+use super::png_decode::{DecodePlan, Header, PlatformFormat};
 use exact_raster::{Metadata, PixelSize, Refusal, MAX_HEADER_BYTES, MAX_SOURCE_PIXELS};
 use std::io::{Read, Seek, SeekFrom};
 use tiny_skia::Pixmap;
@@ -21,21 +21,55 @@ pub(super) fn is_jpeg(head: &[u8]) -> bool {
     head.len() >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF
 }
 
-/// A GIF's or WebP's header from its first 30 bytes, or `None` for neither.
-pub(super) fn inspect_animated(head: &[u8], encoded_bytes: u64) -> Result<Option<Header>, Refusal> {
+/// A GIF's or WebP's header from its leading bytes (plus any WebP `EXIF`
+/// orientation chunk within `MAX_HEADER_BYTES`), or `None` for neither.
+pub(super) fn inspect_animated(
+    head: &[u8],
+    input: &mut (impl Read + Seek),
+    encoded_bytes: u64,
+) -> Result<Option<Header>, Refusal> {
     let le16 = |i: usize| u32::from(u16::from_le_bytes([head[i], head[i + 1]]));
     let le24 = |i: usize| u32::from_le_bytes([head[i], head[i + 1], head[i + 2], 0]);
-    let (width, height) =
+    let mut orientation = 1u8;
+    let (width, height, format, header_len) =
         if head.len() >= 10 && (&head[..6] == b"GIF87a" || &head[..6] == b"GIF89a") {
-            (le16(6), le16(8))
-        } else if head.len() >= 30 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+            (le16(6), le16(8), PlatformFormat::Gif, 10u64)
+        } else if head.len() >= 16 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
             match &head[12..16] {
-                b"VP8 " => (le16(26) & 0x3FFF, le16(28) & 0x3FFF),
-                b"VP8L" => {
+                b"VP8 " if head.len() >= 30 => (
+                    le16(26) & 0x3FFF,
+                    le16(28) & 0x3FFF,
+                    PlatformFormat::Webp,
+                    30u64,
+                ),
+                b"VP8L" if head.len() >= 25 && head[20] == 0x2F => {
                     let bits = u32::from_le_bytes([head[21], head[22], head[23], head[24]]);
-                    ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+                    (
+                        (bits & 0x3FFF) + 1,
+                        ((bits >> 14) & 0x3FFF) + 1,
+                        PlatformFormat::Webp,
+                        25u64,
+                    )
                 }
-                b"VP8X" => (le24(24) + 1, le24(27) + 1),
+                b"VP8X" if head.len() >= 30 => {
+                    let flags = head[20];
+                    let format = if flags & 0x02 != 0 {
+                        PlatformFormat::WebpAnimated
+                    } else if flags & 0x10 != 0 {
+                        PlatformFormat::WebpAlpha
+                    } else {
+                        PlatformFormat::Webp
+                    };
+                    if flags & 0x08 != 0 {
+                        let riff_size =
+                            u64::from(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+                        let riff_end = 8u64.saturating_add(riff_size).min(encoded_bytes);
+                        if let Some(value) = webp_exif_orientation(input, riff_end) {
+                            orientation = value;
+                        }
+                    }
+                    (le24(24) + 1, le24(27) + 1, format, 30u64)
+                }
                 _ => return Err(Refusal::DecodeFailed),
             }
         } else {
@@ -47,11 +81,51 @@ pub(super) fn inspect_animated(head: &[u8], encoded_bytes: u64) -> Result<Option
     if u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS {
         return Err(Refusal::SourcePixels);
     }
-    Ok(Some(Header::platform(Metadata {
-        natural: PixelSize { width, height },
-        encoded_bytes,
-        header_bytes: 30.min(encoded_bytes),
-    })))
+    Ok(Some(
+        Header::platform_format(
+            Metadata {
+                natural: PixelSize { width, height },
+                encoded_bytes,
+                header_bytes: header_len.min(encoded_bytes),
+            },
+            format,
+        )
+        .oriented(orientation),
+    ))
+}
+
+/// Read the `EXIF` chunk's TIFF orientation from a `VP8X` WebP without reading
+/// pixel payloads, bounding total chunk-header + EXIF bytes read by `MAX_HEADER_BYTES`.
+fn webp_exif_orientation(input: &mut (impl Read + Seek), encoded_bytes: u64) -> Option<u8> {
+    input.seek(SeekFrom::Start(12)).ok()?;
+    let mut pos = 12u64;
+    let mut read_budget = MAX_HEADER_BYTES;
+    while pos + 8 <= encoded_bytes && read_budget >= 8 {
+        let mut hdr = [0u8; 8];
+        input.read_exact(&mut hdr).ok()?;
+        read_budget -= 8;
+        let len = u64::from(u32::from_le_bytes(hdr[4..8].try_into().ok()?));
+        let padded = len.checked_add(len & 1)?;
+        let payload_start = pos.checked_add(8)?;
+        let next = payload_start.checked_add(padded)?;
+        if payload_start.checked_add(len)? > encoded_bytes {
+            return None;
+        }
+        if &hdr[..4] == b"EXIF" {
+            if len == 0 || len > read_budget {
+                return None;
+            }
+            let mut data = vec![0u8; usize::try_from(len).ok()?];
+            input.read_exact(&mut data).ok()?;
+            return exif_orientation_tiff(data.strip_prefix(b"Exif\0\0").unwrap_or(&data));
+        }
+        if next > encoded_bytes {
+            return None;
+        }
+        pos = next;
+        input.seek(SeekFrom::Start(pos)).ok()?;
+    }
+    None
 }
 
 /// The natural size from the first frame header, reading at most
@@ -64,7 +138,6 @@ pub(super) fn inspect(
         .seek(SeekFrom::Start(2))
         .map_err(|_| Refusal::DecodeFailed)?;
     let mut at = 2u64;
-    #[cfg(any(windows, target_os = "android", target_os = "macos"))]
     let mut orientation = 1;
     loop {
         if at + 4 > MAX_HEADER_BYTES || at + 4 > encoded_bytes {
@@ -104,7 +177,6 @@ pub(super) fn inspect(
         if at + len > MAX_HEADER_BYTES || at + len > encoded_bytes {
             return Err(Refusal::HeaderLimit);
         }
-        #[cfg(any(windows, target_os = "android", target_os = "macos"))]
         if m == 0xE1 {
             let mut data = vec![0; (len - 2) as usize];
             input
@@ -128,14 +200,26 @@ pub(super) fn inspect(
             if u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS {
                 return Err(Refusal::SourcePixels);
             }
-            let header = Header::platform(Metadata {
-                natural: PixelSize { width, height },
-                encoded_bytes,
-                header_bytes: at + len,
-            });
-            // The picture's size is the upright one: WIC is told to turn it, and Android's decoders
-            // turn it themselves, so a target size in the stored grid would squash a turned photo.
-            #[cfg(any(windows, target_os = "android", target_os = "macos"))]
+            let num_components = f[5];
+            let format = if matches!(m, 0xC2 | 0xCA) {
+                PlatformFormat::JpegProgressive
+            } else if jpeg_first_scan_is_complete(input, at + len, encoded_bytes, num_components) {
+                PlatformFormat::Jpeg
+            } else {
+                // Non-interleaved multi-scan baseline (or SOS past MAX_HEADER_BYTES):
+                // zune-jpeg allocates full padded i16 planes just like progressive.
+                PlatformFormat::JpegProgressive
+            };
+            let header = Header::platform_format(
+                Metadata {
+                    natural: PixelSize { width, height },
+                    encoded_bytes,
+                    header_bytes: at + len,
+                },
+                format,
+            );
+            // The picture's size is the upright one: WIC and the pure-Rust path
+            // turn the decode by it, and Android/macOS decoders turn it themselves.
             let header = header.oriented(orientation);
             return Ok(header);
         }
@@ -146,9 +230,73 @@ pub(super) fn inspect(
     }
 }
 
-#[cfg(any(windows, target_os = "android", target_os = "macos"))]
+/// Checks whether the first SOS marker includes all `num_components` of a
+/// baseline SOF (single-scan interleaved). Seeks past intervening segment
+/// payloads (such as large post-SOF XMP) while bounding bytes read by
+/// `MAX_HEADER_BYTES`, so baseline photos with large metadata after SOF are
+/// not misclassified as progressive.
+fn jpeg_first_scan_is_complete(
+    input: &mut (impl Read + Seek),
+    mut at: u64,
+    encoded_bytes: u64,
+    num_components: u8,
+) -> bool {
+    if num_components == 0 || input.seek(SeekFrom::Start(at)).is_err() {
+        return false;
+    }
+    let mut read_budget = MAX_HEADER_BYTES;
+    loop {
+        if at + 4 > encoded_bytes || read_budget < 4 {
+            return false;
+        }
+        let mut marker = [0u8; 2];
+        if input.read_exact(&mut marker).is_err() || marker[0] != 0xFF {
+            return false;
+        }
+        at += 2;
+        read_budget -= 2;
+        let m = marker[1];
+        if m == 0xFF {
+            if input.seek(SeekFrom::Current(-1)).is_err() {
+                return false;
+            }
+            at -= 1;
+            continue;
+        }
+        if m == 0xD8 || (0xD0..=0xD7).contains(&m) || m == 0x01 {
+            continue;
+        }
+        if m == 0xD9 {
+            return false;
+        }
+        let mut len_bytes = [0u8; 2];
+        if input.read_exact(&mut len_bytes).is_err() {
+            return false;
+        }
+        read_budget -= 2;
+        let len = u64::from(u16::from_be_bytes(len_bytes));
+        if len < 2 || at.checked_add(len).is_none_or(|end| end > encoded_bytes) {
+            return false;
+        }
+        if m == 0xDA {
+            if len < 3 || read_budget == 0 {
+                return false;
+            }
+            let mut ns = [0u8; 1];
+            return input.read_exact(&mut ns).is_ok() && ns[0] == num_components;
+        }
+        at += len;
+        if input.seek(SeekFrom::Start(at)).is_err() {
+            return false;
+        }
+    }
+}
+
 fn exif_orientation(bytes: &[u8]) -> Option<u8> {
-    let tiff = bytes.strip_prefix(b"Exif\0\0")?;
+    exif_orientation_tiff(bytes.strip_prefix(b"Exif\0\0")?)
+}
+
+fn exif_orientation_tiff(tiff: &[u8]) -> Option<u8> {
     let little = match tiff.get(..4)? {
         b"II\x2a\0" => true,
         b"MM\0\x2a" => false,
@@ -190,7 +338,7 @@ fn exif_orientation(bytes: &[u8]) -> Option<u8> {
     None
 }
 
-#[cfg(all(test, any(windows, target_os = "android", target_os = "macos")))]
+#[cfg(test)]
 #[test]
 fn exif_orientation_checks_endianness_types_offsets_and_truncation() {
     let little = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
@@ -288,9 +436,8 @@ pub(crate) fn platform_decoder() -> bool {
     platform::decoder().is_some()
 }
 
-/// The whole file (it is bounded by `MAX_ENCODED_BYTES`): the platform
-/// decoder takes a buffer.
-#[cfg(any(target_os = "android", windows, target_os = "macos"))]
+/// The whole file (it is bounded by `MAX_ENCODED_BYTES`): the platform or
+/// pure-Rust decoder takes a buffer.
 fn read_all<R: Read + Seek>(
     mut input: R,
     plan: &DecodePlan,
@@ -458,12 +605,13 @@ pub(super) fn decode<R: Read + Seek>(
     }
 }
 
-/// No platform decoder on this target.
+#[cfg(any(
+    not(any(target_os = "android", windows, target_os = "macos")),
+    all(target_os = "macos", test)
+))]
+#[path = "pure.rs"]
+pub(super) mod pure;
+
+/// Pure-Rust decoder on Linux and other non-Apple/Windows/Android targets.
 #[cfg(not(any(target_os = "android", windows, target_os = "macos")))]
-pub(super) fn decode<R: Read + Seek>(
-    _input: R,
-    _plan: &DecodePlan,
-    _cancelled: impl Fn() -> bool,
-) -> Result<Pixmap, Refusal> {
-    Err(Refusal::DecodeFailed)
-}
+pub(super) use pure::decode;

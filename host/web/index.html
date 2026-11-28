@@ -36,13 +36,14 @@
      half-circles on every platform. */
   :root { --exact-curve: round; --exact-curve-reach: 1; }
   @supports (corner-shape: superellipse(2)) { :root { --exact-curve: superellipse(1.6); --exact-curve-reach: 1.52; } }
-  /* LLP 1057.003 D5: a `scroll()` or `view()` consumer is paused only where the browser has no
-     `animation-timeline`, which would play it on the clock (css.rs). */
-  :root { --exact-timeline-play: paused; }
-  @supports (animation-timeline: scroll()) { :root { --exact-timeline-play: running; } }
-  /* Where it has none, a consumer of a timeline the browser would run (`--exact-css-timeline`, css.rs) shows its own
-     values, as an inactive timeline's does: no motion piece may be there to put it out of effect. */
-  @supports not (animation-timeline: scroll()) { [style*="--exact-css-timeline"] { animation-name: none !important; } }
+  /* LLP 1057.003 D5: where the browser has no `animation-timeline`, a consumer of a CSS scroll/view timeline
+     (`--exact-css-timeline`, css.rs) is cancelled so it shows its own values instead of playing on the clock, and a
+     running explicit `animation-timeline: none` is likewise cancelled while an authored `paused` one holds at time zero.
+     Named timelines resolving to an inactive scope set `data-exact-timeline-inactive` without taking WAAPI play-state
+     ownership. Leaving elements and closing dialogs are excluded so `-exact-exit-animation` still plays. */
+  [data-exact-timeline-inactive]:not([data-exiting], [data-exact-dialog-closing]) { animation-name: none !important; }
+  @supports not (animation-timeline: scroll()) { [style*="--exact-css-timeline"]:not([data-exiting], [data-exact-dialog-closing]) { animation-name: none !important; animation-play-state: paused !important; } }
+  @supports not (animation-timeline: none) { [style*="--exact-animation-timeline:none"]:not([style*="--exact-animation-play-state"], [data-exiting], [data-exact-dialog-closing]), [style*="--exact-animation-timeline: none"]:not([style*="--exact-animation-play-state"], [data-exiting], [data-exact-dialog-closing]) { animation-name: none !important; } [style*="--exact-animation-timeline:none"][style*="--exact-animation-play-state"][style*="running"]:not([data-exiting], [data-exact-dialog-closing]), [style*="--exact-animation-timeline: none"][style*="--exact-animation-play-state"][style*="running"]:not([data-exiting], [data-exact-dialog-closing]) { animation-play-state: paused !important; } }
   @media (min-resolution: 1.5dppx) { :root { --exact-hairline: calc(1px / 1.5); } }
   @media (min-resolution: 2dppx) { :root { --exact-hairline: .5px; } }
   @media (min-resolution: 2.5dppx) { :root { --exact-hairline: .4px; } }
@@ -374,7 +375,7 @@
   dialog:not([open]) { display: none !important; }
   #exact-root dialog[data-exact-dialog-closing]:not([data-exiting]) { animation: none !important; }
   @media (prefers-reduced-motion: no-preference) {
-    #exact-root dialog[data-exact-dialog-closing="play"]:not([data-exiting]) { animation: var(--exact-exit-animation) !important; }
+    #exact-root dialog[data-exact-dialog-closing="play"]:not([data-exiting]) { animation: var(--exact-exit-animation) !important; animation-timeline: auto !important; }
   }
   /* Gesture feedback is decorative, including when its opacity is zero. */
   [swipeIndicator="true"] { pointer-events: none; }

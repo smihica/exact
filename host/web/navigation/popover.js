@@ -49,6 +49,7 @@ function leaveDialog(dialog, returnValue) {
   if (closingDialogs.has(dialog)) return true;
   const exit = dialog.style.getPropertyValue("--exact-exit-animation").trim();
   if (!dialog.open || !exit || exit === "none" || matchMedia("(prefers-reduced-motion: reduce)").matches) return false;
+  for (const fn of globalThis.exact?.timelineReleasers ?? []) fn(dialog);
   // Stop the entrance before starting the exit, even when both use the same named keyframes.
   dialog.setAttribute(closingMark, "start");
   dialog.getAnimations();

@@ -171,6 +171,9 @@ impl Engine {
                 };
                 play.pending = waits.map(|_| now);
                 play.clock_wait = waits.is_some();
+                if !play.exit && play.pending.is_none() {
+                    play.clocked = true;
+                }
                 for p in play.animation.keyframes.properties() {
                     self.dirty.insert((*node, p));
                 }

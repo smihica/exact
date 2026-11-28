@@ -240,12 +240,16 @@ impl MotionSync {
         for (node, clock) in &self.clocks {
             engine.set_animation_clock(*node, clock.as_deref());
         }
+        // Apply timeline bindings before animations so a new animation added
+        // alongside a timeline switch never inherits the old timeline's progress.
+        for (node, source, _) in &self.timelines {
+            engine.set_drag_timeline(*node, *source);
+        }
+        for (node, _, binding) in &self.timelines {
+            engine.set_animation_timeline(*node, *binding);
+        }
         for (node, animations) in &self.animations {
             engine.set_animations(*node, animations)?;
-        }
-        for (node, source, binding) in &self.timelines {
-            engine.set_drag_timeline(*node, *source);
-            engine.set_animation_timeline(*node, *binding);
         }
         Ok(())
     }

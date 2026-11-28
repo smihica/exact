@@ -64,6 +64,23 @@ strokeStyle = "hsl(120 100% 50% / 50%)"
 strokeStyle = "#0000"
 ? strokeStyle => rgba(0, 0, 0, 0)
 
+## a colour's words part only at CSS white space, as Chrome's do
+# The quoted values hold U+00A0, U+2003 and U+FEFF themselves: JavaScript's
+# white space, not CSS's, so Chrome keeps the colour before each.
+fillStyle = "#123456"
+fillStyle = "rgb(1 2 3)"
+? fillStyle => #123456
+fillStyle = " red"
+? fillStyle => #123456
+fillStyle = "rgb(1 2 3)"
+? fillStyle => #123456
+fillStyle = "rgb(1 2 3 /﻿0.5)"
+? fillStyle => #123456
+fillStyle = "color(srgb 1 0 0)"
+? fillStyle => #123456
+fillStyle = "rgb(1\t2 3)"
+? fillStyle => #010203
+
 ## the transform composes and is reported detached
 translate(10, 20)
 scale(2, 3)

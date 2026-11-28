@@ -3,6 +3,7 @@
 // ones near each scrollport, not every paragraph of a long list: r24's inbox
 // keeps ~2,600 that are never rastered, and visiting each, twice a frame,
 // was most of its main thread while scrolling.
+// Run `bun bench/scroll-pump/run.mjs` when changing how the index serves prefetch.
 #if os(iOS) || os(tvOS)
 import UIKit
 
@@ -93,8 +94,9 @@ final class TextIndex {
     /// Each of `views` whose bounds may meet its scroller's port grown by
     /// `reach` (in `viewport`'s points), and every paragraph whose place is
     /// not indexed. A paragraph not visited has no band at that reach
-    /// (`Presenter.textBand`): its scroller clips it out. `body` returns
-    /// false to stop.
+    /// (`Presenter.textBand`): its scroller clips it out. A visited paragraph
+    /// must still survive every enclosing clip at that reach before it can
+    /// justify a pump pass. `body` returns false to stop.
     func visit(_ views: [UInt32: NodeView], reach: CGFloat, viewport: UIView, _ body: (NodeView) -> Bool) {
         #if DEBUG
         visits += 1

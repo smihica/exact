@@ -463,7 +463,12 @@ fn agrees_with_the_shader_arithmetic(d: &mut impl Device) {
 #[test]
 fn wgpu_coverage_and_shadows_agree_with_the_shader_arithmetic() {
     match super::wgpu::Wgpu::new() {
-        Ok(mut d) => agrees_with_the_shader_arithmetic(&mut d),
+        Ok(mut d) => {
+            // This suite mirrors fs_main's 8-tap shadow arithmetic; fs_fast_shadow
+            // is tested against a high-precision 2D Gaussian oracle in shadow_tests.
+            d.fast_shadow = false;
+            agrees_with_the_shader_arithmetic(&mut d);
+        }
         Err(Error::NoAdapter(e)) => eprintln!("no GPU here ({e}); ink's pixels are not checked"),
         Err(e) => panic!("ink device: {e}"),
     }
@@ -482,49 +487,10 @@ fn d3d11_coverage_and_shadows_agree_with_the_shader_arithmetic() {
 }
 
 #[test]
-fn cached_shadow_exclusion_matches_the_analytic_clip() {
-    let mut d = wgpu::Wgpu::new().expect("wgpu device for shadow coverage");
-    let image = d.create_texture(TextureDesc::rgba(1, 1)).unwrap();
-    d.upload_texture(image, [0, 0], [1, 1], &[255; 4]).unwrap();
-    let target = d.create_target(48, 40).unwrap();
-    let clip = RoundedClip {
-        rect: [8.5, 9.25, 31., 22.5],
-        radii: [9., 2., 5., 7.],
-    };
-    let mut i = Instance::new(Kind::Shadow, Brush::Image, [0., 0., 1., 1.]);
-    i.xform = [48., 0., 0., 40., 0., 0.];
-    i.flags = flags::TINT | flags::RASTERED_SHADOW;
-    i.set_clip(1, clip).unwrap();
-    let mut encoder = Encoder::new(48, 40);
-    encoder
-        .push(
-            i,
-            Bindings {
-                image,
-                ..Bindings::default()
-            },
-        )
-        .unwrap();
-    let frame = encoder.finish();
-    for general in [true, false] {
-        d.general_only = general;
-        d.render(&frame, target, Some([0.; 4])).unwrap();
-        let pixels = d.readback(target).unwrap();
-        assert_eq!(pixels.len(), 48 * 40 * 4);
-        for (n, rgba) in pixels.as_chunks::<4>().0.iter().enumerate() {
-            let p = [(n % 48) as f32 + 0.5, (n / 48) as f32 + 0.5];
-            let alpha = 1. - coverage(p, clip.rect, clip.radii, [1.; 2]);
-            assert!(
-                rgba[3].abs_diff((alpha * 255.).round() as u8) <= 1,
-                "pixel {p:?}"
-            );
-        }
-    }
-}
-
-#[test]
 fn fixed_programs_match_general_coverage_scenes_pixel_for_pixel() {
     let mut d = wgpu::Wgpu::new().expect("wgpu device for program parity");
+    // Verify byte-exact parity of fs_main's fixed program specializations (CLASSES).
+    d.fast_shadow = false;
     for scene in scenes() {
         d.general_only = true;
         let general = render(&mut d, &scene);

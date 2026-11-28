@@ -20,6 +20,10 @@ package protocol ShareHosting: AnyObject {
     /// Once storage is configured: the cold share's files land, and the
     /// inbox is claimed from now on.
     func land(_ session: ExactSession)
+    /// Retries a share claim deferred over a reset hold or pending `needs_apply` receipt.
+    func claimPending(_ session: ExactSession)
+    /// Releases observers, timers, and held inbox locks when `session` is destroyed.
+    func sessionDestroyed(_ session: ExactSession)
     #if os(iOS)
     /// A link's context-menu Share item: the sheet with `url`, off `view`'s
     /// `rect`; `log` gets the journal line.
@@ -48,6 +52,8 @@ package final class NoShare: ShareHosting {
     }
     package func claimCold(_ session: ExactSession) {}
     package func land(_ session: ExactSession) {}
+    package func claimPending(_ session: ExactSession) {}
+    package func sessionDestroyed(_ session: ExactSession) {}
     #if os(iOS)
     package func shareLink(_ url: URL, from view: UIView, at rect: CGRect, log: @escaping (String) -> Void) {}
     #endif

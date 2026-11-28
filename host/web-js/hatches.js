@@ -13,7 +13,7 @@
 // first paint, as a module view's does (rt.js `painted`), and a node mounted before
 // then is told once it has. rt.js re-exports `ht`: only a plan that marks a
 // node bundles this.
-import { onEnd, journal, clock, viewId, inflight, painted, time, paint, drive } from "./rt.js";
+import { onEnd, onMount, journal, clock, viewId, inflight, painted, time, paint, drive } from "./rt.js";
 import { loadOnce } from '../web/load-once.js';
 
 const loads = {};
@@ -476,84 +476,86 @@ const Unhandled = new Map();
 /** The page module's `element` hatch for `e`, and its end. */
 export function ht(e) {
   if (typeof requestAnimationFrame !== "function" || globalThis.__exactRender) return;
-  publish();
-  const word = e.getAttribute("data-hatch"), id = viewId(e);
-  const handled = globalThis.exact?.hatchWords;
-  if (handled && !handled.includes(word)) {
-    if (!Unhandled.has(word)) { Unhandled.set(word, "plan"); say(`element ${word}: not handled on this platform (app.json \`hatches\`); its nodes are shown and never called`); }
-    return;
-  }
-  // What a hatch asks of an element is queued (`ask`): it runs after the
-  // effect or commit that called the hatch, never inside it, as on Apple.
-  const what = `element ${word} #${id}`;
-  const spans = new Set(), site = e.dataset.site != null ? Number(e.dataset.site) : null;
-  const h = {
-    hatch: word, element: e, data: e.dataset, isNew: true, isLive: true,
-    click() { ask(h, what, "click"); }, focus() { ask(h, what, "focus"); }, blur() { ask(h, what, "blur"); }, input(text) { ask(h, what, "input", text); },
-    owns(target, sentence, options) { return h.isLive && owns(`element ${word}`, e, target, sentence, options); },
-    get parts() { return (Parts.get(e) ?? []).map(p => ({ id: p.id, role: p.role, label: p.label, element: p.ref?.deref() ?? null })); },
-    set parts(list) { if (h.isLive) setParts(`element ${word}`, e, list); },
-    diagnostics: diagnostics(`element ${word}`, spans),
-  };
-  // A throw is caught and journaled (LLP 1075.003.000.001 §4.4): this node's
-  // built and changed are not called again; its end still is, so what it
-  // added before throwing is still taken back.
-  let module = null, inRow = false, threw = false;
-  const call = (name, moment) => {
-    if (typeof module?.[name] !== "function" || (threw && name === "element")) return;
-    const n = counted(word).calls[moment] = (counted(word).calls[moment] ?? 0) + 1;
-    if (!inRow || n === 1) say(`element ${word} #${id}: ${moment}`);
-    try { timed(`element ${word}`, site, moment, () => module[name](h)); } catch (error) {
-      if (name === "element") threw = true;
-      say(`element ${word} #${id}: ${name} threw ${error?.message ?? error}${name === "element" ? "; this node's hatch is not called again, its end still is" : ""}`);
-    }
-  };
-  inflight.n++;
-  page().then(m => {
-    // The switch is read here, once the page has started and says what it is.
-    if (!h.isLive || off()) return;
-    // (No page module at all: nothing is called, nor counted live, and it is said once.)
-    if (!m) { if (!said.has(word)) { said.add(word); say(`element ${word}: no page module (modules/web/) on this page; its nodes are shown and never called`); } return; }
-    module = m;
+  onMount(() => {
     publish();
-    counted(word).live++;
-    if (!said.has(word)) { said.add(word); say(`element ${word}: nothing beyond the call on this host (LLP 1075.003.000)`); }
-    const row = e.closest("[data-listitemkey]");
-    inRow = !!row;
-    if (row && !warned.has(word)) {
-      warned.add(word);
-      let list = row.parentElement;
-      while (list && !list.$list) list = list.parentElement;
-      say(`element ${word} is in a row of list ${list?.dataset.testid ?? "#" + (list ? viewId(list) : "?")}: each row's mount calls its hatch on the main thread`);
+    const word = e.getAttribute("data-hatch"), id = viewId(e);
+    const handled = globalThis.exact?.hatchWords;
+    if (handled && !handled.includes(word)) {
+      if (!Unhandled.has(word)) { Unhandled.set(word, "plan"); say(`element ${word}: not handled on this platform (app.json \`hatches\`); its nodes are shown and never called`); }
+      return;
     }
-    // A change of its words (dataset.js) is heard after the effect that made
-    // it, once however many words changed: what the hatch does in answer (a
-    // click) is then an ordinary update, not one inside the running effect.
-    // Installed before `built`, so what `built` itself causes is heard too.
-    let due = false;
-    // Told in a microtask; a seek's hatch instant tells it there and then (`instant`).
-    const tell = () => { if (!due) return; due = false; Changed.delete(tell); if (h.isLive) { h.isNew = false; call("element", "changed"); } };
-    e.$ht = () => {
-      if (due) return;
-      due = true;
-      Changed.add(tell);
-      queueMicrotask(tell);
+    // What a hatch asks of an element is queued (`ask`): it runs after the
+    // effect or commit that called the hatch, never inside it, as on Apple.
+    const what = `element ${word} #${id}`;
+    const spans = new Set(), site = e.dataset.site != null ? Number(e.dataset.site) : null;
+    const h = {
+      hatch: word, element: e, data: e.dataset, isNew: true, isLive: true,
+      click() { ask(h, what, "click"); }, focus() { ask(h, what, "focus"); }, blur() { ask(h, what, "blur"); }, input(text) { ask(h, what, "input", text); },
+      owns(target, sentence, options) { return h.isLive && owns(`element ${word}`, e, target, sentence, options); },
+      get parts() { return (Parts.get(e) ?? []).map(p => ({ id: p.id, role: p.role, label: p.label, element: p.ref?.deref() ?? null })); },
+      set parts(list) { if (h.isLive) setParts(`element ${word}`, e, list); },
+      diagnostics: diagnostics(`element ${word}`, spans),
     };
-    call("element", "built");
-  }, error => say(`element ${word} #${id}: no page module: ${error?.message ?? error}`))
-    .finally(() => setTimeout(() => inflight.n--));
-  onEnd(() => {
-    delete e.$ht;
-    const told = module && h.isLive;
-    // As on Apple: the handle is no longer live in `elementEnded` (its
-    // `click()` does nothing), and keeps no element after it, since a list
-    // may give the element to another row.
-    h.isLive = false;
-    if (told) { counted(word).live--; call("elementEnded", "ended"); }
-    abandon(spans);
-    regionsEnded(`element ${word}`, e);
-    h.data = { ...e.dataset };
-    h.element = null;
+    // A throw is caught and journaled (LLP 1075.003.000.001 §4.4): this node's
+    // built and changed are not called again; its end still is, so what it
+    // added before throwing is still taken back.
+    let module = null, inRow = false, threw = false;
+    const call = (name, moment) => {
+      if (typeof module?.[name] !== "function" || (threw && name === "element")) return;
+      const n = counted(word).calls[moment] = (counted(word).calls[moment] ?? 0) + 1;
+      if (!inRow || n === 1) say(`element ${word} #${id}: ${moment}`);
+      try { timed(`element ${word}`, site, moment, () => module[name](h)); } catch (error) {
+        if (name === "element") threw = true;
+        say(`element ${word} #${id}: ${name} threw ${error?.message ?? error}${name === "element" ? "; this node's hatch is not called again, its end still is" : ""}`);
+      }
+    };
+    inflight.n++;
+    page().then(m => {
+      // The switch is read here, once the page has started and says what it is.
+      if (!h.isLive || off()) return;
+      // (No page module at all: nothing is called, nor counted live, and it is said once.)
+      if (!m) { if (!said.has(word)) { said.add(word); say(`element ${word}: no page module (modules/web/) on this page; its nodes are shown and never called`); } return; }
+      module = m;
+      publish();
+      counted(word).live++;
+      if (!said.has(word)) { said.add(word); say(`element ${word}: nothing beyond the call on this host (LLP 1075.003.000)`); }
+      const row = e.closest("[data-listitemkey]");
+      inRow = !!row;
+      if (row && !warned.has(word)) {
+        warned.add(word);
+        let list = row.parentElement;
+        while (list && !list.$list) list = list.parentElement;
+        say(`element ${word} is in a row of list ${list?.dataset.testid ?? "#" + (list ? viewId(list) : "?")}: each row's mount calls its hatch on the main thread`);
+      }
+      // A change of its words (dataset.js) is heard after the effect that made
+      // it, once however many words changed: what the hatch does in answer (a
+      // click) is then an ordinary update, not one inside the running effect.
+      // Installed before `built`, so what `built` itself causes is heard too.
+      let due = false;
+      // Told in a microtask; a seek's hatch instant tells it there and then (`instant`).
+      const tell = () => { if (!due) return; due = false; Changed.delete(tell); if (h.isLive) { h.isNew = false; call("element", "changed"); } };
+      e.$ht = () => {
+        if (due) return;
+        due = true;
+        Changed.add(tell);
+        queueMicrotask(tell);
+      };
+      call("element", "built");
+    }, error => say(`element ${word} #${id}: no page module: ${error?.message ?? error}`))
+      .finally(() => setTimeout(() => inflight.n--));
+    onEnd(() => {
+      delete e.$ht;
+      const told = module && h.isLive;
+      // As on Apple: the handle is no longer live in `elementEnded` (its
+      // `click()` does nothing), and keeps no element after it, since a list
+      // may give the element to another row.
+      h.isLive = false;
+      if (told) { counted(word).live--; call("elementEnded", "ended"); }
+      abandon(spans);
+      regionsEnded(`element ${word}`, e);
+      h.data = { ...e.dataset };
+      h.element = null;
+    });
   });
 }
 

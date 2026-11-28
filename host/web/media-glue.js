@@ -45,7 +45,9 @@ function syncVisibility(el) {
   state.observer.observe(el);
 }
 function update(el, attaching = false) {
-  const state = states.get(el), props = el.exactMedia.props;
+  const state = states.get(el), props = { ...el.exactMedia.props };
+  const batch = el.exactMedia.commands?.splice(0) ?? [];
+  const srcGen = el.exactMedia.srcGen ?? 0;
   const changed = name => props[name] !== state.applied[name];
   for (const name of booleans) {
     el.toggleAttribute(name, props[name] === 'true');
@@ -69,9 +71,13 @@ function update(el, attaching = false) {
   }
   syncVisibility(el);
   syncPlayback(el);
-  state.applied = { ...props };
-  for (const [name, seconds] of el.exactMedia.commands?.splice(0) ?? []) run(el, name, seconds);
-  claim(el);
+  state.applied = props;
+  for (const [name, seconds] of batch) {
+    if (state.retired) break;
+    if (name === 'load' && (el.exactMedia.srcGen ?? 0) !== srcGen) continue;
+    run(el, name, seconds);
+  }
+  if (!state.retired) claim(el);
 }
 // The commands by HTML's method names (podcast F8, F18), queued on the
 // element by the host until the glue has it. `fastSeek` seeks every time,

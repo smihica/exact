@@ -153,6 +153,167 @@ final class LocalInsetsIOSTests: XCTestCase {
         XCTAssertEqual(reported[3], max(0, safe.left - max(0, box.minX)), accuracy: 0.5, "left")
     }
 
+    /// A full-screen route reads its landed top and bottom insets from its first frame and keeps them steady
+    /// across its animated presentation and dismissal, both barless (expo/exact#2126) and with a native
+    /// navigation bar, while preserving route-owned `additionalSafeAreaInsets`.
+    func testAFullScreenRouteReadsItsTopInsetFromItsFirstFrameThroughPresentationAndDismissal() throws {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            throw missing("scene", "a full-screen presentation requires a window scene")
+        }
+        let (session, view) = try fixture(scene)
+        let navigation = session.presenter.navigationHost
+        until("the home route shows") { self.node(session, "open-cover") != nil }
+        try XCTSkipUnless(view.safeAreaInsets.top > 1, "simulator reports no nonzero status-bar top inset")
+        let openTap = Agent(session: session).tap(["id": Int(try XCTUnwrap(node(session, "open-cover")).id)])
+        XCTAssertNil(openTap["error"], "open-cover tap succeeded: \(openTap)")
+
+        var first: [CGFloat]?
+        var sawInFlight = false
+        var observedTops: [CGFloat] = []
+        var observedBarHeights: [CGFloat] = []
+        let deadline = Date().addingTimeInterval(5)
+        var coverNode: NodeView?
+        var coverController: RouteController?
+        while Date() < deadline {
+            if let cover = node(session, "cover"), let c = navigation.controllers[cover.id] {
+                coverNode = cover
+                coverController = c
+                let inFlight = c.inPresentation || c.transitionCoordinator != nil
+                if let insets = navigation.localInsets.wanted[cover.id] {
+                    if first == nil { first = insets }
+                    observedTops.append(insets[0])
+                    if inFlight { sawInFlight = true }
+                }
+                if let bar = node(session, "cover-bar"), bar.bounds.height > 0 {
+                    observedBarHeights.append(bar.bounds.height)
+                }
+                if c.presentingViewController != nil && !inFlight { break }
+            }
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+        }
+        let cover = try XCTUnwrap(coverNode, "the full-screen cover appeared")
+        let c = try XCTUnwrap(coverController, "the full-screen cover has a controller")
+        XCTAssertTrue(c.presentingViewController != nil && c.transitionCoordinator == nil && !c.inPresentation, "the full-screen cover landed")
+        let landedTop = c.surface.safeAreaInsets.top
+        let landedBottom = c.surface.safeAreaInsets.bottom
+        XCTAssertGreaterThan(landedTop, 1, "the full-screen cover sits under the status bar")
+        XCTAssertTrue(sawInFlight, "the test must observe the cover while its animated presentation is in flight")
+        let reported = try XCTUnwrap(first, "the cover reported local insets during presentation")
+        XCTAssertEqual(reported[0], landedTop, accuracy: 0.5, "top inset matches from the very first frame")
+        XCTAssertEqual(reported[2], landedBottom, accuracy: 0.5, "bottom inset matches from the very first frame")
+        for top in observedTops {
+            XCTAssertEqual(top, landedTop, accuracy: 0.5, "top inset never dipped during presentation: \(observedTops)")
+        }
+        until("the cover bar settled at 44 + top inset") {
+            guard let bar = self.node(session, "cover-bar") else { return false }
+            return abs(bar.bounds.height - (44 + landedTop)) < 0.5
+        }
+        XCTAssertFalse(observedBarHeights.isEmpty, "the cover bar rendered during presentation")
+        for h in observedBarHeights {
+            XCTAssertEqual(h, 44 + landedTop, accuracy: 0.5, "bar height never slid in under the status bar: \(observedBarHeights)")
+        }
+
+        // Route-owned additionalSafeAreaInsets must be preserved by landingSafeArea.
+        c.additionalSafeAreaInsets.left = 20
+        defer { c.additionalSafeAreaInsets.left = 0 }
+        until("route-owned additionalSafeAreaInsets reaches local insets") {
+            abs((navigation.localInsets.wanted[cover.id]?[3] ?? 0) - 20) < 0.5
+        }
+        c.additionalSafeAreaInsets.left = 0
+
+        // Retain the enclosing presented controller so we verify UIKit actually completes dismissal.
+        var presentedModal: UIViewController = c
+        while let parent = presentedModal.parent { presentedModal = parent }
+        let closeTap = Agent(session: session).tap(["id": Int(try XCTUnwrap(node(session, "close-cover")).id)])
+        XCTAssertNil(closeTap["error"], "close-cover tap succeeded: \(closeTap)")
+        var dismissTops: [CGFloat] = []
+        let dismissDeadline = Date().addingTimeInterval(5)
+        var dismissed = false
+        while Date() < dismissDeadline {
+            if let insets = navigation.localInsets.wanted[cover.id] {
+                dismissTops.append(insets[0])
+            }
+            if presentedModal.presentingViewController == nil && presentedModal.viewIfLoaded?.window == nil {
+                dismissed = true
+                break
+            }
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+        }
+        XCTAssertTrue(dismissed, "the full-screen cover's presented modal completed dismissal")
+        for top in dismissTops {
+            XCTAssertEqual(top, landedTop, accuracy: 0.5, "top inset stays steady during dismissal: \(dismissTops)")
+        }
+
+        // A full-screen route with a native navigation bar must include both status bar and bar height from frame 0,
+        // and preserve both route-owned and ancestor-owned `additionalSafeAreaInsets` (with UIKit's floor) in flight.
+        until("home is back on screen") { self.node(session, "open-cover-nav") != nil }
+        let navTap = Agent(session: session).tap(["id": Int(try XCTUnwrap(node(session, "open-cover-nav")).id)])
+        XCTAssertNil(navTap["error"], "open-cover-nav tap succeeded: \(navTap)")
+        var navFirst: [CGFloat]?
+        var navObservedTops: [CGFloat] = []
+        var navSawInFlight = false
+        var navInFlightFloorDelta: CGFloat?
+        var navInFlightRouteDelta: CGFloat?
+        var navInFlightNegTop: CGFloat?
+        var navController: RouteController?
+        let navDeadline = Date().addingTimeInterval(5)
+        while Date() < navDeadline {
+            if let navCover = node(session, "cover-nav"), let nc = navigation.controllers[navCover.id] {
+                navController = nc
+                let inFlight = nc.inPresentation || nc.transitionCoordinator != nil
+                // Record the unaltered first report before probing `additionalSafeAreaInsets`.
+                if let insets = navigation.localInsets.wanted[navCover.id] {
+                    if navFirst == nil { navFirst = insets }
+                    navObservedTops.append(insets[0])
+                    if inFlight { navSawInFlight = true }
+                }
+                if inFlight && navFirst != nil && navInFlightFloorDelta == nil, let nav = nc.navigationController {
+                    let baseLeft = navigation.localInsets.wanted[navCover.id]?[3] ?? 0
+                    // Ancestor +20 with child -20 must keep the ancestor's 20 (UIKit inherited floor).
+                    nav.additionalSafeAreaInsets.left = 20
+                    nc.additionalSafeAreaInsets.left = -20
+                    _ = navigation.reportLocalInsets()
+                    navInFlightFloorDelta = (navigation.localInsets.wanted[navCover.id]?[3] ?? 0) - baseLeft
+                    // Ancestor +20 with child +12 must add to +32.
+                    nc.additionalSafeAreaInsets.left = 12
+                    _ = navigation.reportLocalInsets()
+                    navInFlightRouteDelta = (navigation.localInsets.wanted[navCover.id]?[3] ?? 0) - baseLeft
+                    // Negative child top inset reduces nav-bar clearance down to the inherited status-bar floor.
+                    nc.additionalSafeAreaInsets.top = -200
+                    navInFlightNegTop = NavigationHost.landingSafeArea(nc)?.top
+                    nav.additionalSafeAreaInsets.left = 0
+                    nc.additionalSafeAreaInsets.left = 0
+                    nc.additionalSafeAreaInsets.top = 0
+                    _ = navigation.reportLocalInsets()
+                }
+                if nc.presentingViewController != nil && !inFlight { break }
+            }
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+        }
+        let nc = try XCTUnwrap(navController, "the bar-bearing full-screen cover appeared")
+        XCTAssertTrue(nc.presentingViewController != nil && nc.transitionCoordinator == nil && !nc.inPresentation, "cover-nav landed")
+        let navLandedTop = nc.surface.safeAreaInsets.top
+        XCTAssertGreaterThan(navLandedTop, view.safeAreaInsets.top + 20, "bar-bearing cover includes status bar + nav bar")
+        XCTAssertTrue(navSawInFlight, "observed cover-nav in flight")
+        XCTAssertEqual(try XCTUnwrap(navInFlightFloorDelta, "observed ancestor inset with negative child"), 20, accuracy: 0.5)
+        XCTAssertEqual(try XCTUnwrap(navInFlightRouteDelta, "observed ancestor + route inset"), 32, accuracy: 0.5)
+        XCTAssertEqual(try XCTUnwrap(navInFlightNegTop, "negative child top inset floors at inherited status bar"), view.safeAreaInsets.top, accuracy: 0.5)
+        let navReported = try XCTUnwrap(navFirst)
+        XCTAssertEqual(navReported[0], navLandedTop, accuracy: 0.5, "bar-bearing cover top inset matches from frame 0")
+        for top in navObservedTops {
+            XCTAssertEqual(top, navLandedTop, accuracy: 0.5, "bar-bearing cover top inset never jumped: \(navObservedTops)")
+        }
+
+        // Dismiss cover-nav via its bar button and verify its presented modal leaves the window.
+        var navModal: UIViewController = nc
+        while let parent = navModal.parent { navModal = parent }
+        let doneTap = Agent(session: session).tap(["id": Int(try XCTUnwrap(node(session, "close-cover-nav")).id)])
+        XCTAssertNil(doneTap["error"], "close-cover-nav tap succeeded: \(doneTap)")
+        until("the bar-bearing full-screen cover's presented modal completed dismissal") {
+            navModal.presentingViewController == nil && navModal.viewIfLoaded?.window == nil
+        }
+    }
+
     /// A route coming back in a pop reads the sides it returns to while the pop runs, as UIKit gives them to it, not the
     /// ones it left with, and keeps its top and bottom, which the bars' transition moves, until the pop ends.
     func testARouteComingBackInAPopReadsItsNewSidesDuringThePop() throws {
@@ -280,6 +441,26 @@ final class LocalInsetsIOSTests: XCTestCase {
             abs(self.onScreen(clip).maxY - foot) < 0.5 && abs(self.onScreen(clipped).maxY - foot) < 0.5
                 && abs(clipped.adjustedContentInset.bottom - (foot - safe)) < 0.5
         }
+        // Hiding the tab bar is iOS 18's (`setTabBarHidden`)
+        if #available(iOS 18.0, *) {
+            // With the bar hidden, the list holds the route's foot as UIKit's own does: the route pads nothing, and
+            // the list, with no band left, is inset by the home indicator. The route opts its top out (`topOff`), so
+            // that inset is its clearance, not UIKit's adjustment, which would inset its top too.
+            let home = try XCTUnwrap(window).safeAreaInsets.bottom
+            try press("tabs")
+            waitFor("the separate list takes the foot, inset by the home indicator", facts: {
+                "edge \(route.edgeScroll.map { $0.props["testId"] ?? "?" } ?? "none"), clip foot \(route.node.convert(ControlBars.laid(clip), from: clip.superview).maxY) of \(route.node.bounds.maxY), list \(self.onScreen(clipped)) to \(foot), inset \(clipped.adjustedContentInset) of \(clipped.contentInset), home \(home), noTop \(RouteGeometry.insetsNoTop(route.node)), band \(self.node(session, "clipped-list")?.pageBand.bottom ?? -1), tab bar \(self.onScreen(bar))"
+            }) {
+                route.edgeScroll === self.node(session, "clipped-list")
+                    && abs(route.node.convert(ControlBars.laid(clip), from: clip.superview).maxY - route.node.bounds.maxY) < 0.5
+                    && abs(self.onScreen(clipped).maxY - foot) < 0.5
+                    && abs(clipped.adjustedContentInset.bottom - home) < 0.5
+                    && (self.node(session, "clipped-list")?.pageBand.bottom ?? 1) < 0.5
+            }
+            XCTAssertEqual(clipped.contentInsetAdjustmentBehavior, .never, "UIKit adjusts none of it, the route having no top")
+            XCTAssertEqual(clipped.contentInset.bottom, home, accuracy: 0.5, "the clearance is the home indicator's")
+            try press("tabs")
+        }
         let page = try XCTUnwrap(node(session, "list")?.scrollView)
         try press("footer")
         until("the footer keeps the list above the bar") { self.onScreen(page).maxY < safe && route.edgeScroll == nil }
@@ -298,17 +479,52 @@ final class LocalInsetsIOSTests: XCTestCase {
         }
     }
 
-    func testCoverRouteWithoutTabsKeepsItsBottomClearance() throws {
+    func testCoverRouteWithoutTabsGivesItsBottomEdgeToItsScroller() throws {
         guard let scene = hostedWindowScene() else { throw missing("scene", "the home indicator needs a window") }
         let (session, _) = try fixture(scene, "COVER_SCROLL")
         let route = try XCTUnwrap(session.presenter.navigationHost.activeRoute)
-        let page = try XCTUnwrap(node(session, "home-scroll")?.scrollView)
-        let window = try XCTUnwrap(window)
-        waitFor("the list ends at the window's safe edge") {
-            abs(self.onScreen(page).maxY - window.safeAreaLayoutGuide.layoutFrame.maxY) < 0.5
+        let list = try XCTUnwrap(node(session, "home-scroll"))
+        let page = try XCTUnwrap(list.scrollView)
+        // UIKit's own: a scroll view filling a large-title screen's view, which UIKit insets past the home indicator
+        let reference = UIViewController()
+        reference.title = "Home"
+        let native = UIScrollView(frame: reference.view.bounds)
+        native.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        native.contentSize = CGSize(width: 100, height: 2500)
+        reference.view.addSubview(native)
+        reference.setContentScrollView(native, for: .all)
+        let stack = UINavigationController(rootViewController: reference)
+        stack.navigationBar.prefersLargeTitles = true
+        let oracle = UIWindow(windowScene: scene)
+        oracle.rootViewController = stack
+        oracle.isHidden = false
+        defer { oracle.isHidden = true }
+        waitFor("UIKit insets its own scroll view past the home indicator") {
+            oracle.layoutIfNeeded()
+            return native.adjustedContentInset.bottom > 0
         }
-        XCTAssertNil(route.edgeScroll)
-        XCTAssertEqual(page.adjustedContentInset.bottom, 0, accuracy: 0.5)
+        waitFor("the route's list reaches the bottom edge with UIKit's inset", facts: {
+            "list \(self.onScreen(page)), inset \(page.adjustedContentInset); UIKit's \(self.onScreen(native)), inset \(native.adjustedContentInset)"
+        }) {
+            abs(self.onScreen(page).maxY - self.onScreen(native).maxY) < 0.5
+                && abs(page.adjustedContentInset.bottom - native.adjustedContentInset.bottom) < 0.5
+        }
+        XCTAssertTrue(route.edgeScroll === list)
+        // The window changes size with the app still in the foreground, as an iPhone Duo unfolds after a folded
+        // launch: the list follows to the new foot with UIKit's inset, with no trip to the background to refresh it
+        let window = try XCTUnwrap(self.window), resized = CGRect(origin: .zero, size: CGSize(width: window.bounds.width, height: window.bounds.height - 120))
+        let footBefore = onScreen(native).maxY
+        window.frame = resized
+        oracle.frame = resized
+        waitFor("after the resize the list reaches the new foot with UIKit's inset", facts: {
+            "list \(self.onScreen(page)), inset \(page.adjustedContentInset); UIKit's \(self.onScreen(native)), inset \(native.adjustedContentInset)"
+        }) {
+            oracle.layoutIfNeeded()
+            return abs(self.onScreen(native).maxY - (footBefore - 120)) < 0.5
+                && abs(self.onScreen(page).maxY - self.onScreen(native).maxY) < 0.5
+                && abs(page.adjustedContentInset.bottom - native.adjustedContentInset.bottom) < 0.5
+                && route.edgeScroll === list
+        }
     }
 
     func testCoverRouteScrollInsetsMatchUIKitOnEachEdge() throws {
@@ -327,11 +543,10 @@ final class LocalInsetsIOSTests: XCTestCase {
         let bottomTabs = RouteGeometry.shownBar(tabs.tabBar).map {
             $0.bounds.width > $0.bounds.height && onScreen($0).midY > onScreen(tabs.view).midY
         } ?? false
-        if !bottomTabs && !cover { throw XCTSkip("the UIKit reference needs tabs at the bottom of the screen") }
         session.presenter.press(try XCTUnwrap(node(session, "open")).id)
         waitFor("UIKit takes the pushed route") { nav.viewControllers.count == 2 }
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
-        XCTAssertEqual(route.edgeScroll != nil, bottomTabs, "UIKit takes the pushed route's bottom scroller when its tabs are there")
+        XCTAssertNotNil(route.edgeScroll, "UIKit takes the pushed route's bottom scroller")
         waitFor("the orientation route is on screen") {
             nav.viewControllers.count == 2 && !navigation.inTransition && self.node(session, "open") == nil
         }
@@ -344,9 +559,13 @@ final class LocalInsetsIOSTests: XCTestCase {
         let page = try XCTUnwrap(list.scrollView)
         XCTAssertTrue(page.isDescendant(of: route.view))
         if !bottomTabs {
-            XCTAssertNil(route.edgeScroll)
-            XCTAssertEqual(onScreen(page).maxY, window.safeAreaLayoutGuide.layoutFrame.maxY, accuracy: 0.5)
-            XCTAssertEqual(page.adjustedContentInset.bottom, 0, accuracy: 0.5)
+            // Tabs at the top or in a sidebar leave the route the screen's foot, under either fit
+            waitFor("the list runs under the home indicator, inset by it", facts: {
+                "frame \(self.onScreen(page)), inset \(page.adjustedContentInset), window \(window.safeAreaInsets)"
+            }) {
+                route.edgeScroll === list && abs(self.onScreen(page).maxY - self.onScreen(tabs.view).maxY) < 0.5
+                    && abs(page.adjustedContentInset.bottom - window.safeAreaInsets.bottom) < 0.5
+            }
             return
         }
         let last = try XCTUnwrap(node(session, "end"))
@@ -436,10 +655,11 @@ final class LocalInsetsIOSTests: XCTestCase {
             }
             if #available(iOS 18.0, *), cover {
                 try press("tabs")
-                waitFor("the hidden tab bar gives the cover page its bottom edge back", facts: {
+                waitFor("with the tab bar hidden the list runs under the home indicator, inset by it", facts: {
                     "frame \(self.onScreen(page)), inset \(page.adjustedContentInset), edge \(String(describing: route.edgeScroll))"
                 }) {
-                    route.edgeScroll == nil && abs(self.onScreen(page).maxY - window.safeAreaLayoutGuide.layoutFrame.maxY) < 0.5 && page.adjustedContentInset.bottom == 0
+                    route.edgeScroll === list && abs(self.onScreen(page).maxY - self.onScreen(tabs.view).maxY) < 0.5
+                        && abs(page.adjustedContentInset.bottom - window.safeAreaInsets.bottom) < 0.5
                 }
                 try press("tabs")
                 waitFor("the scroller takes the tab bar again") {

@@ -5,10 +5,12 @@ const loads = {};
 // the first field that has them, outside the signal runtime.
 
 export const decorationPiece = () => loads.Decorations;
-export function startDecoration(e, {own, onEnd, inflight, say}) {
+export function startDecoration(e, {own, onEnd, onMount, inflight, say}) {
   if (typeof requestAnimationFrame !== 'function' || globalThis.__exactRender) return;
-  let handle; onEnd(() => handle?.destroy()); inflight.n++;
-  (loadOnce(loads, "Decorations", () => new Promise(r => requestAnimationFrame(r)).then(() => import('./decorations.js')))).then(module => {
-    if (e.isConnected && !own?.gone) handle = module.install(e, say);
-  }).catch(error => say(`decorations: ${error.message}`)).finally(() => inflight.n--);
+  onMount(() => {
+    let handle; onEnd(() => handle?.destroy()); inflight.n++;
+    (loadOnce(loads, "Decorations", () => new Promise(r => requestAnimationFrame(r)).then(() => import('./decorations.js')))).then(module => {
+      if (e.isConnected && !own?.gone) handle = module.install(e, say);
+    }).catch(error => say(`decorations: ${error.message}`)).finally(() => inflight.n--);
+  });
 }

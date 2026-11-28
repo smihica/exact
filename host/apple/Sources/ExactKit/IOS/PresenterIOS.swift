@@ -625,11 +625,10 @@ package final class Presenter {
             return
         }
         let responder: UIView = target.headerField ?? textEditor ?? projectedGrip ?? target
-        if selectText, textEditor == nil {
-            session?.log("selectText \"\(name)\" refused: not a text editor")
-            return
-        }
+        if selectText, textEditor == nil { session?.log("selectText \"\(name)\" refused: not a text editor"); return }
         chooseFocus(target)
+        // Focused already: select, without asking UIKit to focus it again.
+        if selectText, responder.isFirstResponder { fieldSelections.selectAll(target); return }
         guard responder.canBecomeFirstResponder else {
             session?.log("focus \"\(name)\" refused: not focusable")
             return
@@ -879,7 +878,6 @@ package final class Presenter {
         collections.endBatch()
         return true
     }
-
     func apply(_ batch: Batch) {
         NodeView.scrollLayoutEpoch &+= 1
         defer { NodeView.scrollLayoutEpoch &+= 1 }
@@ -898,7 +896,8 @@ package final class Presenter {
         defer { fieldsWaiting = outerWaiting }
         let outerInput = inputStarted; inputStarted = batch.input
         defer { inputStarted = outerInput }
-        defer { applyLanguage(batch); applyWakeLock(batch); applyOrientationLock(batch) }
+        let languageChanged = takeLanguage(batch)
+        defer { applyLanguage(batch, documentChanged: languageChanged); applyWakeLock(batch); applyOrientationLock(batch) }
         if applySnapshots(batch) { return }
         takeRootTabs(batch)
         PaintOrder.begin(); let schemes = ColorSchemes.begin(); defer { schemes.end() }
@@ -941,7 +940,7 @@ package final class Presenter {
         #if os(iOS)
         if outermost { carryFocus(batch) }
         #endif
-        applying = true
+        applying = true; if languageChanged { invalidateHyphenatedParagraphsForLanguage() }
         // Hatched nodes this batch destroys end first, so a reusable hatch has
         // undone its additions before the pool looks at their rows; inside
         // the batch, so what a hatch clicks waits for it (`afterBatch`).

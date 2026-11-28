@@ -13,19 +13,21 @@ internal object Languages {
 
     private val languageId = Regex("(?:[a-z]{2,3}|[a-z]{5,8})(?:-[a-z]{4})?(?:-(?:[a-z]{2}|[0-9]{3}))?(?:-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))*")
 
-    /** `tag` canonicalised as BCP 47 is (`zh_tw` is `zh-TW`), or null for no tag. */
+    /**
+     * `tag` canonicalised as BCP 47 is (`zh-tw` is `zh-TW`), or null for no tag. `zh_tw` is not
+     * structurally valid BCP 47, so it is refused as the web refuses it (D7).
+     */
     fun canonical(tag: String): String? {
         return try {
-            val input = tag.replace('_', '-')
-            val subtags = input.lowercase(Locale.ROOT).split('-')
+            val subtags = tag.lowercase(Locale.ROOT).split('-')
             val base = subtags.takeWhile { it.length != 1 }
             if (!languageId.matches(base.joinToString("-"))) return null
             // Locale.Builder silently drops repeated extensions and accepts repeated variants.
             val variants = base.drop(1).filter { it.length >= 5 || (it.length == 4 && it[0].isDigit()) }
             val extensions = subtags.drop(base.size).takeWhile { it != "x" }.filter { it.length == 1 }
             if (variants.distinct() != variants || extensions.distinct() != extensions) return null
-            val locale = Locale.Builder().setLanguageTag(input).build()
-            locale.toLanguageTag().takeIf { locale.language.isNotEmpty() || input.substringBefore('-').equals("und", true) }
+            val locale = Locale.Builder().setLanguageTag(tag).build()
+            locale.toLanguageTag().takeIf { locale.language.isNotEmpty() || tag.substringBefore('-').equals("und", true) }
         } catch (_: IllformedLocaleException) { null }
     }
 

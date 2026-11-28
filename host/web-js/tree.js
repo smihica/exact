@@ -7,7 +7,7 @@ import { Refusal } from './shape.js';
 import { regions } from './regions.js';
 import { declare } from './declarations.js';
 import { backdropValue as backdropCss } from './backdrop.js';
-import { onEnd, effect, untracked, say, inflight, After, Paint, Probes, Media, Links, Scrolls, Selects } from './rt.js';
+import { onEnd, onMount, effect, untracked, say, inflight, After, Paint, Probes, Media, Links, Scrolls, Selects } from './rt.js';
 import { Adopt, adopting, PrepareTasks } from './mount.js';
 import { autofocusProp } from './focus.js';
 const SVG = 'http://www.w3.org/2000/svg';
@@ -40,7 +40,7 @@ export function h(p, tag, cls, attrs, text, ns) {
         if (k === 'data-exact-f' || k.startsWith('data-exact-f-')) bits |= Number(attrs[k]);
       }
     if (tag === 'a') Links?.made(e, attrs);
-    if ('data-scrolldocument' in attrs) Docs.add(e);
+    if ('data-scrolldocument' in attrs) onMount(() => Docs.add(e));
     if (tag === 'img') Hooks.image?.(e);
   }
   if (Paint) e.$paintFacts = bits;
@@ -114,10 +114,10 @@ function adopt(p, tag, cls, attrs) {
       const v = rel(k, attrs[k]);
       if (NOT_DOM.test(k)) e['$' + k] = v;
       else if (k === 'autofocus') autofocusProp(e, v !== 'false');
-      else if (e.getAttribute(k) !== v) e.setAttribute(k, v);
+      else if (e.getAttribute(k) !== String(v)) e.setAttribute(k, v);
     }
     if (tag === 'a') Links?.made(e, attrs, rendered);
-    if ('data-scrolldocument' in attrs) Docs.add(e);
+    if ('data-scrolldocument' in attrs) onMount(() => Docs.add(e));
     if (tag === 'img') Hooks.image?.(e);
   }
   Paint?.list(e);
@@ -220,7 +220,7 @@ const navigable = v => {
 export function P(e, name, f) {
   if (PrepareTasks && ['navigationKey', 'navigationBack', 'aria-selected', 'aria-controls', 'id'].includes(name))
     (e.$taskProps ??= {})[name] = f;
-  if (name === 'data-scrolldocument') Docs.add(e);
+  if (name === 'data-scrolldocument') onMount(() => Docs.add(e));
   effect(() => {
     let v = f();
     v = rel(name, v == null ? null : typeof v === 'boolean' ? String(v) : String(v));
@@ -230,6 +230,10 @@ export function P(e, name, f) {
     if (name === 'href' && v != null && (!navigable(v) || v === '')) v = null;
     // no material, cleared as the runner clears it (bridge.rs `prop_value`)
     if (name === 'backgroundMaterial' && v === 'none') v = null;
+    if (name === 'src' && e.localName === 'img' && e.$authoredSrc !== v) {
+      e.$authoredSrc = v;
+      e.$srcGen = (e.$srcGen ?? 0) + 1;
+    }
     if (PropHooks[name]?.(e, v)) return;
     if (NOT_DOM.test(name)) return void (e['$' + name] = v);
     // media.js: `paused`, `volume`, `currentTime` … are the glue's; an `app:/` source its own
@@ -240,7 +244,7 @@ export function P(e, name, f) {
       if (!e.childElementCount && e.textContent !== (v ?? '')) e.textContent = v ?? '';
     } else if (name === 'value') {
       if (e.localName === 'select') {
-        Selects.add(e);
+        onMount(() => Selects.add(e), (e.$selectMountKey ??= {}));
         e.$value = v ?? '';
         e.$set = true;
       }
@@ -250,8 +254,12 @@ export function P(e, name, f) {
       e.exactDecorations?.sync();
     } else if (name === 'scrollTop' || name === 'scrollLeft') {
       // Kept as `$scrollTop`, `$scrollLeft`: where the scroller opens when its page arrives (fragment.js, LLP 1153 D5.1).
-      e['$' + name] = v == null ? undefined : Number(v);
-      if (v != null) (Scrolls.get(e) ?? Scrolls.set(e, {}).get(e))[name] = Number(v);
+      const at = v == null ? undefined : Number(v);
+      e['$' + name] = at;
+      if (at != null)
+        onMount(() => {
+          if (e['$' + name] === at) (Scrolls.get(e) ?? Scrolls.set(e, {}).get(e))[name] = at;
+        }, (e['$scrollMountKey' + name] ??= {}));
     } else if (BOOL.test(name)) {
       if (name === 'inert') e.authoredInert = v === 'true';
       if (name === 'autofocus') autofocusProp(e, v === 'true');
@@ -563,8 +571,10 @@ export function css(e, prop, unit, v, rendered) {
     return;
   }
   // The `animation` shorthand resets the longhands a timeline's consumer writes again after it (LLP 1057.003 D5).
+  // Mark them as `null` rather than deleting them so a follow-up `null` (auto/none/clock) does not
+  // `removeProperty('animation-play-state')` and clear a `paused` written by the shorthand.
   if (prop === 'animation')
-    for (const p of ['animation-timeline', 'animation-range', 'animation-play-state']) delete last[p];
+    for (const p of ['animation-timeline', 'animation-range', 'animation-play-state']) last[p] = null;
   // An adopted node's inline style is the renderer's: a value it already shows is not written again (a write
   // restyles and repaints the node). (`transparent` is the color the renderer writes as rgba(0, 0, 0, 0).)
   const valid = t == null || prop.startsWith('--') || t === 'unset' || normal(prop, t);
@@ -577,8 +587,17 @@ export function css(e, prop, unit, v, rendered) {
   const placement = GPU_PLACEMENT && e.exactPlaced && /^(position|transform|transform-origin|z-index|visibility|clip-path)$/.test(prop)
     ? globalThis.exact?.gpu : null;
   placement?.beforeStyle(e);
-  if (t == null) e.style.removeProperty(prop);
-  else {
+  if (t == null) {
+    if (prop === 'animation-play-state' && last.animation) {
+      const s = (Scratch ??= document.createElement('i').style);
+      s.cssText = '';
+      s.setProperty('animation', last.animation);
+      const ps = s.getPropertyValue('animation-play-state');
+      s.cssText = '';
+      if (ps) e.style.setProperty(prop, ps);
+      else e.style.removeProperty(prop);
+    } else e.style.removeProperty(prop);
+  } else {
     // A value not yet seen is probed on the detached style `normal` keeps, so the live node gets only the final
     // write (LLP 1071.001 A8). Every property takes `unset`: one that reads back empty is a property this browser
     // does not have (Chrome's `-moz-osx-font-smoothing`), not a refusal.

@@ -119,6 +119,21 @@ fn each_argument_binds_its_prop_and_a_bound_draggable_follows_state() {
     assert!(uses(&plan).has(Capability::DragOut) && !uses(&still).has(Capability::DragOut));
 }
 
+/// `DataTransfer(…)` has no value of its own (D1): a component that reads a prop in two of its arguments, a
+/// collection's photos and their names, binds the prop within each argument, as each is its own binding, and
+/// its drag carries both.
+#[test]
+fn a_component_reading_a_prop_in_two_arguments_drags_both() {
+    let src = "component App\n  view\n    Pair(ids=[\"1016\", \"1017\"])\ncomponent Pair\n  props\n    ids: string[]\n  view\n    box testId=\"pair\" draggable=true dataTransfer=DataTransfer(files=ids.map((i) => `assets/${i}.jpg`), names=ids.map((i) => `Landmark ${i}`))\n      text \"Pair\"\n";
+    let r = boot_source(src, Platform::Ios, "");
+    assert_eq!(drag(&r, "pair").3, "assets/1016.jpg\nassets/1017.jpg");
+    assert_eq!(
+        held(&r, "pair", PropId::DataTransferNames).as_deref(),
+        Some("Landmark 1016.jpg\nLandmark 1017.jpg")
+    );
+    assert!(refusals(&r).is_empty(), "{:?}", refusals(&r));
+}
+
 #[test]
 fn the_runner_admits_files_by_the_grants_and_the_host_reach_and_journals_a_refusal_as_it_writes_the_prop(
 ) {
@@ -235,11 +250,20 @@ fn each_refusal_names_what_to_write_instead() {
             "type-data-transfer",
             "a picture of an element is `share`'s",
         ),
-        ("drag=go", "lower-handler-later", "`drag` is not heard yet"),
+        (
+            "draggable=true dataTransfer=DataTransfer(text=\"a\") drag=go",
+            "lower-handler-later",
+            "Exact does not expose a drag's continuous motion at its source",
+        ),
         (
             "dragend=go",
-            "lower-handler-later",
-            "`dragend` is not heard yet",
+            "lower-drag-event-source",
+            "`dragend` is heard where a drag begins, on a node that declares `draggable`",
+        ),
+        (
+            "draggable=false dragstart=go",
+            "lower-drag-event-source",
+            "has `draggable=false`, so it never drags",
         ),
     ] {
         let (got, message) = refused(&node(attrs)).unwrap_or_default();
@@ -257,6 +281,19 @@ fn each_refusal_names_what_to_write_instead() {
         "{message}"
     );
     assert!(refused(&node("draggable=false")).is_none());
+    // LLP 1094.000 D16: a drag's start and end are heard where it begins, by a literal or a bound `draggable`
+    for attrs in [
+        "draggable=true dataTransfer=DataTransfer(text=\"a\") dragstart=go dragend=go",
+        "draggable=(n == 0) dataTransfer=DataTransfer(text=\"a\") dragstart=go",
+    ] {
+        assert!(refused(&node(attrs)).is_none(), "{attrs}");
+    }
+    let field = "component A\n  state n = 0\n  action go\n    n = 1\n  view\n    input draggable=true dataTransfer=DataTransfer(text=\"a\") dragstart=go\n";
+    assert_eq!(
+        refused(field).unwrap_or_default().0,
+        "lower-attr-tag",
+        "an ineligible tag is refused as before"
+    );
     // `draggable=false` drags nothing, so a gesture beside it claims nothing.
     assert!(refused(&node("draggable=false pan=moved")).is_none());
     let within = |body: &str| format!("component A\n  view\n    {body}\n");

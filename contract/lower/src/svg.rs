@@ -1018,15 +1018,29 @@ fn check_svg_attrs_with(
     Ok(())
 }
 
-/// Whether a node's animations follow a named timeline: any
-/// `animation-timeline` but a literal `auto` or a clock timeline, which
-/// keeps them on the clock (LLP 1055.002).
+/// True if `animation-timeline` can resolve to a progress timeline (anything
+/// other than clock, `auto`, `none`, `unset`, or blank; LLP 1055.002).
 fn timeline_bound(attrs: &[Attr]) -> bool {
-    attrs.iter().any(|a| {
-        a.name == "animation-timeline"
-            && !matches!(&a.value, Expr::Str(v, _)
-                if v.trim().eq_ignore_ascii_case("auto") || v.trim().starts_with("-exact-clock("))
-    })
+    let detached_or_clock = |v: &str| {
+        let t = v.trim();
+        t.is_empty()
+            || t.eq_ignore_ascii_case("auto")
+            || t.eq_ignore_ascii_case("none")
+            || t.eq_ignore_ascii_case("unset")
+            || t.starts_with("-exact-clock(")
+    };
+    attrs
+        .iter()
+        .filter(|a| a.name == "animation-timeline")
+        .any(|a| {
+            let mut leaves = contract_checking::value_leaves(&a.value).peekable();
+            leaves.peek().is_none()
+                || !leaves.all(|leaf| match leaf {
+                    Expr::None(_) => true,
+                    Expr::Str(v, _) => detached_or_clock(v),
+                    _ => false,
+                })
+        })
 }
 
 /// An `-exact-exit-animation` must end (LLP 1063 D2): its node is removed when it
@@ -1457,23 +1471,12 @@ fn coordinate_value(value: &Expr, typing: Option<(&Scope, &Shapes)>) -> Option<E
 /// One longhand's text from an animation (for a composed template).
 fn default_part(a: &Animation, index: usize) -> String {
     match index {
-        0 => {
-            if a.name.is_empty() {
-                "none".into()
-            } else {
-                a.name.clone()
-            }
-        }
+        0 => if a.name.is_empty() { "none" } else { &a.name }.into(),
         1 => format!("{}s", exact_num::Shortest(a.duration)),
         2 => exact_motion::animation::easing_css(&a.easing),
         3 => format!("{}s", exact_num::Shortest(a.delay)),
-        4 => {
-            if a.iterations.is_infinite() {
-                "infinite".into()
-            } else {
-                exact_num::Shortest(a.iterations).to_string()
-            }
-        }
+        4 if a.iterations.is_infinite() => "infinite".into(),
+        4 => exact_num::Shortest(a.iterations).to_string(),
         5 => a.direction.name().into(),
         6 => a.fill.name().into(),
         _ => if a.paused { "paused" } else { "running" }.into(),

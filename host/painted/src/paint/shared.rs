@@ -1,6 +1,7 @@
 //! Named live subtrees kept by the Android reader (LLP 1013.000).
 use super::*;
 use exact_kernel::motion::motion_node;
+use exact_kernel::TextAlign;
 
 /// The reader captures geometry before applying the frame that carries this state.
 #[derive(Default)]
@@ -149,21 +150,30 @@ impl Painter {
         offset: PaintOffset,
         clip: Option<Rect4>,
     ) {
+        if self.lift(walk, id, offset) {
+            return;
+        }
+        let name = (walk.scene.kernel.node(id))
+            .filter(|n| (n.props.str(PropId::SharedElement)).is_some_and(|s| !s.is_empty()));
         let named = self.backend.name() == "canvas"
             && self.shared.epoch.is_some()
             && walk.dialog.is_none()
-            && walk.scene.kernel.node(id).is_some_and(|n| {
-                n.props
-                    .str(PropId::SharedElement)
-                    .is_some_and(|s| !s.is_empty())
-                    && n.style.display != Display::None
-                    && !(walk.scene.hidden)(id)
-            });
+            && name
+                .as_ref()
+                .is_some_and(|n| n.style.display != Display::None && !(walk.scene.hidden)(id));
+        // A kept drawing keeps a shared element apart, so a crossing that
+        // flies it from a removed route leaves it out (LLP 1013.004 D4).
+        if let Some((parent, key)) = self.recording().zip(name.as_ref().map(|n| n.key)) {
+            let drawing =
+                self.record_layer(|painter| painter.node_content(walk, id, ts, offset, clip));
+            parent.named(key, Rc::new(drawing));
+            return;
+        }
         if !named {
             self.node_content(walk, id, ts, offset, clip);
             return;
         }
-        let node = walk.scene.kernel.node(id).expect("named live node");
+        let node = name.expect("named live node");
         let shown = (walk.scene.presented)(id);
         let rect = self.node_rect(&node, offset, &shown);
         let paint = BoxPaint::capture(&node, walk.scene.kernel, self.dark);
@@ -246,15 +256,28 @@ impl Painter {
             .iter()
             .flat_map(|&(x, y)| [x, y])
             .fold(0.0, f32::max);
+        // A background that reaches under the bars flies with them, as a
+        // Compose screen drawn edge to edge does.
+        let (x, y, w, h) = shown.surface(rect);
+        let paints = paint.background[3] != 0 || !paint.gradients.is_empty();
+        let [top, right, bottom, left] = match paints {
+            true => self.bleed(walk.scene.kernel, id, &geometry.outer, ts),
+            false => [0.0; 4],
+        };
         let opened = self.backend.shared_begin(&SharedElement {
             key: motion_node(node.key),
-            rect: shown.surface(rect),
+            rect: (x - left, y - top, w + left + right, h + top + bottom),
             radius,
             opacity: shown.opacity,
             transform,
             image,
+            // 6: a label, which a route flight scales by its lines' width.
             fit: if !plain_image {
-                0
+                if node.node_type == NodeType::Text {
+                    6
+                } else {
+                    0
+                }
             } else {
                 match node.style.object_fit {
                     ObjectFit::Fill => 1,
@@ -268,6 +291,17 @@ impl Painter {
             crop,
         });
         self.node_content(walk, id, ts, offset, clip);
+        if let Some(lines) = walk.text.get(&node.key).filter(|_| opened) {
+            let (x, y, w, h) = geometry.content;
+            let width = lines.width.min(w);
+            let computed = node.computed_style(StyleMask::INHERITED);
+            let dx = match computed.text_align.physical(computed.direction) {
+                TextAlign::Left | TextAlign::Start | TextAlign::Justify => 0.0,
+                TextAlign::Right | TextAlign::End => w - width,
+                TextAlign::Center => (w - width) / 2.0,
+            };
+            self.backend.shared_text((x + dx, y, width, h), transform);
+        }
         if opened {
             self.backend.shared_end();
             self.shared.recorded.insert(motion_node(node.key));

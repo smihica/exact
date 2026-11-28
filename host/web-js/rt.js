@@ -130,6 +130,12 @@ function drop(n) {
 }
 function dispose(n) {
   n.gone = 1;
+  n.deferMount = false;
+  n.mounts = null;
+  if (n.mountRefs) {
+    for (const item of n.mountRefs) item[2]?.mounts?.delete(item[3]);
+    n.mountRefs = null;
+  }
   Settle.delete(n);
   drop(n);
   if (n.ends) for (const f of n.ends.splice(0)) f();
@@ -205,14 +211,66 @@ export function fm(m, g) {
     Mask = o;
   }
 }
+let PendingMounts = [], PendingMountAt = 0;
+function enqueueMounts(q) {
+  for (const item of q.values()) PendingMounts.push(item);
+}
+function drainPendingMounts() {
+  // Advance an O(1) cursor per hook so a synchronous commit inside hook A drains
+  // remaining already-connected hooks (even within the same prepared scope) before
+  // nested `After` runs, without quadratic `Array.shift()` overhead.
+  while (PendingMountAt < PendingMounts.length) {
+    if (Poisoned) {
+      PendingMounts.length = 0;
+      PendingMountAt = 0;
+      break;
+    }
+    const item = PendingMounts[PendingMountAt];
+    PendingMounts[PendingMountAt++] = null;
+    const [own, f] = item;
+    item[2] = null;
+    own?.mountRefs?.delete(item);
+    if (own?.gone) continue;
+    const o = Owner;
+    Owner = own;
+    try {
+      f();
+    } catch (err) {
+      // Poison immediately before aborting remaining hooks so no later hook can
+      // synchronously commit or emit commands against a failed tree update.
+      Poisoned = true;
+      Why ??= why('updating the tree', String(err));
+      PendingMounts.length = 0;
+      PendingMountAt = 0;
+      FocusQueue.length = 0;
+      throw err;
+    } finally {
+      Owner = o;
+    }
+  }
+  if (PendingMountAt >= PendingMounts.length) {
+    PendingMounts.length = 0;
+    PendingMountAt = 0;
+  }
+}
 function flush() {
   if (Flushing) return;
   Flushing = true;
   try {
     for (let i = 0; i < Queue.length; i++) if (!Queue[i].gone) fresh(Queue[i]);
+  } catch (e) {
+    PendingMounts.length = 0;
+    PendingMountAt = 0;
+    FocusQueue.length = 0;
+    throw e;
   } finally {
     Queue = [];
     Flushing = false;
+  }
+  drainPendingMounts();
+  if (Poisoned) {
+    FocusQueue.length = 0;
+    return;
   }
   while (FocusQueue.length) FocusQueue.shift()();
 }
@@ -344,11 +402,13 @@ export function effect(fn) {
 }
 /** A scope whose effects `dispose` ends, owned by `parent` (a region's
  * arms and rows belong to the region's scope, never to its effect, which
- * drops what it owns each time it reruns). */
-function scope(f, parent = Owner) {
+ * drops what it owns each time it reruns). With `deferMount`, mount hooks
+ * wait until `mounted` runs after its fragment enters the document. */
+function scope(f, parent = Owner, deferMount = false) {
   const o = Owner;
   Owner = parent;
   const n = node(null);
+  if (deferMount) n.deferMount = true;
   Owner = n;
   try {
     f();
@@ -359,6 +419,54 @@ function scope(f, parent = Owner) {
     Owner = o;
   }
   return n;
+}
+/** Nearest enclosing prepared scope not yet inserted into the document. */
+function preparedScope(s = Owner) {
+  for (; s; s = s.up) if (s.deferMount) return s;
+  return null;
+}
+/** Run `f` once every enclosing prepared scope has been inserted into the document, or now when mounting live.
+ * An optional `key` coalesces repeated pre-mount updates for the same binding to the latest callback. */
+function onMount(f, key) {
+  const s = preparedScope();
+  if (!s) return f();
+  const map = (s.mounts ??= new Map());
+  const k = key ?? {};
+  const prev = map.get(k);
+  if (prev) {
+    prev[0]?.mountRefs?.delete(prev);
+    map.delete(k);
+  }
+  const item = [Owner, f, s, k];
+  map.set(k, item);
+  if (Owner) (Owner.mountRefs ??= new Set()).add(item);
+}
+/** Publish a prepared scope's mount hooks after its fragment is inserted into the DOM (mount.js, document.js).
+ * Inside `flush()`, defers hook invocation until queued child effects finish catching up so hooks read fresh state
+ * and sibling scopes in the same flush batch all drain even if one throws. */
+export function mounted(s) {
+  if (!s?.deferMount) return;
+  s.deferMount = false;
+  const q = s.mounts;
+  s.mounts = null;
+  if (!q?.size) return;
+  const up = preparedScope(s.up);
+  if (up) {
+    const target = (up.mounts ??= new Map());
+    for (const [k, item] of q) {
+      if (item[0]?.gone) continue;
+      const prev = target.get(k);
+      if (prev) {
+        prev[0]?.mountRefs?.delete(prev);
+        target.delete(k);
+      }
+      item[2] = up;
+      target.set(k, item);
+    }
+    return;
+  }
+  enqueueMounts(q);
+  if (!Flushing) drainPendingMounts();
 }
 function end(n) {
   dispose(n);
@@ -378,7 +486,7 @@ export function endAll(rows) {
 }
 // For loaded pieces (list.js): scopes, untracked reads, writes, the owner in
 // force, and a count of what commits changed (an edge's no-op, runner/collection.rs).
-export { scope, end, untracked, write, onEnd };
+export { scope, end, untracked, write, onEnd, onMount, preparedScope };
 export const owner = () => Owner,
   rev = () => Rev,
   // Run `f` once this commit stands (each.js).
@@ -587,11 +695,25 @@ export function commit(f, what = 'commit', finished, presenceSnap = false) {
   }
   // What the commit would have sent and did not is refused, whatever stopped its tree update (a hook that threw, a
   // poisoned tree, a tail a view transition never ran): an answer's batches that wait for it too (ts-stream.js).
-  let sent = 0;
+  let sent = 0, finishesDone = false;
+  const finish = applied => {
+    if (finishesDone) return;
+    finishesDone = true;
+    let firstErr, threw = false;
+    for (const f of finishes) {
+      try { f(applied); }
+      catch (err) { if (!threw) { firstErr = err; threw = true; } else console.error(err); }
+    }
+    if (threw) throw firstErr;
+  };
   const unrun = why => {
-    Output?.done(cmds);
-    for (const go of out.splice(sent)) go.refused?.(why);
-    for (const follow of out.followUps ?? []) follow.refused();
+    let firstErr, threw = false;
+    const safe = g => { try { g(); } catch (err) { if (!threw) { firstErr = err; threw = true; } else console.error(err); } };
+    safe(() => finish(false));
+    safe(() => Output?.done(cmds));
+    for (const go of out.splice(sent)) safe(() => go.refused?.(why));
+    for (const follow of out.followUps ?? []) safe(() => follow.refused());
+    if (threw) throw firstErr;
   };
   const link = Nav?.holdLink();
   const tail = Object.assign(
@@ -607,6 +729,10 @@ export function commit(f, what = 'commit', finished, presenceSnap = false) {
   );
   // the tree update; inside a view transition when it may hand on a shared element's name (LLP 1013.000 D7)
   const update = () => {
+    if (Poisoned) {
+      say(`refused ${what}: the runner is poisoned; reload`);
+      return false;
+    }
     for (const f of Before) f();
     // presence measures what it tracks, and what may gain the row, before the tree changes (LLP 1063); when the flush
     // will run no effect it writes nothing, and presence measures nothing (`still`)
@@ -617,8 +743,8 @@ export function commit(f, what = 'commit', finished, presenceSnap = false) {
     }
     try {
       flush();
-      Tabs.open?.();
-      Sched?.made();
+      if (!Poisoned) Tabs.open?.();
+      if (!Poisoned) Sched?.made();
     } catch (e) {
       Poisoned = true;
       Why = why('updating the tree', String(e));
@@ -626,11 +752,27 @@ export function commit(f, what = 'commit', finished, presenceSnap = false) {
       say(`poisoned: ${e.pc != null ? `Instance(${e.message})` : e.message}`);
       console.error(e);
       Sched?.forget();
-      for (const f of finishes) f(false);
+      finish(false);
       return false;
     }
-    for (const f of finishes) f(ok);
+    // A nested commit inside a mount hook or tab open may have poisoned the runner
+    // and caught its own error; abort before finishing or running outer commands.
+    if (Poisoned) {
+      Sched?.forget();
+      finish(false);
+      return false;
+    }
+    finish(ok);
+    if (Poisoned) {
+      Sched?.forget();
+      settled(false);
+      return false;
+    }
     settled(true);
+    if (Poisoned) {
+      Sched?.forget();
+      return false;
+    }
     if (!ok) return (Sched?.scan(false), false);
     clock.epoch++;
     Store.persist();

@@ -5,14 +5,13 @@
 use exact_kernel::StyleId;
 use exact_plan::BindingKind;
 
-/// In a plan with no drag timeline, every timeline is the browser's: a name
-/// as well as `scroll()` and `view()` is CSS's own row, paused only where the
-/// browser has no `animation-timeline` (css.rs, index.html), and needs no
-/// motion piece to hand it over.
-const CSS_PLAY_STATE: &str =
-    "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\(.*\\))?\\s*$/i.test(v)?null:\"var(--exact-timeline-play,paused)\"";
+/// In a plan with no drag timeline, every timeline is the browser's: a name,
+/// `none`, `scroll()` and `view()` are CSS's own row and leave an authored
+/// `animation-play-state` alone (browsers without `animation-timeline` cancel
+/// `--exact-css-timeline` in index.html).
+const CSS_PLAY_STATE: &str = "v=>null";
 const CSS_TIMELINE: &str =
-    "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\(.*\\))\\s*$/i.test(v)?null:v";
+    "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\([\\s\\S]*\\))?\\s*$/i.test(v)?null:v";
 
 /// A bound `animation-timeline`'s play state: paused for the drag code where
 /// a name may be a drag's, else only where the browser has no timelines.
@@ -25,7 +24,8 @@ pub(crate) fn play_state(drag_timelines: bool) -> &'static str {
 }
 
 /// `animation-timeline` as CSS's own row: any timeline in a plan with no
-/// drag timeline, only `scroll()` and `view()` where a name may be a drag's.
+/// drag timeline, only `none`, `scroll()` and `view()` where a name may be a
+/// drag's.
 pub(crate) fn timeline_map(drag_timelines: bool) -> &'static str {
     if drag_timelines {
         crate::style::ANONYMOUS_TIMELINE
@@ -76,9 +76,10 @@ pub(crate) fn after_shorthand(
     }
 }
 
-/// `--exact-css-timeline` for any timeline but the clock (index.html).
+/// `--exact-css-timeline` for CSS scroll/view timelines, excluding clock and
+/// explicit `none` (index.html pauses `none` instead of cancelling it).
 const CSS_MARK: &str =
-    "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\(.*\\))\\s*$/i.test(v)?null:\"1\"";
+    "v=>v==null||/^\\s*(unset|auto|none|(-exact-)?clock\\([\\s\\S]*\\))?\\s*$/i.test(v)?null:\"1\"";
 
 /// Whether any node can declare a drag timeline: then a timeline's name may
 /// be a drag's, which the motion piece resolves (motion-glue.js
@@ -105,7 +106,7 @@ pub(crate) fn css_timelines(css: &mut String) {
         let name = css[start..end].to_string();
         css.replace_range(
             end..end + PAUSED.len(),
-            &format!(";animation-timeline:{name};animation-play-state:var(--exact-timeline-play,paused);--exact-css-timeline:1;"),
+            &format!(";animation-timeline:{name};--exact-css-timeline:1;"),
         );
     }
 }

@@ -120,7 +120,7 @@ impl<D: DataSource> Host<D> {
             for key in &r.touched {
                 if let Some(node) = self.runner.kernel().node_by_key(*key) {
                     let id = node.id;
-                    self.update(id, &mut batch);
+                    self.update_node(id, node.paragraph_stamp(), &mut batch);
                 }
             }
             if let Some(node) = r
@@ -261,5 +261,23 @@ impl<D: DataSource> Host<D> {
         }
         self.present(&mut batch, false);
         self.finish(batch, error)
+    }
+
+    /// Like [`Self::commit_finish`], also flagging any failed `persist()` store
+    /// write (including writes produced during `resize_rounds`) as an error and
+    /// returning `(batch_json, ok)` in lockstep with the emitted batch.
+    pub(super) fn commit_finish_checked(
+        &mut self,
+        mut batch: Batch,
+        error: Option<String>,
+        error_prefix: Option<&str>,
+    ) -> (String, bool) {
+        self.persist();
+        self.emit_language(&mut batch);
+        if let Some(drag) = self.turn.drag {
+            (drag.emit_transforms)(self, &mut batch);
+        }
+        self.present(&mut batch, false);
+        self.finish_checked(batch, error, error_prefix, true)
     }
 }

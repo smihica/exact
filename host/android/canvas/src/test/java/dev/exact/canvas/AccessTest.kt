@@ -22,16 +22,17 @@ class AccessTest {
         val flags: Int = 0, val range: List<Float> = listOf(0f, 0f, 0f),
     )
 
-    /** A statement of the page telling [nodes] whole, as the reader is given it. */
-    private fun statement(nodes: List<Said>): IntArray {
-        val w = mutableListOf(1, 0, 1, 0)
+    /** A statement of the page telling [nodes], whole or with [changes] (four words a change), as the reader is given it. */
+    private fun statement(nodes: List<Said>, changes: List<Int>? = null): IntArray {
+        val w = mutableListOf(1, 0, if (changes == null) 1 else 0, 0)
         fun string(s: String) {
             val bytes = s.toByteArray(Charsets.UTF_8)
             w.add(bytes.size)
             for (part in bytes.toList().chunked(4)) w.add(part.foldIndexed(0) { i, word, b -> word or ((b.toInt() and 255) shl (i * 8)) })
         }
         string("")
-        w.add(0)
+        w.add((changes?.size ?: 0) / 4)
+        changes?.let(w::addAll)
         w.add(nodes.size)
         for (n in nodes) {
             w.addAll(listOf(n.id, n.parent, n.id, n.role, n.flags, 0, 0, 100, 20))
@@ -195,9 +196,11 @@ class AccessTest {
         }
 
         org.robolectric.Shadows.shadowOf(manager).setEnabled(false)
-        assertFalse("no service, no drag", root.access.drag(1, clip, DragOut.flags(true, 33)))
+        assertFalse("no service, no drag", root.access.drag(1, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
         org.robolectric.Shadows.shadowOf(manager).setEnabled(true)
-        assertTrue(root.access.drag(1, clip, DragOut.flags(true, 33)))
+        Acts.began.clear()
+        assertTrue(root.access.drag(1, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
+        assertEquals("the lift begun is told", listOf(1), Acts.began)
         assertSame(clip, org.robolectric.shadows.ShadowWindowManagerGlobal.getLastDragClipData())
         assertFalse("the window has heard no start yet", root.dragging)
         assertTrue(cancel in actions(1) && start in actions(1))
@@ -220,12 +223,12 @@ class AccessTest {
         assertFalse("the window heard the end", root.dragging)
         assertNull("the root took no drop and offers none", root.createAccessibilityNodeInfo().actionList.firstOrNull { it.id == android.R.id.accessibilityActionDragDrop })
 
-        assertTrue(root.access.drag(2, clip, DragOut.flags(true, 33)))
+        assertTrue(root.access.drag(2, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
         send(android.view.DragEvent.ACTION_DRAG_STARTED)
         send(android.view.DragEvent.ACTION_DRAG_ENDED, result = true)
         assertEquals(listOf("Ochre dunes"), said(android.view.accessibility.AccessibilityEvent.CONTENT_CHANGE_TYPE_DRAG_CANCELLED))
         assertTrue(start in actions(2) && cancel !in actions(2))
-        assertFalse("no node that drags stands for exact2's node 3", root.access.drag(3, clip, DragOut.flags(true, 33)))
+        assertFalse("no node that drags stands for exact2's node 3", root.access.drag(3, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
 
         // While the window has heard a drag start and not its end, a Start is refused before exact2 is asked.
         Acts.asked.clear()
@@ -239,14 +242,14 @@ class AccessTest {
         // the node says the new drag was cancelled.
         send(android.view.DragEvent.ACTION_DRAG_STARTED, queued = true)
         send(android.view.DragEvent.ACTION_DRAG_ENDED, queued = true)
-        assertTrue(root.access.drag(1, clip, DragOut.flags(true, 33)))
+        assertTrue(root.access.drag(1, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
         assertFalse(cancel in actions(android.view.accessibility.AccessibilityNodeProvider.HOST_VIEW_ID))
         assertTrue(cancel !in actions(1) && start in actions(1))
         assertEquals(listOf("Ochre dunes", "Ochre dunes"), said(android.view.accessibility.AccessibilityEvent.CONTENT_CHANGE_TYPE_DRAG_CANCELLED))
 
         // A finger down in the window takes the node's Cancel: a hosted view's drag it begins may share the hold.
-        assertTrue(root.access.drag(2, clip, DragOut.flags(true, 33)))
+        assertTrue(root.access.drag(2, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
         assertTrue(cancel in actions(2))
         root.access.touched()
         assertTrue(cancel !in actions(2) && start in actions(2))
@@ -256,12 +259,35 @@ class AccessTest {
 
         // Another drag's end, heard after this one began, takes the window's hold on it and leaves the view's mark: the
         // node's Cancel reaches nothing, and goes when taken.
-        assertTrue(root.access.drag(1, clip, DragOut.flags(true, 33)))
+        assertTrue(root.access.drag(1, clip, DragOut.flags(true, 33), DragOut.Lift(1, root.context)))
         val attach = android.view.View::class.java.getDeclaredField("mAttachInfo").apply { isAccessible = true }.get(root)
         attach.javaClass.getDeclaredField("mDragToken").apply { isAccessible = true }.set(attach, null)
         assertTrue(cancel in actions(1))
         assertFalse(root.access.provider.performAction(1, cancel, null))
         assertTrue(cancel !in actions(1) && start in actions(1))
+    }
+
+    /** A polite region whose own text changes is listed twice by the presenter, for its text and as spoken: TalkBack
+     * is sent one change from it, and a region whose child's text changes still speaks from the region. */
+    @Test @Config(sdk = [33]) fun aLiveRegionsChangeIsSentOnce() {
+        val activity = org.robolectric.Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val manager = activity.getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+        org.robolectric.Shadows.shadowOf(manager).setEnabled(true)
+        val root = Root(activity).also { activity.setContentView(it); it.accessible = true }
+        val text = 1 shl 1; val live = 1 shl 4 // presenter::access::change::TEXT and LIVE
+        fun nodes(status: String, boxed: String) = listOf(
+            Said(1, 0, Access.TEXT, status, flags = Access.POLITE),
+            Said(2, 0, Access.GROUP, flags = Access.POLITE), Said(3, 2, Access.TEXT, boxed))
+        root.access.told(Access.Told(statement(nodes("1 selected", "Boxed 1"))))
+        val shadow = org.robolectric.Shadows.shadowOf(manager)
+        val before = shadow.sentAccessibilityEvents.size
+        root.access.told(Access.Told(statement(nodes("2 selected", "Boxed 2"),
+            listOf(1, text, 0, 0, 3, text, 0, 0, 1, live, 0, 0, 2, live, 0, 0))))
+        val sent = shadow.sentAccessibilityEvents.drop(before)
+            .filter { it.eventType == android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED }
+        assertEquals("one change from the region whose text changed", 1, sent.count { it.text.joinToString() == "2 selected" })
+        assertEquals("the child's change, and one from its region", listOf("Boxed 2", ""),
+            sent.filter { it.text.joinToString() != "2 selected" }.map { it.text.joinToString() })
     }
 
     @Test fun focusableFlagMapsToAccessibilityNodeFocusable() {
@@ -284,6 +310,9 @@ class AccessTest {
                 if (target == 0) asked += id to action else targets += id to target
                 return true
             }
+            /** The lifts the platform began for a service (LLP 1094.000 D16). */
+            val began = ArrayList<Int>()
+            @JvmStatic @Implementation fun liftBegan(lift: Int) { began += lift }
         }
     }
 }

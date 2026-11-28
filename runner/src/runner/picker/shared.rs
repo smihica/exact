@@ -361,7 +361,7 @@ pub struct Pending {
 
 /// One share claimed: its location, each token with its files still
 /// pending, and the copies left to make.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Claimed {
     /// The location to deliver (D2): the launch location, or a `navigate`.
     pub location: String,
@@ -370,6 +370,13 @@ pub struct Claimed {
     /// The copies, by token: `(source, picked)`, the copy's name in
     /// `app:/tmp/shared/` being the end of `picked.path`.
     copies: Vec<(String, Vec<(std::path::PathBuf, Picked)>)>,
+    /// Already copied and synced member payloads retained across retries when a
+    /// post-copy step (layout, Arrange, resize, or store persist) fails.
+    pub landed: Option<Vec<(String, SharedFiles)>>,
+    /// Source inbox directory from the Apple host.
+    pub inbox: Option<std::path::PathBuf>,
+    /// Locked `(dev, ino)` of `inbox`, verified when opening attachments.
+    pub inbox_inode: Option<(u64, u64)>,
     /// The journal's line (D9).
     pub line: String,
 }
@@ -398,27 +405,73 @@ impl Claims {
     /// `app:/tmp/shared/`. A file no member accepts, or over [`FILE_CAP`],
     /// is dropped. Nothing is copied yet ([`Claimed::copy`]).
     pub fn claim(&mut self, target: &ShareTarget, share: Pending) -> Claimed {
-        let mut by_member: Vec<MemberFiles> = target
-            .files
-            .iter()
-            .map(|(name, _)| {
-                (
-                    name.clone(),
-                    Vec::new(),
-                    share.dropped.get(name).copied().unwrap_or(0),
-                )
-            })
-            .collect();
+        self.claim_inner(target, share, false)
+            .expect("unchecked claim does not return errors")
+    }
+
+    /// Like [`Claims::claim`], but returns an error instead of dropping an
+    /// attachment when reading its filesystem metadata fails and no fallback
+    /// size was supplied (used for durable App Group inbox claims so transient
+    /// I/O or protection errors keep the inbox intact).
+    pub fn claim_checked(
+        &mut self,
+        target: &ShareTarget,
+        share: Pending,
+    ) -> Result<Claimed, String> {
+        self.claim_inner(target, share, true)
+    }
+
+    fn claim_inner(
+        &mut self,
+        target: &ShareTarget,
+        share: Pending,
+        fail_on_stat: bool,
+    ) -> Result<Claimed, String> {
+        // Validate every file and member count before mutating `self.files` or
+        // `self.tokens`, so a rejected claim never advances launch counters.
+        let mut by_member: Vec<(String, Vec<(std::path::PathBuf, String, String, u64)>, u32)> =
+            target
+                .files
+                .iter()
+                .map(|(name, _)| {
+                    (
+                        name.clone(),
+                        Vec::new(),
+                        share.dropped.get(name).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
         let mut sizes = Vec::new();
         for file in share.files {
             let mime = file
                 .mime
                 .clone()
                 .unwrap_or_else(|| super::mime_for(&file.name).into());
-            let size = std::fs::metadata(&file.source)
-                .map(|m| m.len())
-                .ok()
-                .or(file.size);
+            let size = if fail_on_stat {
+                let meta = std::fs::symlink_metadata(&file.source).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        format!(
+                            "share: invalid: attachment missing: {}",
+                            file.source.display()
+                        )
+                    } else {
+                        format!("share: could not stat {}: {e}", file.source.display())
+                    }
+                })?;
+                if !meta.is_file() {
+                    return Err(format!(
+                        "share: invalid: attachment is not a regular file: {}",
+                        file.source.display()
+                    ));
+                }
+                Some(meta.len())
+            } else {
+                match std::fs::metadata(&file.source) {
+                    Ok(m) => Some(m.len()),
+                    Err(_) if file.size.is_some() => file.size,
+                    Err(_) => None,
+                }
+            };
             let member = by_member
                 .iter()
                 .position(|(name, _, _)| match &file.member {
@@ -438,21 +491,43 @@ impl Claims {
                 by_member[i].2 += 1;
                 continue;
             };
-            self.files += 1;
-            let path = shared_path(self.seed, self.files, &file.name);
             sizes.push((mime.clone(), size));
-            let picked = Picked {
-                path,
-                name: file.name,
-                mime,
-                size: size as f64,
-                width: None,
-                height: None,
-                duration: None,
-            };
-            by_member[i].1.push((file.source, picked));
+            by_member[i].1.push((file.source, file.name, mime, size));
         }
-        let members: Vec<String> = by_member
+        if fail_on_stat {
+            for (_, files, dropped) in &by_member {
+                SharedFiles {
+                    files: Vec::new(),
+                    dropped: *dropped,
+                    pending: files.len() as u32,
+                }
+                .validate()
+                .map_err(|why| format!("share: invalid: {why}"))?;
+            }
+        }
+        // Validation passed: mint paths and tokens directly on `self.files` and `self.tokens`.
+        let mut built: Vec<MemberFiles> = Vec::with_capacity(by_member.len());
+        for (name, raw_files, dropped) in by_member {
+            let mut files = Vec::with_capacity(raw_files.len());
+            for (source, fname, mime, size) in raw_files {
+                self.files += 1;
+                let path = shared_path(self.seed, self.files, &fname);
+                files.push((
+                    source,
+                    Picked {
+                        path,
+                        name: fname,
+                        mime,
+                        size: size as f64,
+                        width: None,
+                        height: None,
+                        duration: None,
+                    },
+                ));
+            }
+            built.push((name, files, dropped));
+        }
+        let members: Vec<String> = built
             .iter()
             .filter(|(_, f, d)| !f.is_empty() || *d > 0)
             .map(|(n, _, _)| n.clone())
@@ -473,30 +548,160 @@ impl Claims {
         let mut tokens = Vec::new();
         let mut copies = Vec::new();
         for (member, t) in drawn {
-            let (_, files, dropped) = by_member
+            let (_, files, dropped) = built
                 .iter_mut()
                 .find(|(n, _, _)| *n == member)
                 .expect("drawn for a member");
-            tokens.push((
-                t.clone(),
-                SharedFiles {
-                    files: Vec::new(),
-                    dropped: *dropped,
-                    pending: files.len() as u32,
-                },
-            ));
+            let shared = SharedFiles {
+                files: Vec::new(),
+                dropped: *dropped,
+                pending: files.len() as u32,
+            };
+            tokens.push((t.clone(), shared));
             copies.push((t, std::mem::take(files)));
         }
-        Claimed {
+        Ok(Claimed {
             location,
             tokens,
             copies,
+            landed: None,
+            inbox: None,
+            inbox_inode: None,
             line: received_line(&incoming, &sizes),
-        }
+        })
     }
 }
 
 impl Claimed {
+    /// Whether this claim has any attachment files waiting to copy.
+    pub fn has_files(&self) -> bool {
+        self.copies.iter().any(|(_, files)| !files.is_empty())
+    }
+
+    /// Makes each bounded copy without unlinking sources or mutating `self.copies`,
+    /// binding attachment opens to `inbox_inode` when supplied, and syncing every
+    /// copied file, `shared_dir`, its parent, and any newly created ancestors.
+    /// Returns `(landed, created_paths)` so a caller that fails a later step can
+    /// remove newly created files and retry without losing attachment state.
+    pub fn copy_checked(
+        &self,
+        shared_dir: &std::path::Path,
+    ) -> Result<(Vec<(String, SharedFiles)>, Vec<std::path::PathBuf>), String> {
+        let has_files = self.has_files();
+        // Record ancestors that do not yet exist so every newly created directory
+        // (and its pre-existing parent) is synced once files are written.
+        let mut dirs_to_sync: Vec<std::path::PathBuf> = Vec::new();
+        if has_files {
+            let mut cur = Some(shared_dir);
+            while let Some(p) = cur {
+                if p.as_os_str().is_empty() {
+                    break;
+                }
+                dirs_to_sync.push(p.to_path_buf());
+                if p.exists() {
+                    break;
+                }
+                cur = p.parent();
+            }
+            if let Some(parent) = shared_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                if !dirs_to_sync.iter().any(|d| d == parent) {
+                    dirs_to_sync.push(parent.to_path_buf());
+                }
+            }
+            std::fs::create_dir_all(shared_dir)
+                .map_err(|e| format!("share: could not prepare {}: {e}", shared_dir.display()))?;
+        }
+        #[cfg(unix)]
+        let verified_inbox = if has_files {
+            if let (Some(inbox), Some(want_inode)) = (self.inbox.as_deref(), self.inbox_inode) {
+                Some((
+                    inbox,
+                    want_inode,
+                    open_verified_inbox(inbox, want_inode)
+                        .map_err(|e| format!("share: inbox verification failed: {e}"))?,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut created: Vec<std::path::PathBuf> = Vec::new();
+        let mut out = Vec::new();
+        for ((token, files), (_, now)) in self.copies.iter().zip(self.tokens.iter()) {
+            let mut answer = SharedFiles {
+                files: Vec::new(),
+                dropped: now.dropped,
+                pending: 0,
+            };
+            for (source, picked) in files {
+                let mut picked = picked.clone();
+                let mut created_local: Option<std::path::PathBuf> = None;
+                let result: std::io::Result<u64> = (|| {
+                    use std::io::Read;
+                    #[cfg(unix)]
+                    let from = if let Some((inbox, want_inode, _dir_file)) = &verified_inbox {
+                        open_regular_in_verified_inbox(inbox, *want_inode, source)?
+                    } else {
+                        open_regular_source(source)?
+                    };
+                    #[cfg(not(unix))]
+                    let from = open_regular_source(source)?;
+                    let mut limited = from.take(FILE_CAP + 1);
+                    let (mut to, local) = create_unique_destination(shared_dir, &mut picked.path)?;
+                    created_local = Some(local);
+                    let copied = std::io::copy(&mut limited, &mut to)?;
+                    if copied <= FILE_CAP {
+                        to.sync_all()?;
+                    }
+                    Ok(copied)
+                })();
+                match result {
+                    Ok(size) if size <= FILE_CAP => {
+                        picked.size = size as f64;
+                        if let Some(local) = created_local {
+                            created.push(local);
+                        }
+                        answer.files.push(picked);
+                    }
+                    Ok(_) => {
+                        if let Some(local) = created_local {
+                            let _ = std::fs::remove_file(local);
+                        }
+                        answer.dropped += 1;
+                    }
+                    Err(e) => {
+                        if let Some(local) = created_local {
+                            let _ = std::fs::remove_file(local);
+                        }
+                        for path in created {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return Err(format!("share: could not land {}: {e}", source.display()));
+                    }
+                }
+            }
+            if let Err(e) = answer.validate() {
+                for path in created {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(format!("share: refused: {e}"));
+            }
+            out.push((token.clone(), answer));
+        }
+        if !created.is_empty() {
+            for dir in &dirs_to_sync {
+                if let Err(e) = sync_directory(dir) {
+                    for path in created {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Err(format!("share: could not sync {}: {e}", dir.display()));
+                }
+            }
+        }
+        Ok((out, created))
+    }
+
     /// Makes each bounded copy (removing its source when `moving`), and answers each
     /// token's files as they now are: those that failed are dropped.
     /// `shared_dir` is the host's directory for `app:/tmp/shared/`.
@@ -556,10 +761,216 @@ impl Claimed {
     }
 }
 
+fn create_unique_destination(
+    shared_dir: &std::path::Path,
+    app_path: &mut String,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    let base_rel = app_path.trim_start_matches(SHARED).to_string();
+    for attempt in 0u64..1024 {
+        let rel = if attempt == 0 {
+            base_rel.clone()
+        } else {
+            match base_rel.rsplit_once('.') {
+                Some((stem, ext)) => format!("{stem}-{attempt}.{ext}"),
+                None => format!("{base_rel}-{attempt}"),
+            }
+        };
+        let local = shared_dir.join(&rel);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(unix_o_nofollow());
+        }
+        match opts.open(&local) {
+            Ok(file) => {
+                if attempt > 0 {
+                    *app_path = format!("{SHARED}{rel}");
+                }
+                return Ok((file, local));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique destination under app:/tmp/shared/",
+    ))
+}
+
+#[cfg(unix)]
+const fn unix_o_nofollow() -> i32 {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x0100
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "aarch64", target_arch = "arm")
+    ))]
+    {
+        0o100000
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    {
+        0o400000
+    }
+}
+
+#[cfg(unix)]
+const fn unix_o_nonblock() -> i32 {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        0x0004
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0o4000
+    }
+}
+
+#[cfg(unix)]
+const fn unix_o_directory() -> i32 {
+    #[cfg(target_vendor = "apple")]
+    {
+        0x0010_0000
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "dragonfly"))]
+    {
+        0x0002_0000
+    }
+    #[cfg(target_os = "netbsd")]
+    {
+        0x0020_0000
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "aarch64", target_arch = "arm")
+    ))]
+    {
+        0o40000
+    }
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    {
+        0o200000
+    }
+}
+
+#[cfg(unix)]
+fn open_dir_nofollow(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true)
+        .custom_flags(unix_o_nonblock() | unix_o_directory() | unix_o_nofollow());
+    opts.open(dir)
+}
+
+#[cfg(unix)]
+fn open_verified_inbox(
+    dir: &std::path::Path,
+    want_inode: (u64, u64),
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    let file = open_dir_nofollow(dir)?;
+    let meta = file.metadata()?;
+    if !meta.is_dir() || (meta.dev(), meta.ino()) != want_inode {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "inbox directory inode changed",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_regular_in_verified_inbox(
+    inbox: &std::path::Path,
+    want_inode: (u64, u64),
+    source: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    if source.parent() != Some(inbox) || source.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "attachment path escapes verified inbox",
+        ));
+    }
+    let _dir = open_verified_inbox(inbox, want_inode)?;
+    let file = open_regular_source(source)?;
+    let file_meta = file.metadata()?;
+    let dir_meta = std::fs::symlink_metadata(inbox)?;
+    if !dir_meta.is_dir() || (dir_meta.dev(), dir_meta.ino()) != want_inode {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "inbox directory inode changed during open",
+        ));
+    }
+    let path_meta = std::fs::symlink_metadata(source)?;
+    if !path_meta.is_file()
+        || (path_meta.dev(), path_meta.ino()) != (file_meta.dev(), file_meta.ino())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "attachment inode changed during open",
+        ));
+    }
+    Ok(file)
+}
+
+fn open_regular_source(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(unix_o_nonblock() | unix_o_nofollow());
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "attachment is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        open_dir_nofollow(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 impl SharedFiles {
     /// Refuses a path outside `app:/tmp/shared/` or a count past what a
     /// share could carry.
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         for f in &self.files {
             let rest = f
                 .path
@@ -593,39 +1004,89 @@ impl<D: DataSource> Runner<D> {
         Some(claimed)
     }
 
-    /// What the host copied of a share so far, under its token (D3): the
-    /// readers of `sharedFiles` are evaluated again in one commit. Called
-    /// once before the files land (all `pending`) and again as they do; a
-    /// cold share sets its tokens before the boot instead
-    /// ([`crate::time::Launch::shared`]).
-    pub fn set_shared(
+    /// Like [`Runner::claim_share`], but fails instead of dropping an inbox
+    /// attachment whose metadata cannot be read.
+    pub fn claim_share_checked(
         &mut self,
-        token: &str,
-        files: SharedFiles,
+        target: &ShareTarget,
+        share: Pending,
+    ) -> Result<Claimed, String> {
+        let seed = self.place().seed;
+        let Some(router) = self.router.as_deref() else {
+            let msg = "share: refused: the app declares no routes, so no route reads a share";
+            self.log(msg);
+            return Err(msg.into());
+        };
+        let claimed = router.claims(seed).claim_checked(target, share)?;
+        self.log(claimed.line.clone());
+        Ok(claimed)
+    }
+
+    /// What the host copied of a share so far, under its tokens (D3): updates
+    /// every `(token, files)` atomically and evaluates readers of `sharedFiles`
+    /// in a single commit. Called once before the files land (all `pending`)
+    /// and again as they do; a cold share sets its tokens before the boot
+    /// instead ([`crate::time::Launch::shared`]). If validation fails on any
+    /// entry or the commit fails, every token is left at its prior value.
+    pub fn set_shared<'a>(
+        &mut self,
+        updates: impl IntoIterator<Item = (&'a str, SharedFiles)>,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
-        if !is_token(token) {
-            self.log(format!("share: refused: {token:?} is not a share token"));
-            return Ok(None);
-        }
-        if let Err(why) = files.validate() {
-            self.log(format!("share: refused: {why}"));
-            return Ok(None);
+        let updates: Vec<(&'a str, SharedFiles)> = updates.into_iter().collect();
+        for (token, files) in &updates {
+            if !is_token(token) {
+                self.log(format!("share: refused: {token:?} is not a share token"));
+                return Ok(None);
+            }
+            if let Err(why) = files.validate() {
+                self.log(format!("share: refused: {why}"));
+                return Ok(None);
+            }
         }
         let Some(router) = self.router.as_deref() else {
             self.log("share: refused: the app declares no routes, so no route reads a share");
             return Ok(None);
         };
-        let line = format!(
-            "share: {} files set, {} pending, {} dropped",
-            files.files.len(),
-            files.pending,
-            files.dropped
-        );
-        if !router.share(token, files.value()) {
+        let mut previous = Vec::with_capacity(updates.len());
+        let mut lines = Vec::with_capacity(updates.len());
+        for (token, files) in &updates {
+            if let Some(prev) = router.share(token, Some(files.value())) {
+                previous.push((*token, prev));
+                lines.push(format!(
+                    "share: {} files set, {} pending, {} dropped",
+                    files.files.len(),
+                    files.pending,
+                    files.dropped
+                ));
+            }
+        }
+        if previous.is_empty() {
             return Ok(None);
         }
-        self.log(line);
-        self.commit_again(Vec::new(), "shared").map(Some)
+        match self.commit_again(Vec::new(), "shared") {
+            Ok(receipt) => {
+                for line in lines {
+                    self.log(line);
+                }
+                Ok(Some(receipt))
+            }
+            Err(err) => {
+                if let Some(router) = self.router.as_deref() {
+                    for (token, prev) in previous.into_iter().rev() {
+                        let _ = router.share(token, prev);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Clears a previously staged share token value (used to roll back a failed
+    /// navigation before any commit lands).
+    pub fn clear_shared(&mut self, token: &str) {
+        if let Some(router) = self.router.as_deref() {
+            let _ = router.share(token, None);
+        }
     }
 }
 
@@ -666,6 +1127,127 @@ mod tests {
         assert_eq!(copied[0].1.dropped, 1);
         assert_eq!(std::fs::read_dir(dir.join("large")).unwrap().count(), 0);
         assert!(source.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_checked_keeps_sources_and_errors_on_destination_failure() {
+        let dir = crate::TempDir(
+            std::env::temp_dir().join(format!("exact-share-copy-checked-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("1.txt");
+        std::fs::write(&source, b"keep me").unwrap();
+        let target = ShareTarget::from_json(&serde_json::json!({
+            "action": "/",
+            "params": { "files": [{ "name": "files", "accept": "*/*" }] }
+        }))
+        .unwrap();
+        let make_pending = || {
+            Pending::from_json(
+                &serde_json::json!({"v": 1, "files": [{"file": "1.txt", "name": "note.txt"}]}),
+                Some(&dir),
+            )
+            .unwrap()
+        };
+        let mut claims = Claims::new(11.0);
+        // Destination path is an existing regular file -> create_dir_all fails -> Err, source kept.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let failed = claims.claim(&target, make_pending());
+        assert!(failed.copy_checked(&blocked).is_err());
+        assert!(source.exists());
+
+        // Valid destination -> copies file and keeps inbox source intact until caller removes inbox;
+        // calling copy_checked again does not clear copies and allocates a distinct sibling without
+        // overwriting the existing file (as happens after runner replacement in the same process).
+        let dest = dir.join("shared");
+        let ok = claims.claim(&target, make_pending());
+        let (landed, created) = ok.copy_checked(&dest).unwrap();
+        assert_eq!(landed[0].1.files.len(), 1);
+        assert_eq!(landed[0].1.dropped, 0);
+        assert_eq!(created.len(), 1);
+        assert!(source.exists());
+        let (landed_again, created_again) = ok.copy_checked(&dest).unwrap();
+        assert_eq!(landed_again[0].1.files.len(), 1);
+        assert_ne!(
+            landed[0].1.files[0].path, landed_again[0].1.files[0].path,
+            "EEXIST must allocate a sibling filename instead of overwriting or failing"
+        );
+        assert_eq!(std::fs::read(&created[0]).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(&created_again[0]).unwrap(), b"keep me");
+
+        // Multi-file partial failure: file 1 copies, file 2 becomes a symlink -> O_NOFOLLOW rejects it,
+        // file 1 is rolled back, and inbox sources remain intact.
+        let source2 = dir.join("2.txt");
+        std::fs::write(&source2, b"second").unwrap();
+        let mut multi_claims = Claims::new(12.0);
+        let multi_pending = Pending::from_json(
+            &serde_json::json!({
+                "v": 1,
+                "files": [
+                    { "file": "1.txt", "name": "a.txt", "type": "text/plain", "member": "files" },
+                    { "file": "2.txt", "name": "b.txt", "type": "text/plain", "member": "files" }
+                ],
+                "dropped": {}
+            }),
+            Some(&dir),
+        )
+        .unwrap();
+        let multi = multi_claims.claim_checked(&target, multi_pending).unwrap();
+        let multi_dest = dir.join("shared-multi");
+        std::fs::create_dir_all(&multi_dest).unwrap();
+        let dest1 = multi_dest.join(multi.copies[0].1[0].1.path.trim_start_matches(SHARED));
+        let symlink_target = dir.join("real.txt");
+        std::fs::write(&symlink_target, b"real").unwrap();
+        std::fs::remove_file(&source2).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&symlink_target, &source2).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&source2).unwrap();
+        let err = multi.copy_checked(&multi_dest).unwrap_err();
+        assert!(err.contains("could not land"), "{err}");
+        assert!(!dest1.exists(), "partial copy 1 must be rolled back");
+        assert!(source.exists() && symlink_target.exists());
+        let _ = std::fs::remove_file(&source2);
+        let _ = std::fs::remove_dir_all(&source2);
+
+        // Directory attachment and over-limit dropped count are rejected by claim_checked
+        // without advancing Claims counters.
+        let before_files = multi_claims.files;
+        let before_tokens = multi_claims.tokens;
+        let subdir = dir.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let bad_dir = Pending::from_json(
+            &serde_json::json!({
+                "v": 1,
+                "files": [
+                    { "file": "1.txt", "name": "a.txt", "type": "text/plain", "member": "files" },
+                    { "file": "subdir", "name": "sub", "type": "application/octet-stream", "member": "files", "size": 10 }
+                ],
+                "dropped": {}
+            }),
+            Some(&dir),
+        )
+        .unwrap();
+        assert!(multi_claims.claim_checked(&target, bad_dir).is_err());
+        assert_eq!(multi_claims.files, before_files);
+        assert_eq!(multi_claims.tokens, before_tokens);
+
+        let bad_dropped = Pending::from_json(
+            &serde_json::json!({
+                "v": 1,
+                "files": [{ "file": "1.txt", "name": "a.txt", "type": "text/plain", "member": "files" }],
+                "dropped": { "files": 10000 }
+            }),
+            Some(&dir),
+        )
+        .unwrap();
+        assert!(multi_claims.claim_checked(&target, bad_dropped).is_err());
+        assert_eq!(multi_claims.files, before_files);
+        assert_eq!(multi_claims.tokens, before_tokens);
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 

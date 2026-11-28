@@ -420,6 +420,145 @@ fn a_refused_build_types_the_roots_uses_with_one_scope() {
 }
 
 #[test]
+fn provisional_scope_types_a_resource_over_a_list_as_a_list() {
+    // A refused build checks root call sites against `provisional_scope`: a root
+    // resource declared `for` over a list has type `T[]`, never `T`, so a bogus
+    // `expects T[], given T` must not precede the child's actual diagnostic.
+    let source = r#"shape Img
+  id: string
+
+component App
+  state ids: string[] = []
+  resource images = img(id) for id in ids key=id as shape Img
+  view
+    Child(images=images)
+
+component Child
+  props
+    images: Img[]
+  state n = 0
+  derive ready = images.length
+  action tick
+    n = n + 1
+  task poll when ready
+    every(1000, tick)
+  view
+    text `${n}`
+"#;
+    let file = contract_syntax::parse(source).unwrap();
+    let Err(errors) = crate::check_all(&file, false, |_| false, None) else {
+        panic!("refused");
+    };
+    assert!(!errors.is_empty(), "{errors:?}");
+    assert!(
+        errors.iter().all(|e| e.id == "type-task-gate"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn provisional_scope_does_not_leak_resources_into_state_initializers_or_accept_action_shapes() {
+    // Root state initializers cannot read resources; `provisional_scope` must
+    // leave `count` unknown instead of inferring `number` and putting a spurious
+    // `type-prop` before `type-initializer-scope`.
+    let bad_init = r#"shape Img
+  id: string
+
+component App
+  state ids: string[] = []
+  state count = images.length
+  resource images = img(id) for id in ids key=id as shape Img
+  view
+    Flag(on=count)
+
+component Flag
+  props
+    on: bool
+  view
+    text `${on}`
+"#;
+    let file = contract_syntax::parse(bad_init).unwrap();
+    let Err(errors) = crate::check_all(&file, false, |_| false, None) else {
+        panic!("refused");
+    };
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].id, "type-initializer-scope", "{errors:?}");
+
+    // A component action shadowing a stdlib helper is refused in state
+    // initializers (`type-initializer-scope`), so `provisional_scope` must not
+    // fall through to stdlib `trim` and put a spurious `type-prop` first.
+    let shadowed_action = r#"component App
+  state x = 0
+  state label = trim(" x ")
+  action trim(n: number)
+    x = n
+  view
+    Flag(on=label)
+
+component Flag
+  props
+    on: bool
+  view
+    text `${on}`
+"#;
+    let file = contract_syntax::parse(shadowed_action).unwrap();
+    let Err(errors) = crate::check_all(&file, false, |_| false, None) else {
+        panic!("refused");
+    };
+    assert_eq!(errors[0].id, "type-initializer-scope", "{errors:?}");
+    assert!(
+        errors.iter().all(|e| e.id != "type-prop"),
+        "spurious type-prop from shadowed action initializer: {errors:?}"
+    );
+
+    // An invalid declared state type (`option<action>`) is refused by
+    // `state_type`, so `provisional_scope` must keep it unknown rather than
+    // putting a spurious `type-prop` ahead of `type-action-held`.
+    let held_action = r#"component App
+  state callback: option<action> = none
+  view
+    Show(x=callback)
+
+component Show
+  props
+    x: string
+  view
+    text x
+"#;
+    let file = contract_syntax::parse(held_action).unwrap();
+    let Err(errors) = crate::check_all(&file, false, |_| false, None) else {
+        panic!("refused");
+    };
+    assert_eq!(errors[0].id, "type-action-held", "{errors:?}");
+    assert!(
+        errors.iter().all(|e| e.id != "type-prop"),
+        "spurious type-prop from invalid declared state type: {errors:?}"
+    );
+
+    // `as shape action` is refused by `resolve_value`; `provisional_scope` must
+    // also keep it unknown so it does not invent a second `type-prop` error.
+    let bad_shape = r#"component App
+  resource bad = fetch() as shape action
+  view
+    Show(x=bad)
+
+component Show
+  props
+    x: string
+  view
+    text x
+"#;
+    let file = contract_syntax::parse(bad_shape).unwrap();
+    let Err(errors) = crate::check_all(&file, false, |_| false, None) else {
+        panic!("refused");
+    };
+    assert!(
+        errors.iter().all(|e| e.id != "type-prop"),
+        "spurious type-prop from invalid resource shape: {errors:?}"
+    );
+}
+
+#[test]
 fn incomplete_derives_are_checked_after_handler_writes_type_states() {
     for (expr, refused) in [("(picked == none) ? [] : []", true), ("picked", false)] {
         let source = format!("component App\n  state picked = none\n  derive first = {expr}\n  derive second = first\n  action pick(v)\n    picked = some(v)\n  view\n    button \"Go\" press=pick(1)\n");

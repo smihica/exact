@@ -93,6 +93,8 @@ final class StagePlan {
     let depth: [UInt32: Int]
     let large: Set<UInt32>
     /// The preparation a slice may spend, from what drawing cost the last.
+    var onLanded: (() -> Void)?
+    var onDropped: (() -> Void)?
     var sliceSeconds = 0.001
     /// What preparation made, in the order it made it. These views join the
     /// presenter's table only for a slice and at the reveal.
@@ -121,10 +123,15 @@ final class StagePlan {
     /// The style it gives each live node: a style op carries a node's whole
     /// style, a sampled paint value with the rest.
     let styles: [UInt32: NodeStyle]
+    /// Whether this batch updates the document language or direction.
+    let changesLanguage: Bool
     #if os(macOS)
     /// The views share this flag so they join the committed tree together.
     /// It can outlive the plan without retaining its views or operations.
-    final class Publication { var committed = false }
+    final class Publication {
+        var committed = false
+        fileprivate(set) var language: String?
+    }
     let publication = Publication()
     var tips: [NodeView] = [], cursorRects: [NodeView] = []
     /// Plain destroyed descendants under a plain retiring top, pulled out of
@@ -228,6 +235,11 @@ final class StagePlan {
             while at != found, let up = parent[at] { below[up, default: 0] += 1; at = up; d += 1 }
             depth[id] = d
         }
+        let language = batch.ops.last(where: { $0.op == .language })
+        self.changesLanguage = language != nil
+        #if os(macOS)
+        publication.language = language.map { $0.payload["lang"] as? String ?? "" }
+        #endif
         self.depth = depth
         self.large = Set(below.filter { $0.value > Self.attachLimit }.keys)
         self.structural = structural
@@ -344,6 +356,7 @@ extension StagePlan {
         if other.rootTabs != nil, batch.rootTabs != nil { return false }
         if other.routeInspectors != nil, batch.routeInspectors != nil { return false }
         if other.splitChanged { return false }
+        if changesLanguage, other.ops.contains(where: { $0.op != .present }) { return false }
         if let theirs = other.controlReads, theirs.contains(where: { structural.contains($0.key) || reads[$0.key]?.isDisjoint(with: $0.value.parts) == false }) { return false }
         for op in other.ops {
             switch op.op {
@@ -424,9 +437,11 @@ extension ExactSession {
     /// staged, or was prepared and published here. Under the agent's clock
     /// and `EXACT_FILL_SYNC` the same preparation runs to its end at once
     /// (T9, T12).
-    func stages(_ batch: Batch) -> Bool {
+    func stages(_ batch: Batch, landed: (() -> Void)? = nil, dropped: (() -> Void)? = nil) -> Bool {
         guard stage == nil, !applying, !fillLanding, !presenter.revealsStage, let plan = presenter.stagePlan(batch) else { return false }
         plan.epoch = viewsEpoch
+        plan.onLanded = landed
+        plan.onDropped = dropped
         stage = plan
         // Its timers and frames are the runtime's latest: a deadline before the reveal is asked on time.
         followRunner(batch, shown: false)
@@ -471,15 +486,22 @@ extension ExactSession {
         let outer = landing
         landing = true
         presenter.revealing = plan
-        applyNow(plan.reveal())
+        let landed = plan.onLanded, dropped = plan.onDropped
+        plan.onLanded = nil; plan.onDropped = nil
+        applyNow(plan.reveal(), landed: landed, dropped: dropped)
         presenter.revealing = nil
         if plan.frames != nil { runtime.unshown([]) }
         landing = outer
         landFill()
     }
 
-    /// Every batch the session applies comes here (`order`).
-    package func apply(_ batch: Batch) { order(PendingBatch(batch: batch)) }
+    /// Every batch the session applies comes here (`order`). Invokes `onLanded` only once
+    /// the batch actually applies (including after any multi-frame stage reveal), or
+    /// `onDropped` if dropped by reset/teardown. When `barrier` is true, the batch never
+    /// bypasses an active stage or earlier pending batches.
+    package func apply(_ batch: Batch, barrier: Bool = false, onLanded: (() -> Void)? = nil, onDropped: (() -> Void)? = nil) {
+        order(PendingBatch(batch: batch, barrier: barrier, landed: onLanded, dropped: onDropped))
+    }
     #if os(macOS)
     func applyAppKitEvent(_ batch: Batch) { order(PendingBatch(batch: batch, presentation: .appKitEvent)) }
     #endif
@@ -527,7 +549,10 @@ extension ExactSession {
     /// presenter here, whenever the batch applies (`takeEventResults`).
     func order(_ entry: PendingBatch) {
         var entry = entry
-        guard state != .destroyed, !entry.batch.busy, !entry.batch.held else { return }
+        guard state != .destroyed, !entry.batch.busy, !entry.batch.held else {
+            entry.dropped?()
+            return
+        }
         entry.cause = coversCause
         takeEventResults(&entry.batch)
         if entry.batch.sequence == 0 { entry.batch.sequence = runtime.sequence.next() }
@@ -538,7 +563,10 @@ extension ExactSession {
         }
         if !landing, !insideApply, publicationsClear {
             let mine = footprint(entry.batch)
-            if passes(entry.batch), pending.allSatisfy({ $0.batch.sequence > made || $0.footprint.admits(mine) }) { supersede(mine, before: made); return land(entry) }
+            let mayPass = !entry.barrier
+                ? (passes(entry.batch) && pending.allSatisfy { $0.batch.sequence > made || $0.footprint.admits(mine) })
+                : (stage == nil && pending.allSatisfy { $0.batch.sequence > made })
+            if mayPass { supersede(mine, before: made); return land(entry) }
         }
         wait(entry)
         if !landing, !insideApply { landFill() }
@@ -563,7 +591,10 @@ extension ExactSession {
         var earlier: [BatchFootprint] = []
         for (index, entry) in pending.enumerated() {
             guard entry.batch.sequence < limit else { break }
-            if admitted(entry.batch, entry.footprint, after: earlier) || divide(index, after: earlier) {
+            let admittedNow = !entry.barrier
+                ? (admitted(entry.batch, entry.footprint, after: earlier) || divide(index, after: earlier))
+                : (stage == nil && earlier.isEmpty)
+            if admittedNow {
                 supersede(pending[index].footprint, before: entry.batch.sequence)
                 return index
             }
@@ -633,9 +664,11 @@ extension ExactSession {
             entry.batch = plan.withheld(entry.batch) { [unowned self] in presenter.views[$0]?.style }
         }
         inCoversChain(entry.cause) {
-            if entry.presentation == .full { applyNow(entry.batch, beside: stage) }
-            else { applyUnlessEmptyNow(entry.batch, presentation: entry.presentation, scrolled: entry.scrolled, resized: entry.resized, beside: stage) }
-            entry.landed?()
+            if entry.presentation == .full {
+                applyNow(entry.batch, beside: stage, barrier: entry.barrier, landed: entry.landed, dropped: entry.dropped)
+            } else {
+                applyUnlessEmptyNow(entry.batch, presentation: entry.presentation, scrolled: entry.scrolled, resized: entry.resized, beside: stage, barrier: entry.barrier, landed: entry.landed, dropped: entry.dropped)
+            }
         }
     }
     /// Whether a tick's or an advance's batch waits. The next advance is held
@@ -666,13 +699,14 @@ extension ExactSession {
     /// without applying.
     func cancelStage() {
         let plan = stage
+        let dropped = pending
         stage = nil
+        pending = []
+        newestApplied = nil; newestCommit = 0
         plan?.frames?.stop()
         if plan?.frames != nil { runtime.unshown([]) }
         presenter.abandon(plan)
-        let dropped = pending
-        pending = []
-        newestApplied = nil; newestCommit = 0
+        plan?.onDropped?()
         for entry in dropped { entry.dropped?() }
     }
 
@@ -732,7 +766,7 @@ struct PendingBatch {
     enum Presentation { case full, unlessEmpty, appKitEvent }
     var batch: Batch
     var presentation: Presentation = .full
-    var scrolled = false, resized = false
+    var scrolled = false, resized = false, barrier = false
     /// A frame's tick or a timer's advance, as the bridge read it: no path to `order` can leave it off.
     var clock: Batch.ClockWork? { batch.clockWork }
     var landed: (() -> Void)? = nil
@@ -756,6 +790,8 @@ struct BatchFootprint {
     /// Whether it may go ahead of anything: it restructures nothing and runs
     /// no command, which may name what an earlier batch makes.
     private(set) var movable = true
+    /// Whether it changes the document language or direction, which affects every node.
+    private(set) var changesLanguage = false
     /// The motion samples it carries (`present` ops), which a newer one supersedes.
     private(set) var samples = Set<String>()
     static func sample(_ op: BatchOp) -> String { "\(op.id) \(op.property)" }
@@ -779,6 +815,7 @@ struct BatchFootprint {
             if op.op == .style { styled.insert(op.id); if sampling { paints.insert(op.id) } }
             if Self.structuralOps.contains(op.op) { movable = false; continue }
             if op.op == .command { movable = false }
+            if op.op == .language { changesLanguage = true; movable = false }
             if op.op == .present { samples.insert(Self.sample(op)) }
             // A style op carries the node's whole style: two never commute.
             let key = op.op == .props ? nil : op.op == .present ? "present." + op.property : op.op.rawValue
@@ -789,7 +826,7 @@ struct BatchFootprint {
     /// Whether `later` may apply before the batch this is of: where they are
     /// disjoint, or with a newer sample of a property this one samples.
     func admits(_ later: BatchFootprint) -> Bool {
-        guard later.movable else { return false }
+        guard later.movable, !changesLanguage else { return false }
         for (id, keys) in later.written where restructured.contains(id) || !(written[id]?.isDisjoint(with: keys.filter { !$0.hasPrefix("present.") }) ?? true) { return false }
         return true
     }

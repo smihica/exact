@@ -2,6 +2,7 @@
 //! displayed geometry; this host owns only identity and time (LLP 1013.000 D4).
 use super::*;
 use exact_kernel::CommitReceipt;
+use exact_motion::Transition;
 
 const FLIGHT: u64 = 1 << 63;
 /// Why a flight's content takes no focus until it lands.
@@ -15,11 +16,23 @@ pub(crate) struct FlightFrame {
     pub to: NodeKey,
     pub progress: f32,
     pub ancestor_opacity: f32,
+    /// What takes a route crossing's pose off the destination, in points:
+    /// rest = (posed x × `[0]` + `[2]`, posed y × `[1]` + `[3]`), so the
+    /// flight aims at its rest (LLP 1013.004 D4). Set by the stage; identity
+    /// elsewhere.
+    pub unpose: [f32; 4],
+    /// A route change's: the reader dissolves the source's drawing into the
+    /// destination's (LLP 1013.004 D3 step 4), where an in-page flight
+    /// carries the live destination alone (LLP 1013.000 D4).
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub dissolve: bool,
 }
 
 struct Flight {
     frame: FlightFrame,
     lands_after: Option<f64>,
+    /// A predictive Back holds it at its progress.
+    seeking: bool,
 }
 
 #[derive(Default)]
@@ -53,43 +66,157 @@ impl<D: DataSource> Host<D> {
         });
         self.flights.landed |= self.flights.running.len() != before;
         for h in &receipt.handoffs {
-            if !self.flights.recorded.contains(&motion_node(h.from))
-                || self.runner.kernel().node_by_key(h.to).is_none()
-            {
-                continue;
-            }
-            let node = motion_node(h.to) | FLIGHT;
-            let declared = engine.set_layout_transition(
-                node,
-                &exact_motion::Transitions(vec![h.transition.clone()]),
-            );
-            debug_assert!(declared.is_ok());
-            for x in [0.0, END] {
-                let observed = engine.observe(exact_motion::Change {
-                    node,
-                    property: Property::Layout,
-                    value: exact_motion::Value::four(x, 0.0, 0.0, 0.0),
-                    velocity: None,
-                });
-                debug_assert!(observed.is_ok());
-            }
-            let lands_after = match &h.transition.timing {
-                exact_motion::TimingFunction::Spring(config) => {
-                    land_after(config).map(|t| t - h.transition.delay.min(0.0))
-                }
-                _ => None,
-            };
-            self.flights.running.push(Flight {
-                frame: FlightFrame {
-                    from: h.from,
-                    to: h.to,
-                    progress: 0.0,
-                    ancestor_opacity: 1.0,
-                },
-                lands_after,
-            });
-            self.flights.reveal.push(h.to);
+            self.fly(h.from, h.to, &h.transition, false);
         }
+    }
+
+    /// Fly `from` into `to` on `transition`. A flight already arriving at
+    /// `to` from `from` (one a predictive Back seeks) runs on from where it
+    /// is; one from another source (an in-commit handoff of a name a route
+    /// change pairs, LLP 1013.004 D1) yields, so the name flies once.
+    pub(crate) fn fly(&mut self, from: NodeKey, to: NodeKey, transition: &Transition, route: bool) {
+        self.start_flight(from, to, Some(transition), 0.0, route);
+    }
+
+    /// Hold each pair's flight at `progress`, a predictive Back's, starting
+    /// those not flying yet (LLP 1013.004 D4).
+    pub(crate) fn seek_flights(&mut self, pairs: &[(NodeKey, NodeKey)], progress: f32) {
+        for &(from, to) in pairs {
+            self.start_flight(from, to, None, progress, true);
+        }
+    }
+
+    /// `fly`, or with no `transition` a seek, held at `progress`.
+    fn start_flight(
+        &mut self,
+        from: NodeKey,
+        to: NodeKey,
+        transition: Option<&Transition>,
+        progress: f32,
+        route: bool,
+    ) {
+        // A flight running from `from` goes on though its source is gone
+        // from the paint: a route a pop removed, one a full-screen route
+        // covers. Only a new one needs its source's definition.
+        let running =
+            (self.flights.running.iter()).any(|f| (f.frame.from, f.frame.to) == (from, to));
+        if !self.flights.enabled
+            || !running && !self.flights.recorded.contains(&motion_node(from))
+            || self.runner.kernel().node_by_key(to).is_none()
+        {
+            return;
+        }
+        self.drop_flight_to(from);
+        let node = motion_node(to) | FLIGHT;
+        let at = self.flights.running.iter().position(|f| f.frame.to == to);
+        if let Some(i) = at.filter(|&i| self.flights.running[i].frame.from != from) {
+            self.flights.running.remove(i);
+            self.engine.remove(node);
+        }
+        // A seek has no curve: the value is the gesture's.
+        let seeking = transition.is_none();
+        let x = if seeking {
+            f64::from(progress) * END
+        } else {
+            END
+        };
+        let lands_after = aim(&mut self.engine, node, transition, x);
+        match self.flights.running.iter_mut().find(|f| f.frame.to == to) {
+            Some(f) => {
+                f.seeking = seeking;
+                f.lands_after = lands_after;
+                if seeking {
+                    f.frame.progress = progress;
+                }
+            }
+            None => {
+                self.flights.running.push(Flight {
+                    frame: FlightFrame {
+                        from,
+                        to,
+                        progress,
+                        ancestor_opacity: 1.0,
+                        unpose: [1.0, 1.0, 0.0, 0.0],
+                        dissolve: route,
+                    },
+                    lands_after,
+                    seeking,
+                });
+                // A route change's destination is where its route puts it.
+                if !seeking && !route {
+                    self.flights.reveal.push(to);
+                }
+            }
+        }
+    }
+
+    /// A flight still landing at `key`, which now leaves as a source, ends:
+    /// the name flies once.
+    fn drop_flight_to(&mut self, key: NodeKey) {
+        let engine = &mut self.engine;
+        self.flights.running.retain(|f| {
+            let keep = f.frame.to != key;
+            if !keep {
+                engine.remove(motion_node(key) | FLIGHT);
+            }
+            keep
+        });
+    }
+
+    /// A route change ends each route flight but those landing in `route`,
+    /// the one it shows: one into a route now covered or leaving would draw
+    /// over it.
+    pub(crate) fn end_route_flights_outside(&mut self, route: NodeKey) {
+        let kernel = self.runner.kernel();
+        let inside = |key| {
+            let mut next = kernel.node_by_key(key);
+            while let Some(node) = next {
+                if node.key == route {
+                    return true;
+                }
+                next = node.parent.and_then(|id| kernel.node(id));
+            }
+            false
+        };
+        let (engine, row_dirty, landed) = (
+            &mut self.engine,
+            &mut self.row_dirty,
+            &mut self.flights.landed,
+        );
+        self.flights.running.retain(|f| {
+            let ends = f.frame.dissolve && !inside(f.frame.to);
+            if ends {
+                engine.remove(motion_node(f.frame.to) | FLIGHT);
+                row_dirty.node(f.frame.to);
+                *landed = true;
+            }
+            !ends
+        });
+    }
+
+    /// A predictive Back ended: each flight it seeks goes on to its
+    /// destination (`on`) or back to land at its source, on `transition`.
+    pub(crate) fn release_flights(&mut self, transition: &Transition, on: bool) {
+        let x = if on { END } else { 0.0 };
+        for f in self.flights.running.iter_mut().filter(|f| f.seeking) {
+            f.seeking = false;
+            let node = motion_node(f.frame.to) | FLIGHT;
+            f.lands_after = aim(&mut self.engine, node, Some(transition), x);
+        }
+    }
+
+    /// The flights held at a progress land where they are, now: a
+    /// container that carried them has landed.
+    pub(crate) fn land_seeking(&mut self) {
+        let (engine, row_dirty) = (&mut self.engine, &mut self.row_dirty);
+        self.flights.running.retain(|f| {
+            if f.seeking {
+                engine.remove(motion_node(f.frame.to) | FLIGHT);
+                row_dirty.node(f.frame.to);
+            }
+            !f.seeking
+        });
+        self.flights.landed = true;
     }
 
     pub(super) fn present_flight(&mut self, p: &exact_motion::Presentation) -> bool {
@@ -117,7 +244,7 @@ impl<D: DataSource> Host<D> {
                 .lands_after
                 .zip(engine.curve_start(node, Property::Layout))
                 .is_some_and(|(t, start)| now >= start + t);
-            let flying = engine.is_active(node, Property::Layout) && !landed;
+            let flying = f.seeking || engine.is_active(node, Property::Layout) && !landed;
             if !flying {
                 engine.remove(node);
                 self.row_dirty.node(f.frame.to);
@@ -188,6 +315,11 @@ impl<D: DataSource> Host<D> {
             .collect()
     }
 
+    /// Whether a flight to `to` runs.
+    pub(crate) fn in_flight(&self, to: NodeKey) -> bool {
+        self.flights.running.iter().any(|f| f.frame.to == to)
+    }
+
     pub(crate) fn flying(&self, id: ViewId) -> bool {
         if self.flights.running.is_empty() || self.runner.viewport().preferences.reduced_motion {
             return false;
@@ -201,6 +333,38 @@ impl<D: DataSource> Host<D> {
         }
         false
     }
+}
+
+/// Send a flight's clock to `x` from where it is, on `transition` (none
+/// jumps there): when it lands, for a spring.
+fn aim(engine: &mut Engine, node: u64, transition: Option<&Transition>, x: f64) -> Option<f64> {
+    let declared = engine.set_layout_transition(
+        node,
+        &exact_motion::Transitions(transition.into_iter().cloned().collect()),
+    );
+    debug_assert!(declared.is_ok());
+    // A clock the engine has not seen takes its first value at once.
+    if engine.value(node, Property::Layout).is_none() {
+        observe(engine, node, 0.0);
+    }
+    observe(engine, node, x);
+    let transition = transition?;
+    match &transition.timing {
+        exact_motion::TimingFunction::Spring(config) => {
+            land_after(config).map(|t| t - transition.delay.min(0.0))
+        }
+        _ => None,
+    }
+}
+
+fn observe(engine: &mut Engine, node: u64, x: f64) {
+    let observed = engine.observe(exact_motion::Change {
+        node,
+        property: Property::Layout,
+        value: exact_motion::Value::four(x, 0.0, 0.0, 0.0),
+        velocity: None,
+    });
+    debug_assert!(observed.is_ok());
 }
 
 // Match the Apple host's landing threshold, including underdamped springs.
@@ -506,6 +670,30 @@ component App
     }
 
     #[test]
+    fn a_seek_goes_on_after_its_source_leaves_the_paint_and_lands_at_once() {
+        let mut p = presenter(APP);
+        p.host_mut().flights.enabled = true;
+        p.frame();
+        let thumb = p.host().kernel().node(id(p.host(), "thumb")).unwrap().key;
+        let toggle = id(p.host(), "toggle");
+        p.host_mut().dispatch_at(toggle, Event::Press, 100.0);
+        p.after_commit();
+        p.frame();
+        let detail = p.host().kernel().node(id(p.host(), "detail")).unwrap().key;
+        p.host_mut().seek_flights(&[(thumb, detail)], 0.2);
+        // A container carries it on though its source is no longer painted.
+        p.host_mut().flights.recorded.clear();
+        p.host_mut().seek_flights(&[(thumb, detail)], 0.7);
+        let frames = p.host().flight_frames();
+        assert!(
+            frames.iter().any(|f| f.to == detail && f.progress == 0.7),
+            "{frames:?}"
+        );
+        p.host_mut().land_seeking();
+        assert!(p.host().flight_frames().is_empty());
+    }
+
+    #[test]
     fn flight_clock_reverses_and_retires_with_the_destination() {
         let mut p = presenter(APP);
         let source = p.host().kernel().node(id(p.host(), "thumb")).unwrap().key;
@@ -775,6 +963,35 @@ component App
             let expected = if landed { Some(field) } else { None };
             assert_eq!(p.focus(), expected, "blur({blurred:?})");
         }
+    }
+
+    #[test]
+    fn a_handoff_yields_to_a_route_pair_of_its_destination() {
+        let app = APP.replace(
+            "      if not gone\n",
+            "      view sharedElement=\"other\" width=10 height=10 testId=\"other\"\n      if not gone\n",
+        );
+        let mut p = presenter(&app);
+        let toggle = id(p.host(), "toggle");
+        p.host_mut().dispatch_at(toggle, Event::Press, 100.);
+        p.after_commit();
+        let other = p.host().kernel().find_by_test_id("other")[0];
+        let detail = p.host().kernel().find_by_test_id("detail")[0];
+        let handed = p.host().flights.running[0].frame.from;
+        assert_ne!(handed, other, "the handoff flies first");
+        assert!(
+            !p.host().flight_frames()[0].dissolve,
+            "an in-page flight carries its destination"
+        );
+        let spring = exact_motion::Transition {
+            property: exact_motion::TransitionProperty::All,
+            duration: 0.0,
+            delay: 0.0,
+            timing: exact_motion::TimingFunction::Spring(Default::default()),
+        };
+        p.host_mut().fly(other, detail, &spring, true);
+        let frames = p.host().flight_frames();
+        assert_eq!((frames.len(), frames[0].from), (1, other));
     }
 
     #[test]

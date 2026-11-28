@@ -17,6 +17,7 @@ const observer = new ResizeObserver(entries => {
 export function observeResize(el, deliver) {
   delivers.set(el, deliver);
   observer.observe(el);
+  return () => { if (delivers.get(el) === deliver) { delivers.delete(el); observer.unobserve(el); } };
 }
 
 if (globalThis.exact) globalThis.exact.observeResize = observeResize;

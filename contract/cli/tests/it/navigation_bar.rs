@@ -189,6 +189,16 @@ fn a_header_of_buttons_alone_is_the_bar_and_one_with_a_text_is_named() {
             && m.contains("a header of buttons alone is the bar"),
         "{m}"
     );
+    // A text with no words is no spacer to the bar: the warning names the one that is.
+    let (_, warnings) = contract::compile_warned(&route(
+        "  text \"\" flex=1\n  button press=go aria-label=\"Add\"\n    image \"symbol:add\"",
+    ));
+    let m = &warnings[0].message;
+    assert!(
+        m.contains("this `text` with no words in it is not a bar item")
+            && m.contains("Write a spacer as `view flex=1`"),
+        "{m}"
+    );
     // A heading that presses is still the heading, as the kernel's bar
     // reads it: one is the title, the text after it its subtitle, and two
     // are two headings.

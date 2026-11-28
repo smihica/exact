@@ -212,6 +212,16 @@ pub(crate) fn css_text_in(
             (StyleId::Animation, RowValue::Animations(a)) => {
                 if let Some(link) = crate::link::linked().animations.filter(|_| !a.0.is_empty()) {
                     push_text!(&mut out, "animation:{};", (link.list)(a, press || shift));
+                    if a.0.iter().any(|entry| entry.paused) {
+                        out.push_str("--exact-animation-play-state:");
+                        for (i, entry) in a.0.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            out.push_str(if entry.paused { "paused" } else { "running" });
+                        }
+                        out.push(';');
+                    }
                 }
             }
             // @ref LLP 1063 — not CSS properties: custom properties the page's
@@ -272,11 +282,16 @@ pub(crate) fn css_text_in(
             (StyleId::AnimationTimeline, RowValue::AnimationTimeline(t)) => {
                 if let Some(clock) = t.clock() {
                     push_text!(&mut out, "--exact-animation-clock:{};", clock);
+                } else if t.is_none() {
+                    // `none` detaches the timeline without overriding an
+                    // authored `animation-play-state: paused`; browsers without
+                    // `animation-timeline: none` pause it via index.html.
+                    out.push_str("--exact-animation-timeline:none;animation-timeline:none;");
                 } else if t.anonymous().is_some() {
                     let t = t.css();
                     push_text!(
                         &mut out,
-                        "--exact-animation-timeline:{};animation-timeline:{};animation-play-state:var(--exact-timeline-play,paused);--exact-css-timeline:1;",
+                        "--exact-animation-timeline:{};animation-timeline:{};--exact-css-timeline:1;",
                         t,
                         t
                     );
@@ -1260,25 +1275,24 @@ fn transition_property(tr: &Transition) -> &'static str {
 }
 
 /// A `-exact-layout-transition` row as the presence module reads it: duration and
-/// delay in milliseconds, then a CSS easing (LLP 1063). A spring is
-/// `spring(stiffness, damping, mass)`: the module lowers each move itself,
-/// from its displacement and velocity in points, to the grid and rest
-/// threshold the engine settles on natively. `None` when no declaration
-/// covers layout.
+/// delay in milliseconds, then a CSS easing (LLP 1063 D6). A spring is `spring`
+/// and its curve from rest, over the time a move of
+/// [`exact_motion::LAYOUT_EXTENT`] points settles in (`SpringConfig::easing_over`):
+/// the module adds a spring's moves to the moves under way, which follows the
+/// engine's retarget as LLP 1063 D6 says, and restarts an easing as CSS does.
+/// `None` when no declaration covers layout.
 pub fn layout_transition_css(t: &Transitions) -> Option<String> {
     let tr = t.matching(exact_motion::Property::Layout)?;
-    let easing = match &tr.timing {
-        TimingFunction::Easing(e) => easing_css(e),
-        TimingFunction::Spring(c) => format!(
-            "spring({}, {}, {})",
-            num(c.stiffness as f32),
-            num(c.damping as f32),
-            num(c.mass as f32)
-        ),
+    let (duration, easing) = match &tr.timing {
+        TimingFunction::Easing(e) => (tr.duration, easing_css(e)),
+        TimingFunction::Spring(c) => {
+            let (duration, easing) = c.easing_over(exact_motion::LAYOUT_EXTENT);
+            (duration, format!("spring {}", easing.css()))
+        }
     };
     Some(format!(
         "{} {} {easing}",
-        num((tr.duration * 1000.0) as f32),
+        num((duration * 1000.0) as f32),
         num((tr.delay * 1000.0) as f32)
     ))
 }

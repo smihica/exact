@@ -49,7 +49,7 @@ fn publish(readers: &mut Vec<Reader>, pixels: &[u8], width: usize, height: usize
     });
 }
 
-pub(super) const SOURCE: &str = "kiosk-camera:preview";
+const SOURCE: &str = "kiosk-camera:preview";
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
 
@@ -65,7 +65,7 @@ struct Session {
 }
 
 pub(super) struct Camera {
-    pub enabled: bool,
+    enabled: bool,
     wanted: bool,
     failed: bool,
     session: Option<Session>,
@@ -154,6 +154,14 @@ impl Drop for Camera {
 }
 
 impl super::Images {
+    pub(super) fn camera_source(&self) -> Option<&'static str> {
+        self.camera.enabled.then_some(SOURCE)
+    }
+
+    pub(super) fn stop_camera(&mut self) {
+        self.camera.request(false);
+    }
+
     pub(super) fn sync_camera(&mut self) {
         self.camera
             .request(self.views.values().any(|v| v.source == SOURCE && v.visible));
@@ -355,7 +363,9 @@ mod tests {
         let image = portrait_frame(&[0, 255, 64, 128, 128, 128], 2, 2);
         let gray: Vec<u8> = image
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| {
                 assert_eq!(p, &[p[0], p[0], p[0], 255]);
                 p[0]
@@ -367,7 +377,7 @@ mod tests {
     fn kiosk_camera_chroma_planes_rotate_with_the_image() {
         let image = portrait_frame(&[76, 76, 29, 29, 76, 76, 29, 29, 85, 255, 255, 107], 4, 2);
         assert_eq!((image.width(), image.height()), (2, 4));
-        for (i, p) in image.data().chunks_exact(4).enumerate() {
+        for (i, p) in image.data().as_chunks::<4>().0.iter().enumerate() {
             if i < 4 {
                 assert!(p[0] >= 253 && p[1] <= 2 && p[2] <= 2);
             } else {

@@ -824,17 +824,26 @@ pub fn style_fallback(name: &str) -> String {
 /// css.rs writes no declaration for the row's empty value.
 const NONE: &str = "v=>v==null||/^\\s*none\\s*$/i.test(v)?null:v";
 
-/// `animation-timeline` as CSS's own row where a name may be a drag's: only
+/// `animation-timeline` as CSS's own row where a name may be a drag's: `none`,
 /// `scroll()` and `view()` (css.rs).
-pub(super) const ANONYMOUS_TIMELINE: &str = "v=>v!=null&&/^\\s*(scroll|view)\\(/i.test(v)?v:null";
+pub(super) const ANONYMOUS_TIMELINE: &str =
+    "v=>v!=null&&/^\\s*(?:none\\s*$|(?:scroll|view)\\()/i.test(v)?v:null";
 
 /// `animation-range` as CSS's own row.
 pub(super) const ANIMATION_RANGE: &str = "v=>v==null||/^\\s*normal\\s*$/i.test(v)?null:v";
 
-/// A name's consumer is paused for the drag code; `scroll()` or `view()`
-/// only where the browser has no `animation-timeline` (css.rs, index.html).
+/// Per-entry authored `animation-play-state` from an `animation` shorthand,
+/// recorded only when at least one entry has a standalone `paused` token so
+/// `motion-glue.js` and the unsupported-browser fallback preserve pauses.
+pub(super) const AUTHORED_PLAY_STATE: &str =
+    "v=>{if(v==null)return null;const s=v.replace(/\\([^()]*\\)/g,\"\").split(\",\").map(e=>/(?:^|[\\t\\n\\f\\r ])(running|paused)(?:$|[\\t\\n\\f\\r ])/i.exec(e)?.[1]?.toLowerCase()===\"paused\"?\"paused\":\"running\");return s.includes(\"paused\")?s.join(\",\"):null}";
+
+/// A name's consumer is paused for the drag code; `scroll()`, `view()`, `none`,
+/// `auto`, `unset` and clocks leave an authored `animation-play-state`
+/// untouched (browsers without `animation-timeline` cancel `--exact-css-timeline`
+/// or pause `--exact-animation-timeline: none` in index.html).
 pub(super) const TIMELINE_PLAY_STATE: &str =
-    "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\(.*\\))?\\s*$/i.test(v)?null:/^\\s*(scroll|view)\\(/i.test(v)?\"var(--exact-timeline-play,paused)\":\"paused\"";
+    "v=>v==null||/^\\s*(unset|auto|none|(-exact-)?clock\\([\\s\\S]*\\)|(scroll|view)\\([\\s\\S]*\\))?\\s*$/i.test(v)?null:\"paused\"";
 
 /// A bound corner's map: a list (white space outside parentheses, or a
 /// `/`) is the elliptical radius no row holds, refused whole with the
@@ -947,15 +956,17 @@ fn one(name: impl Into<String>, unit: impl Into<String>) -> Vec<Write> {
     }]
 }
 
-/// A blank's declarations come from the wasm serializer, including companion
-/// properties. A property absent here keeps its map's internal absence rule.
-pub(super) fn clear_css(id: StyleId, press: bool) -> String {
+/// A blank's declarations come from the wasm serializer, including companion properties.
+pub(super) fn clear_css(id: StyleId, press: bool, has_press: bool) -> String {
     let mut style = exact_kernel::StyleProps::default();
     style.written.set(id);
-    if press {
-        style
-            .set_dynamic(StyleId::PressScale, &exact_kernel::StyleValue::Number(0.9))
-            .expect("a press scale");
+    if let Some((row, val)) = match (id, press, has_press) {
+        (i, true, _) if i != StyleId::PressScale => Some((StyleId::PressScale, 0.9)),
+        (StyleId::Transition, _, true) => Some((StyleId::PressOpacity, 0.5)),
+        _ => None,
+    } {
+        let v = exact_kernel::StyleValue::Number(val);
+        style.set_dynamic(row, &v).expect("a press row");
     }
     exact_web::css::css_text(&style, &[]).0
 }
@@ -1107,12 +1118,12 @@ pub fn style_writes(id: u16, timeline: bool, written: bool) -> Result<Vec<Write>
         StyleId::AnimationTimeline => vec![
             with(
                 "--exact-animation-timeline",
-                "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\(.*\\))\\s*$/i.test(v)?null:v",
+                "v=>v==null||/^\\s*(unset|auto|(-exact-)?clock\\([\\s\\S]*\\))?\\s*$/i.test(v)?null:/^\\s*none\\s*$/i.test(v)?\"none\":v",
             ),
             with("animation-timeline", ANONYMOUS_TIMELINE),
             with(
                 "--exact-css-timeline",
-                "v=>v!=null&&/^\\s*(scroll|view)\\(/i.test(v)?\"1\":null",
+                "v=>v!=null&&/^\\s*(?:scroll|view)\\(/i.test(v)?\"1\":null",
             ),
             with(
                 "--exact-animation-clock",

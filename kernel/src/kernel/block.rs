@@ -275,6 +275,9 @@ pub(crate) struct Blocks(
     crate::sorted::SlotSet,
     /// The window's aspect-fit guide a host fits the first root to (LLP 1123 D16, `root_fit.rs`).
     super::root_fit::RootFits,
+    /// The routes their host will present with a block of its own and has not yet placed (LLP 1123, "a presented
+    /// owner waits for its block"), laid out nowhere until it gives one (`set_pending`).
+    crate::sorted::SlotSet,
 );
 
 /// One node's block: the one in force, the host's or else the one the
@@ -412,10 +415,16 @@ impl Blocks {
         }
     }
 
-    /// `slot` gone: neither block stands, nor its local insets.
+    /// `slot` gone: neither block stands, nor its local insets, nor its wait for one.
     pub(crate) fn remove(&mut self, slot: u32) {
         self.0.retain(|b| b.slot != slot);
         self.set_local(slot, None);
+        self.4.remove(slot);
+    }
+
+    /// Whether `slot` waits for the block its host will present it in (`Kernel::set_pending`).
+    pub(crate) fn pending(&self, slot: u32) -> bool {
+        self.4.contains(slot)
     }
 
     /// The local insets a host gave the owner whose root is `slot`.
@@ -573,7 +582,8 @@ pub(crate) fn apply(
     s: &mut taffy::style::Style,
 ) {
     let Some(block) = block else {
-        if closed_dialog(arena, slot) {
+        // A route waiting for the block its host presents it in is laid out nowhere until then, as a closed dialog is
+        if closed_dialog(arena, slot) || arena.blocks.pending(slot) {
             s.display = taffy::Display::None;
         }
         return;
@@ -698,6 +708,30 @@ fn cyclic(block: HostBlock, s: &mut taffy::style::Style) {
 }
 
 impl Kernel {
+    /// Say that `view`, a route its host will present with a block of its own, waits for that block (LLP 1123, "a
+    /// presented owner waits for its block"), or no longer does; whether that changed. Until the host gives the block
+    /// (`set_host_block`, which ends the wait), the route has no layout box: none of its subtree is laid out in its
+    /// parent's flow or published, and its geometry is unavailable, as a closed dialog's is. The host decides it before
+    /// the layout of the batch that creates the route.
+    pub fn set_pending(&mut self, view: ViewId, pending: bool) -> Result<bool, KernelError> {
+        let slot = self
+            .arena
+            .slot_of(view)
+            .ok_or(LayoutError::UnknownView(view))?;
+        let changed = match pending && self.arena.blocks.given(slot).is_none() {
+            true => self.arena.blocks.4.insert(slot),
+            false => self.arena.blocks.4.remove(slot),
+        };
+        if changed {
+            if let (Some(node), Some(layout)) = (self.arena.taffy(slot), self.layout.as_deref_mut())
+            {
+                layout.restyle(&self.arena, slot, node);
+                layout.mark_dirty(node);
+            }
+        }
+        Ok(changed)
+    }
+
     /// Give `view` a containing block, or take it back (`None`): at the next
     /// layout its subtree is laid out in the block, or in its parent again
     /// (in the viewport for a top-layer box, the block the kernel implies).
@@ -736,6 +770,10 @@ impl Kernel {
         }
         let before = self.arena.blocks.get(slot);
         let hosted = self.arena.hosted_readout(slot);
+        // The block its host presents it in ends a route's wait (`set_pending`)
+        if block.is_some() {
+            self.arena.blocks.4.remove(slot);
+        }
         // Measure the readers under a box that gains or gives back a block again, which
         // changes the band they observe; a reader elsewhere that this moves has a frame
         // that moved
@@ -752,6 +790,19 @@ impl Kernel {
             }
         }
         self.block_changed(slot, before);
+        // Under the owner layout an owner's root is skipped in the walk for the scroller at a
+        // covered box's bottom (`cover.rs`), so the covered box above lays its bottom out again
+        // when this box becomes an owner or stops being one, whatever its block
+        let owner_layout = self.arena.observations.owner_layout;
+        if owner_layout && was_owner != owns(&self.arena, slot) {
+            if let Some(layout) = self.layout.as_deref_mut() {
+                super::cover::chain_changed(&self.arena, layout, slot);
+            }
+            // And a content region measures again, as a cover's change makes it (`set_host_cover`)
+            if let Some(region) = &mut self.region {
+                region.intrinsic(slot);
+            }
+        }
         if hosted && !self.arena.hosted_readout(slot) {
             self.bar_text_changed(slot);
         }
@@ -956,6 +1007,9 @@ impl Kernel {
         }
         if before.is_some() == block.is_some() {
             return;
+        }
+        if self.arena.observations.bars.styled.contains(slot) {
+            self.bar_block_changed(slot);
         }
         self.targets_moved(slot);
         if let Some(region) = &mut self.region {
@@ -1347,10 +1401,14 @@ impl Kernel {
             self.layout.replace(Box::new(trial)),
             self.region.take(),
         );
-        // Derive in the copies the owner segments' readers below a box the trial starts
-        // placing, as giving it the block does
+        // Derive in the copies what giving the block derives below a box the trial starts
+        // placing: the readers of native targets and owner segments where it becomes an owner,
+        // else those of owner segments alone
         if placing {
-            self.segments_moved(slot);
+            match owns(&self.arena, slot) {
+                true => self.targets_moved(slot),
+                false => self.segments_moved(slot),
+            }
         }
         let measured = self.measure_trial(slot, node, block);
         let trial = std::mem::replace(&mut self.arena, kept.0);

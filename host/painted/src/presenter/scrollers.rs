@@ -173,11 +173,6 @@ fn gives(action: exact_kernel::TouchAction) -> (bool, bool) {
 }
 
 impl<D: DataSource> Presenter<D> {
-    /// A scroll container's offset.
-    pub fn scroll_of(&self, id: ViewId) -> (f32, f32) {
-        self.scroll.get(&id).copied().unwrap_or((0.0, 0.0))
-    }
-
     /// The page as a scroller: the document past the viewport.
     pub(super) fn page_scroller(&self) -> Scroller {
         let doc = self.document();
@@ -524,8 +519,14 @@ impl<D: DataSource> Presenter<D> {
     ) {
         if id == PAGE {
             self.page = next;
+            self.host
+                .runner_mut()
+                .scrolled(None, f64::from(next.0), f64::from(next.1));
         } else {
             self.scroll.insert(id, next);
+            self.host
+                .runner_mut()
+                .scrolled(Some(id), f64::from(next.0), f64::from(next.1));
             self.scroll_end_input(id, from, completion);
             self.collection_scroll_input(id, from);
         }

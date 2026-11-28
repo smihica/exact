@@ -32,7 +32,11 @@ export function scrollFollowers(positionContexts, schedule = (fn, ms) => setTime
   /** The followed scrollers an authored scroll of `el` (a scroller, or an element in them) moves, now owned by it. */
   function own(el) {
     const owned = [];
-    for (const s of followedScrolls.values()) {
+    for (const s of [...followedScrolls.values()]) {
+      if (!s.el.isConnected) {
+        followScroll(s.el, false);
+        continue;
+      }
       if (s.el === el || s.el.contains(el)) {
         s.owned ??= { quiet: null };
         quiet(s);
@@ -43,6 +47,7 @@ export function scrollFollowers(positionContexts, schedule = (fn, ms) => setTime
   }
   function settleFollow(s) {
     if (!s.el.isConnected) {
+      followScroll(s.el, false);
       return;
     }
     // A reader above the end uses the browser's CSS scroll anchoring. Writing the remembered numeric offset here would

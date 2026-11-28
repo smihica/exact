@@ -1,4 +1,5 @@
 // UIKit moves the scrollport; row construction follows outside its layout pass.
+// Run `bun bench/scroll-pump/run.mjs` when changing work scheduled during scrolling.
 // @ref LLP 1044.000 §6 S5; LLP 1010 §6 — visible-only rescue, bounded lead.
 #if os(iOS) || os(tvOS)
 import UIKit
@@ -217,10 +218,9 @@ package final class ScrollPump: NSObject, UIScrollViewDelegate {
         armRest(after: Self.restDelay)
         p.leaves?.scrolled()
         p.menus.rehostPopovers()
-        // What this frame shows has its text before it commits. A pass
-        // follows only for work owed: a paragraph still without all its
-        // pixels, or a list's rows. A screen painted up front scrolls with
-        // none, and asks for no frames.
+        // Give pixels to what this frame shows before it commits. Queue a
+        // slice only for text within reach or pending rows. Every UIKit
+        // offset callback during a fling can otherwise queue another pass.
         if p.paintVisibleText() { textPending = true }
         guard textPending || !p.collections.fillPending.isEmpty else { return }
         scheduleAfterScroll()

@@ -111,10 +111,13 @@ pub struct Wgpu {
     pipeline: ::wgpu::RenderPipeline,
     replace_pipeline: ::wgpu::RenderPipeline,
     solid_pipeline: ::wgpu::RenderPipeline,
+    fast_shadow_pipeline: ::wgpu::RenderPipeline,
     programs: Vec<::wgpu::RenderPipeline>,
     mip_pipeline: ::wgpu::RenderPipeline,
     #[cfg(test)]
     pub(super) general_only: bool,
+    #[cfg(test)]
+    pub(super) fast_shadow: bool,
     layout: ::wgpu::BindGroupLayout,
     sampler: ::wgpu::Sampler,
     repeat_sampler: ::wgpu::Sampler,
@@ -341,6 +344,11 @@ impl Wgpu {
             Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
             &[],
         );
+        let fast_shadow_pipeline = make_pipeline(
+            "fs_fast_shadow",
+            Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            &[],
+        );
         let programs = programs::CLASSES
             .iter()
             .map(|class| {
@@ -413,10 +421,13 @@ impl Wgpu {
             pipeline,
             replace_pipeline,
             solid_pipeline,
+            fast_shadow_pipeline,
             programs,
             mip_pipeline,
             #[cfg(test)]
             general_only: false,
+            #[cfg(test)]
+            fast_shadow: true,
             layout,
             sampler,
             repeat_sampler,
@@ -620,6 +631,12 @@ impl Wgpu {
             timestamp_writes: (timed.zip(self.timing.as_ref())).map(|(pass, t)| t.writes(pass)),
             ..Default::default()
         });
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Program {
+            General,
+            Fixed(usize),
+            FastShadow,
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, buffer);
         for (batch, bindings) in batches.iter().zip(groups) {
@@ -634,33 +651,39 @@ impl Wgpu {
             });
             pass.set_scissor_rect(s.x, s.y, s.width, s.height);
             pass.set_bind_group(0, bindings, &[]);
-            let class = |i: &Instance| {
+            let select = |i: &Instance| {
                 #[cfg(test)]
                 if self.general_only {
-                    return None;
+                    return Program::General;
                 }
-                (!batch.replace).then(|| programs::class(i)).flatten()
+                if batch.replace {
+                    return Program::General;
+                }
+                let fast = programs::fast_shadow(i);
+                #[cfg(test)]
+                let fast = fast && self.fast_shadow;
+                if fast {
+                    return Program::FastShadow;
+                }
+                programs::class(i).map_or(Program::General, Program::Fixed)
             };
             let mut start = batch.instances.start;
             for run in instances[start as usize..batch.instances.end as usize]
-                .chunk_by(|a, b| class(a) == class(b))
+                .chunk_by(|a, b| select(a) == select(b))
             {
-                let selected = class(&run[0]);
-                let pipeline = selected.map_or_else(
-                    || {
-                        if batch.replace {
-                            &self.replace_pipeline
-                        } else {
-                            &self.pipeline
-                        }
-                    },
-                    |index| &self.programs[index],
-                );
+                let selected = select(&run[0]);
+                let pipeline = match selected {
+                    Program::General if batch.replace => &self.replace_pipeline,
+                    Program::General => &self.pipeline,
+                    Program::Fixed(index) => &self.programs[index],
+                    Program::FastShadow => &self.fast_shadow_pipeline,
+                };
                 pass.set_pipeline(pipeline);
                 let end = start + run.len() as u32;
-                if selected.is_some()
-                    && run[0].kind_brush == Kind::RoundedRect as u32
-                    && run[0].flags == 0
+                if selected != Program::General
+                    && ((run[0].kind_brush == Kind::RoundedRect as u32 && run[0].flags == 0)
+                        || (run[0].kind_brush == Kind::Shadow as u32
+                            && run[0].flags == flags::CLIP1))
                 {
                     solid::draw(&mut pass, pipeline, &self.solid_pipeline, s, start, run);
                 } else {

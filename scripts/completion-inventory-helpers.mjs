@@ -100,7 +100,7 @@ export function helperClassifications(group) {
   group("replies", ["one-shot", "subscription", "durable operation"], "pending ticket and source turn; UI target by default", "UI-owned",
     "The named public runner-crate source is the replies API or its value/admission helper. runner/src/runner/reply.rs:27-88 checks pending, background, tool and module-work tickets; reply.rs:309 preserves effectful reply writes. Ordinary resource/then ownership is inferred from PendingReq.target in commit.rs:960.", [
     ["runner:runner/src/request.rs", "Reply::message Reply::new Reply::send Reply::stream"],
-    ["runner:runner/src/upload.rs", "Message::sent Message::upload_progress Message::upload_start Message::upload_started Request::upload_progress Request::upload_progress_refusal"],
+    ["runner:runner/src/upload.rs", "Message::http_open Message::is_http_open Message::sent Message::upload_progress Message::upload_start Message::upload_started Request::stream_open Request::stream_open_refusal Request::upload_progress Request::upload_progress_refusal"],
   ], "durable when the ticket names background/tool work or retained effectful module work; see reply.rs:70-88 and module_work.rs. Not all tool handlers survive session teardown."),
   group("storage", ["durable operation"], "app store contents; inspection/adoption is synchronous", "durable",
     "The named public runner-crate source is the storage API or its value/admission helper. runner/src/runner/kept.rs adopts stored values and retries store readers; runner/src/runner.rs take_store_writes drains committed writes. Stored effects are distinct from UI settlement (reply.rs:309).", [
@@ -156,7 +156,7 @@ export function helperClassifications(group) {
   ]),
   group("shared tokens", ["one-shot"], "share token in the live router; copying may outlive the initiating view", "UI-owned",
     "The named public runner-crate source is the shared tokens API or its value/admission helper. runner/src/runner/picker/shared.rs:596-630 updates only a token accepted by router.share. Copied files can survive, but this completion targets the current router token.", [
-    ["runner:runner/src/runner/picker/shared.rs", "Claimed::copy Claimed::copy_with Claims::claim Claims::new is_token location Pending::from_json received_line shared_path SharedFiles::value ShareTarget::from_json token"],
+    ["runner:runner/src/runner/picker/shared.rs", "Claimed::copy Claimed::copy_checked Claimed::copy_with Claims::claim Claims::claim_checked Claims::new is_token location Pending::from_json received_line shared_path SharedFiles::validate SharedFiles::value ShareTarget::from_json token"],
   ]),
   group("module lifecycle", ["one-shot"], "module binding, source instance or session configuration", "UI-owned",
     "The named public runner-crate source is the module lifecycle API or its value/admission helper. runner/src/runner/modules/bound.rs binds live module instances; runner/src/runner/kept.rs data_ready reconciles the current source/store before settlement.", [
@@ -196,6 +196,9 @@ export function helperClassifications(group) {
     ["runner:runner/src/runner/lines.rs", "Runner::journal Runner::journal_start Runner::journal_echo"],
     ["runner:runner/src/runner/console.rs", "Console::mark_unjournaled"],
     ["runner:runner/src/runner/faults.rs", "Runner::fetch_fault Runner::share_faults Runner::take_fault_logs"],
+    ["runner:runner/src/agent.rs", "open_web_stream_fixture"],
+    ["runner:runner/src/runner/advance/stream_fixtures.rs", "Runner::take_stream_fixture_failures Runner::release_stream_fixtures#next_step:1 Runner::release_stream_fixtures#next_step:2"],
+    ["runner:runner/src/runner/stream_fixture_spec.rs", "parse_stream_fixture stream_fixture_json StreamFixture::is_buffered_failure StreamFixture::is_streaming StreamMode::as_str StreamMode::eof_message StreamStep::after_ms"],
     ["painted:host/painted/src/executor.rs", "Executor::set_fetch_fault"],
     ["painted:host/painted/src/canvas/jni_extensions.rs", "Java_dev_exact_canvas_Native_journal"],
     ["painted:host/painted/src/canvas/requests.rs", "CanvasHost::journal"],
@@ -220,10 +223,10 @@ export function helperClassifications(group) {
     "runner/router.rs host_root commits the current router's host root; painted stage/authored.rs retains the route's transition parts until arrival; stage/zoom.rs resolves the live source and retains geometry only for its route's transition.", [
     ["apple:host/apple/src/abi/exports.rs", "exact_host_root exact_route_part"],
     ["runner:runner/src/runner/router.rs", "Runner::host_root"],
-    ["painted:host/painted/src/flights.rs", "Host::flying Host::start_flights"],
+    ["painted:host/painted/src/flights.rs", "Host::end_route_flights_outside Host::flying Host::start_flight"],
     ["painted:host/painted/src/presenter/arrive.rs", "Presenter::focus_landed"],
     ["painted:host/painted/src/presenter/stage/authored.rs", "Presenter::entrance Presenter::hold_arriving Presenter::top_of"],
-    ["painted:host/painted/src/presenter/stage/zoom.rs", "Presenter::navigation_container Presenter::source_node Presenter::source_rect Presenter::sync_sources"],
+    ["painted:host/painted/src/presenter/stage/zoom.rs", "Presenter::navigation_container Presenter::return_container Presenter::source_node Presenter::source_rect Presenter::sync_sources"],
   ]),
   group("module announcements", ["subscription"], "bound module, app topic and its current readers", "UI-owned",
     "Store::announce_topic records changed app topics; exact_peer_changed delivers them to another session. Canvas extension activation checks the current plan's declared action before raising its event.", [
@@ -241,7 +244,7 @@ export function helperClassifications(group) {
   ]),
   group("UI facts", ["one-shot"], "current session's launch and presentation configuration", "UI-owned",
     "Apple ABI setters configure the current Bridge. chooses_scheme reads the plan's command use, without starting work.", [
-    ["apple:host/apple/src/abi/exports.rs", "exact_flat_nodes exact_set_launch_direction exact_set_launch_window exact_set_natural_text"],
+    ["apple:host/apple/src/abi/exports.rs", "exact_launch_modes exact_set_launch_direction exact_set_launch_window exact_set_natural_text"],
     ["runner:runner/src/uses.rs", "chooses_scheme"],
     ["web:host/web/src/abi.rs", "exact_chooses_scheme"],
   ]),

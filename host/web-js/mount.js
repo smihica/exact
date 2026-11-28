@@ -9,6 +9,7 @@ import {
   Owner,
   onEnd,
   scope,
+  mounted,
   end,
   endAll,
   untracked,
@@ -163,7 +164,7 @@ function finishTaskScopes() {
 function preparedView(view, own, parent) {
   const frag = document.createDocumentFragment();
   frag.$listOwner = listOwner(parent);
-  const s = view ? scope(() => view(frag), own) : null;
+  const s = view ? scope(() => view(frag), own, true) : null;
   return { frag, s, used: false };
 }
 function armRegion(p, subject, a0, a1, matched) {
@@ -212,6 +213,7 @@ function armRegion(p, subject, a0, a1, matched) {
         s = next.made.s;
         pending.delete(want);
         b.before(next.made.frag);
+        mounted(s);
         Paint?.list(b.parentNode);
       } else {
         const view = viewFor(want);
@@ -339,7 +341,7 @@ export function each(p, list, key, row, pure) {
           r = { k, item: sig(item), index: sig(i) };
           const frag = document.createDocumentFragment();
           frag.$listOwner = listOwner(parent);
-          r.s = scope(() => row(frag, r.item, r.index, r.k), own);
+          r.s = scope(() => row(frag, r.item, r.index, r.k), own, !!PrepareTasks);
           if (PrepareTasks) {
             pending.set(k, r);
             const made = r;
@@ -370,7 +372,11 @@ export function each(p, list, key, row, pure) {
     const result = prepared();
     if (!result) return;
     untracked(() => {
-      const { next, gone, parent } = result;
+      const { next, gone } = result;
+      // Resolve the live parent from the anchor at apply time: a nested `each`
+      // prepared inside a `when` arm moves from the arm's fragment into the DOM
+      // before its own row update runs.
+      const parent = b?.parentNode ?? result.parent;
       const list = (order = [...next.values()]);
       for (let i = 0; i < list.length; i++) list[i].at = i;
       // Every row goes and the region is all its parent holds: emptied at once, but not where the parent holds a modal
@@ -407,12 +413,15 @@ export function each(p, list, key, row, pure) {
         const stay = inOrder(list);
         let anchor = b,
           batch = null,
-          first = null;
+          first = null,
+          batchScopes = null;
         const flush = () => {
           if (batch) {
             parent.insertBefore(batch, anchor);
+            if (batchScopes) for (let j = batchScopes.length - 1; j >= 0; j--) mounted(batchScopes[j]);
             anchor = first;
             batch = null;
+            batchScopes = null;
           }
         };
         for (let i = list.length - 1; i >= 0; i--) {
@@ -420,6 +429,7 @@ export function each(p, list, key, row, pure) {
           if (r.frag) {
             if (batch) batch.prepend(r.frag);
             else batch = r.frag;
+            if (r.s?.deferMount) (batchScopes ??= []).push(r.s);
             first = r.start;
             r.frag = null;
             pending.delete(r.k);

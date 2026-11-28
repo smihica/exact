@@ -49,12 +49,15 @@ fn same_carried(a: &exact_runner::Carried, b: &exact_runner::Carried) -> bool {
         router,
         data_revision,
         picked_count,
+        shared_tokens,
+        shared_claims,
         keeps_answers,
         slots,
         panels,
         resources,
         waiting,
         streams,
+        watched,
         store_readers,
         clock_readers,
         epoch_at_zero,
@@ -78,8 +81,15 @@ fn same_carried(a: &exact_runner::Carried, b: &exact_runner::Carried) -> bool {
         && router == &b.router
         && data_revision == &b.data_revision
         && picked_count == &b.picked_count
+        && shared_claims == &b.shared_claims
+        && shared_tokens.len() == b.shared_tokens.len()
+        && shared_tokens
+            .iter()
+            .zip(&b.shared_tokens)
+            .all(|((an, av), (bn, bv))| an == bn && equivalent(av, bv))
         && keeps_answers == &b.keeps_answers
         && streams == &b.streams
+        && watched == &b.watched
         && store_readers == &b.store_readers
         && clock_readers == &b.clock_readers
         && epoch_at_zero.to_bits() == b.epoch_at_zero.to_bits()

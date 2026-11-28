@@ -7,10 +7,10 @@ enum Languages {
     /// The agent's languages, every pair of two distinct ones `available` (§9).
     static let agent = ["ar", "de", "en", "es", "fr", "hi", "it", "ja", "ko", "pt", "ru", "zh", "zh-Hant"]
 
-    /// `tag` canonicalised as BCP 47 is (`zh_tw` is `zh-TW`), or nil for no tag.
+    /// `tag` canonicalised as BCP 47 is (`zh-tw` is `zh-TW`), or nil for no tag. `zh_tw` is not
+    /// structurally valid BCP 47, so it is refused as the web refuses it (D7).
     static func canonical(_ tag: String) -> String? {
-        let t = tag.replacingOccurrences(of: "_", with: "-")
-        let parts = t.split(separator: "-", omittingEmptySubsequences: false).map(String.init)
+        let parts = tag.split(separator: "-", omittingEmptySubsequences: false).map(String.init)
         guard let first = parts.first, (2...8).contains(first.count), first.allSatisfy(\.isLetter),
               parts.allSatisfy({ !$0.isEmpty && $0.count <= 8 && $0.allSatisfy { $0.isLetter || $0.isNumber } }) else { return nil }
         return parts.enumerated().map { i, p in

@@ -11,7 +11,7 @@
 // land before the browser began a pan, the container's `touch-action` withholding `pinch-zoom` from the browser. A
 // double tap is two touch `pointerup`s within 300 ms (D5). A zoom that moves no offset fires no native `scroll`, so
 // the module fires `scroll` and `scrollend` itself.
-import { After, Clocked, PropHooks, Adopt, at, clock } from './rt.js';
+import { After, Clocked, PropHooks, Adopt, at, clock, onMount } from './rt.js';
 
 let Sheet = null;
 
@@ -53,7 +53,7 @@ export function zoom(e) {
   e.$zoomLayers = { sizer, extent, layer };
   e.$zoom = 1;
   e.$zoomApplied = 1;
-  Zoomed.add(e);
+  onMount(() => Zoomed.add(e));
   return layer;
 }
 
